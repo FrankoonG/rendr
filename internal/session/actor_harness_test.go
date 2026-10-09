@@ -642,7 +642,7 @@ func acIsCtx(err error) bool {
 }
 
 // acHealth is a fake health layer (healthSource): the test publishes
-// per-factory RTT evidence; MarkFailed and Succeeded maintain failed marks
+// per-factory RTT evidence; MarkFailedAt and Succeeded maintain failed marks
 // as the real layer does; every publication rings the subscribers.
 type acHealth struct {
 	mu      sync.Mutex
@@ -728,7 +728,7 @@ func (h *acHealth) Subscribe(b carrier.Doorbell) func() {
 	}
 }
 
-func (h *acHealth) MarkFailed(i int, reason string) {
+func (h *acHealth) MarkFailedAt(i int, reason string, _ time.Time) {
 	h.mu.Lock()
 	h.failed[i] = true
 	h.marks++

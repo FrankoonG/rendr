@@ -8,6 +8,7 @@ import (
 	"net"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,6 +45,13 @@ type relay struct {
 	resets atomic.Int64 // connections the relay reset
 	errs   atomic.Int64 // connections that ended in an error the relay did not cause
 	lastEr atomic.Value // the last such error (error)
+
+	// stallable makes the dialer→passive pump a plain read/write loop that
+	// sleeps stall (when non-zero) before each write; stalled counts those
+	// delayed writes (W4-K11).
+	stallable atomic.Bool
+	stall     atomic.Int64 // time.Duration
+	stalled   atomic.Int64
 }
 
 type relayPair struct {
@@ -108,7 +116,12 @@ func (r *relay) serve(p *relayPair) {
 	}
 	pump := func(dst, src *net.TCPConn) {
 		defer wg.Done()
-		_, err := io.Copy(dst, src)
+		var err error
+		if r.stallable.Load() && dst == p.b {
+			err = r.stallCopy(dst, src)
+		} else {
+			_, err = io.Copy(dst, src)
+		}
 		if err != nil && !p.reset.Load() {
 			fail(err)
 			// Pass the failure on: the other end must not wait forever.
@@ -143,6 +156,32 @@ func (r *relay) serve(p *relayPair) {
 	r.mu.Lock()
 	delete(r.pairs, p)
 	r.mu.Unlock()
+}
+
+// stallCopy is io.Copy for the dialer→passive direction of a stallable
+// relay: before each write it sleeps r.stall when set, so that what the
+// dialer writes reaches the passive late (a stalled peer as the passive
+// sees it).
+func (r *relay) stallCopy(dst, src *net.TCPConn) error {
+	buf := make([]byte, 64<<10)
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if d := time.Duration(r.stall.Load()); d > 0 {
+				r.stalled.Add(1)
+				time.Sleep(d)
+			}
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return werr
+			}
+		}
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
 }
 
 // rstWait is how long the relay keeps a connection open after both FINs
@@ -446,6 +485,82 @@ func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
 		}
 	}
 	lp.relay.idle(10 * time.Second) // every relayed connection ended
+	if n, c := lp.relay.errs.Load(), lp.relay.conns.Load(); n != 0 || c != rounds {
+		t.Fatalf("%d of %d relayed connections ended in an error (%v); want 0 of %d", n, c, lp.relay.lastEr.Load(), rounds)
+	}
+	lp.close(t)
+	check()
+}
+
+// TestLoopbackDrainBoundNoReset_L05: a carrier whose CLOSE the peer has
+// not answered within the drain bound (min(2·srtt + 100 ms, 1 s)) still
+// closes in the L05 order: it consumes what the peer sends afterwards, the
+// peer's own CLOSE included, before it closes the socket, so no frame
+// arrives at a closed socket and draws a TCP RST (W4-K11). Three rounds:
+// the dialer writes 64 KiB and Closes; the passive reads it and EOF; then
+// the relay delays every write in the dialer→passive direction by 300 ms
+// (a stalled dialer as the passive sees it) and the passive Closes. The
+// passive's CLOSE goes unanswered past its drain bound (stimulus: a
+// carrier retired by the drain bound, writes stalled). Both sessions end
+// with io.EOF, every carrier is retired (never killed), the data is
+// intact, and the relay sees every connection end in a FIN on both sides.
+func TestLoopbackDrainBoundNoReset_L05(t *testing.T) {
+	check := rendrtest.AssertNoLeak(t)
+	lp := newLoopPair(t, rendr.Config{})
+	lp.relay.stallable.Store(true)
+	const rounds, size, stall = 3, 64 << 10, 300 * time.Millisecond
+	msg := make([]byte, size)
+	if _, err := io.ReadFull(rendrtest.PRNG(11), msg); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, size+1)
+	drainBound := 0
+	for i := range rounds {
+		lp.relay.stall.Store(0)
+		dc, pc := lp.open(t)
+		if n, err := dc.Write(msg); n != size || err != nil {
+			t.Fatalf("round %d: Write = %d, %v", i, n, err)
+		}
+		if err := dc.Close(); err != nil {
+			t.Fatalf("round %d: Close: %v", i, err)
+		}
+		n, err := io.ReadFull(pc, buf[:size])
+		if err != nil || n != size || string(buf[:size]) != string(msg) {
+			t.Fatalf("round %d: the passive read %d bytes, %v", i, n, err)
+		}
+		if n, err := pc.Read(buf); n != 0 || err != io.EOF {
+			t.Fatalf("round %d: after the data: (%d, %v), want EOF", i, n, err)
+		}
+		lp.relay.stall.Store(int64(stall))
+		pc.Close()
+		for _, c := range []*rendr.Conn{dc, pc} {
+			st := waitEnded(t, c, 30*time.Second)
+			if st.Err != io.EOF || st.Migrations != (rendr.MigrationCounts{}) || st.Rejoins != 0 || st.NoPathEpisodes != 0 {
+				t.Fatalf("round %d: %v ended %+v", i, st.Role, st)
+			}
+		}
+		lp.relay.idle(10 * time.Second) // the connection ended, both directions in a FIN
+		for _, c := range []*rendr.Conn{dc, pc} {
+			st := c.Status()
+			if len(st.Carriers) == 0 {
+				t.Fatalf("round %d: %v lists no carrier", i, st.Role)
+			}
+			for _, cs := range st.Carriers {
+				if cs.DeathCause != rendr.CauseRetired {
+					t.Fatalf("round %d: %v carrier %d not retired: %v %s", i, st.Role, cs.ID, cs.DeathCause, cs.DeathDetail)
+				}
+				if strings.Contains(cs.DeathDetail, "drain bound") {
+					drainBound++
+				}
+			}
+		}
+		if n := lp.relay.errs.Load(); n != 0 {
+			t.Fatalf("round %d: %d relayed connections ended in an error: %v", i, n, lp.relay.lastEr.Load())
+		}
+	}
+	if drainBound == 0 || lp.relay.stalled.Load() == 0 {
+		t.Fatalf("stimulus: %d carriers retired by the drain bound, %d stalled writes", drainBound, lp.relay.stalled.Load())
+	}
 	if n, c := lp.relay.errs.Load(), lp.relay.conns.Load(); n != 0 || c != rounds {
 		t.Fatalf("%d of %d relayed connections ended in an error (%v); want 0 of %d", n, c, lp.relay.lastEr.Load(), rounds)
 	}

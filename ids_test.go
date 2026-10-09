@@ -85,7 +85,7 @@ func TestRandomIDs(t *testing.T) {
 func TestEnumStrings(t *testing.T) {
 	cases := []struct{ got, want string }{
 		{Mode(0).String(), "mode(0)"}, {ModeSelector.String(), "selector"}, {ModeBond.String(), "bond"}, {Mode(3).String(), "mode(3)"},
-		{KindStream.String(), "stream"}, {Kind(2).String(), "kind(2)"},
+		{KindStream.String(), "stream"}, {Kind(2).String(), "datagram"}, {Kind(3).String(), "kind(3)"},
 		{RoleDialer.String(), "dialer"}, {RolePassive.String(), "passive"}, {Role(9).String(), "role(9)"},
 		{StatePending.String(), "pending"}, {StateOpen.String(), "open"}, {StateClosing.String(), "closing"},
 		{StateEnded.String(), "ended"}, {State(0).String(), "state(0)"},

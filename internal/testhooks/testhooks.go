@@ -50,6 +50,21 @@ type Overrides struct {
 	FirstCarrierID uint32 // first CarrierID a dialer Runtime allocates
 	OffsetLimit    uint64 // offset at which a session ends with RST(AbortExhausted) (2^62)
 
+	// M2: packet sessions and datagram carriers (M2 design §A7.4). Timing
+	// and sizes (zero keeps the normalized value).
+	PacketPing, PacketActive, PacketMaxAge time.Duration // PACK/PING cadence of active packet carriers (1 s), activity window (10 s), Packet.MaxAge (100 ms)
+	RelRTOInit, RelRTOMin, RelRTOMax       time.Duration // REL timeout before the first sample (300 ms) and its clamp (200 ms, 2 s)
+	FinWaitMax                             time.Duration // upper clamp of the EOF straggler wait after the peer's FIN (1 s)
+	PacketQueue, PacketMaxPayload          int           // Packet.Queue (1 MiB), Packet.MaxPayload (65,507)
+	PackEvery, DedupBits                   int           // PACK after this many datagrams (256); receive dedup window bits (16,384)
+	MTUProbeEvery, MTUProbeFails           int           // every n-th PacketPing PING is an MTU probe (10); consecutive failed probes that kill (3)
+	FlowMaxFlows, FlowPerSource, FlowInbox int           // udpflow bounds: flows per source, admitting OPEN flows per source IP (32), inbox datagrams (512)
+	FlowPerSourceJoin                      int           // admitting JOIN and probe flows per source IP (32; M2 design Revision 1, R1-21)
+	FlowTombstoneTTL                       time.Duration // how long a removed flow ID stays refused (max(Handshake.Timeout, DialTimeout) + 2 s; R1-11)
+	// Counter presets (L14), equal in both Runtimes of a test.
+	FirstSeq  uint64 // first packet seq of every session direction (0)
+	FirstCseq uint32 // first REL cseq of every datagram carrier direction (1)
+
 	// Rand replaces the U[0,1) jitter source (redial backoff, salts are not
 	// affected). Nil keeps math/rand/v2.
 	Rand func() float64
@@ -62,7 +77,9 @@ type Overrides struct {
 // A hook may block to hold the caller at that point (the test releases it).
 type Hooks struct {
 	// ReadDequeued runs in Conn.Read after the bytes were copied out and before
-	// the commit that decides "Read won / Close won" (L07).
+	// the commit that decides "Read won / Close won" (L07); in M2 also in
+	// PacketConn.ReadFrom after the datagram was copied out (L07, packet
+	// part).
 	ReadDequeued func()
 	// DeathObserved runs in the session actor before it handles the death of
 	// the carrier with this ID (L21, L27).
@@ -73,8 +90,13 @@ type Hooks struct {
 	// DialStart runs before every factory call with the factory index (L20, L51).
 	DialStart func(factory int)
 	// BeforeWrite runs in a carrier writer before every physical write with
-	// the batch's frame and byte counts (L41, L55).
+	// the batch's frame and byte counts (L41, L55). On a datagram carrier
+	// every datagram is one physical write: it runs once per datagram with
+	// that datagram's frames and bytes (M2-D29).
 	BeforeWrite func(carrier uint32, frames, bytes int)
+	// RelRetransmit runs in a datagram carrier's writer each time it
+	// retransmits a REL frame, with its cseq (L12).
+	RelRetransmit func(carrier uint32, cseq uint32)
 	// EventEnqueued runs after an event was assigned its sequence number
 	// (L53), under the event-queue lock: calls are in Seq order, and it runs
 	// also for an event dropped because the queue is full (the drop keeps

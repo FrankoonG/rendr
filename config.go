@@ -11,8 +11,8 @@ import "time"
 // a negative value selects zero. Configuration is frozen when the Runtime
 // is built; each session also snapshots it at Dial or OPEN.
 //
-// Milestone M2 adds PacketPing and Packet (packet sessions); they are not
-// declared before then.
+// PacketPing and Packet configure packet sessions and datagram carriers
+// (milestone M2).
 type Config struct {
 	NoPathGrace      time.Duration // 15 s; 3 s–300 s; counted from the death of the last carrier
 	RejoinBackoffMax time.Duration // 4 s; 1 s–8 s and ≤ NoPathGrace/2; redial backoff cap, also for repeated refusals
@@ -41,6 +41,11 @@ type Config struct {
 	// reading lets it time out. It does not end a finished exchange (both
 	// FINs delivered and this side's FIN acknowledged): Linger bounds the
 	// wait for the peer's final confirmation, and that end is io.EOF.
+	// For a packet session the clock moves on every successful WriteTo, on
+	// every datagram accepted from a carrier and on every datagram ReadFrom
+	// returns (M2-D41); the move on accepted datagrams may lag by up to
+	// PacketPing, which is why IdleTimeout should be at least 2·PacketPing
+	// (the clamps ensure it: PacketPing ≤ DeadMin/2 ≤ 5 s).
 	IdleTimeout time.Duration
 
 	Window                int // 8 MiB; 256 KiB–64 MiB; per session per direction
@@ -66,6 +71,12 @@ type Config struct {
 	Handshake   HandshakeLimits
 	Sessionless SessionlessLimits
 
+	// PacketPing (1 s; 0.2 s–10 s and ≤ DeadMin/2) is the PING cadence of
+	// a datagram carrier that moved a datagram within PingIdle, and the
+	// delay of a packet session's accounting frame (plan:188, plan:301).
+	PacketPing time.Duration
+	Packet     PacketPolicy
+
 	// OnEvent, if set, is called with every event on a single worker
 	// goroutine fed by a bounded queue (256); a full queue drops and counts
 	// (Status.EventsDropped; the Seq gap shows the drop); a panic is
@@ -76,6 +87,22 @@ type Config struct {
 	// never called with a rendr lock held and may call any rendr method,
 	// including Close.
 	OnEvent func(Event)
+}
+
+// PacketPolicy configures packet sessions (plan:285–287). A session fixes
+// its values at Dial or OPEN.
+type PacketPolicy struct {
+	// Queue (1 MiB; 64 KiB–64 MiB, and at least MaxPayload + 64) bounds the
+	// datagram bytes queued per direction, and Queue/64 datagrams; a full
+	// queue drops its oldest datagram (WriteTo never blocks).
+	Queue int
+	// MaxAge (100 ms; 10 ms–2 s): a datagram not handed to a carrier within
+	// this is dropped.
+	MaxAge time.Duration
+	// MaxPayload (65,507; 512–65,507) is the largest datagram this side
+	// offers (dialer) or accepts (passive); a session's limit is fixed at
+	// OPEN from it and its carriers' budgets (PacketConn.MaxPayload).
+	MaxPayload int
 }
 
 // SelectorPolicy are the selector's quality-switch parameters. Death
@@ -113,6 +140,13 @@ type Config struct {
 // cycles through backlog episodes loses the samples taken in and right
 // after an episode, and in pauses between writes of 64 KiB or more, so its
 // quality switch can come a probe interval or two later.
+//
+// Packet sessions: the guard sees only traffic on stream carriers. A packet
+// session's datagram carriers have no self-load gauge (they keep no bytes
+// in flight), so a packet session that saturates its own path loads the
+// probe samples of that path unnoticed: the selector may leave the path on
+// a quality switch and return to it after Cooldown, once the samples
+// recover.
 type SelectorPolicy struct {
 	Band     float64       // 0.25; 0.05–0.90: a challenger's RTT must be ≤ active × (1 − Band) ...
 	Floor    time.Duration // 5 ms; 0–1 s: ... and at least Floor lower

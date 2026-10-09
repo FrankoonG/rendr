@@ -67,6 +67,10 @@ type Session struct {
 	snap  atomic.Pointer[statusSnap] // (A) published under mu with every control change
 	mb    mailbox                    // (A) the actor's mailbox; ringActor rings its doorbell
 	done  chan struct{}              // (A) closed at actor exit
+
+	// pk is the packet data plane (M2-D1): non-nil exactly for packet
+	// sessions, set before the session becomes visible, never changed.
+	pk *packet
 }
 
 // port is the set of *carrier.Conn methods the stream uses on a lane's
@@ -112,6 +116,14 @@ type lane struct {
 	rstSent      bool       // (S)
 	finHere      bool       // (S) our unacknowledged FIN went out here
 	idle         bool       // (S) the writer found nothing in its last Fill
+
+	// Packet lanes only (M2).
+	lastDgramAt  time.Time // (S) when this lane last placed a DGRAM (bond death counting, M2-D44)
+	capMarked    bool      // (S) its latest Fill left a queued datagram for want of capacity and marked the batch cap-blocked: the PONG that frees capacity wakes it (pktWakeCappedLocked)
+	echoRel      uint32    // (S) passive: the epoch echo last placed in a reliable PACK on this lane (M2-D39); (A) initializes it to ctl.epoch−1, never the applied epoch
+	retireEchoAt time.Time // (A) planned switch: when the epoch that removed the lane was echoed (M2-D42)
+	retireEpoch  uint32    // (A) planned switch: the SCHED epoch that removed the lane (M2-D42)
+	awaitSched   bool      // (A) sets it: passive packet bond, a JOIN member confirmed and not yet routed by a SCHED; (A, S) the routing summary (pktRouteLocked, also run by Fill) clears it once the lane routes: txBig waits for it (C4-F2)
 }
 
 // stream is the session's data-path state (design §4.2–§4.12): (S) as a
@@ -342,4 +354,5 @@ const (
 	factExhausted                              // a Write reached Params.OffsetLimit (exhausted)
 	factLaneConfirmed                          // Fill placed a lane's first response frame (firstSent)
 	factWriteBlocked                           // a lane's carrier reported WriteBlocked (duties move off it)
+	factPktFin                                 // packet session: the peer's FIN arrived; the actor arms pk.finWaitAt (M2 design §A5.6)
 )

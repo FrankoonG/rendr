@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/sched"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -189,10 +190,20 @@ func (a *actor) onShutdownLocked(now time.Time) {
 // acknowledged (sBase ≥ retireMark) or at retireAt, whichever is first.
 // ACK advances ring nobody, so the acknowledgement is polled every
 // PingBusy while a retirement waits.
+//
+// A packet lane carried nothing that is ever acknowledged (M2-D42): it
+// retires 2·srtt after the passive echoed the epoch that removed it — the
+// datagrams the passive still had in flight on it arrive meanwhile — or at
+// retireAt, whichever comes first. The echo rings the actor (factEcho), so
+// nothing is polled.
 func (a *actor) retiringLocked(now time.Time) {
 	s := a.s
 	for _, l := range s.lanes {
 		if l.state != LaneRetiring || l.retireCalled {
+			continue
+		}
+		if s.pk != nil {
+			a.pktRetiringLocked(now, l)
 			continue
 		}
 		if s.st.sBase >= l.retireMark || !now.Before(l.retireAt) {
@@ -202,6 +213,27 @@ func (a *actor) retiringLocked(now time.Time) {
 		a.want(l.retireAt)
 		a.want(now.Add(s.pingBusy()))
 	}
+}
+
+// pktRetiringLocked is retiringLocked's rule for lane l of a packet session
+// (M2-D42): retireEchoAt is stamped when the dialer's echoed epoch reaches
+// the one that removed l; l retires at retireEchoAt + 2·srtt or at
+// retireAt, whichever is first.
+func (a *actor) pktRetiringLocked(now time.Time, l *lane) {
+	if l.retireEchoAt.IsZero() && !sched.EpochNewer(l.retireEpoch, a.s.ctl.echoed) {
+		l.retireEchoAt = now
+	}
+	due := l.retireAt
+	if !l.retireEchoAt.IsZero() {
+		if t := l.retireEchoAt.Add(2 * l.port.SRTT()); t.Before(due) {
+			due = t
+		}
+	}
+	if !now.Before(due) {
+		a.retireLaneLocked(l)
+		return
+	}
+	a.want(due)
 }
 
 // readvLocked keeps the window re-advertisement deadline (D18, W6): while

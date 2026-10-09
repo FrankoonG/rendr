@@ -134,6 +134,28 @@ type Params struct {
 	OffsetLimit       uint64               // stream offset limit (2^62, L14)
 	FirstEpoch        uint32               // first SCHED epoch (1)
 	TombstoneTTL      time.Duration        // passive: Grace + Linger
+
+	// Kind is the session kind: wire.KindStream (zero means stream: every
+	// M1 session) or wire.KindDatagram for a packet session (M2-D1).
+	Kind wire.CarrierKind
+	// Packet is the frozen packet configuration (packet sessions only).
+	Packet PacketParams
+}
+
+// PacketParams is the frozen configuration of a packet session (M2-D1),
+// from Config.Packet, Config.PacketPing and testhooks.
+type PacketParams struct {
+	// MaxPayload: dialer — the offer computed from the factory snapshot
+	// (M2-D49); passive — the accepted value. The session's fixed value is
+	// set when the OPEN exchange completes (Session.MaxPayload).
+	MaxPayload int
+	Queue      int           // Packet.Queue: bytes per direction (and Queue/64 datagrams)
+	MaxAge     time.Duration // Packet.MaxAge: a datagram not placed within this is dropped
+	PacketPing time.Duration // PACK delay after the first unreported datagram (Config.PacketPing)
+	PackEvery  int           // PACK after this many datagrams (256)
+	FinWaitMax time.Duration // upper clamp of the EOF straggler wait (1 s)
+	DedupBits  int           // receive dedup window (wire.DefaultSeqWindowBits)
+	FirstSeq   uint64        // first seq in each direction (testhooks preset; 0); the limit is OffsetLimit (L14)
 }
 
 // Env holds the Runtime-wide services a session uses.

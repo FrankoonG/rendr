@@ -216,6 +216,11 @@ func (s *Session) CloseWrite() error {
 //
 // It returns nil, also when repeated, so concurrent closers all see the
 // same result (L03).
+//
+// A packet session's Close (M2 design §A5.6; closeLocked → pktCloseLocked)
+// requests the FIN, discards what was received and wakes every waiter and
+// the lanes; queued datagrams younger than MaxAge still leave, then the
+// FIN, and the DONE exchange ends the session.
 func (s *Session) Close() error {
 	s.mu.Lock()
 	s.closeLocked(time.Now())

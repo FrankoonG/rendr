@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
@@ -150,11 +151,12 @@ func TestReadCloseLinearization_L07(t *testing.T) {
 		}
 	}
 	t.Logf("%d races: Read won %d, Close won %d", runs, readWon, closeWon)
-	for range 100 {
-		if runtime.NumGoroutine() <= baseline {
-			break
-		}
-		runtime.Gosched()
+	// Every racer was joined above; wait, bounded in time rather than in
+	// yields, for the count to settle (L66): under -race a goroutine that is
+	// already on its way out (an earlier test's timer callback) can take
+	// longer than 100 yields. A leaked goroutine stays past the bound.
+	for deadline := time.Now().Add(2 * time.Second); runtime.NumGoroutine() > baseline && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
 	}
 	if g := runtime.NumGoroutine(); g > baseline {
 		t.Fatalf("%d goroutines after the races, baseline %d", g, baseline)

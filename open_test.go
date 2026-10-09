@@ -175,11 +175,11 @@ func TestOpenRaceSingleSession_L47(t *testing.T) {
 		close(go1)
 		wg.Wait()
 		synctest.Wait()
-		if units, bl := rt.table.inUse(), rt.backlog.Load(); units != 1 || bl != 1 {
+		if units, bl := rt.table.inUse(), rt.backlog[kindIdxStream].Load(); units != 1 || bl != 1 {
 			t.Fatalf("after %d racing OPENs: %d MaxSessions units, %d backlog slots", n, units, bl)
 		}
 		ln.mu.Lock()
-		reserved, pending := ln.reserved, len(ln.pending)
+		reserved, pending := ln.q[kindIdxStream].reserved, len(ln.pending)
 		ln.mu.Unlock()
 		if reserved != 0 || pending != 1 {
 			t.Fatalf("listener: %d reservations, %d pending sessions", reserved, pending)

@@ -13,8 +13,14 @@ type PassiveSpec struct {
 	SID            [16]byte
 	Params         Params   // passive: Grace = clamp(OPEN.retain_ms, 1 s, 400 s)
 	DialerInstance [16]byte // from the OPEN carrier's PREFACE; the bound instance
-	PeerWindow     uint32   // OPEN.window: the dialer's initial receive window
+	PeerWindow     uint32   // OPEN.window: the dialer's initial receive window (stream sessions; a packet session's OPEN.window is the carrier budget offer, M2-D11)
 	Metadata       []byte   // copied
+	// MaxPayload is a packet session's accepted MaxPayload (pmtu_acc,
+	// M2-D49), carried by Confirm's OPEN_ACK; 0 for stream sessions.
+	// NewPending fixes the session's MaxPayload from it, so
+	// PendingPacket.MaxPayload reads the accepted value before Confirm (M2
+	// design Revision 1, R1-32).
+	MaxPayload int
 }
 
 // NewPending creates an unstarted passive session in StatePending with
@@ -40,6 +46,11 @@ func NewPending(env *Env, spec PassiveSpec, first *carrier.Conn) *Session {
 	if p.Mode == 0 {
 		p.Mode = ModeSelector
 	}
+	if p.Kind == wire.KindDatagram && spec.MaxPayload > 0 {
+		// The accepted MaxPayload is the session's from here (R1-32):
+		// initPacketLocked fixes it, PendingPacket reads it before Confirm.
+		p.Packet.MaxPayload = spec.MaxPayload
+	}
 	s := &Session{env: env, p: p, id: spec.SID, meta: bytes.Clone(spec.Metadata), peer: spec.DialerInstance}
 	s.done = make(chan struct{})
 	s.mb.init()
@@ -53,6 +64,7 @@ func NewPending(env *Env, spec PassiveSpec, first *carrier.Conn) *Session {
 	l := &lane{s: s, c: first, port: first, id: first.ID(), factory: -1, gen: 1, since: now}
 	l.state = LaneJoining
 	l.schedSent = s.ctl.epoch
+	l.echoRel = s.ctl.epoch - 1 // the first epoch echo placed on l is reliable (M2-D39)
 	s.lanes = append(s.lanes, l)
 	s.laneAddedLocked(l)
 	s.initialSnapLocked()
@@ -78,7 +90,7 @@ func (s *Session) Start() {
 	a.gen = first.gen
 	a.unconfirmed = append(a.unconfirmed, first)
 	a.acceptBy = first.since.Add(orDefault(s.p.AcceptTimeout, defAcceptTimeout))
-	first.c.Start(first, &s.mb, carrier.StartOptions{Hold: true})
+	first.c.Start(s.endpoint(first), &s.mb, carrier.StartOptions{Hold: true})
 	go a.run()
 }
 
@@ -102,6 +114,25 @@ func (s *Session) maxCarriers() int {
 	return defMaxCarriers
 }
 
+// knownCarrierLocked reports whether id is the CarrierID of a carrier the
+// session attached: a lane's, or one of the last eight dead lanes' of the
+// published snapshot (the CarrierStatus history, R1-11).
+func (s *Session) knownCarrierLocked(id uint32) bool {
+	for _, l := range s.lanes {
+		if l.id == id {
+			return true
+		}
+	}
+	if sn := s.snap.Load(); sn != nil {
+		for i := range sn.lanes {
+			if ls := &sn.lanes[i]; ls.state == LaneDead && ls.id == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // finalVerdict is the verdict of an ended session (its last snapshot).
 func (s *Session) finalVerdict() Verdict {
 	if sn := s.snap.Load(); sn != nil {
@@ -116,13 +147,21 @@ func (s *Session) finalVerdict() Verdict {
 // first frame. The carrier limit counts adopts posted but not yet handled
 // (as Join). When it does not take c (session ended, or at MaxCarriers),
 // taken is false and v is the verdict the caller writes as OPEN_ACK before
-// closing c.
+// closing c. A carrier whose CarrierID the session already attached — a
+// live lane's or one of its last eight dead lanes' — is refused with
+// BAD_REQUEST (CodeBadValue): a correct dialer never reuses one, so only a
+// replayed or duplicated first datagram meets it (M2-D84; Revision 1,
+// R1-11). For a packet session the admission has validated c's packet OPEN
+// fields and set its budget (R1-5); its OPEN_ACK window is c's own.
 func (s *Session) AttachOpen(c *carrier.Conn) (taken bool, v Verdict) {
 	s.mu.Lock()
 	switch {
 	case s.ctl.state == StateEnded:
 		s.mu.Unlock()
 		return false, s.finalVerdict()
+	case s.knownCarrierLocked(c.ID()):
+		s.mu.Unlock()
+		return false, Verdict{Status: wire.StatusBadRequest, Code: wire.CodeBadValue}
 	case s.carriersLocked() >= s.maxCarriers():
 		s.mu.Unlock()
 		return false, Verdict{Status: wire.StatusCapacity, Code: wire.CodeCarriers}
@@ -196,14 +235,25 @@ func (s *Session) RefusePending(status wire.AckStatus, code uint32) bool {
 // adopt of c, which the actor gives JOIN_ACK(OK, rxNext = rRead) as its
 // first frame. When taken is false the caller writes JOIN_ACK(status) and
 // closes c.
+//
+// A carrier whose CarrierID the session already attached (a live lane's or
+// one of its last eight dead lanes') is refused with BAD_REQUEST (M2-D84,
+// R1-11). Carrier kinds (§A3.5): a stream session's JOIN on a datagram
+// carrier is BAD_REQUEST; a packet session's JOIN carries the carrier's
+// cmtu offer in RxNext — 0 on a stream carrier, 537 … 65,507 on a datagram
+// carrier, else BAD_REQUEST — and nothing is acknowledged by it; the
+// accepted budget cmtu_acc = min(offer, the transport's limit) is set on c
+// (Conn.SetBudget, outside the session lock and before the adopt is
+// posted) and returned in JOIN_ACK(OK).RxNext (M2-D50).
 func (s *Session) Join(c *carrier.Conn, j *wire.Join) (taken bool, status wire.AckStatus) {
+	cmtu, kindOK := pktJoinBudget(s.pk != nil, c.Kind(), j.RxNext, transportLimit(c))
 	s.mu.Lock()
 	switch {
 	case s.ctl.state == StatePending:
 		status = wire.StatusBadRequest
 	case s.ctl.state == StateEnded:
 		status = wire.StatusUnknownSession
-	case Mode(j.Mode) != s.p.Mode:
+	case Mode(j.Mode) != s.p.Mode, !kindOK, s.knownCarrierLocked(c.ID()):
 		status = wire.StatusBadRequest
 	case s.carriersLocked() >= s.maxCarriers():
 		status = wire.StatusCapacity
@@ -212,6 +262,9 @@ func (s *Session) Join(c *carrier.Conn, j *wire.Join) (taken bool, status wire.A
 	default:
 		s.ctl.adopting++
 		s.mu.Unlock()
+		if s.pk != nil {
+			c.SetBudget(cmtu) // the carrier is unstarted until the actor adopts it
+		}
 		if !s.mb.post(&adopt{conn: c, kind: adoptJoin, join: *j}) {
 			return false, wire.StatusUnknownSession // the actor exited meanwhile
 		}

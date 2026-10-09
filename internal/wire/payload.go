@@ -8,14 +8,19 @@ import (
 // Open is the OPEN payload:
 //
 //	sid[16] | kind u8 | mode u8 | flags u16 | retain_ms u32 | window u32 | pmtu u16 | mlen u16 | metadata
+//
+// A packet session (Kind KindDatagram, M2) gives Window and PMTU their
+// packet meaning (M2 design §A3.5, PA-2; no layout change): Window is the
+// frame budget offer (cmtu) of the carrier the OPEN travels on — 0 on a
+// stream carrier — and PMTU the MaxPayload offer.
 type Open struct {
 	SID      [16]byte    // chosen by the dialer from crypto/rand; all-zero is invalid (ErrReserved)
-	Kind     CarrierKind // session kind: 1 stream (M1)
+	Kind     CarrierKind // session kind: 1 stream, 2 packet (M2)
 	Mode     uint8       // 1 selector, 2 bond (3 race decodes; answered BAD_REQUEST until M3)
 	Flags    uint16      // OpenFlagEarly reserved until M4: all bits must be 0
 	RetainMs uint32      // the dialer's PassiveRetain in milliseconds
-	Window   uint32      // the dialer's initial receive window (0 is legal: memory pressure)
-	PMTU     uint16      // 0 for stream sessions (M2)
+	Window   uint32      // stream: the dialer's initial receive window (0 is legal: memory pressure); packet: the cmtu offer, 0 or MinFrameBudget..MaxDatagram
+	PMTU     uint16      // stream: 0; packet: the MaxPayload offer, MinPacketPayload..MaxPacketPayload
 	Metadata []byte      // mlen u16 + bytes; aliases the input when decoded
 }
 
@@ -41,14 +46,18 @@ func PutOpen(dst []byte, o *Open) int {
 
 // ParseOpen decodes an OPEN payload. The explicit mlen must equal the
 // remaining bytes exactly; mlen > maxMeta returns ErrLength before the
-// metadata is touched. Kind must be 1 or 2, mode 1..3 (ErrValue); flags and
-// PMTU on a stream session must be 0 (ErrReserved). Semantic acceptance
-// (kind stream, mode not race, window) is the admission's job.
+// metadata is touched. Kind must be 1 or 2, mode 1..3 (ErrValue); flags
+// must be 0 and a stream session's PMTU 0 (ErrReserved); a packet session's
+// PMTU must lie in MinPacketPayload..MaxPacketPayload and its Window be 0
+// or in MinFrameBudget..MaxDatagram (ErrValue; M2 design §A3.5). Semantic
+// acceptance (the session kind on this carrier kind, a Window that fits the
+// carrier kind, mode not race) is the admission's job.
 //
 // Check order: fixed part present (ErrShort), mlen > maxMeta (ErrLength),
 // mlen against the remaining bytes (ErrShort/ErrTrailing), zero SID
-// (ErrReserved), kind and mode (ErrValue), flags and PMTU (ErrReserved).
-// maxMeta is clamped to [0, MaxMetadata]. An empty metadata decodes as nil.
+// (ErrReserved), kind and mode (ErrValue), flags and a stream PMTU
+// (ErrReserved), a packet PMTU, then a packet Window (ErrValue). maxMeta is
+// clamped to [0, MaxMetadata]. An empty metadata decodes as nil.
 func ParseOpen(p []byte, maxMeta int) (Open, error) {
 	if len(p) < OpenFixedLen {
 		return Open{}, ErrShort
@@ -81,6 +90,10 @@ func ParseOpen(p []byte, maxMeta int) (Open, error) {
 		return Open{}, ErrReserved
 	case o.Kind == KindStream && o.PMTU != 0:
 		return Open{}, ErrReserved
+	case o.Kind == KindDatagram && (o.PMTU < MinPacketPayload || o.PMTU > MaxPacketPayload):
+		return Open{}, ErrValue
+	case o.Kind == KindDatagram && o.Window != 0 && (o.Window < MinFrameBudget || o.Window > MaxDatagram):
+		return Open{}, ErrValue
 	}
 	if mlen > 0 {
 		o.Metadata = p[OpenFixedLen:len(p):len(p)]
@@ -93,7 +106,7 @@ func ParseOpen(p []byte, maxMeta int) (Open, error) {
 // other status carries Window 0.
 type OpenAck struct {
 	Status AckStatus
-	Window uint32 // passive's initial receive window (may be 0 under memory pressure); 0 unless Status is OK
+	Window uint32 // stream: the passive's initial receive window (may be 0 under memory pressure); packet: PacketWindow(pmtu_acc, cmtu_acc); 0 unless Status is OK
 	Code   uint32 // REJECTED: application code; other non-OK statuses: Code* reason; 0 for OK
 	Msg    []byte // ≤ MaxMsg bytes; empty for OK
 }
@@ -159,7 +172,7 @@ func ParseOpenAck(p []byte) (OpenAck, error) {
 type Join struct {
 	SID    [16]byte
 	Mode   uint8
-	RxNext uint64 // the dialer's delivered offset: trims the passive's retransmissions (never a window)
+	RxNext uint64 // stream: the dialer's delivered offset, trims the passive's retransmissions (never a window); packet: the cmtu offer (0 on a stream carrier)
 }
 
 // PutJoin writes j into dst and returns JoinLen.
@@ -192,7 +205,7 @@ func ParseJoin(p []byte) (Join, error) {
 // JoinAck is the JOIN_ACK payload: status u8 | rxNext u64.
 type JoinAck struct {
 	Status AckStatus
-	RxNext uint64 // the passive's delivered offset (0 unless Status is OK)
+	RxNext uint64 // stream: the passive's delivered offset; packet: cmtu_acc (0 on a stream carrier); 0 unless Status is OK
 }
 
 // PutJoinAck writes a into dst and returns JoinAckLen. It writes RxNext 0
@@ -292,7 +305,8 @@ func ParseAck(p []byte) (Ack, error) {
 	}, nil
 }
 
-// PutFin writes the FIN payload (final stream offset) and returns FinLen.
+// PutFin writes the FIN payload (the final stream offset, or a packet
+// session's final seq) and returns FinLen.
 func PutFin(dst []byte, off uint64) int {
 	_ = dst[FinLen-1]
 	binary.BigEndian.PutUint64(dst[0:8], off)

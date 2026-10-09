@@ -77,39 +77,63 @@ func GuardedDialEarly(ctx context.Context, env *Env, f func(context.Context, []b
 	return guardedDial(ctx, env, func(ctx context.Context) (net.Conn, error) { return f(ctx, first) })
 }
 
-// dialCall is one guarded factory call. The factory goroutine delivers its
-// normalized result through res unless the caller gave up on it first, in
-// which case the caller counted the goroutine in the abandoned-call pool and
-// the goroutine, once f returned, leaves the pool and closes a late conn
-// itself (exactly once).
-type dialCall struct {
+// guardedDial is the guarded call of a stream factory: a conn returned
+// together with an error is closed once, (nil, nil) is ErrNilConn.
+func guardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Conn, error)) (net.Conn, error) {
+	norm := func(c net.Conn, err error) (net.Conn, error) {
+		if c != nil && err != nil {
+			CloseConn(env, c)
+			return nil, err
+		}
+		if c == nil && err == nil {
+			return nil, ErrNilConn
+		}
+		return c, err
+	}
+	return guardedCall(ctx, env, f, norm, func(c net.Conn) { CloseConn(env, c) })
+}
+
+// dialCall is one guarded factory call with a result of type R (a stream
+// conn, or a datagram conn and its peer). The factory goroutine delivers
+// its normalized result through res unless the caller gave up on it first,
+// in which case the caller counted the goroutine in the abandoned-call pool
+// and the goroutine, once f returned, leaves the pool and drops a late
+// result itself (its conn closed exactly once).
+type dialCall[R any] struct {
 	env    *Env
-	res    chan dialResult // cap 1
+	res    chan dialResult[R] // cap 1
 	mu     sync.Mutex
 	gaveUp bool // the caller returned without the result; the goroutine is counted in env.Abandon
 }
 
-type dialResult struct {
-	c   net.Conn
+type dialResult[R any] struct {
+	r   R
 	err error
 }
 
-func guardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Conn, error)) (net.Conn, error) {
+// guardedCall runs the factory call f under the GuardedDial rules. norm
+// normalizes every result f produced — the zero R with an error after a
+// panic or runtime.Goexit too — and closes what it rejects (a conn returned
+// with an error, a conn without a peer); drop closes the conn of a valid
+// result that arrived after the caller gave up (it is called with the
+// zero R only when that has nothing to close).
+func guardedCall[R any](ctx context.Context, env *Env, f func(context.Context) (R, error), norm func(R, error) (R, error), drop func(R)) (R, error) {
+	var zero R
 	if env.Abandon != nil && env.Abandon.Full() {
-		return nil, ErrAbandonFull
+		return zero, ErrAbandonFull
 	}
 	if ctx.Err() != nil {
-		return nil, context.Cause(ctx)
+		return zero, context.Cause(ctx)
 	}
-	d := &dialCall{env: env, res: make(chan dialResult, 1)}
-	go d.run(ctx, f)
+	d := &dialCall[R]{env: env, res: make(chan dialResult[R], 1)}
+	go d.run(ctx, f, norm, drop)
 	tm := env.Timing.withDefaults()
 	t := time.NewTimer(tm.DialTimeout)
 	defer t.Stop()
 	var err error
 	select {
 	case r := <-d.res:
-		return r.c, r.err
+		return r.r, r.err
 	case <-ctx.Done():
 		err = context.Cause(ctx)
 	case <-t.C:
@@ -118,11 +142,11 @@ func guardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Con
 	// Given up: the result is err whatever f returns now. A factory that
 	// honours ctx returns at once, so the call is still joined for a short
 	// grace and is never counted as abandoned (L52).
-	late := func(r dialResult) (net.Conn, error) {
-		if r.c != nil {
-			CloseConn(env, r.c) // too late for the caller: closed exactly once
+	late := func(r dialResult[R]) (R, error) {
+		if r.err == nil {
+			drop(r.r) // too late for the caller: closed exactly once
 		}
-		return nil, err
+		return zero, err
 	}
 	grace := time.NewTimer(min(dialGrace, tm.AbandonWait))
 	defer grace.Stop()
@@ -145,37 +169,31 @@ func guardedDial(ctx context.Context, env *Env, f func(context.Context) (net.Con
 	if env.Abandon != nil {
 		env.Abandon.Adopt()
 	}
-	return nil, err
+	return zero, err
 }
 
 // run calls f and normalizes its result (L51): a panic or Goexit is
-// ErrFactoryPanic, (nil, nil) is ErrNilConn, and a conn returned together
-// with an error is closed once.
-func (d *dialCall) run(ctx context.Context, f func(context.Context) (net.Conn, error)) {
+// ErrFactoryPanic, and norm applies the factory kind's rules.
+func (d *dialCall[R]) run(ctx context.Context, f func(context.Context) (R, error), norm func(R, error) (R, error), drop func(R)) {
 	var (
-		c      net.Conn
+		r      R
 		err    error
 		normal bool
 	)
 	defer func() {
 		if !normal {
-			if r := recover(); r != nil {
-				err = fmt.Errorf("%w: %v", ErrFactoryPanic, r)
+			if v := recover(); v != nil {
+				err = fmt.Errorf("%w: %v", ErrFactoryPanic, v)
 			} else {
 				err = fmt.Errorf("%w (runtime.Goexit)", ErrFactoryPanic)
 			}
-			c = nil
+			var zero R
+			r = zero
 		}
-		if c == nil && err == nil {
-			err = ErrNilConn
-		}
-		if c != nil && err != nil {
-			CloseConn(d.env, c)
-			c = nil
-		}
+		r, err = norm(r, err)
 		d.mu.Lock()
 		if !d.gaveUp {
-			d.res <- dialResult{c, err}
+			d.res <- dialResult[R]{r, err}
 			d.mu.Unlock()
 			return
 		}
@@ -183,11 +201,11 @@ func (d *dialCall) run(ctx context.Context, f func(context.Context) (net.Conn, e
 		if d.env.Abandon != nil {
 			d.env.Abandon.Leave() // f returned: the call is no longer stuck in the embedder
 		}
-		if c != nil {
-			CloseConn(d.env, c) // a late conn: closed exactly once (its own close is watched)
+		if err == nil {
+			drop(r) // a late result: closed exactly once (its own close is watched)
 		}
 	}()
-	c, err = f(ctx)
+	r, err = f(ctx)
 	normal = true
 }
 
@@ -200,6 +218,17 @@ func CloseConn(env *Env, nc net.Conn) {
 		return
 	}
 	(&closeOnce{nc: nc}).async(env)
+}
+
+// deadlineCloser is what a closeOnce closes (M2 design Revision 1, R1-7):
+// the embedder net.Conn of a stream carrier or the PacketIO of a datagram
+// carrier, both of which satisfy it. The closer, its deadline part and the
+// last resort of an abandonment therefore act on the real transport of
+// either kind; a datagram Conn is never built with a nil conn
+// (newDatagramConn).
+type deadlineCloser interface {
+	SetDeadline(t time.Time) error
+	Close() error
 }
 
 // closeOnce closes an embedder conn exactly once (L51, L52): it calls
@@ -223,9 +252,20 @@ func CloseConn(env *Env, nc net.Conn) {
 // silent path, only the peer ends, with the closer and the reader counted
 // in the abandoned-call pool all that time.
 type closeOnce struct {
-	nc      net.Conn
-	setting atomic.Bool // SetDeadline(now) was started
-	closing atomic.Bool // Close was started; a Close that hangs in the embedder keeps it, so nothing closes a second time
+	nc      deadlineCloser // a net.Conn (stream carriers) or a PacketIO (datagram carriers)
+	setting atomic.Bool    // SetDeadline(now) was started
+	closing atomic.Bool    // Close was started; a Close that hangs in the embedder keeps it, so nothing closes a second time
+}
+
+// conn returns the stream conn k closes, for the stream-only paths that
+// also read or write it (readHello, writeAndCloseInline). A datagram
+// transport never takes those paths: conn panics for one.
+func (k *closeOnce) conn() net.Conn {
+	nc, ok := k.nc.(net.Conn)
+	if !ok {
+		panic("rendr/carrier: stream close path on a datagram transport")
+	}
+	return nc
 }
 
 // startDeadline reports whether the caller is to call SetDeadline(now):
@@ -327,16 +367,17 @@ func writeAndCloseInline(env *Env, k *closeOnce, frame []byte, deadline time.Tim
 	}
 	w := armWatch(nil, wait, func() { k.last(env) }) // the last resort only: the caller's owner counts this goroutine
 	defer w.finish()                                 // also on runtime.Goexit in a conn call
-	_ = callSetWriteDeadline(k.nc, deadline)
-	if writeFull(k.nc, frame) == nil {
-		if o, ok := k.nc.(*OwnedTCP); ok {
+	nc := k.conn()
+	_ = callSetWriteDeadline(nc, deadline)
+	if writeFull(nc, frame) == nil {
+		if o, ok := nc.(*OwnedTCP); ok {
 			_ = callCloseWrite(o)
 		}
 		until := time.Now().Add(drainMax)
 		if deadline.Before(until) {
 			until = deadline
 		}
-		drain(k.nc, until)
+		drain(nc, until)
 	}
 	k.async(env)
 }
@@ -459,7 +500,7 @@ func callWriteBuffers(o *OwnedTCP, v *net.Buffers) (n int64, err error) {
 	return o.WriteBuffers(v)
 }
 
-func callSetDeadline(nc net.Conn, t time.Time) (err error) {
+func callSetDeadline(nc deadlineCloser, t time.Time) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = &panicError{"SetDeadline", r}
@@ -486,7 +527,7 @@ func callSetWriteDeadline(nc net.Conn, t time.Time) (err error) {
 	return nc.SetWriteDeadline(t)
 }
 
-func callClose(nc net.Conn) (err error) {
+func callClose(nc deadlineCloser) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = &panicError{"Close", r}

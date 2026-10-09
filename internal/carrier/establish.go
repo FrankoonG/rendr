@@ -18,14 +18,31 @@ import (
 type Factory struct {
 	Index     int                                                       // configuration order
 	Name      string                                                    // unique within the Peer
-	Dial      func(ctx context.Context) (net.Conn, error)               // required
-	DialEarly func(ctx context.Context, first []byte) (net.Conn, error) // optional
+	Dial      func(ctx context.Context) (net.Conn, error)               // stream factories: required
+	DialEarly func(ctx context.Context, first []byte) (net.Conn, error) // stream factories: optional
+
+	// Kind is the factory's carrier kind. NewPeer sets it for every factory
+	// (M2 design Revision 1, R1-32); zero — component tests, M1 factories —
+	// means wire.KindStream, also in the DialInfo Establish attaches. A
+	// datagram factory sets DialPacket and MTU instead of Dial; Establish
+	// dispatches on Kind (M2 design §A5.10).
+	Kind wire.CarrierKind
+	// DialPacket opens one datagram carrier: a net.PacketConn and the peer
+	// address rendr writes to (rendr.DatagramCarrier.Dial). Required for a
+	// datagram factory.
+	DialPacket func(ctx context.Context) (net.PacketConn, net.Addr, error)
+	// MTU is a datagram factory's frame budget: the largest datagram of
+	// rendr bytes it writes (rendr.DatagramCarrier.MTU,
+	// wire.MinFrameBudget–wire.MaxDatagram); a raw-UDP flow header is the
+	// transport's own Headroom and not counted. A carrier's cmtu offer is
+	// min(MTU, its transport's Limit) (M2-D50).
+	MTU int
 }
 
 // Established is a dialer carrier whose handshake completed: PREFACE_ACK(OK)
 // and the passive's first frame were read and verified.
 type Established struct {
-	Conn    *Conn           // unstarted; owns the net.Conn and any bytes read past the response frame
+	Conn    *Conn           // unstarted; owns the net.Conn and any bytes read past the response frame (a datagram carrier: its PacketIO and the response datagram's tail, R1-1)
 	Ack     wire.PrefaceAck // Status == PrefaceOK
 	Resp    wire.Header     // the passive's first frame: OPEN_ACK, JOIN_ACK, PONG, CLOSE or GOAWAY
 	Payload []byte          // a copy of the response payload (≤ 300 bytes)
@@ -146,6 +163,14 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // AbandonWait after its bounds and its conn is closed as a last resort
 // (design §0.8 V2).
 //
+// A datagram factory (f.Kind == wire.KindDatagram) takes the datagram
+// handshake instead (M2 design §A5.10; establishDatagram): the same
+// attempt bounds, outcomes and ownership rules over the factory's
+// net.PacketConn. Every factory call's context carries the attempt's
+// DialInfo (DialInfoFrom: the CarrierID id, the factory's kind — a Kind of
+// 0 is reported as wire.KindStream —, whether t is a PING and, for an OPEN
+// or JOIN, the session ID of payload bytes 0–15; M2-D55).
+//
 // Further contracts of this implementation: Hooks.DialStart(f.Index) runs
 // right before the factory call, on the guarded goroutine (a hook that
 // blocks acts like a hanging factory; a fast-failed attempt calls neither);
@@ -162,6 +187,9 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // PREFACE_ACK of this major also reports the passive's Instance (the
 // instance a GOING_AWAY names, design §6.6), with PrefaceOK false.
 func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type, payload []byte, check func(*wire.PrefaceAck) error) (*Established, error) {
+	if f.Kind == wire.KindDatagram {
+		return establishDatagram(ctx, env, f, id, t, payload, check)
+	}
 	pingID := env.Presets.firstPingID()
 	var sb [8]byte
 	_, _ = rand.Read(sb[:])
@@ -223,15 +251,18 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 			h.DialStart(f.Index)
 		}
 	}
+	// Every factory call carries the DialInfo of its carrier (M2-D55,
+	// integration 1 D20); actx keeps bounding the attempt.
+	dctx := withDialInfo(actx, dialInfoFor(f, id, t, payload))
 	var nc net.Conn
 	var err error
 	if f.DialEarly != nil {
-		nc, err = GuardedDialEarly(actx, env, func(ctx context.Context, first []byte) (net.Conn, error) {
+		nc, err = GuardedDialEarly(dctx, env, func(ctx context.Context, first []byte) (net.Conn, error) {
 			dialStart()
 			return f.DialEarly(ctx, first)
 		}, hello)
 	} else {
-		nc, err = GuardedDial(actx, env, func(ctx context.Context) (net.Conn, error) {
+		nc, err = GuardedDial(dctx, env, func(ctx context.Context) (net.Conn, error) {
 			dialStart()
 			return f.Dial(ctx)
 		})

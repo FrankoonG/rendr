@@ -30,6 +30,30 @@ type Selector struct {
 	seen     [maxFactories]time.Time // factory i's newest unloaded sample at the latest evaluation
 	lastQual time.Time               // last quality switch (valid when hasQual)
 	hasQual  bool                    // D7: no quality switch yet → the first needs no cooldown
+
+	// class is the kind class per factory (M2-D48; SetClasses, all zero
+	// before). A challenger of a lower class than the active factory
+	// qualifies without Band and Floor (still EvFresh, unloaded, with dwell
+	// and cooldown): a packet session that fell back to a stream carrier
+	// returns to a datagram carrier. A challenger of a higher class never
+	// qualifies (Evaluate).
+	class [maxFactories]uint8
+}
+
+// SetClasses records the kind class of every factory (index i of c is
+// factory i; at most 16; missing entries are 0). Factories of one class
+// compete by M1's rules, so a selector whose classes are all equal — every
+// session before this call — behaves as in M1.
+//
+// The session hands Evaluate every factory of the Peer — health keeps each
+// under its Peer index (M2-D46) — and any of them that is not failed may
+// become the quality target. A factory the session may not dial, such as a
+// datagram factory of a stream session on a mixed Peer, must therefore get
+// a class above every factory the session may dial (a higher class never
+// qualifies) or be marked failed for Evaluate.
+func (s *Selector) SetClasses(c []uint8) {
+	s.class = [maxFactories]uint8{}
+	copy(s.class[:], c)
 }
 
 // NewSelector returns a selector with no candidate and no previous quality
@@ -49,25 +73,31 @@ type Verdict struct {
 // is not failed, is EvFresh and whose newest sample is unloaded (Unknown,
 // Stale and Held evidence never challenge: L28; a path this Peer's own
 // sessions are loading is no quality target even while its pre-load value
-// is still Fresh: §8.4). It qualifies iff
+// is still Fresh: §8.4). Its kind class (SetClasses; M2-D48) is compared
+// with the active factory's first. A challenger of a higher class never
+// qualifies. A challenger of a lower class qualifies without Band and Floor,
+// whatever the active factory's evidence: a packet session that fell back
+// to a stream carrier returns to a datagram carrier once one is measured
+// healthy. A challenger of the same class qualifies iff
 //   - active is EvFresh, or EvHeld with RTT > 0 (compared by its held
 //     value): ch.RTT ≤ act.RTT×(1−Band) and act.RTT − ch.RTT ≥ Floor; or
 //   - active is EvStale or EvUnknown (a fresh challenger replaces an
 //     unmeasured incumbent).
 //
-// An EvHeld active without a value is never replaced (§8). Every challenger
-// has its own dwell: it starts at the first evaluation at which the
-// challenger qualifies against this incumbent and restarts whenever an
-// evaluation finds it not qualifying, or finds that its evidence expired
-// since the previous evaluation (stale evidence never extends a dwell, even
-// when the caller missed the ageing Wake: L29). Rank changes among
-// qualifying challengers restart nothing, so near-equal challengers cannot
-// keep each other's dwell from completing. The switch goes to the
-// best-ranked challenger (lowest RTT, ties by index) whose own dwell is
-// complete, once Cooldown has elapsed since the last quality switch. Wake
-// is the earliest of the next dwell end, the cooldown end and the next
-// ageing change (NextChange) of any factory's evidence. Factories beyond
-// the 16-factory Peer limit never challenge.
+// A same-class challenger never replaces an EvHeld active without a value
+// (§8). Every challenger has its own dwell: it starts at the first
+// evaluation at which the challenger qualifies against this incumbent and
+// restarts whenever an evaluation finds it not qualifying, or finds that
+// its evidence expired since the previous evaluation (stale evidence never
+// extends a dwell, even when the caller missed the ageing Wake: L29). Rank
+// changes among qualifying challengers restart nothing, so near-equal
+// challengers cannot keep each other's dwell from completing. The switch
+// goes to the best-ranked challenger (lowest class, then lowest RTT, ties
+// by index: the order of Less) whose own dwell is complete, once Cooldown
+// has elapsed since the last quality switch; a class-up switch is a quality
+// switch like any other. Wake is the earliest of the next dwell end, the
+// cooldown end and the next ageing change (NextChange) of any factory's
+// evidence. Factories beyond the 16-factory Peer limit never challenge.
 func (s *Selector) Evaluate(now time.Time, active int, sum []Summary, failed []bool) Verdict {
 	v := Verdict{Wake: s.ageWake(now, sum)}
 	if active < 0 || active >= len(sum) {
@@ -84,6 +114,7 @@ func (s *Selector) Evaluate(now time.Time, active int, sum []Summary, failed []b
 	n := min(len(sum), maxFactories)
 	s.qual &= 1<<n - 1 // factories no longer present keep no clock
 	act := Classify(sum[active], now, s.p.Fresh)
+	actClass := s.classOf(active)
 	best := -1
 	var bestRTT time.Duration
 	var dwellEnd time.Time // earliest end of a dwell still running
@@ -93,7 +124,7 @@ func (s *Selector) Evaluate(now time.Time, active int, sum []Summary, failed []b
 		}
 		bit := uint32(1) << i
 		ev, ok := s.challenger(now, i, sum, failed)
-		if !ok || !s.qualifies(act, ev) {
+		if !ok || !s.qualifies(act, actClass, ev, s.class[i]) {
 			s.qual &^= bit
 			continue
 		}
@@ -106,7 +137,9 @@ func (s *Selector) Evaluate(now time.Time, active int, sum []Summary, failed []b
 			dwellEnd = earlier(dwellEnd, end)
 			continue
 		}
-		if best < 0 || ev.RTT < bestRTT {
+		// Best-ranked first (Less among Fresh challengers): lowest class,
+		// then lowest RTT; i ascends, so ties keep the lowest index.
+		if best < 0 || s.class[i] < s.class[best] || (s.class[i] == s.class[best] && ev.RTT < bestRTT) {
 			best, bestRTT = i, ev.RTT
 		}
 	}
@@ -150,9 +183,25 @@ func (s *Selector) gap(i int, at time.Time) bool {
 	return at.Before(s.seen[i]) || at.After(s.seen[i].Add(s.p.Fresh+1))
 }
 
-// qualifies applies the band and floor to a Fresh challenger ch against the
-// active factory's evidence act.
-func (s *Selector) qualifies(act, ch Evidence) bool {
+// classOf returns factory i's kind class; a factory beyond the 16-factory
+// Peer limit counts as class 0.
+func (s *Selector) classOf(i int) uint8 {
+	if i < 0 || i >= maxFactories {
+		return 0
+	}
+	return s.class[i]
+}
+
+// qualifies applies the class rule (M2-D48) and then the band and floor to
+// a Fresh, unloaded challenger ch of class chClass against the active
+// factory's evidence act and class actClass.
+func (s *Selector) qualifies(act Evidence, actClass uint8, ch Evidence, chClass uint8) bool {
+	switch {
+	case chClass > actClass:
+		return false // a higher class never qualifies
+	case chClass < actClass:
+		return true // class-up: no Band, no Floor; dwell and cooldown still apply
+	}
 	switch act.State {
 	case EvFresh, EvHeld:
 		if act.RTT <= 0 {

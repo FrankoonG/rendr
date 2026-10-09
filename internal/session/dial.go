@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // DialSpec is everything a dialer session needs, snapshotted at Dial (L20).
@@ -18,6 +19,15 @@ type DialSpec struct {
 	Metadata   []byte                   // copied by Dial
 	GoneAway   func(inst [16]byte) bool // instances that sent GOAWAY to this Peer: never OPEN to them
 	NoteGoAway func(inst [16]byte)      // record an instance that answered GOING_AWAY or sent GOAWAY
+	// Eligible is the set of factories this session may dial (M2-D46): bit
+	// i for Factories[i]; 0 means all (every M1 session). Stream sessions
+	// get the stream factories only; packet sessions all of them, ranked
+	// by kind class (M2-D47). Health keeps every factory under its Peer
+	// index, so a factory outside Eligible is kept out of every scheduling
+	// input (integration 1): never ranked (no race, bond or redial slot)
+	// and marked failed for the selector's Evaluate, so that it never
+	// becomes a quality target.
+	Eligible uint16
 }
 
 // Dial creates a dialer session and runs its opening phase (design §6.6):
@@ -41,6 +51,15 @@ type DialSpec struct {
 // selector race loser on the bound instance is retired with CLOSE instead.
 // A success that raced the cancellation wins (one CAS decides).
 // spec.Health may be nil (inert).
+//
+// A packet session (Params.Kind == wire.KindDatagram, M2 design §A5.4,
+// §A5.12) sends OPEN with its MaxPayload offer (Params.Packet.MaxPayload)
+// and returns once the first OPEN_ACK(OK) fixed MaxPayload; every carrier's
+// OPEN_ACK and JOIN_ACK values are checked per carrier (§A3.5) and fix its
+// frame budget. It dials only the factories in spec.Eligible, ranks its
+// datagram factories first (M2-D47) and skips in its opening race the
+// datagram factories that cannot carry its OPEN (M2-D52). Dial fails at
+// once with ErrNoPath when no factory is eligible.
 //
 // Further contracts of this implementation: Params.Role is set to
 // RoleDialer and a zero Params.Mode to ModeSelector. With a health layer
@@ -70,7 +89,7 @@ func dial(ctx context.Context, env *Env, spec DialSpec, h healthSource) (*Sessio
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if len(spec.Factories) == 0 {
+	if len(spec.Factories) == 0 || !spec.anyEligible() {
 		return nil, fmt.Errorf("%w: no carrier factory", ErrNoPath)
 	}
 	p := spec.Params
@@ -112,6 +131,32 @@ func dial(ctx context.Context, env *Env, spec DialSpec, h healthSource) (*Sessio
 		return nil, wrapLast(ctx.Err(), d.lastErr())
 	}
 	return dialReturn(s, <-d.result) // the actor decided first: its result is on the way
+}
+
+// eligible reports whether the session may dial factory i (M2-D46): bit i
+// of Eligible, every factory when Eligible is 0.
+func (spec *DialSpec) eligible(i int) bool {
+	return spec.Eligible == 0 || (i < 16 && spec.Eligible&(1<<i) != 0)
+}
+
+// anyEligible reports whether the session may dial any of its factories.
+func (spec *DialSpec) anyEligible() bool {
+	for i := range spec.Factories {
+		if spec.eligible(i) {
+			return true
+		}
+	}
+	return false
+}
+
+// kindClass is factory f's kind class for a session of kind k (M2-D47): a
+// packet session ranks its datagram factories (class 0) before its stream
+// factories (class 1); a stream session's factories are all class 0.
+func kindClass(k wire.CarrierKind, f *carrier.Factory) uint8 {
+	if k == wire.KindDatagram && f.Kind != wire.KindDatagram {
+		return 1
+	}
+	return 0
 }
 
 func dialReturn(s *Session, err error) (*Session, error) {

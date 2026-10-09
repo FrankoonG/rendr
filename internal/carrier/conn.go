@@ -54,6 +54,22 @@ type Endpoint interface {
 	WriteBlocked(c *Conn)
 }
 
+// PacketEndpoint is the Endpoint of a packet session's lane (M2-D2). The
+// carrier asserts it once at Start: a stream session's Endpoint does not
+// implement it, and a DGRAM frame delivered to it is a violation of the
+// delivering carrier. Packet session control (PACK, FIN, RST, SCHED)
+// arrives through Control.
+type PacketEndpoint interface {
+	Endpoint
+	// Datagram delivers one CRC-verified DGRAM frame carrying session seq
+	// seq. When buf is non-nil, p aliases buf.B and ownership of buf's
+	// reference moves to the endpoint (kept or released, also on error);
+	// when buf is nil, p is valid only during the call. A non-nil error
+	// kills the carrier with CauseProtocolViolation; the session is
+	// unaffected.
+	Datagram(c *Conn, seq uint64, p []byte, buf *Buf) error
+}
+
 // Doorbell is a non-blocking, coalescing notification (the session actor's
 // mailbox signal or the health layer's). Ring may be called from any
 // goroutine, with or without locks held.
@@ -105,7 +121,7 @@ type Conn struct {
 	env     *Env
 	tm      Timing // env.Timing with defaults for zero fields
 	nc      net.Conn
-	ncClose closeOnce // closes nc exactly once: the closer, or the last resort of its abandonment (V2)
+	ncClose closeOnce // closes nc (a datagram carrier: its dg.io, R1-7) exactly once: the closer, or the last resort of its abandonment (V2)
 	owned   *OwnedTCP // nc itself when it is rendr's ownership token (D3, L57); nil otherwise
 	id      uint32
 	peer    [16]byte
@@ -132,6 +148,7 @@ type Conn struct {
 
 	// Set by Start under mu before the goroutines run; read by them.
 	ep   Endpoint
+	pep  PacketEndpoint // ep when it is a packet session's (asserted once at Start, M2-D2); nil otherwise
 	opts StartOptions
 
 	mu sync.Mutex
@@ -142,6 +159,11 @@ type Conn struct {
 
 	rd reader // reader goroutine (and ReadHello before Start)
 	wr writer // writer goroutine (and the handshake writers before Start)
+
+	// dg is the datagram half of a datagram carrier (M2-D3), set by the
+	// datagram handshakes before the Conn is returned; nil on stream
+	// carriers.
+	dg *dgState
 
 	// Two-stage write watchdog (design §4.8, C6): reused AfterFunc timers
 	// whose callbacks act only for the write generation they were armed for.
@@ -178,6 +200,9 @@ type joinState struct {
 	doneClosed bool
 	timer      *time.Timer // abandons stuck parts
 	drain      *time.Timer // retirement drain bound (stopped at Done)
+	// readerExit, when set, is closed as the reader part finishes: the
+	// closer of a drain-bound retirement waits on it (closeRetiredDrain).
+	readerExit chan struct{}
 }
 
 // newConn returns an unstarted carrier over nc. The handshake code sets the
@@ -212,6 +237,79 @@ func newConn(env *Env, nc net.Conn, id uint32, peer [16]byte, factory int, name 
 
 // ID returns the CarrierID (dialer-assigned, echoed in PREFACE_ACK).
 func (c *Conn) ID() uint32 { return c.id }
+
+// Kind returns the carrier kind: wire.KindDatagram for a datagram carrier,
+// else wire.KindStream. Immutable.
+func (c *Conn) Kind() wire.CarrierKind {
+	if c.dg != nil {
+		return wire.KindDatagram
+	}
+	return wire.KindStream
+}
+
+// MTU returns a datagram carrier's current send frame budget — bytes of
+// frames per datagram, the flow header excluded: the negotiated cmtu,
+// lowered (never raised) by wire.DatagramTooLargeError (M2-D25). 0 on
+// stream carriers. Lock-free.
+func (c *Conn) MTU() int {
+	if c.dg == nil {
+		return 0
+	}
+	return int(c.dg.budget.Load())
+}
+
+// RecvLimit returns a datagram carrier's negotiated cmtu (its reader accepts
+// datagrams of up to that many rendr bytes); 0 on stream carriers.
+func (c *Conn) RecvLimit() int {
+	if c.dg == nil {
+		return 0
+	}
+	return c.dg.recvLimit
+}
+
+// TransportLimit returns the largest datagram a datagram carrier's transport
+// receives (its PacketIO's Limit, the passive's cmtu_acc bound, M2-D50; 0
+// when the transport does not know it, as HandlePacket's); 0 on stream
+// carriers.
+func (c *Conn) TransportLimit() int {
+	if c.dg == nil {
+		return 0
+	}
+	return c.dg.io.Limit()
+}
+
+// DgramMax returns the largest application datagram this carrier takes now:
+// MTU() − wire.DgramOverhead on a datagram carrier, wire.MaxPacketPayload on
+// a stream carrier (a DGRAM is an ordinary frame there).
+func (c *Conn) DgramMax() int {
+	if c.dg == nil {
+		return wire.MaxPacketPayload
+	}
+	return c.MTU() - wire.DgramOverhead
+}
+
+// SetBudget fixes the negotiated cmtu of an unstarted datagram carrier
+// (M2-D50): on the passive the admission's min(the dialer's offer, the
+// transport's Limit), on the dialer the value the OPEN_ACK or JOIN_ACK
+// returned (≤ its offer). It sets the send budget and the receive limit,
+// and lowers the transport's receive limit to it (PacketIO.SetLimit, M2
+// design Revision 1, R1-6), so the started reader's buffer is cmtu +
+// Headroom + 1 and a longer datagram is ReadTruncated. A no-op on stream
+// carriers; it panics after Start.
+func (c *Conn) SetBudget(cmtu int) {
+	if c.dg == nil {
+		return
+	}
+	c.jmu.Lock()
+	started := c.join.started
+	c.jmu.Unlock()
+	if started {
+		panic("rendr/carrier: SetBudget after Start")
+	}
+	c.dg.recvLimit = cmtu
+	c.dg.budget.Store(int32(cmtu))
+	c.dg.io.SetLimit(cmtu)
+}
 
 // PeerInstance returns the remote Runtime's InstanceID from the handshake.
 func (c *Conn) PeerInstance() [16]byte { return c.peer }
@@ -252,12 +350,21 @@ func (c *Conn) Start(ep Endpoint, bell Doorbell, o StartOptions) {
 	now := time.Now()
 	c.mu.Lock()
 	c.ep, c.opts = ep, o
+	c.pep, _ = ep.(PacketEndpoint)
 	st := &c.st
 	st.gauge = o.Gauge
+	if c.dg != nil {
+		st.gauge = nil // no self-load gauge on datagram carriers (M2-D26)
+	}
 	st.rateAt, st.rateCommitAt, st.rxAt, st.intervalStart, st.lastPingRx = now, now, now, now, now
 	c.mu.Unlock()
 	c.wr.held = o.Hold
-	go c.readLoop()
+	if c.dg != nil {
+		c.dg.held.Store(o.Hold)
+		go c.dgReadLoop()
+	} else {
+		go c.readLoop()
+	}
 	go c.writeLoop()
 }
 
@@ -429,6 +536,7 @@ func (c *Conn) Stats() Stats {
 	defer c.mu.Unlock()
 	st := &c.st
 	s := Stats{
+		Kind:       c.Kind(),
 		SRTT:       st.srtt,
 		MinRTT:     st.minRTT,
 		Rate:       st.rate,
@@ -445,11 +553,22 @@ func (c *Conn) Stats() Stats {
 	if n := c.lastRx.Load(); n != 0 {
 		s.LastRx = c.base.Add(time.Duration(n))
 	}
+	if dg := c.dg; dg != nil {
+		s.MTU = int(dg.budget.Load())
+		s.Datagrams = dg.ctr.datagrams.Load()
+		s.DatagramsRx = dg.ctr.datagramsRx.Load()
+		s.Dropped = dg.ctr.dropped.Load()
+		s.Truncated = dg.ctr.truncated.Load()
+		s.Refused = dg.ctr.refused.Load()
+		s.Retransmits = dg.ctr.retransmits.Load()
+		s.Rebinds = dg.ctr.rebinds.Load()
+	}
 	return s
 }
 
 // Stats is a point-in-time view of one carrier.
 type Stats struct {
+	Kind              wire.CarrierKind // the carrier's kind (Conn.Kind)
 	SRTT, MinRTT      time.Duration
 	Rate              float64   // bytes/s proven by PONG watermarks (decaying max, backlog-gated)
 	RxRate            float64   // DATA payload bytes/s received (decaying max)
@@ -459,6 +578,16 @@ type Stats struct {
 	TxBytes, RxBytes  uint64    // DATA payload bytes sent / received on this carrier
 	RetxBytes, Frames uint64    // retransmitted DATA payload bytes; frames written
 	LastRx            time.Time // last frame received
+
+	// M2. TxBytes and RxBytes also count DGRAM payload bytes on every
+	// carrier; the fields below are zero on stream carriers.
+	MTU                    int    // current send frame budget (Conn.MTU)
+	Datagrams, DatagramsRx uint64 // datagrams written / read and handed over
+	Dropped                uint64 // datagrams and frames dropped (M2-D14), Truncated included
+	Truncated              uint64 // truncated or oversize datagrams read
+	Refused                uint64 // DGRAMs lost in datagrams the transport refused as too large (the session adds them to PacketCounters.DropTooLarge)
+	Retransmits            uint64 // REL and H1 retransmissions (L12)
+	Rebinds                uint64 // committed rebinds of a passive raw-UDP flow (L59)
 }
 
 // Closing and joining.
@@ -467,9 +596,10 @@ type Stats struct {
 type closeMode uint8
 
 const (
-	closeKill     closeMode = iota // abrupt: SetDeadline(now) and Close (closeConn)
-	closeRetired                   // planned: CloseWrite (OwnedTCP only), then SetDeadline(now) and Close
-	closeWriteOne                  // WriteAndClose: write one frame, CloseWrite (OwnedTCP), bounded drain, then SetDeadline(now) and Close
+	closeKill         closeMode = iota // abrupt: SetDeadline(now) and Close (closeConn)
+	closeRetired                       // planned: CloseWrite (OwnedTCP only), then SetDeadline(now) and Close
+	closeWriteOne                      // WriteAndClose: write one frame, CloseWrite (OwnedTCP), bounded drain, then SetDeadline(now) and Close
+	closeRetiredDrain                  // planned, an OwnedTCP carrier past the drain bound: CloseWrite, the reader ends (awaitReader, ≤ drainMax), then SetDeadline(now) and Close
 )
 
 // drainMax bounds the drain of a planned close and of WriteAndClose.
@@ -481,10 +611,13 @@ const drainMax = time.Second
 // after the close (plus the bounded write and drain of WriteAndClose).
 func (c *Conn) startCloser(mode closeMode, frame []byte, deadline time.Time) {
 	wait := c.tm.AbandonWait
-	if mode == closeWriteOne {
+	switch mode {
+	case closeWriteOne:
 		if d := time.Until(deadline); d > 0 {
 			wait += d
 		}
+		wait += drainMax
+	case closeRetiredDrain:
 		wait += drainMax
 	}
 	c.jmu.Lock()
@@ -507,6 +640,9 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 		if c.owned != nil {
 			_ = callCloseWrite(c.owned)
 		}
+	case closeRetiredDrain:
+		_ = callCloseWrite(c.owned)
+		c.awaitReader(drainMax)
 	case closeWriteOne:
 		_ = callSetWriteDeadline(c.nc, deadline)
 		if writeFull(c.nc, frame) == nil {
@@ -515,6 +651,38 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 			}
 			drain(c.nc, time.Now().Add(drainMax))
 		}
+	}
+}
+
+// awaitReader waits, at most d, until the reader part finished. The reader
+// owns Read (no second reader drains the conn): after a drain-bound
+// retirement it keeps reading — the peer's late frames are dispatched as
+// before the bound — and ends at the peer's CLOSE (no frame follows it),
+// at EOF or at a read error, so the conn is closed with nothing unread and
+// no late frame of the peer meets a closed socket and draws a TCP RST
+// (L05; W4-K11, TestLoopbackDrainBoundNoReset_L05). A peer that sends
+// nothing more is cut off by closeConn after d. A later Kill does not cut
+// the wait short (the death is already recorded, so it starts no closer):
+// Done and the join may come up to d later, inside the closer's
+// abandonment wait (AbandonWait + drainMax). No owner kills a carrier
+// whose CLOSE was written (the end phase and Runtime.Close kill only those
+// whose CLOSE is unwritten), and only such a carrier reaches this wait.
+func (c *Conn) awaitReader(d time.Duration) {
+	c.jmu.Lock()
+	if c.join.running&partReader == 0 {
+		c.jmu.Unlock()
+		return
+	}
+	if c.join.readerExit == nil {
+		c.join.readerExit = make(chan struct{})
+	}
+	exit := c.join.readerExit
+	c.jmu.Unlock()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-exit:
+	case <-t.C:
 	}
 }
 
@@ -542,11 +710,11 @@ func (c *Conn) closeConn() {
 	if set {
 		go func() {
 			defer c.partDone(partDeadline) // also on runtime.Goexit inside the embedder's SetDeadline
-			_ = callSetDeadline(c.nc, time.Now())
+			_ = callSetDeadline(k.nc, time.Now())
 		}()
 	}
 	if k.startClose() {
-		_ = callClose(c.nc)
+		_ = callClose(k.nc) // the net.Conn, or a datagram carrier's PacketIO (R1-7)
 	}
 }
 
@@ -568,6 +736,10 @@ func drain(nc net.Conn, until time.Time) {
 func (c *Conn) partDone(p uint8) {
 	c.jmu.Lock()
 	c.join.running &^= p
+	if p == partReader && c.join.readerExit != nil {
+		close(c.join.readerExit)
+		c.join.readerExit = nil
+	}
 	left := c.join.abandoned&p != 0
 	c.join.abandoned &^= p
 	c.maybeDoneLocked()
@@ -638,10 +810,23 @@ func (c *Conn) maybeDoneLocked() {
 // finishRetire ends a planned retirement (both CLOSEs exchanged, EOF or
 // read error after a CLOSE, or the drain bound): the death record becomes
 // CauseRetired unless a death came first, and the conn is closed in the
-// L05 order.
-func (c *Conn) finishRetire(detail string) {
+// L05 order. At the drain bound (drained) a carrier over rendr's own TCP
+// (OwnedTCP) half-closes and still consumes what the peer sends until its
+// CLOSE or EOF, bounded by drainMax, before the socket is closed
+// (closeRetiredDrain): a frame of a stalled peer that arrived after the
+// bound would otherwise meet a closed socket and draw a TCP RST (W4-K11).
+// Every other conn — an embedder's net.Conn, which rendr cannot
+// half-close, or a datagram carrier's PacketIO (R1-7) — is closed at the
+// bound.
+func (c *Conn) finishRetire(detail string) { c.retire(detail, false) }
+
+func (c *Conn) retire(detail string, drained bool) {
 	if c.setDeath(CauseRetired, detail) {
-		c.startCloser(closeRetired, nil, time.Time{})
+		mode := closeRetired
+		if drained && c.owned != nil && c.dg == nil {
+			mode = closeRetiredDrain
+		}
+		c.startCloser(mode, nil, time.Time{})
 	}
 }
 
@@ -677,7 +862,7 @@ func (c *Conn) closeWritten() {
 	}
 	c.jmu.Lock()
 	if !c.join.doneClosed {
-		c.join.drain = time.AfterFunc(bound, func() { c.finishRetire("retired: drain bound after CLOSE") })
+		c.join.drain = time.AfterFunc(bound, func() { c.retire("retired: drain bound after CLOSE", true) })
 	}
 	c.jmu.Unlock()
 }
@@ -706,6 +891,11 @@ func (c *Conn) WriteAndClose(t wire.Type, flags uint8, handle uint32, payload []
 	}
 	if deadline.IsZero() {
 		deadline = time.Now().Add(drainMax)
+	}
+	if c.dg != nil {
+		// A datagram verdict is a REL retransmitted until RACKed (M2-D21).
+		c.dgWriteAndClose(t, flags, handle, payload, deadline)
+		return
 	}
 	frame := wire.AppendFrame(nil, wire.Header{Type: t, Flags: flags, Fseq: c.wr.fseq, Handle: handle}, payload)
 	if !c.setDeath(CauseLocalClose, "closed after a "+t.String()) {

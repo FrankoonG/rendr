@@ -86,7 +86,7 @@ func ReadHello(env *Env, nc net.Conn, deadline time.Time, maxMeta int, gate Gate
 // readHello is ReadHello without the Goexit guard: every return path closes
 // k's conn unless a Hello owns it.
 func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gate) (*Hello, error) {
-	nc := k.nc
+	nc := k.conn()
 	fail := func(err error) (*Hello, error) {
 		k.async(env)
 		return nil, err

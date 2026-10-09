@@ -31,18 +31,21 @@ const (
 var zeroPad [wire.MaxPingPad]byte
 
 // bframe is one appended frame. Its header, in-arena payload part (control
-// payload, or DATA's 8-byte offset) and trailer occupy
+// payload, DATA's 8-byte offset or DGRAM's 8-byte seq) and trailer occupy
 // arena[head : head+HeaderLen+ctl+TrailerLen] in that order; a frame with a
-// body (DATA bytes or PING/PONG padding) goes on the wire as header ‖
-// in-arena part ‖ body ‖ trailer, so the arena is split at the body.
+// body (DATA or DGRAM bytes, PING/PONG padding) goes on the wire as header ‖
+// in-arena part ‖ body ‖ trailer, so the arena is split at the body. A REL
+// frame (datagram mode) is a control frame whose in-arena payload is the
+// whole REL payload: cseq · itype · iflags · ihandle · ipayload.
 type bframe struct {
-	hdr   wire.Header // Type, Flags, Len, Handle; Fseq once sealed
+	hdr   wire.Header // Type, Flags, Len, Handle; Fseq once sealed (REL: the outer header)
 	head  int32       // arena offset of the header
 	ctl   int32       // in-arena payload bytes after the header
-	off   uint64      // DATA: stream offset
-	body  []byte      // DATA bytes (alias chunk.B) or zero padding (alias zeroPad)
-	chunk *Buf        // DATA: the referenced chunk until ReleaseRefs
+	off   uint64      // DATA: stream offset; DGRAM: session seq
+	body  []byte      // DATA or DGRAM bytes (alias chunk.B) or zero padding (alias zeroPad)
+	chunk *Buf        // DATA, DGRAM: the referenced chunk until ReleaseRefs
 	retx  bool        // DATA: retransmitted bytes
+	ref   bool        // DGRAM: this frame holds the batch's one reference on chunk
 }
 
 // Batch is the writer-owned, reused set of frames of one physical write.
@@ -54,19 +57,34 @@ type bframe struct {
 // Each round is Reset → (carrier control, Endpoint.Fill) → encode and write
 // → ReleaseRefs. NewBatch, Reset, Frame, WakeTime and CapBlocked also let
 // package session drive Endpoint.Fill directly in its tests and inspect
-// exactly what was appended (design §16.2 WP4).
+// exactly what was appended (design §16.2 WP4). On a datagram carrier the
+// writer puts the batch in datagram mode for the round (SetDatagram,
+// batch_dgram.go): reliable control frames are then reserved as REL frames
+// and the sealed frames are packed into datagrams.
 type Batch struct {
 	now        time.Time
 	wake       time.Time
 	capBlocked bool
 
-	budget int // DATA payload bytes allowed per round
-	data   int // DATA payload bytes added this round
-	retx   int // retransmitted DATA payload bytes added this round
-	ctl    int // control payload bytes added this round (≤ ControlArena)
-	bodies int // body bytes (DATA and padding) added this round
-	used   int // arena bytes used this round
-	n      int // frames
+	budget  int // DATA payload bytes allowed per round
+	data    int // DATA payload bytes added this round (DGRAM bytes too on a stream batch)
+	retx    int // retransmitted DATA payload bytes added this round
+	ctl     int // control payload bytes added this round (≤ ControlArena)
+	bodies  int // body bytes (DATA, DGRAM and padding) added this round
+	used    int // arena bytes used this round
+	n       int // frames
+	dgBytes int // DGRAM body bytes added this round (both modes)
+
+	// The datagram mode of this round (batch_dgram.go; M2 design §A5.8):
+	// set by SetDatagram, ended by Reset.
+	dgram       bool
+	frameBudget int                   // the carrier's send frame budget (DgramRoom)
+	relRoom     int                   // new REL frames this round may reserve
+	nrel        int                   // new REL frames reserved this round
+	relIdx      [wire.RelWindow]uint8 // frame index of the k-th new REL
+	relStamped  uint32                // bit k: relPayload stamped the k-th new REL's cseq
+	relBlocked  bool                  // a reliable Add* found no REL room this round
+	lastRef     *Buf                  // the chunk of the latest DGRAM reference taken this round
 
 	frames [MaxBatchFrames]bframe
 	arena  []byte
@@ -83,59 +101,84 @@ func NewBatch(budget int) *Batch {
 }
 
 // Reset starts a new round at now: it releases every chunk reference the
-// batch still holds (as ReleaseRefs), empties it, and clears the WakeAt
-// request and the cap-blocked mark.
+// batch still holds (as ReleaseRefs), empties it, clears the WakeAt
+// request and the cap-blocked mark, and ends datagram mode.
 func (b *Batch) Reset(now time.Time) {
 	b.ReleaseRefs()
 	clear(b.frames[:b.n])
-	b.n, b.data, b.retx, b.ctl, b.bodies, b.used = 0, 0, 0, 0, 0, 0
+	b.n, b.data, b.retx, b.ctl, b.bodies, b.used, b.dgBytes = 0, 0, 0, 0, 0, 0, 0
 	b.now, b.wake, b.capBlocked = now, time.Time{}, false
+	b.dgram, b.frameBudget, b.relRoom, b.nrel, b.relStamped, b.relBlocked = false, 0, 0, 0, 0, false
 }
 
-// ReleaseRefs releases the chunk references taken by AddData. The writer
-// calls it as soon as the physical write returned; it is idempotent within
-// a round. A batch whose write is still inside an embedder call keeps its
-// references (the abandoned-call rule, design §4.1). After it, Frame no
-// longer reports the DATA bodies (their memory may be recycled).
+// ReleaseRefs releases the chunk references taken by AddData and AddDgram.
+// The writer calls it as soon as the physical write returned (on a
+// datagram carrier: after the last datagram of the batch); it is
+// idempotent within a round. A batch whose write is still inside an
+// embedder call keeps its references (the abandoned-call rule, design
+// §4.1). After it, Frame no longer reports the DATA and DGRAM bodies (their
+// memory may be recycled), and the write shapes would lack them.
 func (b *Batch) ReleaseRefs() {
 	for i := range b.frames[:b.n] {
 		f := &b.frames[i]
-		if f.hdr.Type != wire.TypeData {
-			continue
+		switch f.hdr.Type {
+		case wire.TypeData:
+			if f.chunk != nil {
+				f.chunk.Release()
+				f.chunk = nil
+			}
+			f.body = nil
+		case wire.TypeDgram:
+			if f.ref {
+				f.chunk.Release()
+				f.ref = false
+			}
+			f.chunk, f.body = nil, nil
 		}
-		if f.chunk != nil {
-			f.chunk.Release()
-			f.chunk = nil
-		}
-		f.body = nil
 	}
+	b.lastRef = nil
 }
 
 // BatchFrame is a read-only view of one appended frame (tests and
 // diagnostics; the writer encodes from the batch's own state).
 type BatchFrame struct {
-	Header  wire.Header // Type, Flags, Handle and Len (payload length, the DATA offset included); Fseq is 0 until the writer stamps it
+	Header  wire.Header // Type, Flags, Handle and Len (payload length, the DATA offset or DGRAM seq included); Fseq is 0 until the writer stamps it
 	Off     uint64      // DATA: stream offset
-	Body    []byte      // DATA: the bytes (alias Chunk.B)
-	Chunk   *Buf        // DATA: the referenced send chunk
+	Body    []byte      // DATA, DGRAM: the bytes (alias Chunk.B)
+	Chunk   *Buf        // DATA: the referenced send chunk; DGRAM: the chunk passed to AddDgram
 	Retx    bool        // DATA: retransmitted bytes
 	Payload []byte      // control frames: the encoded payload (aliases the batch arena; valid until Reset)
+	Seq     uint64      // DGRAM: the session seq (Body holds the datagram)
+	Rel     bool        // a reliable control frame wrapped in REL on a datagram batch; Header is the inner header
 }
 
 // Frame returns frame i (0 ≤ i < Len()) in insertion order. A padded PING
 // or PONG reports its fixed 20-byte part as Payload and its zero padding as
-// Body.
+// Body. A REL frame (a reliable control frame of a datagram batch, or a
+// retransmission) reports its inner frame — Header the inner type, flags,
+// handle and payload length (Fseq: the outer frame's), Payload the inner
+// payload — with Rel set, so Fill-level tests read a wrapped FIN exactly
+// like a bare one.
 func (b *Batch) Frame(i int) BatchFrame {
 	if i < 0 || i >= b.n {
 		panic("rendr/carrier: Batch.Frame index out of range")
 	}
 	f := &b.frames[i]
-	if f.hdr.Type == wire.TypeData {
+	switch f.hdr.Type {
+	case wire.TypeData:
 		return BatchFrame{Header: f.hdr, Off: f.off, Body: f.body, Chunk: f.chunk, Retx: f.retx}
+	case wire.TypeDgram:
+		return BatchFrame{Header: f.hdr, Seq: f.off, Body: f.body, Chunk: f.chunk}
 	}
 	start := int(f.head) + wire.HeaderLen
 	end := start + int(f.ctl)
-	return BatchFrame{Header: f.hdr, Body: f.body, Payload: b.arena[start:end:end]}
+	p := b.arena[start:end:end]
+	if f.hdr.Type == wire.TypeRel {
+		h := relInner(p)
+		h.Fseq = f.hdr.Fseq
+		return BatchFrame{Header: h, Payload: p[wire.RelHeadLen:], Rel: true}
+	}
+	return BatchFrame{Header: f.hdr, Body: f.body, Payload: p}
 }
 
 // WakeTime returns the earliest WakeAt request of this round (zero if none).
@@ -160,22 +203,31 @@ func (b *Batch) Len() int {
 }
 
 // Room returns the DATA payload bytes still allowed in this batch
-// (Timing.BatchBudget minus DATA already added); control frames do not
-// count against it.
+// (Timing.BatchBudget minus DATA already added; on a stream batch DGRAM
+// bytes count as DATA, M2-D26); control frames do not count against it.
 func (b *Batch) Room() int {
 	return b.budget - b.data
 }
 
 // Full reports that no further frame of any kind fits (frame count or
 // control arena exhausted). Every Add* refuses while Full is true, DATA
-// included. Full false does not promise that a particular frame fits:
-// AddData also needs len(body) ≤ Room(), and a control frame needs room
-// for its payload in the arena, so callers check every Add* result.
+// and DGRAM included. Full false does not promise that a particular frame
+// fits: AddData also needs len(body) ≤ Room(), AddDgram len(body) ≤
+// DgramRoom(), a reliable frame of a datagram batch REL room, and a
+// control frame needs room for its payload in the arena, so callers check
+// every Add* result.
 func (b *Batch) Full() bool {
 	return b.n >= MaxBatchFrames || b.ctl >= ControlArena
 }
 
-// AddOpenAck appends an OPEN_ACK frame; false if the batch is full.
+// The reliable control frames — OPEN_ACK, JOIN_ACK, FIN, RST, SCHED, a
+// reliable PACK (AddPack), CLOSE and GOAWAY — are REL frames on a datagram
+// batch (M2-D7, plan:356): each of their Add* calls then also returns false
+// when the round's REL room is used (RelRoom), so the frame stays due in
+// the session (W5). On a stream batch they are ordinary frames.
+
+// AddOpenAck appends an OPEN_ACK frame (REL on a datagram batch); false if
+// the batch is full or no REL room is left.
 func (b *Batch) AddOpenAck(handle uint32, a *wire.OpenAck) bool {
 	n := wire.OpenAckFixedLen
 	if a.Status != wire.StatusOK {
@@ -184,16 +236,17 @@ func (b *Batch) AddOpenAck(handle uint32, a *wire.OpenAck) bool {
 	if len(a.Msg) > wire.MaxMsg {
 		panic("rendr/carrier: OPEN_ACK message beyond wire.MaxMsg")
 	}
-	p, ok := b.addSession(wire.TypeOpenAck, 0, handle, n)
+	p, ok := b.addSessionRel(wire.TypeOpenAck, 0, handle, n)
 	if ok {
 		wire.PutOpenAck(p, a)
 	}
 	return ok
 }
 
-// AddJoinAck appends a JOIN_ACK frame; false if the batch is full.
+// AddJoinAck appends a JOIN_ACK frame (REL on a datagram batch); false if
+// the batch is full or no REL room is left.
 func (b *Batch) AddJoinAck(handle uint32, a *wire.JoinAck) bool {
-	p, ok := b.addSession(wire.TypeJoinAck, 0, handle, wire.JoinAckLen)
+	p, ok := b.addSessionRel(wire.TypeJoinAck, 0, handle, wire.JoinAckLen)
 	if ok {
 		wire.PutJoinAck(p, a)
 	}
@@ -201,10 +254,14 @@ func (b *Batch) AddJoinAck(handle uint32, a *wire.JoinAck) bool {
 }
 
 // AddAck appends an ACK frame with header flags (FlagAckFinDelivered,
-// FlagAckDone); false if the batch is full.
+// FlagAckDone); false if the batch is full. ACK belongs to stream sessions:
+// it panics on a datagram batch (a packet session places PACK).
 func (b *Batch) AddAck(handle uint32, flags uint8, a *wire.Ack) bool {
 	if flags&^wire.AllowedFlags(wire.TypeAck) != 0 {
 		panic("rendr/carrier: undefined ACK flags")
+	}
+	if b.dgram {
+		panic("rendr/carrier: ACK on a datagram batch")
 	}
 	p, ok := b.addSession(wire.TypeAck, flags, handle, wire.AckLen)
 	if ok {
@@ -213,29 +270,32 @@ func (b *Batch) AddAck(handle uint32, flags uint8, a *wire.Ack) bool {
 	return ok
 }
 
-// AddFin appends a FIN frame at stream offset off; false if the batch is full.
+// AddFin appends a FIN frame at stream offset off (a packet session: its
+// final seq; REL on a datagram batch); false if the batch is full or no
+// REL room is left.
 func (b *Batch) AddFin(handle uint32, off uint64) bool {
-	p, ok := b.addSession(wire.TypeFin, 0, handle, wire.FinLen)
+	p, ok := b.addSessionRel(wire.TypeFin, 0, handle, wire.FinLen)
 	if ok {
 		wire.PutFin(p, off)
 	}
 	return ok
 }
 
-// AddRst appends an RST frame; false if the batch is full.
+// AddRst appends an RST frame (REL on a datagram batch); false if the batch
+// is full or no REL room is left.
 func (b *Batch) AddRst(handle uint32, r *wire.Rst) bool {
 	if len(r.Msg) > wire.MaxMsg {
 		panic("rendr/carrier: RST message beyond wire.MaxMsg")
 	}
-	p, ok := b.addSession(wire.TypeRst, 0, handle, wire.RstFixedLen+len(r.Msg))
+	p, ok := b.addSessionRel(wire.TypeRst, 0, handle, wire.RstFixedLen+len(r.Msg))
 	if ok {
 		wire.PutRst(p, r)
 	}
 	return ok
 }
 
-// AddSched appends a SCHED frame carrying cause in its flags; false if the
-// batch is full.
+// AddSched appends a SCHED frame carrying cause in its flags (REL on a
+// datagram batch); false if the batch is full or no REL room is left.
 func (b *Batch) AddSched(handle uint32, cause wire.SchedCause, s *wire.Sched) bool {
 	if uint8(cause)&^wire.SchedCauseMask != 0 {
 		panic("rendr/carrier: SCHED cause outside wire.SchedCauseMask")
@@ -243,7 +303,7 @@ func (b *Batch) AddSched(handle uint32, cause wire.SchedCause, s *wire.Sched) bo
 	if s.N < 1 || s.N > wire.MaxSchedIDs {
 		panic("rendr/carrier: SCHED carrier count outside 1..wire.MaxSchedIDs")
 	}
-	p, ok := b.addSession(wire.TypeSched, uint8(cause), handle, wire.SchedFixedLen+4*s.N)
+	p, ok := b.addSessionRel(wire.TypeSched, uint8(cause), handle, wire.SchedFixedLen+4*s.N)
 	if ok {
 		wire.PutSched(p, s)
 	}
@@ -257,13 +317,17 @@ func (b *Batch) AddSched(handle uint32, cause wire.SchedCause, s *wire.Sched) bo
 // recycled while the write may still read it (L17, L43). retx marks
 // retransmitted bytes (RetxBytes). It returns false, adding nothing, when
 // len(body) > Room() or the batch is full; len(body) must be ≥ 1. A nil
-// chunk (tests) takes no reference.
+// chunk (tests) takes no reference. DATA belongs to stream sessions: it
+// panics on a datagram batch.
 func (b *Batch) AddData(handle uint32, off uint64, body []byte, chunk *Buf, retx bool) bool {
 	if len(body) == 0 || len(body) > wire.MaxFramePayload-wire.DataPrefixLen {
 		panic("rendr/carrier: DATA body length outside 1..MaxFramePayload-8")
 	}
 	if handle == 0 {
 		panic("rendr/carrier: session frame with handle 0")
+	}
+	if b.dgram {
+		panic("rendr/carrier: DATA on a datagram batch")
 	}
 	if b.Full() || len(body) > b.Room() {
 		return false
@@ -311,6 +375,15 @@ func (b *Batch) addSession(t wire.Type, flags uint8, handle uint32, n int) (p []
 	return b.addControl(t, flags, handle, n)
 }
 
+// addSessionRel is addSession for a reliable session frame: REL-wrapped on
+// a datagram batch (addReliable).
+func (b *Batch) addSessionRel(t wire.Type, flags uint8, handle uint32, n int) (p []byte, ok bool) {
+	if handle == 0 {
+		panic("rendr/carrier: session frame with handle 0")
+	}
+	return b.addReliable(t, flags, handle, n)
+}
+
 // addControl reserves a control frame whose whole n-byte payload lives in
 // the arena.
 func (b *Batch) addControl(t wire.Type, flags uint8, handle uint32, n int) (p []byte, ok bool) {
@@ -345,7 +418,8 @@ func (b *Batch) reserve(t wire.Type, flags uint8, handle uint32, ctl, body int) 
 // write shapes. These run on the writer goroutine only, in the order
 // Reset → add → seal → appendBuffers or appendTo → write → ReleaseRefs
 // (ReleaseRefs drops the DATA bodies, so a write shape built after it
-// would lack them).
+// would lack them). A datagram carrier's writer packs the sealed frames
+// into datagrams instead (batch_dgram.go).
 
 // addPing appends a PING (FlagPingBusy when busy) with p's id, timestamp,
 // nonce and padding; false if the batch is full.
@@ -388,18 +462,20 @@ func (b *Batch) addPingFrame(t wire.Type, flags uint8, p *wire.Ping) bool {
 	return true
 }
 
-// addClose appends CLOSE(reason); false if the batch is full.
+// addClose appends CLOSE(reason) (REL on a datagram batch); false if the
+// batch is full or no REL room is left.
 func (b *Batch) addClose(r wire.CloseReason) bool {
-	p, ok := b.addControl(wire.TypeClose, 0, 0, wire.ReasonLen)
+	p, ok := b.addReliable(wire.TypeClose, 0, 0, wire.ReasonLen)
 	if ok {
 		wire.PutReason(p, uint8(r))
 	}
 	return ok
 }
 
-// addGoAway appends GOAWAY(reason); false if the batch is full.
+// addGoAway appends GOAWAY(reason) (REL on a datagram batch); false if the
+// batch is full or no REL room is left.
 func (b *Batch) addGoAway(r wire.GoAwayReason) bool {
-	p, ok := b.addControl(wire.TypeGoAway, 0, 0, wire.ReasonLen)
+	p, ok := b.addReliable(wire.TypeGoAway, 0, 0, wire.ReasonLen)
 	if ok {
 		wire.PutReason(p, uint8(r))
 	}
@@ -411,9 +487,18 @@ func (b *Batch) addGoAway(r wire.GoAwayReason) bool {
 // (chained over header, in-arena payload and body without copying), and
 // returns the fseq that follows the last frame. It reads the referenced
 // bodies and writes only the batch's own arena, so it runs outside every
-// lock. A DATA body changed after seal no longer matches its trailer: the
-// receiver kills the carrier instead of accepting altered bytes (L43).
+// lock. A DATA or DGRAM body changed after seal no longer matches its
+// trailer: the receiver never accepts the altered bytes (L43; a stream
+// carrier is killed, a datagram carrier drops the rest of the datagram,
+// PA-1). On a datagram batch every frame — a REL around its stamped REL
+// payload, a DGRAM over seq ‖ datagram — is an outer frame of its own,
+// sealed the same way; every new REL must carry its cseq first
+// (relPayload), else seal panics: an unstamped REL would leave with a cseq
+// the sender never tracks.
 func (b *Batch) seal(fseq uint32) uint32 {
+	if b.relStamped != uint32(1)<<b.nrel-1 {
+		panic("rendr/carrier: a new REL frame sealed before relPayload stamped its cseq")
+	}
 	for i := range b.frames[:b.n] {
 		f := &b.frames[i]
 		f.hdr.Fseq = fseq
@@ -436,7 +521,9 @@ func (b *Batch) wireLen() int {
 }
 
 // dataBytes returns the DATA payload bytes of this round (bodies only, the
-// offset prefixes excluded); retxBytes the retransmitted part of them.
+// offset prefixes excluded) — on a stream batch the DGRAM bytes too
+// (M2-D26), on a datagram batch none of them; retxBytes the retransmitted
+// part of them.
 func (b *Batch) dataBytes() int { return b.data }
 
 func (b *Batch) retxBytes() int { return b.retx }

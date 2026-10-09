@@ -10,6 +10,8 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/sched"
 	"github.com/FrankoonG/rendr/v2/internal/session"
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
+	"github.com/FrankoonG/rendr/v2/internal/udpflow"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // Configuration defaults and clamp ranges (plan §4). The four fields whose
@@ -57,6 +59,13 @@ const (
 	defAcceptBacklog, minAcceptBacklog, maxAcceptBacklog = 128, 1, 65536
 	defAcceptTimeout, minAcceptTimeout, maxAcceptTimeout = 10 * time.Second, 100 * time.Millisecond, 60 * time.Second
 
+	// Packet sessions and datagram carriers (M2-D64, M2 design §A7.4).
+	defPacketPing, minPacketPing, maxPacketPing                   = time.Second, 200 * time.Millisecond, 10 * time.Second // and ≤ DeadMin/2 (constraint 2)
+	defPacketQueue, minPacketQueue, maxPacketQueue                = 1 << 20, 64 << 10, 64 << 20                           // and ≥ MaxPayload + 64 (constraint 8)
+	defPacketMaxAge, minPacketMaxAge, maxPacketMaxAge             = 100 * time.Millisecond, 10 * time.Millisecond, 2 * time.Second
+	defPacketMaxPayload, minPacketMaxPayload, maxPacketMaxPayload = wire.MaxPacketPayload, wire.MinPacketPayload, wire.MaxPacketPayload
+	packetQueueSlack                                              = 64 // Packet.Queue ≥ MaxPayload + this (a datagram's queue charge is max(len, 64), M2-D32)
+
 	// minPassiveRetain and maxPassiveRetain clamp the retain_ms a passive
 	// receives in OPEN (P15).
 	minPassiveRetain, maxPassiveRetain = 1 * time.Second, 400 * time.Second
@@ -80,6 +89,16 @@ const (
 	defProbeIdleStop     = 5 * time.Minute        // probing stops after this long unused (§7.8)
 	defFirstEpoch        = 1                      // first SCHED epoch a dialer publishes
 	defOffsetLimit       = uint64(1) << 62        // stream offset limit (L14)
+
+	// M2 internal values (M2 design §A7.4).
+	defRelRTOInit    = 300 * time.Millisecond // REL and H1 timeout before the first RTT sample
+	defRelRTOMin     = 200 * time.Millisecond // REL timeout clamp, lower
+	defRelRTOMax     = 2 * time.Second        // REL timeout clamp, upper
+	defMTUProbeEvery = 10                     // every n-th PacketPing-cadence PING is an MTU probe
+	defMTUProbeFails = 3                      // consecutive unanswered probes that kill
+	defPackEvery     = 256                    // PACK after this many datagrams
+	defFinWaitMax    = time.Second            // upper clamp of the EOF straggler wait
+	defFlowSlack     = 2 * time.Second        // flow tombstones: max(Handshake.Timeout, DialTimeout) + this (R1-11)
 )
 
 // effective is the configuration a Runtime runs with (design §10.4): the
@@ -106,6 +125,13 @@ type effective struct {
 	// BackoffMax, AcceptTimeout and TombstoneTTL are filled per session by
 	// dialerParams and passiveParams (design §10.4 step 4).
 	params session.Params
+
+	// packet is the template of a packet session's frozen packet
+	// configuration (M2-D64): MaxPayload is Config.Packet.MaxPayload, which
+	// DialPacket replaces by its offer and the admission by the accepted
+	// value. flow bounds every FromPacketConn source (M2-D59).
+	packet session.PacketParams
+	flow   udpflow.Limits
 
 	retainSlack    time.Duration    // the "+5 s" of PassiveRetain
 	eventQueue     int              // OnEvent queue capacity
@@ -168,6 +194,11 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		c.Sessionless.Idle = defSlIdle
 	}
 
+	clampField(&a, "PacketPing", &c.PacketPing, defPacketPing, minPacketPing, maxPacketPing, false, fmtDur)
+	clampField(&a, "Packet.Queue", &c.Packet.Queue, defPacketQueue, minPacketQueue, maxPacketQueue, false, fmtInt)
+	clampField(&a, "Packet.MaxAge", &c.Packet.MaxAge, defPacketMaxAge, minPacketMaxAge, maxPacketMaxAge, false, fmtDur)
+	clampField(&a, "Packet.MaxPayload", &c.Packet.MaxPayload, defPacketMaxPayload, minPacketMaxPayload, maxPacketMaxPayload, false, fmtInt)
+
 	// Step 2: cross-parameter constraints (plan §3.6; design §7.9), in this
 	// order. Each lowers or raises only the dependent field, and every
 	// adjusted value stays inside the field's own range (DeadMin ≥ 500 ms
@@ -191,6 +222,10 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		a.record("PingBusy", fmtDur(c.PingBusy), fmtDur(lim), "constraint 2: PingBusy ≤ DeadMin/4")
 		c.PingBusy = lim
 	}
+	if lim := c.DeadMin / 2; c.PacketPing > lim {
+		a.record("PacketPing", fmtDur(c.PacketPing), fmtDur(lim), "constraint 2: PacketPing ≤ DeadMin/2")
+		c.PacketPing = lim
+	}
 	if lim := c.NoPathGrace / 2; c.RejoinBackoffMax > lim {
 		a.record("RejoinBackoffMax", fmtDur(c.RejoinBackoffMax), fmtDur(lim), "constraint 3: RejoinBackoffMax ≤ NoPathGrace/2")
 		c.RejoinBackoffMax = lim
@@ -202,6 +237,10 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 	if lim := 2 * c.Probe.Interval; c.Probe.Fresh < lim {
 		a.record("Probe.Fresh", fmtDur(c.Probe.Fresh), fmtDur(lim), "constraint 7: Probe.Fresh ≥ 2×Probe.Interval")
 		c.Probe.Fresh = lim
+	}
+	if lim := c.Packet.MaxPayload + packetQueueSlack; c.Packet.Queue < lim {
+		a.record("Packet.Queue", fmtInt(c.Packet.Queue), fmtInt(lim), "constraint 8: Packet.Queue ≥ Packet.MaxPayload + 64")
+		c.Packet.Queue = lim
 	}
 
 	e := effective{
@@ -216,6 +255,11 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		capFloor: defCapFloor, batchBudget: defBatchBudget, segment: defSegment,
 		loadThreshold: defLoadThreshold, idleStop: defProbeIdleStop,
 		agg: sched.DefaultAggParams(), firstEpoch: defFirstEpoch, offsetLimit: defOffsetLimit,
+		packetActive: c.PingIdle, relRTOInit: defRelRTOInit, relRTOMin: defRelRTOMin, relRTOMax: defRelRTOMax,
+		mtuProbeEvery: defMTUProbeEvery, mtuProbeFails: defMTUProbeFails, packEvery: defPackEvery,
+		finWaitMax: defFinWaitMax, dedupBits: wire.DefaultSeqWindowBits,
+		flowPerSource: udpflow.DefaultPerSource, flowPerSourceJoin: udpflow.DefaultPerSourceJoin,
+		flowInbox: udpflow.DefaultInbox,
 	}
 
 	// Step 5: overrides, last, unclamped and not recorded (a zero field
@@ -242,6 +286,13 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		CapFloor:         k.capFloor,
 		BatchBudget:      k.batchBudget,
 		Segment:          k.segment,
+		PacketPing:       c.PacketPing,
+		PacketActive:     k.packetActive,
+		RelRTOInit:       k.relRTOInit,
+		RelRTOMin:        k.relRTOMin,
+		RelRTOMax:        k.relRTOMax,
+		MTUProbeEvery:    k.mtuProbeEvery,
+		MTUProbeFails:    k.mtuProbeFails,
 	}
 	e.health = carrier.HealthParams{
 		Interval:      c.Probe.Interval,
@@ -275,7 +326,40 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		OffsetLimit:       k.offsetLimit,
 		FirstEpoch:        k.firstEpoch,
 	}
+	e.packet = session.PacketParams{
+		MaxPayload: c.Packet.MaxPayload,
+		Queue:      c.Packet.Queue,
+		MaxAge:     c.Packet.MaxAge,
+		PacketPing: c.PacketPing,
+		PackEvery:  k.packEvery,
+		FinWaitMax: k.finWaitMax,
+		DedupBits:  k.dedupBits,
+		FirstSeq:   k.firstSeq,
+	}
+	e.flow = udpflow.Limits{
+		MaxFlows:      k.flowMaxFlows,
+		PerSource:     k.flowPerSource,
+		PerSourceJoin: k.flowPerSourceJoin,
+		Inbox:         k.flowInbox,
+		TombstoneTTL:  k.flowTombstoneTTL,
+		Tombstones:    udpflow.DefaultTombstones,
+	}
+	if e.flow.MaxFlows == 0 {
+		e.flow.MaxFlows = flowCap(c)
+	}
+	if e.flow.TombstoneTTL == 0 {
+		e.flow.TombstoneTTL = addSat(max(c.Handshake.Timeout, c.DialTimeout), defFlowSlack)
+	}
 	return e, a.out
+}
+
+// flowCap is the flow bound of one FromPacketConn source (M2-D59):
+// min(65,536, MaxSessions × MaxCarriersPerSession + Sessionless.Total +
+// Handshake.MaxConcurrent), computed in 64 bits so that test overrides
+// cannot overflow it.
+func flowCap(c Config) int {
+	n := int64(c.MaxSessions)*int64(c.MaxCarriersPerSession) + int64(c.Sessionless.Total) + int64(c.Handshake.MaxConcurrent)
+	return int(min(max(n, 1), udpflow.MaxFlowsCap))
 }
 
 // internalConstants collects the plan §4 internal constants that only
@@ -295,6 +379,23 @@ type internalConstants struct {
 	firstOffset       uint64
 	offsetLimit       uint64
 	firstEpoch        uint32
+
+	// M2: datagram carriers, packet sessions and udpflow sources.
+	packetActive      time.Duration
+	relRTOInit        time.Duration
+	relRTOMin         time.Duration
+	relRTOMax         time.Duration
+	mtuProbeEvery     int
+	mtuProbeFails     int
+	packEvery         int
+	finWaitMax        time.Duration
+	dedupBits         int
+	firstSeq          uint64
+	flowMaxFlows      int // 0: flowCap
+	flowPerSource     int
+	flowPerSourceJoin int
+	flowInbox         int
+	flowTombstoneTTL  time.Duration // 0: max(Handshake.Timeout, DialTimeout) + 2 s
 }
 
 // applyOverrides folds ov into the normalized config and the internal
@@ -326,6 +427,10 @@ func applyOverrides(c *Config, e *effective, k *internalConstants, ov *testhooks
 	override(&c.MaxCarriersPerSession, ov.MaxCarriersPerSession)
 	override(&c.MaxSessions, ov.MaxSessions)
 	override(&c.MaxBufferedBytes, ov.MaxBufferedBytes)
+	override(&c.PacketPing, ov.PacketPing)
+	override(&c.Packet.Queue, ov.PacketQueue)
+	override(&c.Packet.MaxAge, ov.PacketMaxAge)
+	override(&c.Packet.MaxPayload, ov.PacketMaxPayload)
 
 	override(&e.retainSlack, ov.RetainSlack)
 	override(&e.eventQueue, ov.EventQueue)
@@ -335,7 +440,7 @@ func applyOverrides(c *Config, e *effective, k *internalConstants, ov *testhooks
 		e.rand = ov.Rand
 	}
 	e.hooks = ov.Hooks
-	e.presets = carrier.Presets{FirstFseq: ov.FirstFseq, FirstPingID: ov.FirstPingID}
+	e.presets = carrier.Presets{FirstFseq: ov.FirstFseq, FirstPingID: ov.FirstPingID, FirstCseq: ov.FirstCseq}
 
 	override(&k.ackEvery, ov.AckEvery)
 	override(&k.ackDelay, ov.AckDelay)
@@ -355,6 +460,23 @@ func applyOverrides(c *Config, e *effective, k *internalConstants, ov *testhooks
 	override(&k.firstOffset, ov.FirstOffset)
 	override(&k.offsetLimit, ov.OffsetLimit)
 	override(&k.firstEpoch, ov.FirstEpoch)
+
+	k.packetActive = c.PingIdle // PacketActive = PingIdle (after the PingIdle override) unless set itself
+	override(&k.packetActive, ov.PacketActive)
+	override(&k.relRTOInit, ov.RelRTOInit)
+	override(&k.relRTOMin, ov.RelRTOMin)
+	override(&k.relRTOMax, ov.RelRTOMax)
+	override(&k.mtuProbeEvery, ov.MTUProbeEvery)
+	override(&k.mtuProbeFails, ov.MTUProbeFails)
+	override(&k.packEvery, ov.PackEvery)
+	override(&k.finWaitMax, ov.FinWaitMax)
+	override(&k.dedupBits, ov.DedupBits)
+	override(&k.firstSeq, ov.FirstSeq)
+	override(&k.flowMaxFlows, ov.FlowMaxFlows)
+	override(&k.flowPerSource, ov.FlowPerSource)
+	override(&k.flowPerSourceJoin, ov.FlowPerSourceJoin)
+	override(&k.flowInbox, ov.FlowInbox)
+	override(&k.flowTombstoneTTL, ov.FlowTombstoneTTL)
 }
 
 // override replaces *p with v unless v is the zero value ("a zero field
@@ -408,6 +530,16 @@ func (e *effective) passiveParams(mode Mode, retainMs uint32, acceptTimeout time
 	p.Grace = clampDur(time.Duration(retainMs)*time.Millisecond, minPassiveRetain, maxPassiveRetain)
 	p.TombstoneTTL = addSat(p.Grace, e.cfg.Linger)
 	p.AcceptTimeout = acceptTimeout
+	return p
+}
+
+// packetParams turns p into the Params of a packet session (M2-D1) whose
+// MaxPayload is maxPayload: the dialer's offer (M2-D49) or the passive's
+// accepted value.
+func (e *effective) packetParams(p session.Params, maxPayload int) session.Params {
+	p.Kind = wire.KindDatagram
+	p.Packet = e.packet
+	p.Packet.MaxPayload = maxPayload
 	return p
 }
 

@@ -54,6 +54,19 @@ type writer struct {
 
 	// Physical writes by shape (tests and diagnostics).
 	vectored, coalesced uint64
+
+	// Datagram carriers (dgwrite.go): the scratch every datagram is built in
+	// after Headroom() bytes (DBufs, charged to the stage account for the
+	// writer's life; budget + Headroom, M2 §A5.8), and the current round's
+	// marks.
+	dscratch *Buf
+	probe    bool   // the round's PING is an MTU probe
+	retx     bool   // the round carries the retransmission of retxCseq
+	retxCseq uint32 //
+	rack     bool   // the round carries a RACK with cumAck rackCum at frame rackAt
+	rackCum  uint32 //
+	rackAt   int    // frame index of the RACK (−1: none)
+	pingAt   int    // frame index of the round's PING (−1: none)
 }
 
 // backlogged reports whether the writer was busy for at least 25% of the
@@ -96,6 +109,10 @@ func (c *Conn) writerInit() {
 	if c.owned != nil {
 		w.vec = make(net.Buffers, 0, 2*MaxBatchFrames+1)
 	}
+	if dg := c.dg; dg != nil {
+		n := max(int(dg.budget.Load()), wire.MinFrameBudget) + dg.io.Headroom()
+		w.dscratch = c.dbufs().Get(n, c.env.stageBudget())
+	}
 }
 
 // writeLoop is the carrier's writer goroutine: one batch per round, rounds
@@ -117,6 +134,10 @@ func (c *Conn) writeLoop() {
 			w.scratch.Release()
 			w.scratch = nil
 		}
+		if w.dscratch != nil {
+			w.dscratch.Release()
+			w.dscratch = nil
+		}
 		if w.timer != nil {
 			w.timer.Stop()
 		}
@@ -137,6 +158,9 @@ func (c *Conn) writeLoop() {
 // when the writer must exit: the carrier is dead (never Fill after a death
 // it saw or caused, C1) or our CLOSE was written.
 func (c *Conn) writeRound(w *writer) bool {
+	if c.dg != nil {
+		return c.dgWriteRound(w) // a datagram carrier (dgwrite.go)
+	}
 	if c.death.Load() != nil {
 		return false
 	}

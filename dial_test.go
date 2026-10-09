@@ -63,7 +63,7 @@ func TestSessionDialEntryContract(t *testing.T) {
 		reg := &countReg{}
 		env := p.env
 		env.Registry = reg
-		spec := p.spec(SessionID(wpSID(1)), DialOptions{})
+		spec := p.spec(SessionID(wpSID(1)), DialOptions{}, false)
 		done, cancel := context.WithCancel(context.Background())
 		cancel()
 
@@ -104,11 +104,11 @@ func TestSessionDialEntryContract(t *testing.T) {
 		}
 
 		// Peer.open reports what Peer.Dial hands over to the session's Ended.
-		if _, created, err := p.open(done, SessionID(wpSID(2)), DialOptions{}, &dialReg{rt: rt, sid: SessionID(wpSID(2))}); created || err == nil {
+		if _, created, err := p.open(done, SessionID(wpSID(2)), DialOptions{}, false, &dialReg{rt: rt, sid: SessionID(wpSID(2))}); created || err == nil {
 			t.Fatalf("open with a done context: created %v, %v", created, err)
 		}
 		dr := &dialReg{rt: rt, sid: SessionID(wpSID(3))}
-		if _, created, err := p.open(context.Background(), SessionID(wpSID(3)), DialOptions{}, dr); !created || !errors.Is(err, ErrNoPath) {
+		if _, created, err := p.open(context.Background(), SessionID(wpSID(3)), DialOptions{}, false, dr); !created || !errors.Is(err, ErrNoPath) {
 			t.Fatalf("open with a refusing factory: created %v, %v", created, err)
 		}
 		synctest.Wait()

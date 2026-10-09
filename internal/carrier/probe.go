@@ -258,15 +258,24 @@ func earliest(a, b time.Time) time.Time {
 // B6 only at a session slot's first refusal or inside its recovery window);
 // for probe slots that would loop on such a path, so a probe establishment
 // leaves n alone (resultLocked).
+//
+// A datagram probe carrier learns a refusal of the passive's sessionless
+// pool only after its establishment PONG, as the passive's REL{CLOSE
+// (capacity)}, which retires it (M2 design §A5.10, Revision 1, R1-3): that
+// planned end is a probe failure with reason "capacity" (plan:175), read
+// through Conn.PeerCloseReason.
 func (r *healthRun) endedLocked(i int, s *probeSlot, cause Cause, now time.Time) {
 	h := r.h
 	f := &h.fac[i]
-	if f.conn == s.conn {
+	c := s.conn
+	if f.conn == c {
 		f.conn = nil
 	}
 	s.conn, s.retired = nil, false
 	if cause.Death() {
 		h.markLocked(i, cause.String(), now)
+	} else if reason, ok := c.PeerCloseReason(); ok && reason == wire.CloseCapacity {
+		h.markLocked(i, "capacity", now)
 	}
 	if !now.Before(s.cad.LastStart.Add(h.p.BackoffMax)) {
 		s.cad.Fails = 0
@@ -315,9 +324,23 @@ func (r *healthRun) resultLocked(i int, s *probeSlot, a *probeAttempt, now time.
 	f.conn = c
 	f.agg.Reset()                               // a new incarnation starts Unknown (L23)
 	f.pHead, f.pN, f.early = 0, 0, probeEarly{} // its PING ids restart: no record of another incarnation may match
-	if f.failed && !a.start.Before(f.markAt) {
-		h.clearLocked(i) // a successful probe dial after the mark (plan §3.9)
+	if c.Kind() != wire.KindDatagram {
+		// A successful stream probe dial proves the factory from its start:
+		// it clears a mark set before that, and (proofAt) a late
+		// MarkFailedAt for a death before that start (W4-MARKAT).
+		if a.start.After(f.proofAt) {
+			f.proofAt = a.start
+		}
+		if f.failed && !a.start.Before(f.markAt) {
+			h.clearLocked(i) // a successful probe dial after the mark (plan §3.9)
+		}
 	}
+	// A datagram probe's establishment PONG is H2p, written by the
+	// passive's handshake before its admission decided; the sessionless
+	// pool's refusal follows as REL{CLOSE(capacity)} (R1-3). Its mark is
+	// therefore cleared by the carrier's first probe sample (sampleLocked),
+	// which proves the admission, so a refusing passive's factory does not
+	// flap between failed and healthy at every redial.
 	r.acts = append(r.acts, probeAction{op: opStart, conn: c})
 }
 

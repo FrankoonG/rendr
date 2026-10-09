@@ -665,7 +665,7 @@ func TestAcceptSkipsEndedSessions_L50(t *testing.T) {
 			t.Helper()
 			ln.mu.Lock()
 			k := 0
-			for it := ln.head; it != nil; it = it.next {
+			for it := ln.q[kindIdxStream].head; it != nil; it = it.next {
 				k++
 			}
 			ln.mu.Unlock()

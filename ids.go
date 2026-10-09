@@ -93,17 +93,27 @@ func (m Mode) String() string {
 	return "mode(" + itoa(uint64(m)) + ")"
 }
 
-// Kind is the session or carrier kind. Packet sessions and datagram
-// carriers (value 2) follow in milestone M2.
+// Kind is the session or carrier kind: stream sessions run on stream
+// carriers; packet sessions (DialPacket) prefer datagram carriers and fall
+// back to stream carriers (plan:125).
 type Kind uint8
 
 // Kinds.
-const KindStream Kind = 1
+const (
+	KindStream Kind = 1
+	// KindDatagram is the kind of datagram carriers and of packet sessions
+	// (M2-D56); KindPacket names it for sessions.
+	KindDatagram Kind = 2
+	KindPacket        = KindDatagram
+)
 
-// String returns "stream" or "kind(N)".
+// String returns "stream", "datagram" or "kind(N)".
 func (k Kind) String() string {
-	if k == KindStream {
+	switch k {
+	case KindStream:
 		return "stream"
+	case KindDatagram:
+		return "datagram"
 	}
 	return "kind(" + itoa(uint64(k)) + ")"
 }

@@ -11,7 +11,11 @@ import (
 
 // acceptors lists the top-level decoders that accept b as one whole, valid
 // encoding: "preface", "preface_ack", or "frame/<TYPE>" (DecodeFrame
-// consuming every byte, then the payload parser of the frame's type).
+// consuming every byte, then the payload parser of the frame's type); M2
+// adds "datagram" (rendr bytes of more than one element: a PREFACE or
+// PREFACE_ACK and frames, or several frames), "flow_header" (a bare valid
+// raw-UDP flow header) and "udp" (a flow header and valid rendr bytes). A
+// single element is its own decoder's, so the sets stay disjoint.
 func acceptors(b []byte) []string {
 	var out []string
 	if _, err := ParsePreface(b); err == nil {
@@ -25,12 +29,26 @@ func acceptors(b []byte) []string {
 			out = append(out, "frame/"+f.Type.String())
 		}
 	}
+	if elems, err := decodeDatagram(b); err == nil && len(elems) > 1 {
+		out = append(out, "datagram")
+	}
+	if _, rest, err := ParseFlowHeader(b); err == nil {
+		if len(rest) == 0 {
+			out = append(out, "flow_header")
+		} else if _, err := decodeDatagram(rest); err == nil {
+			out = append(out, "udp")
+		}
+	}
 	return out
 }
 
+// wantAcceptor is the one decoder that accepts v ("" for a reject vector).
 func wantAcceptor(v vector) string {
-	if v.kind == "frame" {
+	switch v.kind {
+	case "frame":
 		return "frame/" + v.hdr.Type.String()
+	case "reject":
+		return ""
 	}
 	return v.kind
 }
@@ -41,23 +59,36 @@ func reseal(b []byte) []byte {
 	return b
 }
 
-// TestDecoderSeedsExactlyOne_L44_L43: every valid encoding is accepted by
-// exactly one decoder (L44: the messages are mutually exclusive), no
-// truncated-by-1 or extended-by-1 variant is accepted, and no single-bit
-// corruption of any vector is accepted by any decoder (L43: the CRC32C
-// covers the header and the payload; a spliced header fails it).
+// TestDecoderSeedsExactlyOne_L44_L43: every valid encoding — M2's four
+// frame types, REL-wrapped control, datagrams and the flow header included
+// — is accepted by exactly one decoder (L44: the messages are mutually
+// exclusive), a reject vector by none, no truncated-by-1 or extended-by-1
+// variant is accepted, and no single-bit corruption of any vector is
+// accepted by any decoder (L43: the CRC32C covers the header and the
+// payload; a spliced header fails it). The one exception is the raw-UDP
+// flow ID, which has no integrity check (a demultiplexing key, not
+// authentication: plan:361): a corrupted ID names another flow, never the
+// original one.
 func TestDecoderSeedsExactlyOne_L44_L43(t *testing.T) {
 	vs := goldenVectors()
-	flips := 0
+	flips, flowFlips := 0, 0
 	for _, v := range vs {
-		if got := acceptors(v.b); len(got) != 1 || got[0] != wantAcceptor(v) {
-			t.Errorf("%s: accepted by %v, want exactly [%s]", v.name, got, wantAcceptor(v))
+		want := wantAcceptor(v)
+		if got := acceptors(v.b); (want == "" && len(got) != 0) || (want != "" && (len(got) != 1 || got[0] != want)) {
+			t.Errorf("%s: accepted by %v, want exactly [%s]", v.name, got, want)
 		}
 		if got := acceptors(v.b[:len(v.b)-1]); len(got) != 0 {
 			t.Errorf("%s truncated by 1: accepted by %v", v.name, got)
 		}
 		if got := acceptors(append(bytes.Clone(v.b), 0)); len(got) != 0 {
 			t.Errorf("%s extended by 1: accepted by %v", v.name, got)
+		}
+		if v.kind == "reject" {
+			continue // a corrupted invalid encoding may be valid (flow ID 0 → 1)
+		}
+		var flow uint64
+		if v.kind == "udp" || v.kind == "flow_header" {
+			flow = binary.BigEndian.Uint64(v.b[1:FlowHeaderLen])
 		}
 		// Single-bit corruption: every bit of short vectors, a deterministic
 		// spread (header, trailer and a stride through the payload) of long ones.
@@ -72,12 +103,20 @@ func TestDecoderSeedsExactlyOne_L44_L43(t *testing.T) {
 				continue
 			}
 			c[i/8] ^= 1 << (i % 8)
-			if got := acceptors(c); len(got) != 0 {
+			if flow != 0 && i >= 8 && i < 8*FlowHeaderLen {
+				if f, _, err := ParseFlowHeader(c); err != nil || f == flow {
+					t.Errorf("%s with flow ID bit %d flipped: flow %#x, %v", v.name, i, f, err)
+				}
+				flowFlips++
+			} else if got := acceptors(c); len(got) != 0 {
 				t.Errorf("%s with bit %d flipped: accepted by %v", v.name, i, got)
 			}
 			c[i/8] ^= 1 << (i % 8)
 			flips++
 		}
+	}
+	if flowFlips != 2*64 {
+		t.Errorf("%d flow ID flips, want 128 (two flow-headed vectors)", flowFlips)
 	}
 	// Stimulus proof: the corruption sweep actually ran over every vector.
 	if flips < 20000 {
@@ -104,13 +143,14 @@ func TestDecoderSeedsExactlyOne_L44_L43(t *testing.T) {
 	if _, _, err := DecodeFrame(spliced); !errors.Is(err, ErrCRC) {
 		t.Errorf("header of one ACK on another's payload: %v, want ErrCRC", err)
 	}
-	// Two frames back to back decode one at a time.
+	// Two frames back to back decode one at a time: never as one frame,
+	// only as the frames of one datagram (M2).
 	both := append(bytes.Clone(ack), ackFin...)
 	if _, n, err := DecodeFrame(both); err != nil || n != len(ack) {
 		t.Errorf("concatenated frames: n=%d err=%v, want n=%d", n, err, len(ack))
 	}
-	if got := acceptors(both); len(got) != 0 {
-		t.Errorf("two concatenated frames accepted as one encoding by %v", got)
+	if got := acceptors(both); len(got) != 1 || got[0] != "datagram" {
+		t.Errorf("two concatenated frames accepted by %v, want exactly [datagram]", got)
 	}
 
 	// A PREFACE or PREFACE_ACK fed to the frame decoder fails check (1)
@@ -534,7 +574,10 @@ func TestPayloadErrors_L44(t *testing.T) {
 		{"open early flag", ErrReserved, e(ParseOpen(open(1, 1, OpenFlagEarly, 0, 0, ""), 100))},
 		{"open undefined flag", ErrReserved, e(ParseOpen(open(1, 1, 0x8000, 0, 0, ""), 100))},
 		{"open stream pmtu", ErrReserved, e(ParseOpen(open(1, 1, 0, 1200, 0, ""), 100))},
-		{"open datagram pmtu", nil, e(ParseOpen(open(2, 1, 0, 1200, 0, ""), 100))},
+		// M2 (§A8.7): a packet OPEN's window is its cmtu offer; 1 MiB is no
+		// frame budget (TestOpenPacketFields_L44 sweeps the ranges).
+		{"open datagram pmtu, 1 MiB window", ErrValue, e(ParseOpen(open(2, 1, 0, 1200, 0, ""), 100))},
+		{"open datagram pmtu 0", ErrValue, e(ParseOpen(open(2, 1, 0, 0, 0, ""), 100))},
 		{"open_ack short", ErrShort, e(ParseOpenAck(make([]byte, 9)))},
 		{"open_ack msg short", ErrShort, e(ParseOpenAck(append(make([]byte, 9), 1)))},
 		{"open_ack msg trailing", ErrTrailing, e(ParseOpenAck(append(make([]byte, 10), 'x')))},
@@ -762,13 +805,19 @@ func TestParseHeaderRules_L44(t *testing.T) {
 			}
 		}
 	}
-	if accepted != 13+128 {
-		t.Fatalf("%d type bytes accepted, want 13 core + 128 extension", accepted)
+	if accepted != 17+128 {
+		t.Fatalf("%d type bytes accepted, want 17 core (13 of M1, 4 of M2) + 128 extension", accepted)
 	}
-	// M2 types are unknown core types in M1.
-	for _, ty := range []byte{0x20, 0x21, 0x34, 0x35, 0x00, 0x7f, 'R'} {
+	// Unassigned core types — 0x52 ('R') never — are ErrType. The M2 types
+	// 0x20, 0x21, 0x34 and 0x35 are known since M2 (§A8.7) and swept above.
+	for _, ty := range []byte{0x00, 0x05, 0x15, 0x22, 0x36, 0x7f, 'R'} {
 		if _, err := ParseHeader(hdr(ty, 0, 9, 1)); !errors.Is(err, ErrType) {
 			t.Errorf("type %#x: %v, want ErrType", ty, err)
+		}
+	}
+	for _, ty := range []Type{TypeDgram, TypePack, TypeRel, TypeRack} {
+		if !ty.Known() || ty.Extension() || ty.CarrierLevel() != (ty == TypeRel || ty == TypeRack) {
+			t.Errorf("%v: known %v, carrier level %v", ty, ty.Known(), ty.CarrierLevel())
 		}
 	}
 	// (1) precedes (2)..(5): an oversize length is ErrLength even for an
@@ -784,8 +833,14 @@ func TestParseHeaderRules_L44(t *testing.T) {
 		}
 	}
 	// (2) precedes (3), (3) precedes (4), (4) precedes (5).
-	if _, err := ParseHeader(hdr(0x20, 0xff, 1, 0)); !errors.Is(err, ErrType) {
+	if _, err := ParseHeader(hdr(0x22, 0xff, 1, 0)); !errors.Is(err, ErrType) {
 		t.Errorf("unknown type with bad flags: %v, want ErrType", err)
+	}
+	if _, err := ParseHeader(hdr(byte(TypePack), 0x04, 3, 0)); !errors.Is(err, ErrFlags) {
+		t.Errorf("PACK with an undefined flag, handle 0 and a bad length: %v, want ErrFlags", err)
+	}
+	if _, err := ParseHeader(hdr(byte(TypeRack), 0, 3, 1)); !errors.Is(err, ErrHandle) {
+		t.Errorf("RACK with handle 1 and a bad length: %v, want ErrHandle", err)
 	}
 	if _, err := ParseHeader(hdr(byte(TypeFin), 0x01, 3, 0)); !errors.Is(err, ErrFlags) {
 		t.Errorf("FIN with a flag, handle 0 and a bad length: %v, want ErrFlags", err)
@@ -886,9 +941,21 @@ var (
 	sinkGoAway     GoAwayReason
 	sinkErr        error
 	sinkN          int
+	sinkAt         int
+	sinkBytes      []byte
+	sinkPack       Pack
+	sinkRack       Rack
+	sinkRelHead    RelHead
+	sinkVerdict    WindowVerdict
+	sinkBool       bool
+	sinkU16        uint16
+	sinkU32        uint32
 )
 
-// decodeConcrete runs the decoder of v without boxing results in interfaces.
+// decodeConcrete runs the decoders of b without boxing results in
+// interfaces: a 40-byte preface candidate by both preface parsers; anything
+// else as a frame (its payload by its type's parser, a REL's inner payload
+// too), as the rendr bytes of a datagram, and as a raw-UDP datagram.
 func decodeConcrete(b []byte) {
 	if len(b) == PrefaceLen && b[0] == 'R' {
 		sinkPreface, sinkErr = ParsePreface(b)
@@ -897,37 +964,20 @@ func decodeConcrete(b []byte) {
 	}
 	sinkHeader, sinkErr = ParseHeader(b)
 	sinkFrame, sinkN, sinkErr = DecodeFrame(b)
-	p := sinkFrame.Payload
-	switch sinkFrame.Type {
-	case TypeOpen:
-		sinkOpen, sinkErr = ParseOpen(p, MaxMetadata)
-	case TypeOpenAck:
-		sinkOpenAck, sinkErr = ParseOpenAck(p)
-	case TypeJoin:
-		sinkJoin, sinkErr = ParseJoin(p)
-	case TypeJoinAck:
-		sinkJoinAck, sinkErr = ParseJoinAck(p)
-	case TypeData:
-		sinkU64, sinkErr = ParseDataOffset(p)
-	case TypeAck:
-		sinkAck, sinkErr = ParseAck(p)
-	case TypeFin:
-		sinkU64, sinkErr = ParseFin(p)
-	case TypeRst:
-		sinkRst, sinkErr = ParseRst(p)
-	case TypeSched:
-		sinkSched, sinkErr = ParseSched(p)
-	case TypePing, TypePong:
-		sinkPing, sinkErr = ParsePing(p)
-	case TypeClose:
-		sinkClose, sinkErr = ParseClose(p)
-	case TypeGoAway:
-		sinkGoAway, sinkErr = ParseGoAway(p)
+	if sinkErr == nil {
+		sinkErr = parseTyped(sinkFrame.Type, sinkFrame.Payload)
+	}
+	sinkN, sinkAt, sinkErr = walkDatagram(b)
+	var rest []byte
+	if sinkU64, rest, sinkErr = ParseFlowHeader(b); sinkErr == nil {
+		sinkN, sinkAt, sinkErr = walkDatagram(rest)
 	}
 }
 
 // TestCodecZeroAllocs_L41_L44: every decoder and every encoder (into caller
-// memory) allocates nothing, for every golden vector and every error path.
+// memory) allocates nothing, for every golden vector — M2's frames,
+// datagrams and flow headers included — and every error path; neither do
+// the M2 helpers and both windows.
 func TestCodecZeroAllocs_L41_L44(t *testing.T) {
 	vs := goldenVectors()
 	for _, v := range vs {
@@ -959,7 +1009,40 @@ func TestCodecZeroAllocs_L41_L44(t *testing.T) {
 	}
 	pg := Ping{ID: 1, Pad: 1000}
 	payload := pattern(1<<16, 3)
+	pk := Pack{HighestSeq: 9, Received: 8, EpochEcho: 1}
+	rh := RelHead{Cseq: 7, Type: TypeSched, Flags: 2, Handle: SessionHandle}
+	rk := Rack{CumAck: 0xfffffffe, Sack: 0x41}
+	var fw FseqWindow
+	fw.Init(1)
+	var sw SeqWindow
+	sw.Init(make([]uint64, DefaultSeqWindowBits/64))
+	fseq, seq := uint32(1), uint64(1)
 	encoders := map[string]func(){
+		"PutDgramSeq":   func() { PutDgramSeq(dst, 1<<62-1) },
+		"PutPack":       func() { sinkN = PutPack(dst, &pk) },
+		"PutRelHead":    func() { PutRelHead(dst, &rh) },
+		"PutRack":       func() { sinkN = PutRack(dst, &rk) },
+		"PutFlowHeader": func() { PutFlowHeader(dst, gFlow) },
+		"helpers": func() {
+			sinkBool = Wrappable(TypePack) || IsPreface(dst[:PrefaceLen])
+			sinkU32 = PacketWindow(1127, 1152)
+			pmtu, cmtu := SplitPacketWindow(sinkU32)
+			sinkU16 = pmtu ^ cmtu
+		},
+		"FseqWindow": func() {
+			fseq += 2
+			sinkVerdict = fw.Accept(fseq)
+			sinkVerdict = fw.Accept(fseq - 1)
+			sinkVerdict = fw.Accept(fseq - 1)
+			sinkVerdict = fw.Accept(fseq - 2000)
+		},
+		"SeqWindow": func() {
+			seq += 2
+			sinkVerdict = sw.Accept(seq)
+			sinkVerdict = sw.Accept(seq - 1)
+			sinkVerdict = sw.Accept(seq - 1)
+			sinkVerdict = sw.Accept(0)
+		},
 		"PutPreface":    func() { PutPreface(dst, &pre) },
 		"PutPrefaceAck": func() { PutPrefaceAck(dst, &ack) },
 		"PutHeader":     func() { PutHeader(dst, &h) },
@@ -1102,7 +1185,8 @@ func TestTypeStrings(t *testing.T) {
 		TypeOpen: "OPEN", TypeOpenAck: "OPEN_ACK", TypeJoin: "JOIN", TypeJoinAck: "JOIN_ACK",
 		TypeData: "DATA", TypeAck: "ACK", TypeFin: "FIN", TypeRst: "RST", TypeSched: "SCHED",
 		TypePing: "PING", TypePong: "PONG", TypeClose: "CLOSE", TypeGoAway: "GOAWAY",
-		0x20: "0x20", 0x80: "0x80", 0xff: "0xff", 0x00: "0x00",
+		0x20: "DGRAM", 0x21: "PACK", 0x34: "REL", 0x35: "RACK", // M2 (§A8.7)
+		0x22: "0x22", 0x52: "0x52", 0x80: "0x80", 0xff: "0xff", 0x00: "0x00",
 	}
 	for ty, s := range want {
 		if got := ty.String(); got != s {

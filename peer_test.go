@@ -112,7 +112,7 @@ func TestFactorySnapshotFrozen_L20(t *testing.T) {
 	cfg.Carriers[0] = other.carrier()
 	cfg.Carriers = append(cfg.Carriers, other.carrier())
 
-	spec := p.spec(SessionID(wpSID(1)), DialOptions{Mode: ModeBond, Metadata: []byte("m"), NoPathGrace: time.Second})
+	spec := p.spec(SessionID(wpSID(1)), DialOptions{Mode: ModeBond, Metadata: []byte("m"), NoPathGrace: time.Second}, false)
 	if len(spec.Factories) != 1 || spec.Factories[0].Name != "orig" || spec.Factories[0].Index != 0 {
 		t.Fatalf("snapshot %+v", spec.Factories)
 	}
@@ -127,7 +127,7 @@ func TestFactorySnapshotFrozen_L20(t *testing.T) {
 	if spec.SID != wpSID(1) || string(spec.Metadata) != "m" || spec.Health != nil {
 		t.Fatalf("spec %+v", spec)
 	}
-	if ps := p.spec(SessionID(wpSID(2)), DialOptions{}).Params; ps.Mode != session.ModeSelector || ps.Grace != rt.eff.cfg.NoPathGrace {
+	if ps := p.spec(SessionID(wpSID(2)), DialOptions{}, false).Params; ps.Mode != session.ModeSelector || ps.Grace != rt.eff.cfg.NoPathGrace {
 		t.Fatalf("default Dial params %+v", ps)
 	}
 
@@ -249,7 +249,7 @@ func TestPeerGoneAwaySet(t *testing.T) {
 	if len(p.gone) != goneAwayLimit {
 		t.Fatalf("%d instances remembered", len(p.gone))
 	}
-	spec := p.spec(SessionID(wpSID(1)), DialOptions{})
+	spec := p.spec(SessionID(wpSID(1)), DialOptions{}, false)
 	spec.NoteGoAway(inst(1000))
 	if !spec.GoneAway(inst(1000)) || !p.goneAway(inst(1000)) {
 		t.Fatal("the session's GoneAway/NoteGoAway are not the Peer's set")
