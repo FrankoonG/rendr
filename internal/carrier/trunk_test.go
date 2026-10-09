@@ -211,6 +211,9 @@ func TestZeroConnIdentity(t *testing.T) {
 }
 
 // muxCase is one row of TestTrunkOptMuxNegotiation_L44's stream table.
+// optUnknown is an optional PREFACE bit no rendr version defines.
+const optUnknown uint32 = 1 << 7
+
 type muxCase struct {
 	name       string
 	mux        bool      // the factory is mux-eligible (Factory.Mux)
@@ -240,6 +243,7 @@ type muxCase struct {
 func TestTrunkOptMuxNegotiation_L44(t *testing.T) {
 	setMux := func(b []byte) { b[15] |= byte(wire.OptMux) }
 	clearOpt := func(b []byte) { b[12], b[13], b[14], b[15] = 0, 0, 0, 0 }
+	setUnknown := func(b []byte) { b[15] |= byte(optUnknown) }
 	cases := []muxCase{
 		{name: "mux OPEN", mux: true, first: wire.TypeOpen, prefOpt: wire.OptMux, ackOpt: wire.OptMux, dialerMux: true, passiveMux: true},
 		{name: "mux JOIN", mux: true, first: wire.TypeJoin, prefOpt: wire.OptMux, ackOpt: wire.OptMux, dialerMux: true, passiveMux: true},
@@ -248,6 +252,10 @@ func TestTrunkOptMuxNegotiation_L44(t *testing.T) {
 		{name: "passive without mux", mux: true, first: wire.TypeOpen, passive: clearOpt, prefOpt: wire.OptMux, passiveMux: true},
 		{name: "probe offering mux", first: wire.TypePing, dialer: setMux, passive: clearOpt, prefOpt: wire.OptMux},
 		{name: "unsolicited echo", first: wire.TypeOpen, passive: setMux, violation: true},
+		// Unknown optional bits are ignored and never echoed (§A3.1): the
+		// PREFACE_ACK carries exactly OptMux or nothing.
+		{name: "unknown bit with mux", mux: true, first: wire.TypeOpen, dialer: setUnknown, prefOpt: wire.OptMux | optUnknown, ackOpt: wire.OptMux, dialerMux: true, passiveMux: true},
+		{name: "unknown bit alone", first: wire.TypeOpen, dialer: setUnknown, prefOpt: optUnknown},
 	}
 	for _, tc := range cases {
 		t.Run("stream/"+tc.name, func(t *testing.T) {
@@ -318,11 +326,11 @@ func muxStream(t *testing.T, tc muxCase) {
 	if ph.err != nil {
 		t.Fatalf("ReadHello: %v", ph.err)
 	}
-	if got := ph.h.Preface.Opt & wire.OptMux; got != tc.prefOpt {
-		t.Errorf("PREFACE opt %#x, want OptMux %#x", ph.h.Preface.Opt, tc.prefOpt)
+	if ph.h.Preface.Opt != tc.prefOpt {
+		t.Errorf("PREFACE opt %#x, want %#x", ph.h.Preface.Opt, tc.prefOpt)
 	}
-	if got := est.Ack.Opt & wire.OptMux; got != tc.ackOpt {
-		t.Errorf("PREFACE_ACK opt %#x, want OptMux %#x", est.Ack.Opt, tc.ackOpt)
+	if est.Ack.Opt != tc.ackOpt {
+		t.Errorf("PREFACE_ACK opt %#x, want exactly %#x", est.Ack.Opt, tc.ackOpt)
 	}
 	if est.Conn.Mux() != tc.dialerMux || est.Fresh != tc.dialerMux {
 		t.Errorf("dialer Mux %v Fresh %v, want %v", est.Conn.Mux(), est.Fresh, tc.dialerMux)
@@ -372,11 +380,11 @@ func muxDatagram(t *testing.T) {
 				if len(hs) != 1 {
 					t.Fatalf("%d Hellos, want 1", len(hs))
 				}
-				if got := hs[0].Preface.Opt & wire.OptMux; got != tc.wantOpt {
-					t.Errorf("PREFACE opt %#x, want OptMux %#x", hs[0].Preface.Opt, tc.wantOpt)
+				if hs[0].Preface.Opt != tc.wantOpt {
+					t.Errorf("PREFACE opt %#x, want %#x", hs[0].Preface.Opt, tc.wantOpt)
 				}
-				if got := est.Ack.Opt & wire.OptMux; got != tc.wantOpt {
-					t.Errorf("PREFACE_ACK opt %#x, want OptMux %#x", est.Ack.Opt, tc.wantOpt)
+				if est.Ack.Opt != tc.wantOpt {
+					t.Errorf("PREFACE_ACK opt %#x, want exactly %#x", est.Ack.Opt, tc.wantOpt)
 				}
 				if est.Conn.Mux() != tc.wantMux || est.Fresh != tc.wantMux || hs[0].Conn.Mux() != tc.wantMux {
 					t.Errorf("dialer Mux %v Fresh %v, passive Mux %v; want %v", est.Conn.Mux(), est.Fresh, hs[0].Conn.Mux(), tc.wantMux)
@@ -429,6 +437,70 @@ func muxDatagram(t *testing.T) {
 			}
 		})
 	})
+	// A raw dialer sends an H1 whose PREFACE opt it chooses to the real
+	// datagram passive (ReadHelloDatagram): the passive echoes exactly the
+	// OptMux bit the PREFACE carried (§A3.1), never an unknown optional
+	// bit, and its carrier is a MUX trunk only when the first frame is a
+	// session's (M3-D41: a PING-first carrier never is, whatever the
+	// PREFACE offered).
+	for _, tc := range []struct {
+		name    string
+		opt     uint32
+		first   wire.Type
+		wantAck uint32
+		wantMux bool
+	}{
+		{name: "probe offering mux", opt: wire.OptMux, first: wire.TypePing, wantAck: wire.OptMux},
+		{name: "unknown bit with mux", opt: wire.OptMux | optUnknown, first: wire.TypeOpen, wantAck: wire.OptMux, wantMux: true},
+		{name: "unknown bit alone", opt: optUnknown, first: wire.TypeOpen},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wbBubble(t, func(t *testing.T) {
+				denv, penv := wbEnvs()
+				a, b := newFakeIOPair(1500)
+				defer a.Close()
+				ch := wbReadHello(penv, b, nil)
+				pre := make([]byte, wire.PrefaceLen)
+				wire.PutPreface(pre, &wire.Preface{Minor: wire.Minor, Kind: wire.KindDatagram, Opt: tc.opt, Instance: denv.Local, CarrierID: 9})
+				first := denv.Presets.fseqFrom(pre)
+				h1 := pre
+				if tc.first == wire.TypePing {
+					h1 = append(h1, wbFrame(wire.TypePing, 0, first, 0, wbPingPayload(wire.Ping{ID: 1, Nonce: 42}))...)
+				} else {
+					h1 = append(h1, wbFrame(wire.TypeRel, 0, first, 0, relPayloadOf(denv.Presets.firstCseq(), tc.first, 0, wire.SessionHandle, wbOpen(1100)))...)
+				}
+				if err := a.WriteDatagram(h1); err != nil {
+					t.Fatalf("H1: %v", err)
+				}
+				r := <-ch
+				if r.err != nil {
+					t.Fatalf("ReadHelloDatagram: %v", r.err)
+				}
+				defer func() {
+					r.h.Conn.Kill(CauseLocalClose, "test end")
+					<-r.h.Conn.Done()
+				}()
+				if r.h.First.Type != tc.first || r.h.Preface.Opt != tc.opt {
+					t.Fatalf("Hello first %v opt %#x, want %v %#x", r.h.First.Type, r.h.Preface.Opt, tc.first, tc.opt)
+				}
+				synctest.Wait()
+				h2, ok := a.tryRead()
+				if !ok || !wire.IsPreface(h2) {
+					t.Fatalf("no H2 (%x)", h2)
+				}
+				ack, err := wire.ParsePrefaceAck(h2[:wire.PrefaceLen])
+				if err != nil || ack.Status != wire.PrefaceOK {
+					t.Fatalf("H2 PREFACE_ACK %+v, %v", ack, err)
+				}
+				if ack.Opt != tc.wantAck {
+					t.Errorf("PREFACE_ACK opt %#x, want exactly %#x", ack.Opt, tc.wantAck)
+				}
+				if r.h.Conn.Mux() != tc.wantMux {
+					t.Errorf("passive Mux %v, want %v", r.h.Conn.Mux(), tc.wantMux)
+				}
+			})
+		})
+	}
 	t.Run("unsolicited echo", func(t *testing.T) {
 		wbBubble(t, func(t *testing.T) {
 			est, err, h1 := raw(t, false, wire.OptMux)
