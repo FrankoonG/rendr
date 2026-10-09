@@ -115,8 +115,8 @@ func TestDecoderSeedsExactlyOne_L44_L43(t *testing.T) {
 			flips++
 		}
 	}
-	if flowFlips != 2*64 {
-		t.Errorf("%d flow ID flips, want 128 (two flow-headed vectors)", flowFlips)
+	if flowFlips != 3*64 {
+		t.Errorf("%d flow ID flips, want 192 (three flow-headed vectors: M3 adds udp_h1_open_optmux)", flowFlips)
 	}
 	// Stimulus proof: the corruption sweep actually ran over every vector.
 	if flips < 20000 {
@@ -793,30 +793,32 @@ func TestParseHeaderRules_L44(t *testing.T) {
 				t.Errorf("type %v flag %#x: %v, want ErrFlags", ty, f, err)
 			}
 		}
-		// Handles (design §0.7 W1): carrier-level frames need 0, session
-		// frames exactly SessionHandle (M1: one session per carrier), so 0,
-		// 2 and 0xffffffff are ErrHandle on a session frame; extension
-		// handles are opaque.
-		for _, hd := range []uint32{0, 1, 2, 0xffffffff} {
+		// Handles (M3-D4): carrier-level frames need 0, session frames any
+		// handle but 0 (M1 and M2 required exactly SessionHandle; since M3
+		// the carrier decides which handles it carries), so 0 is ErrHandle
+		// on a session frame and every non-zero handle on a carrier-level
+		// one; extension handles are opaque.
+		for _, hd := range []uint32{0, 1, 2, 7, 0x80000000, 0xffffffff} {
 			_, err := ParseHeader(hdr(byte(i), 0, uint32(lo), hd))
-			wantOK := ty.Extension() || (ty.CarrierLevel() && hd == 0) || (!ty.CarrierLevel() && hd == SessionHandle)
+			wantOK := ty.Extension() || (ty.CarrierLevel() && hd == 0) || (!ty.CarrierLevel() && hd != 0)
 			if wantOK != (err == nil) || (!wantOK && !errors.Is(err, ErrHandle)) {
 				t.Errorf("type %v handle %d: %v (want accepted: %v)", ty, hd, err, wantOK)
 			}
 		}
 	}
-	if accepted != 17+128 {
-		t.Fatalf("%d type bytes accepted, want 17 core (13 of M1, 4 of M2) + 128 extension", accepted)
+	if accepted != 18+128 {
+		t.Fatalf("%d type bytes accepted, want 18 core (13 of M1, 4 of M2, DETACH of M3) + 128 extension", accepted)
 	}
 	// Unassigned core types — 0x52 ('R') never — are ErrType. The M2 types
-	// 0x20, 0x21, 0x34 and 0x35 are known since M2 (§A8.7) and swept above.
-	for _, ty := range []byte{0x00, 0x05, 0x15, 0x22, 0x36, 0x7f, 'R'} {
+	// 0x20, 0x21, 0x34 and 0x35 are known since M2 (§A8.7), DETACH 0x36
+	// since M3 (M3 design §A3.4); all are swept above.
+	for _, ty := range []byte{0x00, 0x05, 0x15, 0x22, 0x37, 0x7f, 'R'} {
 		if _, err := ParseHeader(hdr(ty, 0, 9, 1)); !errors.Is(err, ErrType) {
 			t.Errorf("type %#x: %v, want ErrType", ty, err)
 		}
 	}
-	for _, ty := range []Type{TypeDgram, TypePack, TypeRel, TypeRack} {
-		if !ty.Known() || ty.Extension() || ty.CarrierLevel() != (ty == TypeRel || ty == TypeRack) {
+	for _, ty := range []Type{TypeDgram, TypePack, TypeRel, TypeRack, TypeDetach} {
+		if !ty.Known() || ty.Extension() || ty.CarrierLevel() != (ty == TypeRel || ty == TypeRack || ty == TypeDetach) {
 			t.Errorf("%v: known %v, carrier level %v", ty, ty.Known(), ty.CarrierLevel())
 		}
 	}
@@ -848,8 +850,15 @@ func TestParseHeaderRules_L44(t *testing.T) {
 	if _, err := ParseHeader(hdr(byte(TypePing), 0, 3, 1)); !errors.Is(err, ErrHandle) {
 		t.Errorf("PING with handle 1 and a bad length: %v, want ErrHandle", err)
 	}
-	if _, err := ParseHeader(hdr(byte(TypeAck), 0, 3, 2)); !errors.Is(err, ErrHandle) {
-		t.Errorf("ACK with handle 2 and a bad length: %v, want ErrHandle", err)
+	if _, err := ParseHeader(hdr(byte(TypeAck), 0, 3, 0)); !errors.Is(err, ErrHandle) {
+		t.Errorf("ACK with handle 0 and a bad length: %v, want ErrHandle", err)
+	}
+	// Since M3 handle 2 is a valid session handle: the length check runs.
+	if _, err := ParseHeader(hdr(byte(TypeAck), 0, 3, 2)); !errors.Is(err, ErrLength) {
+		t.Errorf("ACK with handle 2 and a bad length: %v, want ErrLength", err)
+	}
+	if _, err := ParseHeader(hdr(byte(TypeDetach), 0, 3, 1)); !errors.Is(err, ErrHandle) {
+		t.Errorf("DETACH with handle 1 and a bad length: %v, want ErrHandle", err)
 	}
 	if _, err := ParseHeader(make([]byte, HeaderLen-1)); !errors.Is(err, ErrShort) {
 		t.Errorf("12-byte header: %v, want ErrShort", err)
@@ -1023,8 +1032,11 @@ func TestCodecZeroAllocs_L41_L44(t *testing.T) {
 		"PutRelHead":    func() { PutRelHead(dst, &rh) },
 		"PutRack":       func() { sinkN = PutRack(dst, &rk) },
 		"PutFlowHeader": func() { PutFlowHeader(dst, gFlow) },
+		"PutDetach":     func() { sinkN = PutDetach(dst, &Detach{Handle: 0xffffffff, Reason: DetachRetired}) },
 		"helpers": func() {
-			sinkBool = Wrappable(TypePack) || IsPreface(dst[:PrefaceLen])
+			sinkBool = Wrappable(TypePack) || Wrappable(TypeDetach) || IsPreface(dst[:PrefaceLen])
+			sinkU32 = EchoOpt(0xffffffff)
+			sinkBool, sinkErr = MuxNegotiated(0, OptMux)
 			sinkU32 = PacketWindow(1127, 1152)
 			pmtu, cmtu := SplitPacketWindow(sinkU32)
 			sinkU16 = pmtu ^ cmtu
@@ -1186,7 +1198,8 @@ func TestTypeStrings(t *testing.T) {
 		TypeData: "DATA", TypeAck: "ACK", TypeFin: "FIN", TypeRst: "RST", TypeSched: "SCHED",
 		TypePing: "PING", TypePong: "PONG", TypeClose: "CLOSE", TypeGoAway: "GOAWAY",
 		0x20: "DGRAM", 0x21: "PACK", 0x34: "REL", 0x35: "RACK", // M2 (§A8.7)
-		0x22: "0x22", 0x52: "0x52", 0x80: "0x80", 0xff: "0xff", 0x00: "0x00",
+		0x36: "DETACH", // M3 (M3 design §A3.4)
+		0x22: "0x22", 0x37: "0x37", 0x52: "0x52", 0x80: "0x80", 0xff: "0xff", 0x00: "0x00",
 	}
 	for ty, s := range want {
 		if got := ty.String(); got != s {

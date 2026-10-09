@@ -12,9 +12,11 @@ import (
 	"testing"
 )
 
-// The fuzz targets of design §5.5 and of M2 design §A3.10 (DGRAM, PACK,
+// The fuzz targets of design §5.5, of M2 design §A3.10 (DGRAM, PACK,
 // REL with its nesting, RACK, the flow header, whole datagrams and both
-// windows). Plain `go test` replays the seeds (every golden vector, each
+// windows) and of M3 design §A3.7 (DETACH: FuzzDetach_L44 in
+// detach_test.go; every target gains the M3 golden vectors as seeds).
+// Plain `go test` replays the seeds (every golden vector, each
 // truncated and extended by one byte, the v1 and msess handshakes, one
 // PREFACE and one PREFACE_ACK failing at each step of the canonical order,
 // extension frames with non-zero flags and handles 0 and 1, every
@@ -83,7 +85,7 @@ func refPrefaceErr(b []byte, role Role) error {
 // headerRule is the §5.2/§5.3 row of one core type.
 type headerRule struct {
 	flags   byte
-	carrier bool // handle must be 0; otherwise it must be 1 (the M1 session handle, design §0.7 W1)
+	carrier bool // handle must be 0; otherwise it must not be 0 (any session handle, M3-D4)
 	lo, hi  int  // payload length bounds
 }
 
@@ -107,6 +109,8 @@ var refRules = map[byte]headerRule{
 	0x21: {0x03, false, 20, 20},  // PACK: FIN_DELIVERED, DONE
 	0x34: {0, true, 10, 1 << 20}, // REL: cseq · itype · iflags · ihandle · ipayload
 	0x35: {0, true, 8, 8},        // RACK: cumAck · sack
+	// M3 (design §A3.4).
+	0x36: {0, true, 5, 5}, // DETACH: handle u32 · reason u8
 }
 
 // refHeaderErr is an independent statement of header checks (1)–(5).
@@ -128,7 +132,7 @@ func refHeaderErr(b []byte) error {
 		return ErrType
 	case b[1]&^r.flags != 0:
 		return ErrFlags
-	case r.carrier && handle != 0, !r.carrier && handle != 1:
+	case r.carrier && handle != 0, !r.carrier && handle == 0:
 		return ErrHandle
 	case n < r.lo || n > r.hi:
 		return ErrLength
@@ -195,7 +199,12 @@ func fuzzSeeds() [][]byte {
 		{0x35, 0, 0, 0, 8, 0, 0, 0, 1, 0, 0, 0, 1},                         // RACK with handle 1
 		{0x11, 0x04, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 1},                     // ACK undefined flag
 		{0x30, 0, 0, 0, 20, 0, 0, 0, 1, 0, 0, 0, 1},                        // PING handle 1
-		{0x11, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 2},                        // ACK handle 2 (not the session handle)
+		{0x11, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 2},                        // ACK handle 2 (a valid header since M3: any non-zero session handle)
+		{0x11, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 0},                        // ACK handle 0 (never a session handle)
+		{0x36, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0},                         // DETACH header (M3)
+		{0x36, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 1},                         // DETACH with handle 1 (carrier-level: 0)
+		{0x36, 0x01, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0},                      // DETACH with a flag
+		{0x36, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0},                         // DETACH len 6
 		{0x12, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 1},                         // FIN short
 		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // short header
 	} {
@@ -489,10 +498,11 @@ func decodeChunked(b []byte, seed uint64) (frames []Frame, at int, err error) {
 // M2 fuzz targets (M2 design §A3.10).
 
 // refWrappable is an independent copy of the REL set: plan:356's nine
-// control frames and PACK (M2-D39).
+// control frames, PACK (M2-D39) and DETACH (M3-D6).
 var refWrappable = map[byte]bool{
 	0x01: true, 0x02: true, 0x03: true, 0x04: true, 0x12: true,
 	0x13: true, 0x14: true, 0x32: true, 0x33: true, 0x21: true,
+	0x36: true,
 }
 
 // refRelErr is an independent statement of ParseRel's check order (§A3.3):
@@ -509,7 +519,7 @@ func refRelErr(p []byte) error {
 		return ErrType
 	case p[5]&^r.flags != 0:
 		return ErrFlags
-	case r.carrier && handle != 0, !r.carrier && handle != 1:
+	case r.carrier && handle != 0, !r.carrier && handle == 0:
 		return ErrHandle
 	case n < r.lo || n > r.hi:
 		return ErrLength
@@ -822,6 +832,8 @@ func datagramSeeds() [][]byte {
 		bcat(g["h3_open_ack"], g["h4_rack"], g["dgram_empty"]),
 		bcat(g["h2_ok"], g["preface"]),
 		bcat(g["refusal_version"], g["rack_zero"]),
+		// M3: a REL-wrapped DETACH in front of DGRAMs of two other handles.
+		bcat(g["rel_detach"], g["dgram_handle_3"], g["dgram_1000"]),
 	)
 	for _, at := range []int{20, PrefaceLen + 3, len(g["h1_open"]) - 1} {
 		bad := bytes.Clone(g["h1_open"])

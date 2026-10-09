@@ -1,5 +1,7 @@
 package wire
 
+import "encoding/binary"
+
 // DETACH (M3 design §A3.4, M3-D6): the carrier-level frame that ends one
 // handle of a MUX trunk without touching the trunk or the other handles.
 //
@@ -9,11 +11,13 @@ package wire
 // violation), REL-wrapped on datagram trunks and ordered by the byte stream
 // on stream trunks. A side places at most one DETACH per handle and nothing
 // for that handle after it. The reason is informational: DETACH ends the
-// view and never changes session state (M3 design Revision 1, R1-5).
+// view and never changes session state (M3 design Revision 1, R1-5). A
+// refusal response (OPEN_ACK or JOIN_ACK not OK) ends its handle without a
+// DETACH (M3-D7).
 //
-// Until the M3 wire work package implements the codec and flips Known,
-// CarrierLevel and Wrappable, a received 0x36 stays an unknown core type
-// (ErrType), so an M3 build keeps M2's wire behaviour.
+// The codec knows DETACH like every other core type (Known, CarrierLevel,
+// Wrappable, PayloadBounds, String); whether a carrier accepts it is the
+// carrier's legality rule (§A3.3), not a header property.
 
 // TypeDetach ends one handle of a MUX trunk (carrier-level: its frame
 // handle is 0; the ended handle is in the payload).
@@ -44,12 +48,23 @@ type Detach struct {
 // as given (no validation, so tests can build invalid frames). It panics if
 // dst is too small.
 func PutDetach(dst []byte, d *Detach) int {
-	panic("unimplemented: M3")
+	_ = dst[DetachLen-1]
+	binary.BigEndian.PutUint32(dst[0:4], d.Handle)
+	dst[4] = uint8(d.Reason)
+	return DetachLen
 }
 
 // ParseDetach decodes a DETACH payload: exactly DetachLen bytes (ErrShort
 // or ErrTrailing otherwise, as every fixed-size payload), a handle other
-// than 0 and a reason of 1 or 2 (else ErrValue).
+// than 0 and a reason of 1 or 2 (else ErrValue). An error returns the zero
+// Detach.
 func ParseDetach(p []byte) (Detach, error) {
-	panic("unimplemented: M3")
+	if err := exactTail(len(p), DetachLen); err != nil {
+		return Detach{}, err
+	}
+	d := Detach{Handle: binary.BigEndian.Uint32(p[0:4]), Reason: DetachReason(p[4])}
+	if d.Handle == 0 || d.Reason < DetachEnded || d.Reason > DetachRetired {
+		return Detach{}, ErrValue
+	}
+	return d, nil
 }

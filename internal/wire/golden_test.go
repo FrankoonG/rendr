@@ -68,8 +68,11 @@ type vector struct {
 	kind string
 	hdr  Header // frames: the expected header (Len included)
 	val  any    // Preface, PrefaceAck, the decoded payload value, []dgElem, udpVal or flowVal
-	as   string // reject: "frame" (a valid header and CRC, the payload parser fails) or "flow_header"
-	err  error  // reject: the error of that decoder
+	// as (reject): "frame" (a valid header and CRC, the payload parser
+	// fails), "header" (M3: DecodeFrame fails at the header, err is its
+	// error) or "flow_header".
+	as  string
+	err error // reject: the error of that decoder
 }
 
 func prefaceVec(name string, p Preface) vector {
@@ -189,7 +192,8 @@ func goldenVectors() []vector {
 	add(frameVec("ext_fe_flagsff_handle0_empty", Type(0xfe), 0xff, 11, 0, extVal(nil)))
 	add(frameVec("ext_ff_flags00_handle1", Type(0xff), 0x00, 11, 1, extVal("x")))
 
-	return append(vs, goldenVectorsM2()...)
+	vs = append(vs, goldenVectorsM2()...)
+	return append(vs, goldenVectorsM3()...)
 }
 
 // goldenVectorsM2 builds the vectors M2 adds (M2 design §A3.10), after
@@ -325,6 +329,8 @@ func decodeTyped(t Type, p []byte) (any, error) {
 		return ParsePack(p)
 	case TypeRack:
 		return ParseRack(p)
+	case TypeDetach:
+		return ParseDetach(p)
 	case TypeRel:
 		h, inner, err := ParseRel(p)
 		if err != nil {
@@ -399,6 +405,8 @@ func encodeTyped(t Type, v any) []byte {
 		n = PutPack(b, &v)
 	case Rack:
 		n = PutRack(b, &v)
+	case Detach:
+		n = PutDetach(b, &v)
 	case extVal:
 		n = copy(b, v)
 	default:
@@ -472,6 +480,8 @@ func checkVector(v vector) error {
 				return fmt.Errorf("not a whole frame: n=%d %v", n, ferr)
 			}
 			_, err = decodeTyped(f.Type, f.Payload)
+		case "header":
+			_, _, err = DecodeFrame(v.b)
 		case "flow_header":
 			_, _, err = ParseFlowHeader(v.b)
 		}
@@ -582,25 +592,38 @@ func TestGolden_L44(t *testing.T) {
 		"open_packet_pmtu_low", "open_packet_window_bad", "ping_mtu_probe_1152", "flow_header", "flow_header_zero",
 		"h1_open", "h1_join", "h1_probe", "h2_ok", "h2_probe", "h3_open_ack", "h4_rack", "h1_resend",
 		"refusal_version", "udp_h1_open",
+		// M3 (design §A3.7).
+		"preface_optmux", "preface_ack_optmux", "open_mode_race", "join_mode_race", "data_handle_2",
+		"data_handle_max", "ack_handle_7", "dgram_handle_3", "detach_ended", "detach_retired", "rel_detach",
+		"udp_h1_open_optmux", "detach_handle_0", "detach_reason_0", "detach_reason_3", "detach_trailing",
+		"detach_short", "open_mode_4", "data_handle_0", "open_ack_capacity_listener_closed",
+		"rel_open_ack_capacity_listener_closed", "open_ack_capacity_mux_full", "open_ack_bad_request_duplicate_view",
 	} {
 		if _, ok := enc[want]; !ok {
 			t.Errorf("golden file lacks %q", want)
 		}
 	}
-	// M1's vectors keep their positions and bytes; the resent H1 is
-	// byte-identical to the first (PA-21).
-	if names[0] != "preface" || names[len(names)-1] != "udp_h1_open" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
+	// M1's and M2's vectors keep their positions and bytes (M3 design
+	// §A3: no existing encoding changes); the resent H1 is byte-identical
+	// to the first (PA-21).
+	if names[0] != "preface" || names[len(names)-1] != "open_ack_bad_request_duplicate_view" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
 		t.Errorf("golden order or H1 resend: first %q, last %q", names[0], names[len(names)-1])
 	}
-	m1 := 0
+	m1, m12 := 0, 0
 	for _, v := range vs {
 		if v.name == "dgram_empty" {
+			m1 = m12
+		}
+		if v.name == "preface_optmux" {
 			break
 		}
-		m1++
+		m12++
 	}
 	if m1 != 73-4 { // the M1 file: 73 lines, four of them comments
 		t.Errorf("%d vectors precede the M2 ones, want the 69 of M1", m1)
+	}
+	if m12 != 111-4 || vs[m12-1].name != "udp_h1_open" { // the M2 file: 111 lines, four of them comments
+		t.Errorf("%d vectors precede the M3 ones, want the 107 of M1 and M2 ending with udp_h1_open", m12)
 	}
 }
 
