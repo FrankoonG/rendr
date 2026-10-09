@@ -72,8 +72,9 @@ const dcLong = 32
 // racing the withdrawal; a packet session. Modes rotate over selector,
 // race and bond, so race and bond members open and retire views on both
 // trunks; after every quarter of the cycles one link kills its carriers
-// (failover: the long sessions' views requeue, and the next views open on
-// new trunks).
+// while the churn runs (failover: the views on it — long sessions' and
+// in-flight cycles' — requeue or end mid-exchange, and the next views open
+// on new trunks).
 //
 // PASS: no carrier of either Runtime ended with protocol_violation (the
 // defect: the passive followed its refusal with a DETACH, and the dialer,
@@ -85,7 +86,8 @@ const dcLong = 32
 // accept-timeout cycles crossed — the passive session ended by its
 // AcceptTimeout at the virtual instant the passive dispatched a dialer's
 // DETACH; DETACH was placed and dispatched on both sides (AfterDetach);
-// most views opened on a live trunk (FastPaths). Then both Runtimes close
+// most views opened on a live trunk (FastPaths); every failover hit cycles
+// in flight. Then both Runtimes close
 // without leftovers. The crossing needs two Ps to interleave inside the
 // passive's Fill: at -cpu 1 the scenario cannot fail without the fix
 // (TestPassiveResponseCrossesPeerDetach_R1_9 is the deterministic row).
@@ -179,27 +181,22 @@ func detachChurn(t *testing.T, cycles int) {
 		total += n
 	}
 	var ran [dcPaths]atomic.Int64
+	var busy atomic.Int64 // cycles in flight
+	var atKill []int64    // cycles in flight at each failover
 	sem := make(chan struct{}, inflight)
 	var wg sync.WaitGroup
 	errs := make(chan error, cycles)
 	for i := range cycles {
 		if i > 0 && i%failoverEvery == 0 {
-			// Failover: one link kills its carriers; the long sessions'
-			// views on its trunks requeue, and the race and bond ones rejoin
-			// it on a new trunk. The churn resumes once they did, so that a
-			// new trunk's first view is a long session's JOIN, answered at
-			// once (an undecided session opening a trunk holds the sessions
-			// coalesced on that dial until its AcceptTimeout, which equals
-			// their attempt bound here).
-			wg.Wait()
+			// Failover while the churn runs: one link kills its carriers;
+			// the views on its trunks — the long sessions' and the cycles'
+			// in flight — requeue or end, and the race and bond members
+			// rejoin it on a new trunk.
 			l := w.links[(i/failoverEvery)%2]
+			atKill = append(atKill, busy.Load())
 			if n := l.Kill(); n == 0 {
 				t.Fatalf("failover at cycle %d: link %s had no carrier to kill", i, l.Name())
 			}
-			waitFor(t, 10*time.Second, "the long sessions rejoined link "+l.Name(), func() bool {
-				_, open := sessionCarriers(l)
-				return open > 0
-			})
 		}
 		sem <- struct{}{}
 		path, r := 0, rng.IntN(total)
@@ -213,8 +210,9 @@ func detachChurn(t *testing.T, cycles int) {
 			within = time.Duration(rng.IntN(8000)+2000) * time.Microsecond
 		}
 		key := fmt.Sprintf("%c%d", dcCode(path), i)
+		busy.Add(1)
 		wg.Go(func() {
-			defer func() { <-sem }()
+			defer func() { busy.Add(-1); <-sem }()
 			if err := w.cycle(key, path, mode, within); err != nil {
 				errs <- fmt.Errorf("cycle %s (%s, %v): %w", key, dcNames[path], mode, err)
 				return
@@ -268,12 +266,17 @@ func detachChurn(t *testing.T, cycles int) {
 			t.Errorf("%s: DETACH placed %d, dispatched %d: want both > 0", side(i), w.detach[i][1].Load(), w.detach[i][0].Load())
 		}
 	}
+	for k, n := range atKill {
+		if n == 0 {
+			t.Errorf("failover %d: no cycle in flight at the kill", k+1)
+		}
+	}
 	m := w.d.Status().Mux
 	if m.FastPaths < uint64(cycles/2) {
 		t.Errorf("FastPaths %d of %d cycles: the views did not share trunks", m.FastPaths, cycles)
 	}
-	t.Logf("%d cycles:%s; AcceptTimeouts crossing a DETACH %d of %d; DETACH dialer placed %d dispatched %d, passive placed %d dispatched %d; Mux %+v",
-		cycles, load.String(), crossed, capEnds, w.detach[0][1].Load(), w.detach[0][0].Load(), w.detach[1][1].Load(), w.detach[1][0].Load(), m)
+	t.Logf("%d cycles:%s; AcceptTimeouts crossing a DETACH %d of %d; DETACH dialer placed %d dispatched %d, passive placed %d dispatched %d; cycles in flight at the failovers %v; Mux %+v",
+		cycles, load.String(), crossed, capEnds, w.detach[0][1].Load(), w.detach[0][0].Load(), w.detach[1][1].Load(), w.detach[1][0].Load(), atKill, m)
 	if t.Failed() {
 		t.FailNow()
 	}

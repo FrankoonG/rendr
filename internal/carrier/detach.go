@@ -491,7 +491,9 @@ func (t *trunk) expireLocked(v *Conn, p *postList) {
 
 // refusedLocked ends a view through a refusal response: gone without a
 // DETACH, its handle tolerated (a crossing RST or DETACH of the dialer is
-// dropped).
+// dropped) — unless the dialer's DETACH is already in: it was the handle's
+// last frame, so nothing can cross the refusal and an entry would only push
+// a needed one out of the ring.
 func (t *trunk) refusedLocked(v *Conn, p *postList) {
 	v.vx.refused = true
 	v.vx.fillOK.Store(false)
@@ -499,7 +501,31 @@ func (t *trunk) refusedLocked(v *Conn, p *postList) {
 	v.held.Store(false)
 	v.state = viewGone
 	t.removeLocked(v)
-	t.tolerateLocked(v.handle, false)
+	if !v.vx.peerDet.Load() {
+		t.tolerateLocked(v.handle, false)
+	}
+}
+
+// withdrawResponseLocked runs when a passive view's Fill placed its first
+// response: a response still queued as the view's last frame — the refusal
+// its Kill queued while the Fill ran (abandonLocked: a view that has not
+// answered gets a refusal) — is withdrawn, so the handle gets one
+// response; the dialer ends a handle at its first refusal (M3-D7) and
+// would kill the trunk for a second response (TestPassiveResponseCrossesKill_R1_9).
+// It reports whether one was withdrawn: the view was abandoned, and after
+// an OK it places its DETACH(ended) only (R1-9).
+func (t *trunk) withdrawResponseLocked(v *Conn) bool {
+	lf := v.vx.last
+	if lf == nil || (lf.t != wire.TypeOpenAck && lf.t != wire.TypeJoinAck) {
+		return false
+	}
+	if lf.timer != nil {
+		lf.timer.Stop()
+	}
+	v.vx.last = nil
+	t.dropLastLocked(v)
+	v.vx.detQ = false
+	return true
 }
 
 // The tolerance ring: handles whose crossing frames are legal although no
