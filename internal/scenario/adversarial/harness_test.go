@@ -1467,9 +1467,15 @@ type dflipConn struct {
 
 func (c *dflipConn) WriteTo(p []byte, a net.Addr) (int, error) {
 	if c.record {
-		c.mu.Lock()
-		c.sent = append(c.sent, slices.Clone(p))
-		c.mu.Unlock()
+		// Recorded once the link has it: a snapshot of written() then never
+		// holds a datagram the link's own record (ReplayInto) lacks yet (a
+		// snapshot between the two, on the Linux race lane, made ReplayInto
+		// of the latest index panic).
+		defer func(b []byte) {
+			c.mu.Lock()
+			c.sent = append(c.sent, b)
+			c.mu.Unlock()
+		}(slices.Clone(p))
 	}
 	if q := c.f.apply(c, p); q != nil {
 		if _, err := c.PacketConn.WriteTo(q, a); err != nil {
