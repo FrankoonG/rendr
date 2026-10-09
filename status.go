@@ -159,6 +159,14 @@ type MigrationCounts struct {
 // final once its goroutines have finished (or were abandoned) and it was
 // released. A session that returns to a shared carrier it used before
 // lists that carrier's ID once per use; Handle tells the rows apart.
+//
+// On a carrier shared between sessions (rendr mux, Shared > 1) TxBytes,
+// RxBytes, RetxBytes and Frames count this session's traffic only; the
+// estimator (SRTT, MinRTT, Rate, Inflight, Cap) and the datagram fields
+// (MTU, Dropped, Retransmits, Rebinds) are the carrier's, the same for
+// every session on it — a datagram the carrier drops belongs to no
+// session — and a dead row keeps the values it had when the session left
+// the carrier.
 type CarrierStatus struct {
 	ID       CarrierID
 	Name     string // factory name ("" on the passive side)
