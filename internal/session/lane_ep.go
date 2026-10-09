@@ -47,22 +47,55 @@ func (l *lane) Handle() uint32 {
 // lane that owes its go frame places it first — an ACK for a stream
 // session, a PACK for a packet session (REL-wrapped on a datagram trunk,
 // plain on a stream trunk, R1-12) — and nothing else in a call that could
-// not place it. A dedicated carrier and handle 1 of a trunk owe nothing.
-func (s *Session) muxFillLocked(l *lane, b *carrier.Batch) bool {
+// not place it, unless the call's datagram batch only lacked REL room.
+//
+// That exception (m3 DGMUX, L40): the REL window is the trunk's, shared by
+// every view, and a lost REL holds it for a REL RTO (RelRTOMin 200 ms at
+// least), longer than Packet.MaxAge. Holding the lane's frames behind the
+// go frame then dropped every datagram the application wrote right after
+// DialPacket, and holding the passive (which places nothing until a
+// dialer frame arrives) dropped every datagram its application wrote
+// right after Confirm. A datagram batch that refuses the go PACK for REL
+// room only lets the lane's packet Fill run (standIn): its datagrams (and
+// anything else unreliable) leave now, and if it placed nothing, the go
+// PACK's content leaves once as a plain PACK (placeStandInLocked, at most
+// once per lane); any of these that arrives ends the passive's hold as a
+// first frame does. The go PACK stays owed and is placed first by the
+// next call with REL room (the refusal REL-marked the view, so the RACK
+// that frees room re-readies it). The go frame keeps its purpose — one
+// reliable frame that ends the hold although every unreliable one was
+// lost — and REL its bounds. A full batch refuses the plain frames too,
+// so it needs no rule of its own. A dedicated carrier and handle 1 of a
+// trunk owe nothing.
+func (s *Session) muxFillLocked(l *lane, b *carrier.Batch) (run, standIn bool) {
 	if l.c != nil && l.c.HeldAfterResponse() {
-		return false
+		return false, false
 	}
 	if !l.goOwed {
-		return true
+		return true, false
 	}
 	if l.state == LaneDead || s.st.ended {
-		return false
+		return false, false
 	}
-	if !s.placeGoLocked(l, b) {
-		return false // the batch is full or has no REL room: the go frame stays first
+	if !s.placeGoLocked(l, b, true) {
+		// The go frame stays first, except on a datagram batch that
+		// refused it for REL room only (only a packet session has one).
+		relOnly := b.Datagram() && b.RelRoom() == 0
+		return relOnly, relOnly
 	}
 	l.goOwed = false
-	return true
+	return true, false
+}
+
+// placeStandInLocked places the stand-in of lane l's owed go frame (m3
+// DGMUX, L40): its go PACK unreliable, once per lane, after a packet Fill
+// that found no REL room for the go PACK and placed nothing else, so that
+// the passive's hold ends although the dialer has nothing to send. The go
+// PACK stays owed.
+func (s *Session) placeStandInLocked(l *lane, b *carrier.Batch) {
+	if !l.goStandIn && s.placeGoLocked(l, b, false) {
+		l.goStandIn = true
+	}
 }
 
 // placeGoLocked places lane l's go frame (M3-D8): for a stream session an
@@ -70,15 +103,17 @@ func (s *Session) muxFillLocked(l *lane, b *carrier.Batch) bool {
 // window already advertised, never a new one: the peer's limit is a max
 // merge, P10); for a packet session a PACK of the datagrams received so
 // far. It carries no flags and changes no ACK duty state: the passive
-// reads it as an ordinary ACK or PACK that ends its response hold.
-func (s *Session) placeGoLocked(l *lane, b *carrier.Batch) bool {
+// reads it as an ordinary ACK or PACK that ends its response hold. reliable
+// asks for the REL-wrapped PACK on a datagram batch (the go frame; false
+// for its stand-in).
+func (s *Session) placeGoLocked(l *lane, b *carrier.Batch, reliable bool) bool {
 	st := &s.st
 	if pk := s.pk; pk != nil {
 		pa := wire.Pack{Received: pk.rxCount}
 		if pk.rxCount > 0 {
 			pa.HighestSeq = pk.rxHigh
 		}
-		return b.AddPack(l.Handle(), 0, &pa, true)
+		return b.AddPack(l.Handle(), 0, &pa, reliable)
 	}
 	win := uint64(0)
 	if st.rightEdge > st.rRead {
@@ -105,8 +140,8 @@ func (s *Session) placeGoLocked(l *lane, b *carrier.Batch) bool {
 func (l *lane) Fill(c *carrier.Conn, b *carrier.Batch) {
 	s := l.s
 	s.mu.Lock()
-	if s.muxFillLocked(l, b) {
-		s.fillLocked(l, b)
+	if run, _ := s.muxFillLocked(l, b); run {
+		s.fillLocked(l, b) // a stream session: never a stand-in
 	}
 	s.mu.Unlock()
 }

@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
@@ -279,12 +282,39 @@ func TestAttemptThroughPool(t *testing.T) {
 			t.Fatalf("CheapSubflow Peer: %d factory calls, Mux %+v; want 2 calls and no MUX trunk of its own", n, m)
 		}
 
-		pb := e.mxPeer(mxTapCarrier(e.links[0], &burst))
+		// The burst's factory call waits on a gate until all four Dials are
+		// in the pool: the first in that call, the other three coalesced on
+		// it. Without the gate the premise was a scheduling accident — a
+		// Dial whose goroutine ran after the call returned found the trunk
+		// live and took the fast path uncoalesced (Coalesced 2, the race
+		// lane's flake).
+		bc := mxTapCarrier(e.links[0], &burst)
+		gate := make(chan struct{})
+		var gateOnce sync.Once
+		open := func() { gateOnce.Do(func() { close(gate) }) }
+		defer open() // a failure must not leave the factory call blocked
+		var gated atomic.Int32
+		dial := bc.Dial
+		bc.Dial = func(ctx context.Context) (net.Conn, error) {
+			gated.Add(1)
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return dial(ctx)
+		}
+		pb := e.mxPeer(bc)
 		acc := newAcceptLog(e.ln, func(pc *PendingConn) (*Conn, error) { return pc.Confirm() })
 		var rs []<-chan dialResult
 		for range 4 {
 			rs = append(rs, e2eDialAsync(context.Background(), pb, DialOptions{}))
 		}
+		synctest.Wait()
+		if n, ps := gated.Load(), pb.pool.Stats(); n != 1 || ps.Coalesced != 3 {
+			t.Fatalf("premise: %d factory calls in flight, pool %+v; want 1 call with 3 coalesced waiters", n, ps)
+		}
+		open()
 		var ds []*Conn
 		for i, r := range rs {
 			var x dialResult
@@ -586,4 +616,506 @@ func TestSessionEndBoundSparesNeighbours(t *testing.T) {
 		ps[0].Close()
 		e.close()
 	})
+}
+
+// The datagram go frame under loss (M3-D8 as amended by m3 DGMUX; L40).
+// On a started datagram trunk a dialer view owes its go frame — a REL{PACK}
+// — at attach. The REL window is the trunk's (wire.RelWindow frames per
+// direction, shared by every view's OPENs, go frames, FINs and DETACHes),
+// and a lost REL holds it at its cseq until REL retransmits it (RelRTOMin
+// 200 ms at least), longer than Packet.MaxAge (100 ms). A lane whose Fill
+// placed nothing while its go frame found no REL room lost every datagram
+// the application wrote right after DialPacket (DropAge = writes, the
+// passive's Received 0: the pool's lesson/pkt-openclose case at 1 % loss).
+
+// mxDgTap wraps the conns of a datagram factory (the dialer's side of a
+// peHub): it logs the dialer's outgoing session frames (DGRAMs, plain
+// frames of a handle, REL inner frames) with handle, cseq and time, and,
+// once armed, removes the first copy of the
+// drop-th distinct REL{OPEN} frame from its datagram — the datagram's
+// other frames leave as written, so the frame looks lost and its cseq
+// stays unacknowledged until REL retransmits it.
+type mxDgTap struct {
+	mu             sync.Mutex
+	drop           int             // the REL{OPEN} (1-based, distinct cseqs after arming) whose first copy is removed; 0: none
+	opens          map[uint32]bool // REL{OPEN} cseqs seen after arming
+	dropCs         uint32
+	dropped        int
+	dropAt, retxAt time.Time
+	log            []mxDgRec
+}
+
+// mxDgRec is one logged outgoing frame of the dialer.
+type mxDgRec struct {
+	at     time.Time
+	typ    wire.Type // the frame's type, or the REL inner type
+	rel    bool      // a REL inner frame
+	handle uint32
+	cseq   uint32 // REL frames only
+}
+
+// arm makes the tap remove the first copy of the n-th REL{OPEN} from now.
+func (m *mxDgTap) arm(n int) {
+	m.mu.Lock()
+	m.drop, m.opens = n, map[uint32]bool{}
+	m.mu.Unlock()
+}
+
+// wrap returns dial with every conn passing through the tap.
+func (m *mxDgTap) wrap(dial func(context.Context) (net.PacketConn, net.Addr, error)) func(context.Context) (net.PacketConn, net.Addr, error) {
+	return func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+		pc, a, err := dial(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return &mxDgConn{PacketConn: pc, m: m}, a, nil
+	}
+}
+
+// mxDgConn is a dialer conn of an mxDgTap.
+type mxDgConn struct {
+	net.PacketConn
+	m *mxDgTap
+}
+
+func (c *mxDgConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	out := c.m.filter(b, time.Now())
+	if len(out) == len(b) {
+		return c.PacketConn.WriteTo(b, addr)
+	}
+	if len(out) > 0 {
+		if _, err := c.PacketConn.WriteTo(out, addr); err != nil {
+			return 0, err
+		}
+	}
+	return len(b), nil // the removed frame is lost on the way
+}
+
+// filter logs the frames of datagram b sent at now and returns b, or a
+// copy without the removed REL{OPEN} frame.
+func (m *mxDgTap) filter(b []byte, now time.Time) []byte {
+	if wire.IsPreface(b) {
+		return b // a handshake datagram (the trunk's H1)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []byte
+	cut := false
+	for rest := b; len(rest) > 0; {
+		f, n, err := wire.DecodeFrame(rest)
+		if err != nil {
+			out = append(out, rest...)
+			break
+		}
+		raw := rest[:n]
+		rest = rest[n:]
+		switch f.Type {
+		case wire.TypeDgram:
+			m.log = append(m.log, mxDgRec{at: now, typ: f.Type, handle: f.Handle})
+		case wire.TypeRel:
+			rh, _, err := wire.ParseRel(f.Payload)
+			if err != nil {
+				break
+			}
+			m.log = append(m.log, mxDgRec{at: now, typ: rh.Type, rel: true, handle: rh.Handle, cseq: rh.Cseq})
+			if rh.Type != wire.TypeOpen || m.drop == 0 {
+				break
+			}
+			if m.opens[rh.Cseq] {
+				if m.dropped > 0 && rh.Cseq == m.dropCs && m.retxAt.IsZero() {
+					m.retxAt = now // REL's retransmission of the removed copy
+				}
+				break
+			}
+			m.opens[rh.Cseq] = true
+			if len(m.opens) == m.drop {
+				m.dropCs, m.dropAt = rh.Cseq, now
+				m.dropped++
+				cut = true
+				continue // not copied: lost
+			}
+		default:
+			if f.Handle != 0 {
+				m.log = append(m.log, mxDgRec{at: now, typ: f.Type, handle: f.Handle})
+			}
+		}
+		out = append(out, raw...)
+	}
+	if !cut {
+		return b
+	}
+	return out
+}
+
+// mxDgCycle is one DialPacket cycle of mxDgRun: the dialer's session, when
+// DialPacket returned, and the session's handle on the trunk.
+type mxDgCycle struct {
+	dc       *PacketConn
+	returned time.Time
+	handle   uint32
+}
+
+// mxDgRun dials n packet sessions on p at once. The writing side — each
+// dialer right after its DialPacket returned, as the field case does, or
+// with passiveWrites each passive session right after its Confirm while
+// its dialer stays silent — writes writes datagrams (mxDgWrite); the other
+// side reads each session's datagrams (verified) until writes arrived or
+// within passed without one. within must cover the longest DialPacket
+// under the test's loss (an OPEN_ACK retransmitted by REL), as a passive
+// session is accepted before its dialer's DialPacket returns. It returns
+// the cycles, the passive sessions (in accept order, not the cycles'
+// order) and the readers' verifiers: the passive sessions' (accept order),
+// with passiveWrites the dialers' (cycle order).
+func mxDgRun(t *testing.T, p *Peer, ln *Listener, n, writes int, within time.Duration, passiveWrites bool) ([]mxDgCycle, []*PacketConn, []*rendrtest.PacketVerifier) {
+	t.Helper()
+	cycles := make([]mxDgCycle, n)
+	vs := make([]*rendrtest.PacketVerifier, n)
+	errs := make(chan error, 2*n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c, err := p.DialPacket(context.Background(), DialOptions{})
+			if err != nil {
+				errs <- err
+				return
+			}
+			cycles[i] = mxDgCycle{dc: c, returned: time.Now()}
+			if passiveWrites {
+				vs[i] = mxDgRead(c, writes, within)
+				return
+			}
+			if err := mxDgWrite(c, writes); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	pcs := make([]*PacketConn, n)
+	for i := range n {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		pp, err := ln.AcceptPacket(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("AcceptPacket %d: %v", i, err)
+		}
+		if pcs[i], err = pp.Confirm(); err != nil {
+			t.Fatalf("Confirm %d: %v", i, err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if !passiveWrites {
+				vs[i] = mxDgRead(pcs[i], writes, within)
+				return
+			}
+			if err := mxDgWrite(pcs[i], writes); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("writer: %v", err)
+	}
+	for i := range cycles {
+		for _, cs := range cycles[i].dc.Status().Carriers {
+			if cs.State != CarrierDead {
+				cycles[i].handle = cs.Handle
+			}
+		}
+	}
+	return cycles, pcs, vs
+}
+
+// mxDgWrite writes writes datagrams on c (seed 40, seqs from 0, 64 bytes)
+// at once and waits (at most 2 s) until its counters account for every
+// write: each is either sent or dropped within MaxAge of its write (the
+// writer and the age step run after WriteTo returns).
+func mxDgWrite(c *PacketConn, writes int) error {
+	buf := make([]byte, 64)
+	for k := range writes {
+		if _, err := c.WriteTo(rendrtest.PacketPayload(buf, 40, uint64(k), len(buf), time.Now()), nil); err != nil {
+			return err
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		pk := c.Status().Packet
+		if pk.Sent+pk.DropQueue+pk.DropAge+pk.DropTooLarge+pk.DropNoPath >= uint64(writes) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return nil // the caller's assertion reports the counters
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// mxDgRead reads c until n datagrams arrived or within passed without one,
+// verifying each against seed 40 (peRecv without a testing.TB: it runs on
+// its own goroutine; a corrupt datagram shows in the verifier's Result).
+func mxDgRead(c *PacketConn, n int, within time.Duration) *rendrtest.PacketVerifier {
+	v := rendrtest.NewPacketVerifier(40)
+	buf := make([]byte, wire.MaxDatagram)
+	for range n {
+		c.SetReadDeadline(time.Now().Add(within))
+		k, _, err := c.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+		_ = v.Add(buf[:k], time.Now())
+	}
+	c.SetReadDeadline(time.Time{})
+	return v
+}
+
+// mxDgEnd closes the sessions and waits for each Done (bounded).
+func mxDgEnd(t *testing.T, cs ...*PacketConn) {
+	t.Helper()
+	for _, c := range cs {
+		c.Close()
+	}
+	for _, c := range cs {
+		select {
+		case <-c.Done():
+		case <-time.After(time.Minute):
+			t.Fatal("a session did not end within a minute of its Close")
+		}
+	}
+}
+
+// mxDgDialers returns the dialer sessions of cycles.
+func mxDgDialers(cycles []mxDgCycle) []*PacketConn {
+	out := make([]*PacketConn, 0, len(cycles))
+	for _, c := range cycles {
+		out = append(out, c.dc)
+	}
+	return out
+}
+
+// TestMuxDatagramGoFrameUnderLoss_L40 (M3-D8 as amended by m3 DGMUX; L40,
+// the RI finding of lesson/pkt-openclose): 16 packet sessions dialled at
+// once on a started datagram trunk, each writing 10 datagrams right after
+// DialPacket returned. Stimulus (mxDgHeldWindow): the first copy of the
+// fourth REL{OPEN} is lost (removed by the tap), so the trunk's REL window
+// stays full at its cseq until REL retransmits it — longer than MaxAge —
+// while the views whose OPENs went before it attach and owe their go
+// frames (at least two attach, at least one go frame finds no REL room).
+// Every session's datagrams leave at once (Sent 10, DropAge 0; the first
+// DGRAM of its handle on the wire within one REL RTO of DialPacket's
+// return) and arrive intact (the passive's verifier: 10 unique, nothing
+// corrupt): no session ends with DropAge = writes and the passive's
+// Received 0; every view's go frame (REL{PACK}) is still placed once REL
+// room frees. The "passive writes first" row has the dialers silent and
+// each passive write 10 datagrams right after Confirm: a dialer frame
+// other than a DGRAM (an unreliable PACK) ends each passive's hold within
+// one REL RTO of DialPacket's return, so the passive sends all 10 (DropAge
+// 0) and its dialer receives them intact. The "1 % loss" row runs 100
+// rounds of 16 concurrent cycles over a hub with 10 ms and 1 % loss each
+// way: every cycle's datagrams leave (Sent 10, DropAge 0) and at least
+// 95 % of all arrive intact.
+func TestMuxDatagramGoFrameUnderLoss_L40(t *testing.T) {
+	const writes = 10
+	for _, passiveWrites := range []bool{false, true} {
+		name := "window held by a lost OPEN"
+		if passiveWrites {
+			name = "window held by a lost OPEN, passive writes first"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { mxDgHeldWindow(t, writes, passiveWrites) })
+		})
+	}
+	t.Run("1 % loss", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			h := peNewHub(t, Config{}, ListenConfig{}, nil)
+			p := h.peer(h.carrier("h1", 1, nil))
+			d1, p1 := peOpen(t, p, h.ln, DialOptions{})
+			for _, d := range []rendrtest.Dir{rendrtest.Up, rendrtest.Down} {
+				h.hub.SetDelay(d, 10*time.Millisecond, 0)
+				h.hub.SetLoss(d, 0.01)
+			}
+			sent, got := 0, uint64(0)
+			for round := range 100 {
+				cycles, pcs, vs := mxDgRun(t, p, h.ln, 16, writes, 3*time.Second, false)
+				for i, c := range cycles {
+					pk := c.dc.Status().Packet
+					if pk.Sent != writes || pk.DropAge != 0 {
+						t.Fatalf("round %d session %d (handle %d): %+v, want its %d datagrams sent at once (the go frame held them)", round, i, c.handle, *pk, writes)
+					}
+					r := vs[i].Result()
+					if r.Corrupt != 0 || r.Duplicates != 0 || r.BadSize != 0 {
+						t.Fatalf("round %d passive %d: %+v", round, i, r)
+					}
+					sent += writes
+					got += r.Unique
+				}
+				mxDgEnd(t, append(mxDgDialers(cycles), pcs...)...)
+			}
+			if float64(got) < 0.95*float64(sent) {
+				t.Fatalf("%d of %d datagrams arrived at 1 %% loss", got, sent)
+			}
+			t.Logf("%d of %d datagrams arrived", got, sent)
+			mxDgEnd(t, d1, p1)
+			h.close()
+		})
+	})
+}
+
+// mxDgHeldWindow is the "window held by a lost OPEN" row of
+// TestMuxDatagramGoFrameUnderLoss_L40: 16 packet sessions dialled at once
+// on a started datagram trunk while the first copy of the drop-th
+// REL{OPEN} is lost, so that the trunk's REL window stays full at its
+// cseq until REL retransmits it (longer than MaxAge) while the views whose
+// OPENs went before it attach and owe their go frames. The writing side
+// (mxDgRun) writes writes datagrams per session; with passiveWrites the
+// dialers stay silent, so only a dialer frame that is not a DGRAM can end
+// each passive's hold (M3-D8).
+func mxDgHeldWindow(t *testing.T, writes int, passiveWrites bool) {
+	const drop = 4 // three views attach before the lost OPEN
+	h := peNewHub(t, Config{}, ListenConfig{}, nil)
+	tap := &mxDgTap{}
+	fc := h.carrier("h1", 1, nil)
+	fc.Dial = tap.wrap(fc.Dial)
+	p := h.peer(fc)
+	d1, p1 := peOpen(t, p, h.ln, DialOptions{}) // the started trunk (view 1)
+	synctest.Wait()
+	tap.arm(drop)
+	cycles, pcs, vs := mxDgRun(t, p, h.ln, 16, writes, 2*time.Second, passiveWrites)
+
+	// Stimulus: one REL{OPEN} copy lost; the window full at its cseq for
+	// longer than MaxAge; views attached meanwhile.
+	tap.mu.Lock()
+	dropped, dropCs, dropAt, retxAt := tap.dropped, tap.dropCs, tap.dropAt, tap.retxAt
+	maxCs := dropCs
+	for _, r := range tap.log {
+		if r.cseq != 0 && r.at.Before(retxAt) && wire.SeqLess(maxCs, r.cseq) {
+			maxCs = r.cseq
+		}
+	}
+	log := append([]mxDgRec(nil), tap.log...)
+	tap.mu.Unlock()
+	const maxAge = 100 * time.Millisecond // Packet.MaxAge's default
+	if dropped != 1 || retxAt.IsZero() || retxAt.Sub(dropAt) <= maxAge {
+		t.Fatalf("stimulus: %d REL{OPEN} copies removed, retransmitted %v after the loss; want 1, later than MaxAge", dropped, retxAt.Sub(dropAt))
+	}
+	if maxCs-dropCs < wire.RelWindow-1 {
+		t.Fatalf("stimulus: REL cseqs %d…%d placed before the retransmission, want a full window (%d)", dropCs, maxCs, wire.RelWindow)
+	}
+	attached, refused := 0, 0
+	for _, c := range cycles {
+		if c.returned.Before(dropAt) || !c.returned.Before(retxAt) {
+			continue
+		}
+		attached++
+		// Its go frame found the window full: no REL{PACK} of its handle
+		// before the retransmission.
+		early := false
+		for _, r := range log {
+			if r.handle == c.handle && r.typ == wire.TypePack && r.rel && r.at.Before(retxAt) {
+				early = true
+				break
+			}
+		}
+		if !early {
+			refused++
+		}
+	}
+	if attached < 2 || refused < 1 {
+		t.Fatalf("stimulus: %d DialPackets returned while the REL window was held, %d of their go frames refused; want at least 2 and 1", attached, refused)
+	}
+
+	// Load and integrity: every session's datagrams left at once and
+	// arrived intact.
+	if passiveWrites {
+		mxDgCheckPassive(t, cycles, pcs, vs, writes, log)
+	} else {
+		mxDgCheck(t, cycles, vs, writes, log)
+	}
+	// The go frame keeps its purpose: every view's REL{PACK} is placed
+	// once REL room frees, so the passive's hold ends although every other
+	// dialer frame might have been lost.
+	peWait(t, 2*time.Second, "every view's go frame", func() bool {
+		tap.mu.Lock()
+		defer tap.mu.Unlock()
+		gone := map[uint32]bool{}
+		for _, r := range tap.log {
+			if r.typ == wire.TypePack && r.rel {
+				gone[r.handle] = true
+			}
+		}
+		for _, c := range cycles {
+			if !gone[c.handle] {
+				return false
+			}
+		}
+		return true
+	})
+	t.Logf("REL window held %v (cseq %d…%d); %d views attached meanwhile, %d go frames refused", retxAt.Sub(dropAt), dropCs, maxCs, attached, refused)
+	mxDgEnd(t, append(mxDgDialers(cycles), pcs...)...)
+	mxDgEnd(t, d1, p1)
+	h.close()
+}
+
+// mxDgCheckPassive is mxDgCheck for passive writers: every passive
+// session sent its writes and dropped none by age, every dialer received
+// them intact, and each dialer's first frame of its handle after its OPEN
+// (the frame that ends the passive's hold) went on the wire within one REL
+// RTO (RelRTOMin, 200 ms) of DialPacket's return.
+func mxDgCheckPassive(t *testing.T, cycles []mxDgCycle, pcs []*PacketConn, vs []*rendrtest.PacketVerifier, writes int, log []mxDgRec) {
+	t.Helper()
+	first := map[uint32]mxDgRec{}
+	for _, r := range log {
+		if r.handle != 0 && r.typ != wire.TypeOpen {
+			if _, ok := first[r.handle]; !ok {
+				first[r.handle] = r
+			}
+		}
+	}
+	for i, c := range cycles {
+		r, ok := first[c.handle]
+		if !ok || r.at.Sub(c.returned) > 200*time.Millisecond {
+			t.Errorf("session %d (handle %d): first dialer frame %v (rel %v) on the wire %v after DialPacket returned (any: %v), want within one REL RTO", i, c.handle, r.typ, r.rel, r.at.Sub(c.returned), ok)
+		}
+		if r := vs[i].Result(); r.Unique != uint64(writes) || r.Corrupt != 0 || r.Duplicates != 0 || r.BadSize != 0 {
+			t.Errorf("dialer session %d (handle %d): %+v, want %d intact datagrams", i, c.handle, r, writes)
+		}
+	}
+	for i, c := range pcs {
+		if pk := c.Status().Packet; pk.Sent != uint64(writes) || pk.DropAge != 0 {
+			t.Errorf("passive session %d: %+v, want its %d datagrams sent (the response hold kept them)", i, *pk, writes)
+		}
+	}
+}
+
+// mxDgCheck asserts every cycle's counters and the passive's verdicts:
+// all writes sent, none dropped by age, the first DGRAM of each handle on
+// the wire within one REL RTO (RelRTOMin, 200 ms) of DialPacket's return,
+// and writes unique intact datagrams at the passive.
+func mxDgCheck(t *testing.T, cycles []mxDgCycle, vs []*rendrtest.PacketVerifier, writes int, log []mxDgRec) {
+	t.Helper()
+	first := map[uint32]time.Time{}
+	for _, r := range log {
+		if r.typ == wire.TypeDgram {
+			if _, ok := first[r.handle]; !ok {
+				first[r.handle] = r.at
+			}
+		}
+	}
+	for i, c := range cycles {
+		pk := c.dc.Status().Packet
+		if pk.Sent != uint64(writes) || pk.DropAge != 0 {
+			t.Errorf("session %d (handle %d): %+v, want its %d datagrams sent (the go frame held them)", i, c.handle, *pk, writes)
+		}
+		at, ok := first[c.handle]
+		if !ok || at.Sub(c.returned) > 200*time.Millisecond {
+			t.Errorf("session %d (handle %d): first DGRAM on the wire %v after DialPacket returned (any: %v), want within one REL RTO", i, c.handle, at.Sub(c.returned), ok)
+		}
+	}
+	for i, v := range vs {
+		if r := v.Result(); r.Unique != uint64(writes) || r.Corrupt != 0 || r.Duplicates != 0 || r.BadSize != 0 {
+			t.Errorf("passive session %d: %+v, want %d intact datagrams", i, r, writes)
+		}
+	}
 }
