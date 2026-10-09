@@ -191,8 +191,20 @@ func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 // write-blocked; otherwise it moves the duty to the best qualifying lane
 // (chooseAckLaneLocked, which may keep the current one if nothing better
 // exists) or clears it.
+//
+// A race session re-chooses at every call — every ACK or PACK placement
+// decision (bumps and the delivery cadence) and every lane attach and death
+// (their bumps): the duty sits on the fastest live lane
+// (raceAckLaneLocked, M3-D33, PA-33), and M1's choice applies only when no
+// lane qualifies there (every lane blocked or leaving).
 func (s *Session) ensureAckLaneLocked() {
 	st := &s.st
+	if s.p.Mode == ModeRace {
+		if l := s.raceAckLaneLocked(); l != nil {
+			st.ackLane = l
+			return
+		}
+	}
 	cur := st.ackLane
 	if cur != nil && s.ackKeepLocked(cur) {
 		return

@@ -18,16 +18,30 @@ func (s *Session) fillLocked(l *lane, b *carrier.Batch) {
 		return
 	}
 	start := b.Len()
+	ctl := b.ControlOnly() // a MUX writer's control pass (quota 0, R1-1 rule 5)
 	if s.fillControlLocked(l, b) && l.data {
-		// 5. DATA, then 6. the FIN.
-		s.fillDataLocked(l, b)
-		if st := &s.st; s.finDueLocked() && b.AddFin(wire.SessionHandle, st.fin.off) {
-			st.fin.lane = l
-			l.finHere = true
+		// 5. DATA (not in a control pass), then 6. the FIN (race: from the
+		// lane's own cursor, and the FIN once per member, M3-D30).
+		if s.p.Mode == ModeRace {
+			if !ctl {
+				s.raceFillDataLocked(l, b)
+			}
+			s.raceFinLocked(l, b)
+		} else {
+			if !ctl {
+				s.fillDataLocked(l, b)
+			}
+			if st := &s.st; s.finDueLocked() && b.AddFin(wire.SessionHandle, st.fin.off) {
+				st.fin.lane = l
+				l.finHere = true
+			}
 		}
 	}
-	// 7.
-	l.idle = b.Len() == start
+	// 7. Only a call that may place payload decides idleness: a control
+	// pass places control frames only, so DATA may still wait (R1-1).
+	if !ctl {
+		l.idle = b.Len() == start
+	}
 }
 
 // refusedLocked reports that l's first response frame, already placed, was
@@ -119,15 +133,16 @@ type rescueHook struct {
 	fn func(l *lane, holder bool)
 }
 
-// fillDataLocked is Fill step 5 on a data lane: the rescue duplicate if l
-// may send it (rescueSenderLocked: any data lane but the holder of the
-// stuck head, the holder only while it is the only data lane and
-// interleaved DATA is unacknowledged), then retransmissions lowest first (a
-// replay completes before new data, the FIN and retirement, L10), then new
-// bytes up to min(end, peerLimit). It stops at the batch's DATA budget, a
-// full batch or the carrier's capacity cap; at the cap with bytes still
-// pullable it marks the batch cap-blocked, so the PONG that frees capacity
-// wakes the writer (§4.10).
+// fillDataLocked is Fill step 5 on a selector or bond data lane (a race
+// lane: raceFillDataLocked): the rescue duplicate if l may send it
+// (rescueSenderLocked: any data lane but the holder of the stuck head, the
+// holder only while it is the only data lane and interleaved DATA is
+// unacknowledged), then retransmissions lowest first (a replay completes
+// before new data, the FIN and retirement, L10), then new bytes up to
+// min(end, peerLimit). It stops at the batch's DATA budget, a full batch or
+// the carrier's capacity cap (Capacity − Inflight − Taken, M3-D11); at the
+// cap with bytes still pullable it marks the batch cap-blocked, so the PONG
+// that frees capacity wakes the writer (§4.10).
 //
 // It also keeps st.interleaved (bond): cleared while everything sent is
 // acknowledged (sBase == sNext: nothing can be held out of order), set when
@@ -139,7 +154,9 @@ func (s *Session) fillDataLocked(l *lane, b *carrier.Batch) {
 	if st.sBase == st.sNext {
 		st.interleaved = false
 	}
-	left := l.port.Capacity() - l.port.Inflight()
+	// The lane's share of its carrier's capacity: on a MUX trunk the
+	// payload earlier views placed in this batch is taken (M3-D11).
+	left := l.port.Capacity() - l.port.Inflight() - int64(b.Taken())
 	sent := false
 	if st.rescue.set && left > 0 && s.rescueSenderLocked(l) {
 		sp, holder := st.rescue.sp, st.rescue.holder == l

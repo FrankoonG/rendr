@@ -102,7 +102,7 @@ type Status struct {
 // rendr.RaceCounters; M3-D35).
 type RaceCounters struct {
 	CopyBytes uint64 // stream: payload bytes placed below another lane's cursor
-	Copies    uint64 // packet: extra placements of datagrams another lane already placed
+	Copies    uint64 // packet: extra placements of datagrams another lane already placed, less the carriers' refusals (raceRefused)
 }
 
 // PacketCounters count the datagrams of one packet session on this side
@@ -116,7 +116,7 @@ type PacketCounters struct {
 	Duplicates    uint64 // received again inside the dedup window
 	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
 	DropAge       uint64 // send side: older than Packet.MaxAge before placement while a data lane existed
-	DropTooLarge  uint64 // send side: no live data lane could carry it, or a carrier refused it as too large
+	DropTooLarge  uint64 // send side: no live data lane could carry it, a carrier refused it as too large, or a budget shrink left it on a member too small for it while every member that can carry it was write-blocked or at its capacity (M2-D45, L37)
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no data lane
 	DropRecvQueue uint64 // receive side: evicted by a full receive queue (the application did not read)
 	DropLate      uint64 // receive side: older than the dedup window, or arrived after the peer's FIN was delivered (R1-12)

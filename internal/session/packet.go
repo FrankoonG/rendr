@@ -47,6 +47,7 @@ type packet struct {
 	mixed     bool         // bond with live datagram data lanes and a stream member (a data lane, or one awaiting its SCHED): WriteTo puts datagrams above dgMax in txBig
 	bigHeld   bool         // mixed by stream members awaiting their SCHED only: txBig waits for one, aged by the actor (C4-F2)
 	rcopy     *carrier.Buf // a datagram ReadFrom detached and copies outside the lock (L07: released at its commit)
+	copies    uint64       // race sender: extra placements of datagrams another lane already placed (Race.Copies, M3-D35)
 
 	base        time.Time // immutable: the origin of pdesc.at (monotonic)
 	stale       *lane     // bond minimum share (R1-19): the lane found stale, remembered until it places a DGRAM
@@ -70,6 +71,14 @@ type pring struct {
 	desc []pdesc // descriptor ring
 	head int
 	n    int
+
+	// Race (M3-D32; pkt_race.go): pos is the absolute position of the head
+	// descriptor (the descriptors popped so far), the frame of the lanes'
+	// cursors; seq, parallel to desc and allocated by a race session's
+	// first Fill only, holds 1 + the seq a descriptor got at its first
+	// placement (0: never placed), which its copies reuse.
+	pos uint64
+	seq []uint64
 
 	charge int64 // Σ max(len, 64) of queued descriptors
 	bytes  int64 // Σ len of queued descriptors (pendingBytes)
