@@ -2,8 +2,10 @@ package carrier
 
 import (
 	"slices"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -209,6 +211,200 @@ func TestDatagramJumpWithRebind_L59(t *testing.T) {
 		synctest.Wait()
 		if pongs, _ := fjPings(p.read(), true); !slices.Contains(pongs, 7) {
 			t.Fatalf("PONGs %v: replies do not follow the committed rebind", pongs)
+		}
+		if dead, cause, detail, _ := s.c.Death(); dead {
+			t.Fatalf("carrier died: %v %q", cause, detail)
+		}
+	})
+}
+
+// fjChal returns the nonces of the challenge PINGs (pong false) or
+// challenge PONGs (pong true), the ones with id 0, in ds.
+func fjChal(ds [][]byte, pong bool) (nonces []uint64) {
+	_, all := fjPings(ds, pong)
+	for _, pg := range all {
+		if pg.ID == 0 {
+			nonces = append(nonces, pg.Nonce)
+		}
+	}
+	return nonces
+}
+
+// TestDatagramJumpChallengePing_L59: the challenge-PONG slot under the
+// forward-jump rule (dgJumpClaim). While the writer is held and the
+// answer to a genuine challenge PING is due, a challenge PING a window
+// ahead in the same datagram leaves it. Once the slot is free, a challenge
+// PING a window ahead — the passive's challenge after an outage that cost
+// both directions a window of frames — is answered with its nonce, and
+// the PONG to the PING the carrier asked for proves the jump.
+func TestDatagramJumpChallengePing_L59(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := rawPair(t, 1200, true)
+		s.start(StartOptions{})
+		synctest.Wait()
+		fjSettle(p)
+		gate := make(chan struct{})
+		s.io.setOut(func([]byte) error { <-gate; return nil })
+		p.send(pingFrame(wire.TypePing, wire.Ping{ID: 29, Nonce: 3})) // the write the writer blocks in
+		synctest.Wait()
+		d := p.datagram(pingFrame(wire.TypePing, wire.Ping{ID: 0, Nonce: 0x6e6e}))
+		p.fseq += 1 << 20
+		d = append(d, p.datagram(pingFrame(wire.TypePing, wire.Ping{ID: 0, Nonce: 0x7a7a}))...)
+		_ = p.io.WriteDatagram(d)
+		synctest.Wait()
+		s.io.setOut(nil)
+		close(gate)
+		synctest.Wait()
+		ds := p.read()
+		if got := fjChal(ds, true); !slices.Equal(got, []uint64{0x6e6e}) {
+			t.Fatalf("challenge PONGs %#x, want the genuine 0x6e6e only, never the jumped 0x7a7a in its place", got)
+		}
+		_, ours := fjPings(ds, false)
+		if len(ours) == 0 {
+			t.Fatal("the carrier asked for no PING of its own after the jumped frame")
+		}
+		// The slot is free: a jumped challenge PING is answered.
+		p.send(pingFrame(wire.TypePing, wire.Ping{ID: 0, Nonce: 0x5151}), dgramFrame(40, 100))
+		synctest.Wait()
+		if got := fjChal(p.read(), true); !slices.Equal(got, []uint64{0x5151}) {
+			t.Fatalf("challenge PONGs %#x, want 0x5151: a jumped challenge PING was not answered", got)
+		}
+		if got := fjDelivered(s.ep); len(got) != 0 {
+			t.Fatalf("delivered %v before the jump was proved", got)
+		}
+		p.send(pingFrame(wire.TypePong, ours[len(ours)-1]), dgramFrame(41, 100))
+		synctest.Wait()
+		if got := fjDelivered(s.ep); !slices.Equal(got, []uint64{41}) {
+			t.Fatalf("delivered %v, want [41]: the PONG to the carrier's PING did not prove the jump", got)
+		}
+		if dead, cause, detail, _ := s.c.Death(); dead {
+			t.Fatalf("carrier died: %v %q", cause, detail)
+		}
+	})
+}
+
+// TestDatagramJumpBothWaysWithRebind_L59: an outage costs both directions
+// of a raw-UDP flow 1500 frames and moves the dialer's NAT mapping. The
+// dialer's next DGRAM reaches the passive a window ahead from a new
+// source: it is dropped and starts a rebind challenge, whose PING reaches
+// the dialer a window ahead too. The dialer answers it (dgJumpClaim), the
+// answer proves the jump to the passive and commits the rebind, and the
+// passive's PONG to the dialer's PING, now sent to the new address, proves
+// the jump to the dialer: DGRAMs flow both ways again, nothing dies.
+func TestDatagramJumpBothWaysWithRebind_L59(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		a, b := dgPair(t, 1200)
+		b.io.rebind = true
+		var wantA, wantB, size atomic.Int32
+		size.Store(10)
+		a.ep.setFill(dgramFill(&wantA, &size))
+		b.ep.setFill(dgramFill(&wantB, &size))
+		a.start(StartOptions{})
+		b.start(StartOptions{})
+		synctest.Wait()
+		wantA.Store(1)
+		wantB.Store(1)
+		a.c.Wake()
+		b.c.Wake()
+		synctest.Wait()
+		if na, nb := len(b.ep.datagrams()), len(a.ep.datagrams()); na != 1 || nb != 1 {
+			t.Fatalf("before the outage: %d and %d DGRAMs delivered, want 1 each", na, nb)
+		}
+		// The outage: 1500 DGRAMs each way are lost, then the dialer moves.
+		drop := func([]byte) bool { return false }
+		a.io.setFilter(drop)
+		b.io.setFilter(drop)
+		const lost = 1500
+		wantA.Store(lost)
+		wantB.Store(lost)
+		for wantA.Load() > 0 || wantB.Load() > 0 {
+			a.c.Wake()
+			b.c.Wake()
+			synctest.Wait()
+		}
+		if la, lb := a.io.lost.Load(), b.io.lost.Load(); la < lost || lb < lost {
+			t.Fatalf("stimulus: the outage lost %d and %d datagrams, want ≥ %d each", la, lb, lost)
+		}
+		a.io.setFilter(nil)
+		b.io.setFilter(nil)
+		a.io.moveTo(fakeAddr(9))
+		da, db := a.c.Stats().Dropped, b.c.Stats().Dropped
+		wantA.Store(1)
+		a.c.Wake()
+		time.Sleep(time.Second)
+		if st := b.c.Stats(); st.Rebinds != 1 || b.io.cur != fakeAddr(9) {
+			t.Fatalf("rebinds %d, peer %v: the passive's challenge, a window ahead, was not answered", st.Rebinds, b.io.cur)
+		}
+		if a.c.Stats().Dropped == da || b.c.Stats().Dropped == db {
+			t.Fatalf("stimulus: no frame was dropped as ahead (dropped %d → %d, %d → %d)",
+				da, a.c.Stats().Dropped, db, b.c.Stats().Dropped)
+		}
+		na, nb := len(b.ep.datagrams()), len(a.ep.datagrams())
+		wantA.Store(1)
+		wantB.Store(1)
+		a.c.Wake()
+		b.c.Wake()
+		synctest.Wait()
+		if ga, gb := len(b.ep.datagrams())-na, len(a.ep.datagrams())-nb; ga != 1 || gb != 1 {
+			t.Fatalf("after the recovery %d and %d DGRAMs delivered, want 1 each way", ga, gb)
+		}
+		for _, s := range []*dgSide{a, b} {
+			if dead, cause, detail, _ := s.c.Death(); dead {
+				t.Fatalf("carrier died: %v %q", cause, detail)
+			}
+		}
+	})
+}
+
+// TestDatagramJumpChallengeProof_L59: a challenge answer proves a jump
+// only as the challenge itself accepts it (onChallengePong): its nonce,
+// from its candidate, before its expiry. The right nonce from a third
+// source proves nothing, nor does it from the candidate once the challenge
+// expired while the writer was held (an expired challenge stays recorded
+// until the writer runs); the frames are dropped. A PONG to a PING of the
+// carrier still proves the jump afterwards.
+func TestDatagramJumpChallengeProof_L59(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := rawPairWith(t, 1200, false, func(env *Env) { env.Timing.WriteStall = 3 * time.Second })
+		s.io.rebind = true
+		s.start(StartOptions{})
+		synctest.Wait()
+		fjSettle(p)
+		gate := make(chan struct{})
+		s.io.setOut(func([]byte) error { <-gate; return nil })
+		defer func() {
+			s.io.setOut(nil)
+			close(gate)
+		}()
+		p.io.moveTo(fakeAddr(9))
+		p.fseq += 5000
+		p.send(pingFrame(wire.TypePing, wire.Ping{ID: 5, Nonce: 1}))
+		synctest.Wait()
+		s.c.mu.Lock()
+		ch := s.c.dg.chal
+		s.c.mu.Unlock()
+		if !ch.active || ch.cand != fakeAddr(9) {
+			t.Fatalf("stimulus: no challenge to the new source (%+v)", ch)
+		}
+		answer := pingFrame(wire.TypePong, wire.Ping{ID: 0, Nonce: ch.nonce})
+		s.io.inject(fakeAddr(30), p.datagram(dgramFrame(50, 100), answer))
+		synctest.Wait()
+		if got := fjDelivered(s.ep); len(got) != 0 {
+			t.Fatalf("delivered %v: the challenge's nonce from a third source proved the jump", got)
+		}
+		time.Sleep(time.Until(ch.at.Add(chalExpiry)))
+		p.send(dgramFrame(51, 100), answer)
+		synctest.Wait()
+		if got := fjDelivered(s.ep); len(got) != 0 {
+			t.Fatalf("delivered %v: the expired challenge's answer proved the jump", got)
+		}
+		if st := s.c.Stats(); st.Rebinds != 0 {
+			t.Fatalf("rebinds %d after a misdirected and an expired answer", st.Rebinds)
+		}
+		p.send(dgramFrame(52, 100), pingFrame(wire.TypePong, wire.Ping{ID: 77, Nonce: s.c.salt ^ 77}))
+		synctest.Wait()
+		if got := fjDelivered(s.ep); !slices.Equal(got, []uint64{52}) {
+			t.Fatalf("delivered %v, want [52]: a PONG with the carrier's salt did not prove the jump", got)
 		}
 		if dead, cause, detail, _ := s.c.Death(); dead {
 			t.Fatalf("carrier died: %v %q", cause, detail)

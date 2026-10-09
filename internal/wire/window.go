@@ -36,7 +36,13 @@ const (
 // A6), lands there about half the time — taking it would move the window
 // up to 2^31 ahead and make every genuine frame late. The caller drops such
 // a frame and moves the window (Jump) only when the frame's datagram proves
-// it comes from this direction's sender (m3 FSEQJUMP).
+// it comes from this direction's sender (m3 FSEQJUMP). The other walks
+// drop an ahead frame with no proof path: the dialer's walk before the
+// handshake response (a passive that has not answered yet has sent too few
+// frames to have lost a window of them) and the passive's walk for the RACK
+// of a closing verdict (a RACK a window ahead counts as lost: the verdict
+// is resent until its deadline and the carrier closes, as when every RACK
+// is lost).
 type FseqWindow struct {
 	top  uint32                      // the newest fseq accepted
 	bits [FseqWindowBits / 64]uint64 // bit (f mod FseqWindowBits) marks fseq f within the window
