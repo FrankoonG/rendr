@@ -15,7 +15,8 @@ import (
 // The fuzz targets of design §5.5, of M2 design §A3.10 (DGRAM, PACK,
 // REL with its nesting, RACK, the flow header, whole datagrams and both
 // windows) and of M3 design §A3.7 (DETACH: FuzzDetach_L44 in
-// detach_test.go; every target gains the M3 golden vectors as seeds). Plain `go test` replays the seeds (every golden vector, each
+// detach_test.go; every target gains the M3 golden vectors as seeds).
+// Plain `go test` replays the seeds (every golden vector, each
 // truncated and extended by one byte, the v1 and msess handshakes, one
 // PREFACE and one PREFACE_ACK failing at each step of the canonical order,
 // extension frames with non-zero flags and handles 0 and 1, every

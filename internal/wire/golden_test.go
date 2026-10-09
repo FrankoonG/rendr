@@ -596,7 +596,8 @@ func TestGolden_L44(t *testing.T) {
 		"preface_optmux", "preface_ack_optmux", "open_mode_race", "join_mode_race", "data_handle_2",
 		"data_handle_max", "ack_handle_7", "dgram_handle_3", "detach_ended", "detach_retired", "rel_detach",
 		"udp_h1_open_optmux", "detach_handle_0", "detach_reason_0", "detach_reason_3", "detach_trailing",
-		"detach_short", "open_mode_4", "data_handle_0",
+		"detach_short", "open_mode_4", "data_handle_0", "open_ack_capacity_listener_closed",
+		"rel_open_ack_capacity_listener_closed", "open_ack_capacity_mux_full", "open_ack_bad_request_duplicate_view",
 	} {
 		if _, ok := enc[want]; !ok {
 			t.Errorf("golden file lacks %q", want)
@@ -605,7 +606,7 @@ func TestGolden_L44(t *testing.T) {
 	// M1's and M2's vectors keep their positions and bytes (M3 design
 	// §A3: no existing encoding changes); the resent H1 is byte-identical
 	// to the first (PA-21).
-	if names[0] != "preface" || names[len(names)-1] != "data_handle_0" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
+	if names[0] != "preface" || names[len(names)-1] != "open_ack_bad_request_duplicate_view" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
 		t.Errorf("golden order or H1 resend: first %q, last %q", names[0], names[len(names)-1])
 	}
 	m1, m12 := 0, 0

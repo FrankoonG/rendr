@@ -59,7 +59,62 @@ func goldenVectorsM3() []vector {
 	add(headerRejectVec("detach_short", Header{Type: TypeDetach, Fseq: 18}, []byte{0, 0, 0, 2}, ErrLength))
 	add(rejectFrameVec("open_mode_4", TypeOpen, FirstFseq, SessionHandle, Open{SID: gSID, Kind: KindStream, Mode: MaxMode + 1, RetainMs: 34000, Window: 8 << 20}, ErrValue))
 	add(headerRejectVec("data_handle_0", Header{Type: TypeData, Fseq: 2}, []byte{0, 0, 0, 0, 0, 0, 0, 0, 0x5a}, ErrHandle))
+
+	// The M3 refusal codes (§A3.5, R1-10, M3-D23) on an OPEN for a later
+	// handle of a live MUX trunk: CAPACITY CodeListenerClosed (bare and
+	// REL-wrapped), CAPACITY CodeMuxFull, BAD_REQUEST CodeDuplicateView.
+	add(frameVec("open_ack_capacity_listener_closed", TypeOpenAck, 0, 5, 2, OpenAck{Status: StatusCapacity, Code: CodeListenerClosed}))
+	add(relVec("rel_open_ack_capacity_listener_closed", 16, RelHead{Cseq: 8, Type: TypeOpenAck, Handle: 2}, OpenAck{Status: StatusCapacity, Code: CodeListenerClosed}))
+	add(frameVec("open_ack_capacity_mux_full", TypeOpenAck, 0, 5, 3, OpenAck{Status: StatusCapacity, Code: CodeMuxFull}))
+	add(frameVec("open_ack_bad_request_duplicate_view", TypeOpenAck, 0, 5, 2, OpenAck{Status: StatusBadRequest, Code: CodeDuplicateView}))
 	return vs
+}
+
+// TestRefusalCodesM3: the reason codes M3 adds keep their values and
+// status classes (§A3.5, R1-10, M3-D23): CodeDuplicateView 5 (BAD_REQUEST),
+// CodeMuxFull 6 and CodeListenerClosed 7 (CAPACITY), none colliding with
+// an earlier code of its class; their OPEN_ACKs round-trip with the code at
+// bytes 5..9 and decode from the committed golden vectors.
+func TestRefusalCodesM3(t *testing.T) {
+	if CodeDuplicateView != 5 || CodeMuxFull != 6 || CodeListenerClosed != 7 {
+		t.Fatalf("CodeDuplicateView %d, CodeMuxFull %d, CodeListenerClosed %d, want 5, 6, 7", CodeDuplicateView, CodeMuxFull, CodeListenerClosed)
+	}
+	badRequest := []uint32{CodeBadMode, CodeBadKind, CodeMetadataSize, CodeBadValue, CodeDuplicateView}
+	capacity := []uint32{CodeMaxSessions, CodeBacklog, CodeAcceptTimeout, CodeCarriers, CodeAbandoned, CodeMuxFull, CodeListenerClosed}
+	for _, class := range [][]uint32{badRequest, capacity} {
+		seen := map[uint32]bool{}
+		for _, c := range class {
+			if c == 0 || seen[c] {
+				t.Errorf("reason code %d is zero or used twice in %v", c, class)
+			}
+			seen[c] = true
+		}
+	}
+	_, enc := readGolden(t)
+	for _, tc := range []struct {
+		name   string
+		status AckStatus
+		code   uint32
+		handle uint32
+	}{
+		{"open_ack_capacity_listener_closed", StatusCapacity, CodeListenerClosed, 2},
+		{"open_ack_capacity_mux_full", StatusCapacity, CodeMuxFull, 3},
+		{"open_ack_bad_request_duplicate_view", StatusBadRequest, CodeDuplicateView, 2},
+	} {
+		var b [OpenAckFixedLen]byte
+		if n := PutOpenAck(b[:], &OpenAck{Status: tc.status, Code: tc.code}); n != OpenAckFixedLen || binary.BigEndian.Uint32(b[5:9]) != tc.code {
+			t.Errorf("%s: PutOpenAck wrote %d bytes % x", tc.name, n, b[:])
+		}
+		f, _, err := DecodeFrame(enc[tc.name])
+		if err != nil || f.Type != TypeOpenAck || f.Handle != tc.handle {
+			t.Errorf("%s: DecodeFrame %+v, %v", tc.name, f, err)
+			continue
+		}
+		a, err := ParseOpenAck(f.Payload)
+		if err != nil || a.Status != tc.status || a.Code != tc.code || a.Window != 0 || len(a.Msg) != 0 {
+			t.Errorf("%s: ParseOpenAck %+v, %v", tc.name, a, err)
+		}
+	}
 }
 
 // TestPrefaceOptMux_L44: OptMux is optional PREFACE bit 0 (M3-D3): a
@@ -263,11 +318,14 @@ func TestSessionHandleRule_L14(t *testing.T) {
 	if _, _, err := DecodeFrame(goldenByName(t, "data_handle_0").b); !errors.Is(err, ErrHandle) {
 		t.Errorf("data_handle_0: %v, want ErrHandle", err)
 	}
-	// The M1 and M2 vectors keep handle 1 on every session frame (a
-	// dedicated carrier carries handle 1 only; the carrier enforces it).
+	// The M1 and M2 vectors (those before preface_optmux) keep handle 1 on
+	// every session frame (a dedicated carrier carries handle 1 only; the
+	// carrier enforces it).
 	for _, v := range goldenVectors() {
-		if v.kind == "frame" && !v.hdr.Type.Extension() && !v.hdr.Type.CarrierLevel() &&
-			v.hdr.Handle != SessionHandle && !bytes.Contains([]byte(v.name), []byte("handle")) {
+		if v.name == "preface_optmux" {
+			break
+		}
+		if v.kind == "frame" && !v.hdr.Type.Extension() && !v.hdr.Type.CarrierLevel() && v.hdr.Handle != SessionHandle {
 			t.Errorf("%s: session handle %d", v.name, v.hdr.Handle)
 		}
 	}
