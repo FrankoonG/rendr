@@ -366,7 +366,11 @@ func (t *trunk) viewDoneClosed(v *Conn) {
 	close(v.done)
 	v.vx.doneShut = true
 	t.nviews--
-	t.ms.full = false
+	if !v.vx.refused {
+		// A view leaving frees a place; the refused view's own Done (it
+		// closes right after the CodeMuxFull answer) does not (M3-D12).
+		t.ms.full = false
+	}
 	b := v.vx.onDone
 	v.vx.onDone = nil
 	f := t.viewDone
