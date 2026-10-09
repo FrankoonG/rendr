@@ -647,7 +647,7 @@ func (c *Conn) Capacity() int64 {
 }
 
 func (t *trunk) capacityLocked() int64 {
-	return sched.Capacity(t.st.rate, t.st.minRTT, t.tm.PingBusy, t.tm.CapFloor, t.tm.Window)
+	return sched.CapacityDuplex(t.st.rate, t.st.minRTT, t.tm.PingBusy, t.st.dlvRate, t.st.revDelayLocked(), t.tm.CapFloor, t.tm.Window)
 }
 
 // Stats returns a point-in-time copy of the estimator and counters.

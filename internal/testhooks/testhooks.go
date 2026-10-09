@@ -149,6 +149,13 @@ type Hooks struct {
 	// AfterViewFill runs in a MUX trunk's writer after a DRR Fill call of
 	// handle returned and before the writer's ready-set decision (R1-1).
 	AfterViewFill func(carrier, handle uint32)
+	// PingTS rewrites the TS a carrier's writer puts into each PING it
+	// encodes (ts: nanoseconds of the carrier's monotonic clock since its
+	// start), so that a test can run one side's clock slow, fast or
+	// stepped against the other's (M3 estimator: the reverse-queue floor).
+	// It runs under the carrier's lock: it must not block or call into
+	// rendr.
+	PingTS func(carrier uint32, ts uint64) uint64
 }
 
 // Session registry gauges (M3 design Revision 1, R1-24): always compiled,

@@ -451,11 +451,17 @@ func p99(ds []time.Duration) time.Duration {
 // TestMuxFairness_L15 (M3 design §A11.2, §A5.3; L15, M3-D10 DRR): 8 bulk
 // sessions (4 sending A → B, 4 B → A, open-ended) and 1 echo session share
 // the one carrier of a one-factory Peer over a Link of 20 ms RTT shaped to
-// 4 MiB/s per direction (under -race too, see below) with a bottleneck
-// queue of rate/16 (62.5 ms; rendrtest's default 2-MiB buffer is a 500-ms
-// queue at 4 MiB/s, and with it one direction of a carrier loaded both
-// ways collapses: TestMuxBulkBothWaysKeepsTheLink), at the default 64-KiB
-// DRR quantum: a session's 1 MiB/s is 16 quanta per 1-s window.
+// 4 MiB/s per direction (2 MiB/s under -race: the WP13 race size, R1-11
+// rule 3's practice for bulk miniatures) with a bottleneck queue of
+// rate/16 (62.5 ms), at the default 64-KiB DRR quantum: a session's
+// 1 MiB/s is 16 quanta per 1-s window. With rendrtest's default 2-MiB
+// buffer (a 500-ms queue at 4 MiB/s) both directions keep the link since
+// the capacity's reverse-path allowance (TestMuxBulkBothWaysKeepsTheLink),
+// but the echo's round trip crosses both directions' standing queues (each
+// near 2·k·(minRTT + PingBusy + 50 ms) − minRTT, k the rate overestimate;
+// sched.CapacityDuplex): P99 0.98–1.05 s against a limit of 0.87 s that
+// counts one Cap, and Jain's index down to 0.79 in a window (at -cpu 1, 2
+// and 4), so the row keeps the short queue.
 //
 // The echo session's dialer writes a 1-KiB request every 100 ms and times
 // its echo (pipelined, as G2's echo); its unloaded round trip (base) is
@@ -484,13 +490,18 @@ func TestMuxFairness_L15(t *testing.T) {
 }
 
 func fairness(t *testing.T) {
-	// 4 MiB/s under -race too (not R1-11's quarter): at 2 MiB/s one
-	// direction of the carrier, loaded both ways, falls to 0.55–0.85 of the
-	// link with any bottleneck queue from 64 to 512 KiB, with or without
-	// the race detector (TestMuxBulkBothWaysKeepsTheLink, the estimator's
-	// defect); the row returns to R1-11's size once that is fixed.
+	// The WP13 race size, half the rate (R1-11 rule 3's practice for bulk
+	// miniatures; the rule's list does not name this row). Before the
+	// capacity's reverse-path allowance (TestMuxBulkBothWaysKeepsTheLink)
+	// one direction of the carrier, loaded both ways at 2 MiB/s, fell to
+	// 0.55–0.85 of the link, and the row ran at 4 MiB/s under -race too; at
+	// 2 MiB/s it now passes 8 of 8 runs under -race and 9 of 9 at -cpu 1, 2
+	// and 4 (each direction 0.90–0.94 of the link).
 	const quantum = 64 << 10 // the default DRR quantum (M3-D10)
-	const rate = float64(4 << 20)
+	rate := float64(4 << 20)
+	if raceEnabled {
+		rate = 2 << 20 // the WP13 race size
+	}
 	const oneWay, run = 10 * time.Millisecond, 10 * time.Second
 	w := newWorld(t, worldOpts{}, linkSpec{name: "a", oneWay: oneWay, rate: rate, buffer: int(rate) / 16})
 	peer := w.peer("a")
