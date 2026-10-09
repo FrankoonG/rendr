@@ -168,3 +168,57 @@ func mxTrunkSet(rt *Runtime) []*carrier.Conn {
 	defer rt.mu.Unlock()
 	return mapKeys(rt.trunks)
 }
+
+// mxPeOpen is peOpen bounded by within (virtual time): a Dial or an Accept
+// that does not complete fails the test by its assertion instead of the
+// binary's timeout.
+func mxPeOpen(t testing.TB, p *Peer, ln *Listener, o DialOptions, within time.Duration) (dc, pc *PacketConn) {
+	t.Helper()
+	ch := peDial(p, o)
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	pp, err := ln.AcceptPacket(ctx)
+	if err != nil {
+		t.Fatalf("AcceptPacket: %v (no packet session offered within %v)", err, within)
+	}
+	if pc, err = pp.Confirm(); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			t.Fatalf("DialPacket: %v", r.err)
+		}
+		return r.c, pc
+	case <-time.After(within):
+		t.Fatalf("DialPacket did not return within %v of its confirmation", within)
+	}
+	return nil, nil
+}
+
+// mxOpenWithin is e2eOpen bounded by within (virtual time): a Dial or an
+// Accept that does not complete fails the test by its assertion instead of
+// the binary's timeout.
+func mxOpenWithin(t testing.TB, p *Peer, ln *Listener, o DialOptions, within time.Duration) (dc, pc *Conn) {
+	t.Helper()
+	res := e2eDialAsync(context.Background(), p, o)
+	ctx, cancel := context.WithTimeout(context.Background(), within)
+	defer cancel()
+	pend, err := ln.Accept(ctx)
+	if err != nil {
+		t.Fatalf("Accept: %v (no session offered within %v)", err, within)
+	}
+	if pc, err = pend.Confirm(); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	select {
+	case r := <-res:
+		if r.err != nil {
+			t.Fatalf("Dial: %v", r.err)
+		}
+		return r.c, pc
+	case <-time.After(within):
+		t.Fatalf("Dial did not return within %v of its confirmation", within)
+	}
+	return nil, nil
+}

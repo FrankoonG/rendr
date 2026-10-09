@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"context"
 	"encoding/binary"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
@@ -118,11 +119,19 @@ func (b *Batch) nearFull() bool {
 // patchViewOffer writes a datagram trunk's current send budget into the
 // first frame of a view opened on it (§A3.3, M3-D24): a packet OPEN
 // offers it in OPEN.window, a JOIN in JOIN.rxNext, as buildH1 does for
-// handle 1; the passive answers within it. p is the view's own copy.
-func patchViewOffer(kind wire.Type, p []byte, budget int) {
+// handle 1; the passive answers within it. When fromBudgets (the attempt's
+// WithBudgetOffer intent) a packet OPEN's pmtu is lowered to the budget as
+// well (openPmtu, W4 L3-1), so that the session's MaxPayload fits the trunk
+// it opens on. p is the view's own copy.
+func patchViewOffer(kind wire.Type, p []byte, budget int, fromBudgets bool) {
 	switch {
 	case kind == wire.TypeOpen && len(p) >= wire.OpenFixedLen:
 		binary.BigEndian.PutUint32(p[24:28], uint32(budget))
+		if fromBudgets {
+			if m := openPmtu(int(binary.BigEndian.Uint16(p[28:30])), budget); m >= 0 {
+				binary.BigEndian.PutUint16(p[28:30], uint16(m))
+			}
+		}
 	case kind == wire.TypeJoin && len(p) >= 25:
 		binary.BigEndian.PutUint64(p[17:25], uint64(budget))
 	}
@@ -134,3 +143,23 @@ var rstWithdrawnPayload = func() []byte {
 	var p [wire.RstFixedLen]byte
 	return p[:wire.PutRst(p[:], &wire.Rst{Code: wire.RstWithdrawn})]
 }()
+
+// budgetIntentKey is the context key of an attempt's budget-offer intent
+// (WithBudgetOffer).
+type budgetIntentKey struct{}
+
+// WithBudgetOffer returns ctx marked with the attempt's budget-offer
+// intent: the session's MaxPayload offer came from the datagram factories'
+// budgets (package rendr's packetOffer), so a packet OPEN lowers its pmtu
+// to its carrier's budget (openPmtu, W4 L3-1). A dial reads the factory's
+// MarkBudgetOffer instead (M2's path); a pool's fast path, which calls no
+// factory, reads this mark (Pool.Attempt, patchViewOffer).
+func WithBudgetOffer(ctx context.Context) context.Context {
+	return context.WithValue(ctx, budgetIntentKey{}, true)
+}
+
+// budgetOffered reports WithBudgetOffer's mark on ctx.
+func budgetOffered(ctx context.Context) bool {
+	b, _ := ctx.Value(budgetIntentKey{}).(bool)
+	return b
+}

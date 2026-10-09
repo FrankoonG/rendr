@@ -144,6 +144,11 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bo
 			if reg.fit != nil || fromBudgets {
 				hint := &dialHint{fit: reg.fit, fromBudgets: fromBudgets}
 				spec.AttemptContext = func(ctx context.Context) context.Context {
+					if fromBudgets {
+						// A fast path calls no factory: the view's OPEN reads
+						// the intent from the context (W4 L3-1).
+						ctx = carrier.WithBudgetOffer(ctx)
+					}
 					return context.WithValue(ctx, dialHintKey{}, hint)
 				}
 			}

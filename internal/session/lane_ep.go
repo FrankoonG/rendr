@@ -20,8 +20,17 @@ var _ carrier.Endpoint = (*lane)(nil)
 // the dialer allocated on a MUX trunk. Every session frame the lane places
 // carries it. It is read through the lane's port (the carrier itself in
 // production); a port without a handle (the stream's fakes) or a bare
-// Conn's 0 means wire.SessionHandle.
+// Conn's 0 means wire.SessionHandle. It runs for every frame placed: the
+// production port is checked by its concrete type first (one word
+// compare; the handle is an immutable field of the view), and only a fake
+// pays for the interface assertion.
 func (l *lane) Handle() uint32 {
+	if c, ok := l.port.(*carrier.Conn); ok {
+		if h := c.Handle(); h != 0 {
+			return h
+		}
+		return wire.SessionHandle
+	}
 	if hp, ok := l.port.(interface{ Handle() uint32 }); ok {
 		if h := hp.Handle(); h != 0 {
 			return h

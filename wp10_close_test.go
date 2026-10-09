@@ -199,8 +199,8 @@ func TestMuxDatagramOpenBudget_L37(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		h := peNewHub(t, Config{}, ListenConfig{}, nil)
 		p := h.peer(h.carrier("h1", 1, nil))
-		d1, p1 := peOpen(t, p, h.ln, DialOptions{})
-		d2, p2 := peOpen(t, p, h.ln, DialOptions{})
+		d1, p1 := mxPeOpen(t, p, h.ln, DialOptions{}, 10*time.Second)
+		d2, p2 := mxPeOpen(t, p, h.ln, DialOptions{}, 10*time.Second)
 		if m := h.d.Status().Mux; m.Carriers != 1 || m.Views != 2 || m.FastPaths != 1 {
 			t.Fatalf("dialer Mux %+v, want the second session on the live datagram trunk", m)
 		}

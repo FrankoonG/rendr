@@ -203,7 +203,7 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 			if p.afterPick != nil {
 				p.afterPick(c)
 			}
-			v, err := c.openView(kind, payload, sess)
+			v, err := c.openViewMux(kind, payload, sess, budgetOffered(ctx))
 			if err != nil {
 				// E3: the trunk died (or sealed, or filled) between the usable
 				// check and the allocation; this attempt continues without it.

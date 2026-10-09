@@ -262,8 +262,8 @@ func TestAttemptThroughPool(t *testing.T) {
 		defer cheap.close()
 		defer burst.close()
 		pm := e.mxPeer(mxTapCarrier(e.links[0], &mux))
-		a1, b1 := e2eOpen(t, pm, e.ln, DialOptions{})
-		a2, b2 := e2eOpen(t, pm, e.ln, DialOptions{})
+		a1, b1 := mxOpenWithin(t, pm, e.ln, DialOptions{}, 10*time.Second)
+		a2, b2 := mxOpenWithin(t, pm, e.ln, DialOptions{}, 10*time.Second)
 		if n, m := mux.dials.Load(), e.d.Status().Mux; n != 1 || m.FastPaths != 1 || m.Carriers != 1 || m.Views != 2 {
 			t.Fatalf("mux Peer: %d factory calls, Mux %+v; want 1 call, 1 fast path, 1 carrier with 2 views", n, m)
 		}
@@ -285,8 +285,13 @@ func TestAttemptThroughPool(t *testing.T) {
 			rs = append(rs, e2eDialAsync(context.Background(), pb, DialOptions{}))
 		}
 		var ds []*Conn
-		for _, r := range rs {
-			x := <-r
+		for i, r := range rs {
+			var x dialResult
+			select {
+			case x = <-r:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("concurrent Dial %d did not return within 10 s: its coalesced wait was never served", i)
+			}
 			if x.err != nil {
 				t.Fatal(x.err)
 			}

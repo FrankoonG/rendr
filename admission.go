@@ -299,8 +299,9 @@ func (rt *Runtime) admitView(v *carrier.Conn, hdr wire.Header, p []byte) {
 }
 
 // isView reports whether c is a view admitted on a started MUX trunk (a
-// handle above 1) rather than the first carrier of a handshake.
-func isView(c *carrier.Conn) bool { return c.Handle() != wire.SessionHandle }
+// handle above 1) rather than the first carrier of a handshake (handle 1;
+// a bare Conn's 0 is no view either: it has no trunk to refuse through).
+func isView(c *carrier.Conn) bool { return c.Handle() > wire.SessionHandle }
 
 // respType is the response type of a first frame type.
 func respType(t wire.Type) wire.Type {

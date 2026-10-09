@@ -193,9 +193,8 @@ func TestMuxReattachSameTrunk(t *testing.T) {
 // trunk leaves (its row retired), its session stays open with no error and
 // keeps delivering on the new lane, it sends no RST —; the dialer receives
 // the passive's answer, DETACH(ended), on its retiring view and its session
-// likewise goes on. (No M3 path ends a live view of a live session with
-// DETACH(ended) other than this answer: the session reads no reason, only
-// the view's end.)
+// likewise goes on. DETACH(ended) on a live view of a live session (the
+// passive's side of a rewritten reason) is TestDetachEndedOnLiveView.
 func TestDetachReasonInformational(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := e2eNew(t, Config{}, Config{}, mxSwitchOverrides(time.Hour), ListenConfig{}, "a", "b")
@@ -255,12 +254,13 @@ func TestDetachReasonInformational(t *testing.T) {
 //
 //   - dialer opening/awaiting, abandoned (Dial withdrawn): RST then DETACH,
 //     the passive's pending session withdraws (TestMuxCancelCrossesConfirm_L49);
-//   - dialer attached-pending, the peer's DETACH: the carrier half (the
-//     view retires; our DETACH answers); the session's half — the attach
-//     finding PeerClosed and counting a carrier refusal — has no organic
-//     stimulus here (a peer's DETACH of a live session's view needs that
-//     session's end, which reaches the dialer first);
-//   - live, the peer's DETACH: the lane leaves (TestDetachReasonInformational);
+//   - dialer attached-pending, the peer's DETACH: the view retires, our
+//     DETACH answers, the attach finds the view detached and counts a
+//     carrier refusal, for a JOIN and an OPEN (TestAttachedPendingPeerDetach);
+//   - live, the peer's DETACH(retired) or DETACH(ended): the lane leaves
+//     (TestDetachReasonInformational, TestDetachEndedOnLiveView);
+//   - dialer opening race lost after the session opened: DETACH only
+//     (TestOpeningRaceLoserDetachOnly);
 //   - live, planned retirement: DETACH (TestRetireIsDetach);
 //   - passive held, its session ends: DETACH only (TestHeldViewSessionEnd);
 //   - any, trunk death: every view's lane dies once, each session counts its

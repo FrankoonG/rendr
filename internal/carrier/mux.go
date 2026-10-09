@@ -1030,7 +1030,10 @@ func (c *Conn) startView(ep Endpoint, bell Doorbell, o StartOptions) {
 // (M3-D4): the view in state opening, its first frame copied and queued in
 // the opens FIFO behind every earlier handle (awaitResponse releases it),
 // the view count raised. At the end of the handle space the trunk seals.
-func (t *trunk) openViewMux(kind wire.Type, payload []byte, sess uintptr) (*Conn, error) {
+// fromBudgets is the attempt's budget-offer intent (WithBudgetOffer): a
+// packet OPEN on a datagram trunk then lowers its pmtu to the trunk's
+// budget, as buildH1 does for handle 1 (W4 L3-1).
+func (t *trunk) openViewMux(kind wire.Type, payload []byte, sess uintptr, fromBudgets bool) (*Conn, error) {
 	if kind != wire.TypeOpen && kind != wire.TypeJoin {
 		return nil, fmt.Errorf("rendr/carrier: openView of %v", kind)
 	}
@@ -1060,7 +1063,7 @@ func (t *trunk) openViewMux(kind wire.Type, payload []byte, sess uintptr) (*Conn
 	v.vx.dialer, v.vx.first, v.vx.sess = true, kind, sess
 	v.vx.firstP = append([]byte(nil), payload...)
 	if t.dg != nil {
-		patchViewOffer(kind, v.vx.firstP, int(t.dg.budget.Load())) // the trunk's current budget (§A3.3)
+		patchViewOffer(kind, v.vx.firstP, int(t.dg.budget.Load()), fromBudgets) // the trunk's current budget (§A3.3)
 	}
 	v.vx.resp = make(chan struct{})
 	t.opens[(t.ms.opHead+t.ms.opN)%len(t.opens)] = v

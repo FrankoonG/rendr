@@ -23,8 +23,25 @@ import (
 // wrote, re-sent alone with a fresh fseq and a valid CRC, one after each
 // switch and one before the first —: the passive's Duplicates equals the
 // number injected, the dialer's stays 0. No carrier ends with
-// protocol_violation.
-func TestPacketExactlyOnceAcrossSwitches_L39(t *testing.T) {
+// protocol_violation. The session runs on dedicated carriers
+// (CheapSubflow), whose rows count every frame they drop;
+// TestPacketExactlyOnceAcrossSwitchesMux_L39 is the same run on rendr mux
+// trunks.
+func TestPacketExactlyOnceAcrossSwitches_L39(t *testing.T) { exactlyOnceAcrossSwitches(t, false) }
+
+// TestPacketExactlyOnceAcrossSwitchesMux_L39 is the L39 run above on the
+// default path, every carrier a view of a rendr mux trunk (M3-D2). Only the
+// accounting of the network's duplicates changes: a view's final
+// CarrierStatus row is settled at the view's Done, while its trunk may
+// still read and drop late duplicates after it (per-view datagram counters
+// on a shared trunk, a known limitation), so the carriers' fseq drops are
+// read trunk-wide from each Runtime's Status.Datagram.Dropped. The
+// exactly-once oracle — Duplicates equal to the injected ones on the
+// passive and 0 on the dialer, every datagram intact and at most once — is
+// unchanged.
+func TestPacketExactlyOnceAcrossSwitchesMux_L39(t *testing.T) { exactlyOnceAcrossSwitches(t, true) }
+
+func exactlyOnceAcrossSwitches(t *testing.T, mux bool) {
 	synctest.Test(t, func(t *testing.T) {
 		ov := testhooks.Overrides{
 			ProbeInterval: 50 * time.Millisecond, ProbeFresh: time.Second, ProbeBackoffMax: 200 * time.Millisecond,
@@ -41,17 +58,20 @@ func TestPacketExactlyOnceAcrossSwitches_L39(t *testing.T) {
 		}
 		cs := make([]rendr.Carrier, len(w.links))
 		for i, l := range w.links {
-			// The session's own carriers, whose CarrierStatus.Dropped counts
-			// every duplicate frame they read: dedicated (M3-D2; a view's
-			// final row is settled at its own Done, while a MUX trunk may
-			// still read the network's late duplicates after it).
+			// Dedicated: the session's own carriers, whose CarrierStatus.Dropped
+			// counts every duplicate frame they read (M3-D2; a view's final
+			// row is settled at its own Done, while a MUX trunk may still
+			// read the network's late duplicates after it).
 			c := w.dgCarrier(l, 1400)
-			c.Props.CheapSubflow = true
+			c.Props.CheapSubflow = !mux
 			cs[i] = c
 		}
 		dc, pc := w.open(w.peer(cs...), rendr.DialOptions{})
 		if act, ok := activeOf(dc.Status()); !ok || act.Name != "a" {
 			t.Fatalf("the session did not start on a: %+v", dc.Status().Carriers)
+		}
+		if m := w.d.Status().Mux; mux != (m.Carriers > 0) {
+			t.Fatalf("mux %v: the dialer's Mux %+v (stimulus)", mux, m)
 		}
 
 		const n = 1000
@@ -194,6 +214,12 @@ func TestPacketExactlyOnceAcrossSwitches_L39(t *testing.T) {
 			dupl, lost = dupl+st.Duplicated, lost+st.Lost
 		}
 		dDrop, pDrop := dropped(ds), dropped(ps)
+		if mux {
+			// Trunk-wide (see TestPacketExactlyOnceAcrossSwitchesMux_L39):
+			// each Runtime's datagram drops, the late duplicates a trunk
+			// read after a view's Done included.
+			dDrop, pDrop = w.d.Status().Datagram.Dropped, w.p.Status().Datagram.Dropped
+		}
 		t.Logf("links: Duplicated %d, Lost %d; taps: dialer %+v, passive %+v; Dropped dialer %d, passive %d; injected %d; migrations %+v; last switch %v before the writers ended",
 			dupl, lost, dt, pt, dDrop, pDrop, injected, ds.Migrations, time.Since(switchedAt))
 		if dupl < 50 {

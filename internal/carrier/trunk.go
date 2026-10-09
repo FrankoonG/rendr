@@ -280,7 +280,7 @@ func (t *trunk) admit(h uint32, hdr wire.Header, p []byte) {
 // session for the one-view-per-trunk rule. It fails with ErrDead on a dead
 // or sealed trunk; at the end of the handle space it seals the trunk.
 func (t *trunk) openView(kind wire.Type, payload []byte, sess uintptr) (*Conn, error) {
-	return t.openViewMux(kind, payload, sess) // mux.go
+	return t.openViewMux(kind, payload, sess, false) // mux.go
 }
 
 // viewCount returns the views that are not gone (the pool's close rule,

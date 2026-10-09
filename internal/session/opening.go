@@ -608,6 +608,12 @@ func (a *actor) killEst(est *carrier.Established, cause carrier.Cause, detail st
 	a.dropConn(est.Conn)
 }
 
+// viewDetached reports a result whose view of a MUX trunk the peer
+// detached before the attach (R1-9, attached-pending × the peer's DETACH).
+// A dedicated carrier keeps M2's reading: a peer CLOSE that arrives before
+// the attach is handled by the attached lane as any peer CLOSE.
+func viewDetached(c *carrier.Conn) bool { return c.Mux() && c.PeerClosed() }
+
 // poolKey identifies the session to the Peer's pool (M3-D17, R1-6: at most
 // one unreaped view of a session per trunk): the session's address, which
 // stays unique while any of its views lives (each view's endpoint
@@ -843,7 +849,7 @@ func (a *actor) attemptAnsweredLocked(now time.Time, i int, at *attempt, est *ca
 func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Established, window uint32) {
 	s := a.s
 	d := a.d
-	if dead, _, _, _ := est.Conn.Death(); dead || est.Conn.PeerClosed() {
+	if dead, _, _, _ := est.Conn.Death(); dead || viewDetached(est.Conn) {
 		// Ended before the attach — also a view whose peer detached it
 		// while it was attached-pending (R1-9): a carrier refusal, no
 		// cadence failure, no lane.
@@ -937,7 +943,16 @@ func (a *actor) openRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 // (beyond what was sent kills that carrier); then the lane attaches.
 func (a *actor) joinOKLocked(now time.Time, i int, at *attempt, est *carrier.Established, rxNext uint64) {
 	s := a.s
-	if dead, _, _, _ := est.Conn.Death(); dead || est.Conn.PeerClosed() || est.Ack.Instance != s.peer {
+	if viewDetached(est.Conn) {
+		// The peer detached the view while it was attached-pending (R1-9):
+		// a carrier refusal, no cadence failure, no lane; our DETACH(ended)
+		// answered it already.
+		a.dropConn(est.Conn)
+		a.finish(now, i, at, sched.OutcomeRefused)
+		a.switchFailedLocked(now, i)
+		return
+	}
+	if dead, _, _, _ := est.Conn.Death(); dead || est.Ack.Instance != s.peer {
 		a.killEst(est, carrier.CauseInstanceMismatch, "JOIN answered by another instance")
 		a.finish(now, i, at, sched.OutcomeRefused)
 		a.switchFailedLocked(now, i)
