@@ -140,7 +140,9 @@ func TestThousandSessionsPoolsReturnToZero_L48(t *testing.T) {
 // selector session is its actor plus one reader and one writer per
 // carrier, on each side; no per-session goroutine anywhere else): at most
 // 6 per session plus a constant, exactly one actor per session end, and
-// none of them outlives the sessions (L52).
+// none of them outlives the sessions (L52). The count is taken within
+// ActorLinger, before the actors park (M3-D42); parked actors hold no
+// goroutine at all, which the timers scenarios check.
 func TestGoroutineBound_L52(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const n = 1000

@@ -123,7 +123,7 @@ type SessionStatus struct {
 // TxBytes count every copy.
 type RaceCounters struct {
 	CopyBytes uint64 // stream sender: payload bytes placed by a lane below another lane's cursor (extra copies)
-	Copies    uint64 // packet sender: extra placements of datagrams another lane already placed
+	Copies    uint64 // packet sender: extra placements of datagrams another lane already placed, less the carriers' refusals
 }
 
 // PacketCounters count the datagrams of one packet session on this side.
