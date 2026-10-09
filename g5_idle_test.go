@@ -258,6 +258,8 @@ func g5MeasureIdle(t testing.TB, e *e2ePair, parks *atomic.Int64, c g5IdleCase, 
 		} else {
 			cs[i] = g5PipeCarrier(string(rune('a'+i)), e.ln)
 		}
+		// The cost of one session with its own carriers: dedicated (M3-D2).
+		cs[i] = dedicated(cs[i].(StreamCarrier))
 	}
 	peer, err := e.d.NewPeer(PeerConfig{Carriers: cs})
 	if err != nil {

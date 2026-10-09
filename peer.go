@@ -120,6 +120,9 @@ func newPeer(rt *Runtime, cfg PeerConfig) (*Peer, error) {
 		return nil, err
 	}
 	p.props = props
+	// rendr mux is the default (M3-D2, plan:135): a factory whose carriers
+	// are not cheap subflows shares them between the Peer's sessions.
+	props.muxFactories(p.factories)
 	p.env = session.Env{
 		Carrier: &rt.cenv,
 		Events:  rt.ev, // a nil *eventQueue discards every event
@@ -128,6 +131,16 @@ func newPeer(rt *Runtime, cfg PeerConfig) (*Peer, error) {
 	}
 	if n >= 2 {
 		p.health = carrier.NewHealth(&rt.cenv, p.factories, rt.eff.health)
+	}
+	for i := range p.factories {
+		if p.factories[i].Mux {
+			// The Peer's pool (M3-D16): every attempt of the Peer's sessions
+			// goes through it. Its datagram factories read the per-Dial
+			// hints from the attempt's context (poolFactories).
+			p.pool = carrier.NewPool(&rt.cenv, poolFactories(p.factories))
+			rt.addPool(p.pool)
+			break
+		}
 	}
 	return p, nil
 }
@@ -180,23 +193,31 @@ func (p *Peer) Status() PeerStatus {
 }
 
 // Close stops probing; later Dials return net.ErrClosed. Sessions already
-// dialled keep running on their factory snapshot. Idempotent.
+// dialled keep running on their factory snapshot — also on the carriers
+// they share (rendr mux): each closes at its last session, and
+// Runtime.Close joins them. Idempotent.
 func (p *Peer) Close() error {
 	p.shutdown()
 	p.rt.mu.Lock()
 	delete(p.rt.peers, p)
+	p.rt.prunePoolsLocked()
 	p.rt.mu.Unlock()
 	return nil
 }
 
 // shutdown marks the Peer closed and stops its health layer (bounded;
-// Health.Close is idempotent).
+// Health.Close is idempotent). The Peer's pool keeps serving the sessions
+// that survive (their redials and JOINs) until its trunks drained
+// (Pool.Close only lets Runtime.Close's join return).
 func (p *Peer) shutdown() {
 	p.mu.Lock()
 	p.closed = true
 	p.mu.Unlock()
 	if p.health != nil {
 		p.health.Close()
+	}
+	if p.pool != nil {
+		p.pool.Close()
 	}
 }
 

@@ -97,7 +97,7 @@ func TestG5IdleStagesLeaveDataBudget_L15(t *testing.T) {
 		)
 		ov := &testhooks.Overrides{MaxBufferedBytes: budget}
 		e := e2eNew(t, Config{}, Config{}, ov, ListenConfig{}, "a")
-		peer := e.peer()
+		peer := e.dedicatedPeer() // one reader stage per session's carrier (M3-D2)
 		var (
 			mu      sync.Mutex
 			passive = make(map[SessionID]*Conn)

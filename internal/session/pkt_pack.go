@@ -50,7 +50,7 @@ func (s *Session) placePackLocked(l *lane, b *carrier.Batch) {
 		flags |= wire.FlagPackDone
 	}
 	reliable := flags != 0 || (passive && pa.EpochEcho != l.echoRel)
-	if !b.AddPack(wire.SessionHandle, flags, &pa, reliable) {
+	if !b.AddPack(l.Handle(), flags, &pa, reliable) {
 		if reliable && b.Datagram() && b.RelRoom() == 0 {
 			s.movePackDutyLocked(l) // R1-17
 		}

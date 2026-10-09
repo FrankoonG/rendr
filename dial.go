@@ -137,7 +137,19 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bo
 	ec := &entryCtx{Context: dctx}
 	spec := p.spec(sid, o, packet)
 	if packet {
-		spec.Factories = wrapDatagram(spec.Factories, reg.fit, offerFromBudgets(spec.Factories, everyMemberCarries(spec.Params.Mode)))
+		fromBudgets := offerFromBudgets(spec.Factories, everyMemberCarries(spec.Params.Mode))
+		if spec.Pool != nil {
+			// The pool dials with the Peer's own factories (poolFactories),
+			// which read this Dial's hints from each attempt's context.
+			if reg.fit != nil || fromBudgets {
+				hint := &dialHint{fit: reg.fit, fromBudgets: fromBudgets}
+				spec.AttemptContext = func(ctx context.Context) context.Context {
+					return context.WithValue(ctx, dialHintKey{}, hint)
+				}
+			}
+		} else {
+			spec.Factories = wrapDatagram(spec.Factories, reg.fit, fromBudgets)
+		}
 	}
 	s, err = session.Dial(ec, &env, spec)
 	// session.Dial's documented contract: it creates no session (and makes
@@ -172,9 +184,54 @@ func (p *Peer) spec(sid SessionID, o DialOptions, packet bool) session.DialSpec 
 		GoneAway:   p.goneAway,
 		NoteGoAway: p.noteGoAway,
 		Eligible:   eligible,
+		Pool:       p.pool, // nil when no factory shares its carriers (M3-D16)
 	}
 	p.props.dialProps(&spec) // fate groups and HoLCoupled (M3-D36)
 	return spec
+}
+
+// dialHint is one packet Dial's per-attempt factory behaviour that
+// wrapDatagram installs on a copy of the factories when the session dials
+// itself (M2's path): the budget-offer mark and the openFit record (W4
+// L3-1). With rendr mux the Peer's pool dials with the Peer's own
+// factories, so the hint travels in the attempt's context instead
+// (session.DialSpec.AttemptContext) and poolFactories applies it.
+type dialHint struct {
+	fit         *openFit
+	fromBudgets bool
+}
+
+// dialHintKey is the context key of a dialHint.
+type dialHintKey struct{}
+
+// poolFactories returns the factory snapshot of a Peer's pool: fs with each
+// datagram factory's DialPacket wrapped so that it applies the dialHint of
+// the attempt's context, if any, exactly as wrapDatagram's wrapper does.
+// Without a hint (stream sessions, probe carriers never come here) the
+// wrapper only calls the factory.
+func poolFactories(fs []carrier.Factory) []carrier.Factory {
+	out := make([]carrier.Factory, len(fs))
+	copy(out, fs)
+	for i := range out {
+		dial, mtu := out[i].DialPacket, out[i].MTU
+		if out[i].Kind != wire.KindDatagram || dial == nil {
+			continue
+		}
+		out[i].DialPacket = func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+			h, _ := ctx.Value(dialHintKey{}).(*dialHint)
+			if h != nil && h.fromBudgets {
+				carrier.MarkBudgetOffer(ctx)
+			}
+			pc, a, err := dial(ctx)
+			if h != nil && h.fit != nil && i < len(h.fit.budget) {
+				if o, ok := pc.(*carrier.OwnedUDP); ok && o != nil && err == nil {
+					h.fit.budget[i].Store(int32(min(o.Limit(), mtu)))
+				}
+			}
+			return pc, a, err
+		}
+	}
+	return out
 }
 
 // allFactories is the DialSpec.Eligible mask of n factories.

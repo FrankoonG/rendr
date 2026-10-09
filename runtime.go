@@ -59,6 +59,15 @@ type Runtime struct {
 
 	fmu    sync.Mutex                    // guards pflows; taken before a udpflow.Flow's lock (holdFlow), never while one is held
 	pflows map[*session.Session]*flowSet // passive packet sessions: the raw-UDP flows of their OPEN carriers (listener_pkt.go)
+
+	// rendr mux (M3 design §A4.5, §A4.6, §A5.6). The trunk set holds the
+	// passive MUX trunks (view 1 of each, the handshake's Conn) until their
+	// Done; trk joins their watchers. pools are the Peers' carrier pools,
+	// kept after Peer.Close until their trunks drained (Runtime.Close joins
+	// them). Both maps are guarded by mu.
+	trunks map[*carrier.Conn]*trunkRec
+	trk    *group
+	pools  map[*carrier.Pool]struct{}
 }
 
 // Join bounds of Runtime.Close (design §3.1, §6.8).
@@ -113,6 +122,9 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		sources:   make(map[*udpflow.Source]struct{}),
 		pflows:    make(map[*session.Session]*flowSet),
 		pruneAt:   minPruneAt,
+		trunks:    make(map[*carrier.Conn]*trunkRec),
+		trk:       newGroup(),
+		pools:     make(map[*carrier.Pool]struct{}),
 	}
 	rt.cenv = carrier.Env{
 		Local:   id,
@@ -126,6 +138,7 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		Hooks:   eff.hooks,
 		DBufs:   carrier.NewDatagramBufPool(),
 		Dgram:   &carrier.DgramStats{},
+		Admit:   rt.admitView, // OPENs and JOINs on live passive MUX trunks (M3-D21)
 	}
 	rt.eff.params.Actors = &rt.actors // every session's Params counts its running actor (M3-D44)
 	rt.gateFn = rt.gate
@@ -215,8 +228,184 @@ func (rt *Runtime) Status() Status {
 }
 
 // muxStatus returns Status.Mux: the Peers' pools (dialer) and the trunk set
-// of passive MUX trunks. Zero while the Runtime has no MUX trunk.
-func (rt *Runtime) muxStatus() MuxStatus { return MuxStatus{} }
+// of passive MUX trunks. Zero while the Runtime has no MUX trunk. Carriers
+// counts the live MUX trunks of both roles, Views the views on them that
+// are not gone (Σ over those trunks, TestStatusMuxIdentities).
+func (rt *Runtime) muxStatus() MuxStatus {
+	rt.mu.Lock()
+	pools := mapKeys(rt.pools)
+	trunks := mapKeys(rt.trunks)
+	rt.mu.Unlock()
+	var m MuxStatus
+	for _, p := range pools {
+		st := p.Stats()
+		m.Carriers += st.Carriers
+		m.Views += st.Views
+		m.FastPaths += st.FastPaths
+		m.Coalesced += st.Coalesced
+		m.MuxFull += st.MuxFull
+	}
+	for _, c := range trunks {
+		if c.TrunkDying() {
+			continue
+		}
+		m.Carriers++
+		m.Views += c.Views()
+	}
+	return m
+}
+
+// trunkRec is the trunk set's entry of one passive MUX trunk (M3-D22): the
+// Listener that accepted it (the admission of later OPENs uses its queues,
+// §A5.6) and the bound of a trunk left without views — after RetireGrace
+// at zero views it holds a place of the Sessionless limits (over a cap:
+// CLOSE(capacity)), and after Sessionless.Idle at zero views it is
+// retired. A new view cancels both.
+type trunkRec struct {
+	rt   *Runtime
+	c    *carrier.Conn // view 1 (the handshake's Conn)
+	ln   *Listener
+	inst InstanceID
+
+	mu      sync.Mutex
+	gen     uint64      // invalidates armed timers
+	timer   *time.Timer // the zero-view bound; nil while not armed
+	counted bool        // holds a Sessionless place
+	done    bool        // the trunk is done: nothing is armed any more
+}
+
+// addTrunk registers the passive MUX trunk of view 1 c, accepted by ln, in
+// the trunk set — before its session starts it, so the first OPEN or JOIN
+// for a new handle on it finds its record — and starts its watcher, a
+// member of rt.trk joined by Runtime.Close (L52). A trunk is registered
+// once.
+func (rt *Runtime) addTrunk(c *carrier.Conn, ln *Listener) {
+	rec := &trunkRec{rt: rt, c: c, ln: ln, inst: InstanceID(c.PeerInstance())}
+	rt.mu.Lock()
+	if _, ok := rt.trunks[c]; ok {
+		rt.mu.Unlock()
+		return
+	}
+	rt.trunks[c] = rec
+	rt.trk.add()
+	rt.mu.Unlock()
+	c.SetOwnerTag(rec)
+	c.OnViewEnd(func(*carrier.Conn) { rec.viewEnded() })
+	go rt.watchTrunk(rec)
+}
+
+// watchTrunk removes a passive trunk from the set at its Done and frees
+// what its zero-view bound held.
+func (rt *Runtime) watchTrunk(rec *trunkRec) {
+	defer rt.trk.done(nil)
+	<-rec.c.TrunkDone()
+	rec.mu.Lock()
+	rec.done = true
+	rec.gen++
+	if rec.timer != nil {
+		rec.timer.Stop()
+		rec.timer = nil
+	}
+	counted := rec.counted
+	rec.counted = false
+	rec.mu.Unlock()
+	if counted {
+		rt.slt.release(rec.inst)
+	}
+	rt.mu.Lock()
+	delete(rt.trunks, rec.c)
+	rt.mu.Unlock()
+}
+
+// viewAdded runs when a new view is admitted on the trunk (admitView): the
+// zero-view bound is cancelled and its Sessionless place released.
+func (rec *trunkRec) viewAdded() {
+	rec.mu.Lock()
+	rec.gen++
+	if rec.timer != nil {
+		rec.timer.Stop()
+		rec.timer = nil
+	}
+	counted := rec.counted
+	rec.counted = false
+	rec.mu.Unlock()
+	if counted {
+		rec.rt.slt.release(rec.inst)
+	}
+}
+
+// viewEnded is the trunk's view hook (on a goroutine of the carrier's): at
+// zero views a closing Runtime closes the trunk at once with GOAWAY
+// (M3-D26); otherwise the zero-view bound is armed (M3-D22).
+func (rec *trunkRec) viewEnded() {
+	if rec.c.Views() > 0 {
+		return
+	}
+	rt := rec.rt
+	if rt.closing.Load() {
+		rec.c.GoAwayTrunk()
+		return
+	}
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if rec.done || rec.timer != nil {
+		return
+	}
+	rec.gen++
+	gen := rec.gen
+	rec.timer = time.AfterFunc(rt.eff.cfg.RetireGrace, func() { rec.zeroBound(gen, false) })
+}
+
+// zeroBound fires the zero-view bound of generation gen: after RetireGrace
+// the trunk takes a Sessionless place (none left: CLOSE(capacity)); after
+// Sessionless.Idle at zero views (idle) it is retired.
+func (rec *trunkRec) zeroBound(gen uint64, idle bool) {
+	rt := rec.rt
+	rec.mu.Lock()
+	if rec.gen != gen || rec.done {
+		rec.mu.Unlock()
+		return
+	}
+	rec.timer = nil
+	if rec.c.Views() > 0 {
+		rec.mu.Unlock()
+		return // a view came meanwhile (its admission cancels the bound as well)
+	}
+	if idle {
+		rec.mu.Unlock()
+		rec.c.RetireTrunk(wire.CloseRetire)
+		return
+	}
+	if !rt.slt.acquire(rec.inst) {
+		rec.mu.Unlock()
+		rec.c.RetireTrunk(wire.CloseCapacity)
+		return
+	}
+	rec.counted = true
+	rest := max(rt.eff.cfg.Sessionless.Idle-rt.eff.cfg.RetireGrace, 0)
+	rec.timer = time.AfterFunc(rest, func() { rec.zeroBound(gen, true) })
+	rec.mu.Unlock()
+}
+
+// addPool records a Peer's pool for Runtime.Close's join (L52); pools of
+// closed Peers whose trunks all drained are dropped on the way.
+func (rt *Runtime) addPool(p *carrier.Pool) {
+	rt.mu.Lock()
+	rt.prunePoolsLocked()
+	rt.pools[p] = struct{}{}
+	rt.mu.Unlock()
+}
+
+// prunePoolsLocked drops the pools that are closed and track no trunk.
+func (rt *Runtime) prunePoolsLocked() {
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	for p := range rt.pools {
+		if p.Wait(done) == nil {
+			delete(rt.pools, p)
+		}
+	}
+}
 
 // Close shuts the Runtime down (idempotent, bounded): new handshakes are
 // answered PREFACE_ACK(GOING_AWAY); every Listener closes; every pending
@@ -258,6 +447,7 @@ func (rt *Runtime) Close() error {
 	peers := mapKeys(rt.peers)
 	sl := mapKeys(rt.sl)
 	srcs := mapKeys(rt.sources)
+	pools := mapKeys(rt.pools)
 	rt.mu.Unlock()
 	rt.cancel(net.ErrClosed) // in-flight Dials withdraw (session.Dial returns within 100 ms)
 
@@ -289,6 +479,22 @@ func (rt *Runtime) Close() error {
 	// before Close returns (L52).
 	for _, c := range sl {
 		c.GoAway()
+	}
+	// rendr mux (M3-D26, §A4.6): a passive MUX trunk without views gets its
+	// GOAWAY now; one with views gets it from its sessions' Shutdown (each
+	// view's GoAway places the trunk's GOAWAY once) and closes after its
+	// last view (trunkRec.viewEnded). Every Peer's pool stops admitting
+	// nothing new by itself: its trunks close at their last view.
+	rt.mu.Lock()
+	trunks := mapKeys(rt.trunks)
+	rt.mu.Unlock()
+	for _, c := range trunks {
+		if c.Views() == 0 {
+			c.GoAwayTrunk()
+		}
+	}
+	for _, p := range pools {
+		p.Close()
 	}
 	for _, nc := range rt.hs.drain() {
 		rt.hsg.add()
@@ -331,6 +537,19 @@ func (rt *Runtime) Close() error {
 			}
 		}
 	}
+	// The close bound of the passive MUX trunks (C24, R1-2): a trunk whose
+	// CLOSE is still unwritten then is killed — every view on it ends with
+	// it.
+	if !rt.trk.wait(killAt, nil) {
+		rt.mu.Lock()
+		trunks = mapKeys(rt.trunks)
+		rt.mu.Unlock()
+		for _, c := range trunks {
+			if !c.TrunkCloseSent() {
+				c.KillTrunk(carrier.CauseLocalClose, "Runtime.Close: CLOSE not written within the close bound")
+			}
+		}
+	}
 	close(rt.cut)
 	// FromPacketConn sources close their sockets only after the sessions
 	// (M2-D58, M2 design §A4.6): the open packet sessions' RST(GoingAway)
@@ -360,6 +579,15 @@ func (rt *Runtime) Close() error {
 	waitDone(join, bound)
 	rt.slg.wait(bound, nil)
 	health.wait(bound, nil)
+	// The shared trunks (L52, M3-D25): the passive trunk set's watchers end
+	// at their trunks' Done; every pool (also of a closed Peer) is joined
+	// once its trunks are done.
+	rt.trk.wait(bound, nil)
+	pctx, pcancel := context.WithDeadline(context.Background(), bound)
+	for _, p := range pools {
+		_ = p.Wait(pctx)
+	}
+	pcancel()
 
 	// Step 6: the event queue delivers what is queued (SessionEnd events of
 	// the sessions ended above included) and its worker is joined.

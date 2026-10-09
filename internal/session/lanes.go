@@ -161,14 +161,25 @@ func (a *actor) hasAliveLocked() bool {
 	return false
 }
 
-// laneByIDLocked returns the live lane with CarrierID id, or nil.
+// laneByIDLocked returns the lane with CarrierID id (SCHED routing), or
+// nil. A session that returned to a MUX trunk it used before may hold two
+// lanes of one CarrierID for a moment — the old view on its way out and
+// the new one (R1-6) —, so the lane whose view has not ended and has no
+// peer DETACH wins (rule 4); otherwise the first match, as in M2.
 func (a *actor) laneByIDLocked(id uint32) *lane {
+	var first *lane
 	for _, l := range a.s.lanes {
-		if l.id == id {
+		if l.id != id {
+			continue
+		}
+		if !laneEnded(l) && !l.c.PeerClosed() {
 			return l
 		}
+		if first == nil {
+			first = l
+		}
 	}
-	return nil
+	return first
 }
 
 // wakeLaneLocked makes l's writer run Fill again (a SCHED or first frame

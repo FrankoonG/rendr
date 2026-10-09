@@ -256,13 +256,13 @@ func (a *actor) refuseAdopt(ad *adopt) {
 	if ad.kind == adoptJoin {
 		var p [wire.JoinAckLen]byte
 		n := wire.PutJoinAck(p[:], &wire.JoinAck{Status: wire.StatusUnknownSession})
-		ad.conn.WriteAndClose(wire.TypeJoinAck, 0, wire.SessionHandle, p[:n], time.Time{})
+		ad.conn.WriteAndClose(wire.TypeJoinAck, 0, ad.conn.Handle(), p[:n], time.Time{})
 		return
 	}
 	oa := a.verdict.OpenAck()
 	p := make([]byte, wire.OpenAckFixedLen+len(oa.Msg))
 	n := wire.PutOpenAck(p, &oa)
-	ad.conn.WriteAndClose(wire.TypeOpenAck, 0, wire.SessionHandle, p[:n], time.Time{})
+	ad.conn.WriteAndClose(wire.TypeOpenAck, 0, ad.conn.Handle(), p[:n], time.Time{})
 }
 
 // lanesConfirmedLocked handles factLaneConfirmed on the passive: a lane

@@ -264,7 +264,7 @@ func (s *Session) fillAckLocked(l *lane, b *carrier.Batch) {
 		a.EpochEcho = s.ctl.epoch
 	}
 	flags := st.ackFlags
-	if !b.AddAck(wire.SessionHandle, flags, &a) {
+	if !b.AddAck(l.Handle(), flags, &a) {
 		st.rightEdge = edge
 		return
 	}

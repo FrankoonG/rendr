@@ -43,7 +43,7 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 				st.fin.off = pk.nextSeq // the final seq is fixed at its first placement (M2-D34)
 				pk.finPlaced = true
 			}
-			if b.AddFin(wire.SessionHandle, st.fin.off) {
+			if b.AddFin(l.Handle(), st.fin.off) {
 				st.fin.lane = l
 				l.finHere = true
 			}
@@ -148,7 +148,7 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 				return placed
 			}
 			body, buf := q.data(d)
-			if !b.AddDgram(wire.SessionHandle, pk.nextSeq, body, buf) {
+			if !b.AddDgram(l.Handle(), pk.nextSeq, body, buf) {
 				return placed // the batch is full: the writer self-continues
 			}
 			q.pop().ext.Release() // the batch holds its own reference

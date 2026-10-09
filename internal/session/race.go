@@ -4,7 +4,6 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
-	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // Race (M3 design §A6; M3-D28 … M3-D35). Every member carries every byte
@@ -187,7 +186,7 @@ func (s *Session) raceDupLocked(n uint64, whole bool) {
 // (raceFinDueLocked) and reports whether it did.
 func (s *Session) raceFinLocked(l *lane, b *carrier.Batch) bool {
 	st := &s.st
-	if !s.raceFinDueLocked(l) || !b.AddFin(wire.SessionHandle, st.fin.off) {
+	if !s.raceFinDueLocked(l) || !b.AddFin(l.Handle(), st.fin.off) {
 		return false
 	}
 	st.fin.lane = l

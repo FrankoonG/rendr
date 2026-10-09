@@ -125,7 +125,7 @@ func (rt *Runtime) handshake(ln *Listener, slot *hsSlot, nc net.Conn, at time.Ti
 	case wire.TypeOpen:
 		refused = rt.admitOpen(ln, h, deadline, 0, nil)
 	case wire.TypeJoin:
-		refused = rt.admitJoin(h, deadline, 0, nil)
+		refused = rt.admitJoin(ln, h, deadline, 0, nil)
 	case wire.TypePing:
 		c, inst, ok := rt.admitSessionless(h, deadline)
 		if !ok {
@@ -192,8 +192,15 @@ func (c *onceConn) Close() error {
 }
 
 // answerOpen writes one OPEN_ACK refusal as c's first frame and closes c in
-// the L05 order, bounded by the handshake deadline (design §6.1).
+// the L05 order, bounded by the handshake deadline (design §6.1). On a view
+// admitted on a live MUX trunk the refusal is queued in the trunk's refusal
+// ring instead (R1-4): the handle never becomes a session's, and the trunk
+// lives (a fixed-size answer: a REJECTED message is not repeated there).
 func answerOpen(c *carrier.Conn, a wire.OpenAck, deadline time.Time) {
+	if isView(c) {
+		c.Refuse(c.Handle(), carrier.Answer{Type: wire.TypeOpenAck, Status: a.Status, Code: a.Code, Window: a.Window})
+		return
+	}
 	if len(a.Msg) > wire.MaxMsg {
 		a.Msg = a.Msg[:wire.MaxMsg]
 	}
@@ -202,8 +209,14 @@ func answerOpen(c *carrier.Conn, a wire.OpenAck, deadline time.Time) {
 	c.WriteAndClose(wire.TypeOpenAck, 0, wire.SessionHandle, b[:n], deadline)
 }
 
-// answerJoin writes one JOIN_ACK refusal as c's first frame and closes c.
+// answerJoin writes one JOIN_ACK refusal as c's first frame and closes c
+// (on a view of a live MUX trunk: an answer in the trunk's refusal ring,
+// R1-4).
 func answerJoin(c *carrier.Conn, st wire.AckStatus, deadline time.Time) {
+	if isView(c) {
+		c.Refuse(c.Handle(), carrier.Answer{Type: wire.TypeJoinAck, Status: st})
+		return
+	}
 	var b [wire.JoinAckLen]byte
 	n := wire.PutJoinAck(b[:], &wire.JoinAck{Status: st})
 	c.WriteAndClose(wire.TypeJoinAck, 0, wire.SessionHandle, b[:n], deadline)

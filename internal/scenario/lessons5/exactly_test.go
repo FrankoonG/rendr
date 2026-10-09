@@ -41,7 +41,13 @@ func TestPacketExactlyOnceAcrossSwitches_L39(t *testing.T) {
 		}
 		cs := make([]rendr.Carrier, len(w.links))
 		for i, l := range w.links {
-			cs[i] = w.dgCarrier(l, 1400)
+			// The session's own carriers, whose CarrierStatus.Dropped counts
+			// every duplicate frame they read: dedicated (M3-D2; a view's
+			// final row is settled at its own Done, while a MUX trunk may
+			// still read the network's late duplicates after it).
+			c := w.dgCarrier(l, 1400)
+			c.Props.CheapSubflow = true
+			cs[i] = c
 		}
 		dc, pc := w.open(w.peer(cs...), rendr.DialOptions{})
 		if act, ok := activeOf(dc.Status()); !ok || act.Name != "a" {
