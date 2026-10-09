@@ -63,10 +63,13 @@ const (
 	// PREFACE_ACK that opened it (design §0.13 A6) unless a test preset
 	// fixes it.
 	FirstFseq uint32 = 1
-	// SessionHandle is the handle every session frame uses in M1 and M2
-	// (one session per carrier, chosen by the dialer, echoed by the
-	// passive). ParseHeader rejects a session frame, and ParseRel a wrapped
-	// one, with any other handle (ErrHandle).
+	// SessionHandle is the first handle of every carrier: the handle of
+	// the session that opened it, and the only session handle a dedicated
+	// (non-MUX) carrier carries. Since M3 the codec accepts any non-zero
+	// handle on a session frame (ParseHeader, ParseRel; 0 is ErrHandle):
+	// a MUX trunk dispatches by handle, and the rule "handle 1 only" of a
+	// dedicated carrier is the carrier's, no longer the codec's (M3 design
+	// §A3.2, M3-D4).
 	SessionHandle uint32 = 1
 	// KnownRequired is the set of required PREFACE feature bits this build
 	// implements (none). Any other required bit is answered FEATURE.
@@ -82,11 +85,16 @@ const (
 	// PREFACE_ACK with OptMux for a PREFACE without it fails the dialer's
 	// attempt as a carrier error.
 	OptMux uint32 = 1 << 0
+	// KnownOptional is the set of optional PREFACE feature bits this build
+	// implements (OptMux). A passive echoes only these (EchoOpt); every
+	// other optional bit is ignored in both directions.
+	KnownOptional uint32 = OptMux
 )
 
 // Session modes as OPEN.mode and JOIN.mode carry them (1 selector, 2 bond,
-// 3 race). The codec accepts 1 … MaxMode; a build without race answers
-// mode 3 BAD_REQUEST CodeBadMode.
+// 3 race). The codec accepts 1 … MaxMode (ErrValue otherwise, answered
+// BAD_REQUEST CodeBadMode); a build without race (M2) answers mode 3
+// BAD_REQUEST CodeBadMode as well (M3-D28).
 const (
 	// ModeRace: every member carrier carries every byte or datagram (M3).
 	ModeRace uint8 = 3
@@ -160,34 +168,34 @@ const (
 func (t Type) Extension() bool { return t >= 0x80 }
 
 // CarrierLevel reports whether t is a carrier-level core type (PING, PONG,
-// CLOSE, GOAWAY, REL, RACK), whose handle must be 0. Every other core type
-// is a session frame whose handle must be SessionHandle: an M1–M2 carrier
-// carries exactly one session (M3's mux relaxes this to any non-zero
-// handle, dispatched by handle). ParseHeader and ParseRel enforce both
-// rules (ErrHandle). The handle of an extension type is opaque and never
-// checked.
+// CLOSE, GOAWAY, REL, RACK, DETACH), whose handle must be 0. Every other
+// core type is a session frame whose handle must not be 0: SessionHandle
+// on a dedicated carrier, the view's handle on a MUX trunk (M3-D4; the
+// carrier, not the codec, checks which handles it carries). ParseHeader
+// and ParseRel enforce both rules (ErrHandle). The handle of an extension
+// type is opaque and never checked.
 func (t Type) CarrierLevel() bool {
 	switch t {
-	case TypePing, TypePong, TypeClose, TypeGoAway, TypeRel, TypeRack:
+	case TypePing, TypePong, TypeClose, TypeGoAway, TypeRel, TypeRack, TypeDetach:
 		return true
 	}
 	return false
 }
 
-// Known reports whether t is one of the 17 core types of wire format v2:
-// the 13 of stream sessions (M1) and DGRAM, PACK, REL and RACK (M2).
-// 0x52 is never Known (TypeReservedR).
+// Known reports whether t is one of the 18 core types of wire format v2:
+// the 13 of stream sessions (M1), DGRAM, PACK, REL and RACK (M2) and
+// DETACH (M3). 0x52 is never Known (TypeReservedR).
 func (t Type) Known() bool {
 	switch t {
 	case TypeOpen, TypeOpenAck, TypeJoin, TypeJoinAck, TypeData, TypeAck, TypeFin,
 		TypeRst, TypeSched, TypePing, TypePong, TypeClose, TypeGoAway,
-		TypeDgram, TypePack, TypeRel, TypeRack:
+		TypeDgram, TypePack, TypeRel, TypeRack, TypeDetach:
 		return true
 	}
 	return false
 }
 
-// String returns the frame type name ("OPEN", "ACK", "DGRAM", ...) or
+// String returns the frame type name ("OPEN", "ACK", "DGRAM", "DETACH", ...) or
 // "0xNN".
 func (t Type) String() string {
 	switch t {
@@ -225,6 +233,8 @@ func (t Type) String() string {
 		return "REL"
 	case TypeRack:
 		return "RACK"
+	case TypeDetach:
+		return "DETACH"
 	}
 	const hex = "0123456789abcdef"
 	return string([]byte{'0', 'x', hex[t>>4], hex[t&0x0f]})

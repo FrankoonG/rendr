@@ -16,7 +16,7 @@ import (
 type Open struct {
 	SID      [16]byte    // chosen by the dialer from crypto/rand; all-zero is invalid (ErrReserved)
 	Kind     CarrierKind // session kind: 1 stream, 2 packet (M2)
-	Mode     uint8       // 1 selector, 2 bond (3 race decodes; answered BAD_REQUEST until M3)
+	Mode     uint8       // 1 selector, 2 bond, 3 race (ModeRace, M3; an M2 build answers it BAD_REQUEST CodeBadMode)
 	Flags    uint16      // OpenFlagEarly reserved until M4: all bits must be 0
 	RetainMs uint32      // the dialer's PassiveRetain in milliseconds
 	Window   uint32      // stream: the dialer's initial receive window (0 is legal: memory pressure); packet: the cmtu offer, 0 or MinFrameBudget..MaxDatagram
@@ -46,12 +46,12 @@ func PutOpen(dst []byte, o *Open) int {
 
 // ParseOpen decodes an OPEN payload. The explicit mlen must equal the
 // remaining bytes exactly; mlen > maxMeta returns ErrLength before the
-// metadata is touched. Kind must be 1 or 2, mode 1..3 (ErrValue); flags
+// metadata is touched. Kind must be 1 or 2, mode 1..MaxMode (ErrValue); flags
 // must be 0 and a stream session's PMTU 0 (ErrReserved); a packet session's
 // PMTU must lie in MinPacketPayload..MaxPacketPayload and its Window be 0
 // or in MinFrameBudget..MaxDatagram (ErrValue; M2 design §A3.5). Semantic
 // acceptance (the session kind on this carrier kind, a Window that fits the
-// carrier kind, mode not race) is the admission's job.
+// carrier kind, a mode this build serves) is the admission's job.
 //
 // Check order: fixed part present (ErrShort), mlen > maxMeta (ErrLength),
 // mlen against the remaining bytes (ErrShort/ErrTrailing), zero SID
@@ -84,7 +84,7 @@ func ParseOpen(p []byte, maxMeta int) (Open, error) {
 		return Open{}, ErrReserved
 	case o.Kind != KindStream && o.Kind != KindDatagram:
 		return Open{}, ErrValue
-	case o.Mode < 1 || o.Mode > 3:
+	case o.Mode < 1 || o.Mode > MaxMode:
 		return Open{}, ErrValue
 	case o.Flags != 0:
 		return Open{}, ErrReserved
@@ -185,8 +185,8 @@ func PutJoin(dst []byte, j *Join) int {
 }
 
 // ParseJoin decodes a JOIN payload (exactly JoinLen bytes, non-zero SID,
-// mode 1..3). Errors: ErrShort/ErrTrailing, ErrReserved (zero SID), ErrValue
-// (mode).
+// mode 1..MaxMode). Errors: ErrShort/ErrTrailing, ErrReserved (zero SID),
+// ErrValue (mode).
 func ParseJoin(p []byte) (Join, error) {
 	if err := exactTail(len(p), JoinLen); err != nil {
 		return Join{}, err
@@ -196,7 +196,7 @@ func ParseJoin(p []byte) (Join, error) {
 	switch {
 	case j.SID == ([16]byte{}):
 		return Join{}, ErrReserved
-	case j.Mode < 1 || j.Mode > 3:
+	case j.Mode < 1 || j.Mode > MaxMode:
 		return Join{}, ErrValue
 	}
 	return j, nil
