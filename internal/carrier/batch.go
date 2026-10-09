@@ -346,6 +346,19 @@ func (b *Batch) AddData(handle uint32, off uint64, body []byte, chunk *Buf, retx
 	return true
 }
 
+// Taken returns the DATA and DGRAM payload bytes earlier endpoint calls
+// of this writer round placed in the batch (M3-D11): a view on a MUX trunk
+// subtracts it from the shared capacity, Capacity() − Inflight() − Taken().
+// Always 0 on a dedicated carrier, whose one endpoint fills the round.
+func (b *Batch) Taken() int { return 0 }
+
+// limit sets the payload quota of the next endpoint call (M3-D10): Room
+// and DgramRoom then report at most q more payload bytes, and q == 0 lets
+// the call place control frames only. A negative q removes the quota. The
+// MUX writer sets it around each view's Fill; a dedicated carrier never
+// sets one.
+func (b *Batch) limit(q int) {}
+
 // MarkCapBlocked records that pullable data remained for this carrier
 // because it reached its capacity cap: the writer counts the time until
 // the next Fill that pulls data as backlog (§4.10) and requests a cap-hit

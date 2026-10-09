@@ -31,6 +31,14 @@ type Env struct {
 	// Dgram are the Runtime-wide datagram counters behind
 	// rendr.Status.Datagram; nil in component tests.
 	Dgram *DgramStats
+
+	// Admit (passive) receives an OPEN or JOIN for a new handle on a started
+	// MUX trunk (M3-D21, §A5.6): v is the new view (pending or joining,
+	// endpoint shim), h and p the frame. It runs on the trunk's reader with
+	// no carrier lock held, must not block, and answers through v (a
+	// response as the view's first frame) or Conn.Refuse. nil: no passive
+	// mux (an OPEN or JOIN on a live trunk is then refused).
+	Admit func(v *Conn, h wire.Header, p []byte)
 }
 
 // stageBudget returns the account a carrier's reader stage is charged to
@@ -74,6 +82,13 @@ type Timing struct {
 	RelRTOMax     time.Duration // REL timeout clamp, upper (2 s)
 	MTUProbeEvery int           // every n-th PacketPing-cadence PING is an MTU probe (10)
 	MTUProbeFails int           // consecutive unanswered probes that kill the carrier (3)
+
+	// M3: rendr mux (M3-D10, M3-D12, M3-D50). Internal constants with
+	// testhooks overrides; zero selects the default.
+	MuxMaxViews         int // views per stream MUX trunk, refusal answers queued included (256)
+	MuxMaxViewsDatagram int // views per datagram MUX trunk, refusal answers queued included (64)
+	MuxQuantum          int // DRR quantum: DATA/DGRAM payload bytes per view per writer round (64 KiB)
+	MuxRefusalRing      int // queued refusal answers per trunk (the trunk kind's MuxMaxViews, R1-4)
 }
 
 // Defaults for zero Timing fields (plan §4). package rendr always fills
@@ -158,6 +173,7 @@ type Presets struct {
 	FirstFseq   uint32 // first fseq in each direction (0: derived from the direction's PREFACE or PREFACE_ACK, §0.13 A6)
 	FirstPingID uint32 // first PING id (0 = 1)
 	FirstCseq   uint32 // first REL cseq in each direction of a datagram carrier (0 = wire.FirstCseq; L14)
+	FirstHandle uint32 // first handle a dialer allocates on a MUX trunk (0 = wire.SessionHandle; L14)
 }
 
 // firstFseq returns the fseq a Conn starts with before its handshake sets

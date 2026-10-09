@@ -91,6 +91,18 @@ type Status struct {
 	Kind       wire.CarrierKind
 	MaxPayload int
 	Packet     *PacketCounters
+
+	// M3. DupBytes counts the stream receiver's discarded duplicates (every
+	// mode); Race the sender's extra copies (race sessions only).
+	DupBytes uint64
+	Race     RaceCounters
+}
+
+// RaceCounters are a race sender's extra copies (field-for-field
+// rendr.RaceCounters; M3-D35).
+type RaceCounters struct {
+	CopyBytes uint64 // stream: payload bytes placed below another lane's cursor
+	Copies    uint64 // packet: extra placements of datagrams another lane already placed
 }
 
 // PacketCounters count the datagrams of one packet session on this side

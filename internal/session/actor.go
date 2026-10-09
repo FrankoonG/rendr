@@ -69,6 +69,11 @@ var (
 type actor struct {
 	s *Session
 
+	// state is the actor's run state (park.go: parked, running, again,
+	// exited): the only word kick and the parking goroutine race on
+	// (M3-D42, L09).
+	state atomic.Uint32
+
 	timer  *time.Timer
 	wakeAt time.Time // earliest deadline collected by want during a step
 	cmds   []command // drain buffer

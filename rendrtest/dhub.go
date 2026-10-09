@@ -313,6 +313,11 @@ func (h *DatagramHub) Replay(i, k int) {
 	}
 }
 
+// ReplayFlow re-delivers the datagrams client from sent as client to's,
+// rewriting their flow header to to's flow: datagram replay across flows
+// (M3 design §A9.2). It panics for an unknown client.
+func (h *DatagramHub) ReplayFlow(from, to int) { panic("unimplemented: M3") }
+
 // foreignIn puts b into the passive socket from src at now, bypassing the
 // path; false when the socket is closed or its foreign queue is full.
 // n.mu held.

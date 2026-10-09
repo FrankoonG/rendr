@@ -117,6 +117,30 @@ type StartOptions struct {
 // join bookkeeping lives under jmu (a leaf). The reader and writer state is
 // owned by those goroutines. The Endpoint is never called with mu held.
 type Conn struct {
+	// trunk is the mux state of a MUX trunk (M3-D1; trunk.go); nil on a
+	// dedicated carrier, whose one view this Conn is.
+	*trunk
+
+	// The view (M3 design §A5.1): one session's part of the carrier. On a
+	// dedicated carrier it is the carrier's only view and every accessor is
+	// M2's.
+	handle uint32                      // immutable: the session handle (wire.SessionHandle on a dedicated carrier)
+	end    atomic.Pointer[deathRecord] // the view's own end record, published once (R1-3); nil: Death is the carrier's
+	state  viewState                   // the handle lifecycle (§A5.4; trunk.mx); viewNone on a dedicated carrier
+	held   atomic.Bool                 // passive view on a started trunk: OK response placed, the dialer's go frame not yet received (M3-D8)
+	needGo atomic.Bool                 // dialer view on a started trunk: its go frame is not yet placed (M3-D8)
+	calls  atomic.Int32                // reader, writer and watchdog calls into the endpoint in progress (M3-D13, R1-16)
+	ready  atomic.Bool                 // in the trunk's ready ring or the writer's round scratch (R1-1)
+
+	// The writer's DRR state of the view (MUX trunks; writer goroutine only).
+	deficit   int   // payload bytes owed from earlier rounds (≤ 2 quanta)
+	capMarked bool  // the view's last Fill marked the batch cap-blocked: the PONG that frees capacity readies it
+	wakeAt    int64 // nanoseconds after base of the view's Batch.WakeAt request; 0 = none
+
+	// Per-view counters (MUX trunks; the carrier's own counters stay
+	// trunk-wide).
+	tx, rx, retx, frames atomic.Uint64
+
 	// Immutable from construction.
 	env     *Env
 	tm      Timing // env.Timing with defaults for zero fields
@@ -203,6 +227,8 @@ type joinState struct {
 	// readerExit, when set, is closed as the reader part finishes: the
 	// closer of a drain-bound retirement waits on it (closeRetiredDrain).
 	readerExit chan struct{}
+	// onDone is rung once when Done closes (OnDone, R1-7).
+	onDone Doorbell
 }
 
 // newConn returns an unstarted carrier over nc. The handshake code sets the
@@ -215,6 +241,7 @@ func newConn(env *Env, nc net.Conn, id uint32, peer [16]byte, factory int, name 
 		ncClose: closeOnce{nc: nc},
 		id:      id,
 		peer:    peer,
+		handle:  wire.SessionHandle,
 		factory: factory,
 		name:    name,
 		dialer:  dialer,
@@ -313,6 +340,79 @@ func (c *Conn) SetBudget(cmtu int) {
 
 // PeerInstance returns the remote Runtime's InstanceID from the handshake.
 func (c *Conn) PeerInstance() [16]byte { return c.peer }
+
+// Handle returns the view's session handle: wire.SessionHandle (1) on a
+// dedicated carrier, the handle the dialer allocated on a MUX trunk.
+// Immutable.
+func (c *Conn) Handle() uint32 { return c.handle }
+
+// Shared returns the number of live views on the carrier: 1 on a dedicated
+// carrier, 0 once the view ended.
+func (c *Conn) Shared() int {
+	if dead, _, _, _ := c.Death(); dead {
+		return 0
+	}
+	if c.trunk == nil {
+		return 1
+	}
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.nviews
+}
+
+// Mux reports whether the carrier negotiated wire.OptMux (a MUX trunk).
+// Immutable after the handshake.
+func (c *Conn) Mux() bool { return c.trunk != nil && c.mux }
+
+// HeldAfterResponse reports a passive view admitted on a started MUX trunk
+// whose OK response was placed and whose go frame from the dialer has not
+// arrived: its lane's Fill places nothing for it (M3-D8). Always false on a
+// dedicated carrier.
+func (c *Conn) HeldAfterResponse() bool { return c.held.Load() }
+
+// NeedGo reports a dialer view opened on a started MUX trunk whose go frame
+// (an ACK for a stream session, a PACK for a packet session) is not yet
+// placed: its lane's first Fill places it before anything else (M3-D8).
+// Always false on a dedicated carrier.
+func (c *Conn) NeedGo() bool { return c.needGo.Load() }
+
+// KillTrunk kills the physical carrier and so every view on it (R1-2,
+// M3-D61): carrier-internal failures, every protocol violation (M3-D15)
+// and the Runtime close bound. It returns what Kill returns. On a
+// dedicated carrier it is Kill.
+func (c *Conn) KillTrunk(cause Cause, detail string) bool {
+	return c.Kill(cause, detail)
+}
+
+// OnDone rings b once when Done closes, at once if it already closed
+// (M3-D43, R1-7): the session registers its doorbell on every carrier
+// whose join it waits for — the carriers it dropped, started or not, and an
+// ended lane's carrier whose reader it awaits — so a parked actor learns
+// the join without selecting on Done. The doorbell given to Start is not
+// rung at Done: it rings once per death (L01). A Conn keeps one OnDone
+// doorbell; a later call replaces one that has not rung. A nil b does
+// nothing.
+func (c *Conn) OnDone(b Doorbell) {
+	if b == nil {
+		return
+	}
+	c.jmu.Lock()
+	if c.join.doneClosed {
+		c.jmu.Unlock()
+		b.Ring()
+		return
+	}
+	c.join.onDone = b
+	c.jmu.Unlock()
+}
+
+// Refuse queues the refusal a for handle h of a passive MUX trunk, a handle
+// that never becomes a view (the refusal ring, M3-D12, R1-4). It returns
+// false when the ring was full: the trunk was then killed
+// (protocol_violation "mux flood").
+func (c *Conn) Refuse(h uint32, a Answer) bool {
+	panic("unimplemented: M3")
+}
 
 // Factory returns the dialer factory index (-1 on the passive side).
 func (c *Conn) Factory() int { return c.factory }
@@ -467,9 +567,14 @@ func (c *Conn) GoAway() {
 }
 
 // Death returns the death record (lock-free): whether the carrier ended,
-// the first cause, a diagnostic detail and when it was recorded.
+// the first cause, a diagnostic detail and when it was recorded. On a view
+// of a MUX trunk it is the view's own end record (retired, killed, written
+// and closed; R1-3) once it is set, else the carrier's.
 func (c *Conn) Death() (dead bool, cause Cause, detail string, at time.Time) {
-	r := c.death.Load()
+	r := c.end.Load()
+	if r == nil {
+		r = c.death.Load()
+	}
 	if r == nil {
 		return false, CauseNone, "", time.Time{}
 	}
@@ -482,7 +587,8 @@ func (c *Conn) Death() (dead bool, cause Cause, detail string, at time.Time) {
 // the CarrierID is released and every abandoned goroutine is counted in
 // Env.Abandon, so a joiner woken by Done sees the final state; a closer
 // abandoned before its Close has had its conn's last-resort close started
-// (design §0.8 V2).
+// (design §0.8 V2). When it closes it rings the OnDone doorbell (M3-D43,
+// R1-7).
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
 // PeerClosed reports that the peer sent CLOSE on this carrier.
@@ -532,10 +638,13 @@ func (c *Conn) capacityLocked() int64 {
 
 // Stats returns a point-in-time copy of the estimator and counters.
 func (c *Conn) Stats() Stats {
+	shared := c.Shared()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st := &c.st
 	s := Stats{
+		Handle:     c.handle,
+		Shared:     shared,
 		Kind:       c.Kind(),
 		SRTT:       st.srtt,
 		MinRTT:     st.minRTT,
@@ -569,6 +678,8 @@ func (c *Conn) Stats() Stats {
 // Stats is a point-in-time view of one carrier.
 type Stats struct {
 	Kind              wire.CarrierKind // the carrier's kind (Conn.Kind)
+	Handle            uint32           // the view's handle (Conn.Handle; 1 on a dedicated carrier)
+	Shared            int              // live views on the carrier at the snapshot (Conn.Shared; 1 on a live dedicated carrier, 0 once ended)
 	SRTT, MinRTT      time.Duration
 	Rate              float64   // bytes/s proven by PONG watermarks (decaying max, backlog-gated)
 	RxRate            float64   // DATA payload bytes/s received (decaying max)
@@ -805,6 +916,13 @@ func (c *Conn) maybeDoneLocked() {
 		c.env.IDs.Release(c.id) // the allocator's lock is a leaf
 	}
 	close(c.done)
+	// The OnDone doorbell: non-blocking and lock-free, so it may ring under
+	// this leaf lock (M3-D43, R1-7). The Start doorbell does not ring here:
+	// it rings once per death (L01).
+	if b := j.onDone; b != nil {
+		j.onDone = nil
+		b.Ring()
+	}
 }
 
 // finishRetire ends a planned retirement (both CLOSEs exchanged, EOF or

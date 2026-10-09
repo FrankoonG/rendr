@@ -71,6 +71,27 @@ const (
 	// KnownRequired is the set of required PREFACE feature bits this build
 	// implements (none). Any other required bit is answered FEATURE.
 	KnownRequired uint32 = 0
+
+	// OptMux is optional PREFACE feature bit 0 (M3-D3): rendr mux. The
+	// dialer sets it in the PREFACE of a session carrier of a mux-eligible
+	// factory (never on a probe carrier); a passive that implements mux
+	// echoes it in PREFACE_ACK(OK) iff the PREFACE carried it. A carrier is
+	// a MUX trunk iff both carry it: it then carries several sessions, one
+	// per handle (OPEN and JOIN for new handles on the live carrier, DETACH
+	// to end one). Otherwise it is dedicated and carries handle 1 only. A
+	// PREFACE_ACK with OptMux for a PREFACE without it fails the dialer's
+	// attempt as a carrier error.
+	OptMux uint32 = 1 << 0
+)
+
+// Session modes as OPEN.mode and JOIN.mode carry them (1 selector, 2 bond,
+// 3 race). The codec accepts 1 … MaxMode; a build without race answers
+// mode 3 BAD_REQUEST CodeBadMode.
+const (
+	// ModeRace: every member carrier carries every byte or datagram (M3).
+	ModeRace uint8 = 3
+	// MaxMode is the largest mode value the codec accepts.
+	MaxMode uint8 = ModeRace
 )
 
 // Magic starts every PREFACE and PREFACE_ACK.
@@ -279,11 +300,20 @@ const (
 	CodeBadKind       uint32 = 2 // BAD_REQUEST: an unknown session kind, or a session kind this carrier cannot open (M2 design §A3.5)
 	CodeMetadataSize  uint32 = 3 // BAD_REQUEST: mlen exceeds the passive's MaxMetadata → ErrMetadataTooLarge
 	CodeBadValue      uint32 = 4 // BAD_REQUEST: reserved flags, pmtu or another field out of range
+	CodeDuplicateView uint32 = 5 // BAD_REQUEST: the session already holds a view on this MUX trunk without the peer's DETACH (M3-D23)
 	CodeMaxSessions   uint32 = 1 // CAPACITY: the passive Runtime is at MaxSessions
 	CodeBacklog       uint32 = 2 // CAPACITY: the Listener's AcceptBacklog is full
 	CodeAcceptTimeout uint32 = 3 // CAPACITY: the application did not Confirm within AcceptTimeout
 	CodeCarriers      uint32 = 4 // CAPACITY: the session already holds MaxCarriersPerSession carriers
 	CodeAbandoned     uint32 = 5 // CAPACITY: the passive's abandoned-call pool is full
+	// CodeMuxFull (CAPACITY): the MUX trunk holds its maximum of views (M3
+	// design §A3.5): a carrier refusal, never an application error; the
+	// attempt dials elsewhere without penalty.
+	CodeMuxFull uint32 = 6
+	// CodeListenerClosed (CAPACITY): an OPEN on a MUX trunk whose Listener
+	// was closed (R1-10): a carrier refusal for OPENs only; the trunk stays
+	// usable for JOINs and the dialer's gone-away set is not touched.
+	CodeListenerClosed uint32 = 7
 )
 
 // RST codes below 256 are reserved for rendr; rendr.AbortCode values equal

@@ -38,6 +38,7 @@ type Runtime struct {
 	cancel  context.CancelCauseFunc
 	backlog [numKinds]atomic.Int64 // pending sessions across Listeners per kind (Status.AcceptBacklog)
 	closing atomic.Bool            // set under mu by Close; read lock-free on admission paths
+	actors  atomic.Int64           // running session actor goroutines (Status.Actors; session.Params.Actors)
 
 	hsg  *group        // handshake goroutines (accept loops and Handle start them) and their conn closers
 	slg  *group        // sessionless carriers' watchers
@@ -207,8 +208,14 @@ func (rt *Runtime) Status() Status {
 		CallbackPanics:     panics,
 		ConfigAdjustments:  adj,
 		Datagram:           rt.datagramStatus(srcs),
+		Mux:                rt.muxStatus(),
+		Actors:             int(rt.actors.Load()),
 	}
 }
+
+// muxStatus returns Status.Mux: the Peers' pools (dialer) and the trunk set
+// of passive MUX trunks. Zero while the Runtime has no MUX trunk.
+func (rt *Runtime) muxStatus() MuxStatus { return MuxStatus{} }
 
 // Close shuts the Runtime down (idempotent, bounded): new handshakes are
 // answered PREFACE_ACK(GOING_AWAY); every Listener closes; every pending

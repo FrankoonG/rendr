@@ -977,6 +977,7 @@ func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	default:
 		a.retireLaneLocked(l)
 	}
+	s.raceAttachLocked(l)
 	s.routingChangedLocked()
 	a.episodeEndLocked(now)
 	est.Conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Gauge: a.laneGauge(est.Conn.Kind(), i)})

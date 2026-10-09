@@ -38,6 +38,10 @@ type StreamCarrier struct {
 	// before anything else inside the embedder's own open request, saving
 	// one round trip. The returned conn must not deliver first again.
 	DialEarly func(ctx context.Context, first []byte) (net.Conn, error)
+	// Props describe the factory to the scheduler: fate group, cheap
+	// subflows, head-of-line coupling. The zero value shares the factory's
+	// carriers between the Peer's sessions in a fate group of its own.
+	Props Props
 }
 
 func (StreamCarrier) isCarrier() {}
@@ -72,6 +76,8 @@ type Peer struct {
 	names     []string          // factory names in configuration order (PeerStatus)
 	health    *carrier.Health   // nil for a single factory (no probing, design §7.8)
 	env       session.Env       // the Env template of this Peer's sessions; each Dial adds its own Registry (dialReg)
+	props     peerProps         // the factories' interned Props (peer_props.go)
+	pool      *carrier.Pool     // the Peer's shared carriers (rendr mux); nil while no factory is mux-eligible
 
 	mu     sync.Mutex // a leaf (design §3.2)
 	closed bool

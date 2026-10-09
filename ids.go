@@ -80,6 +80,14 @@ const (
 	// bond sessions should not have more factories than the passive's
 	// MaxCarriersPerSession.
 	ModeBond Mode = 2
+	// ModeRace: every member carrier carries every byte or datagram and the
+	// receiver keeps the first copy. Members are chosen as for ModeBond: one
+	// per fate group (Props.FateGroup), up to MaxCarriersPerSession; a dead
+	// member is redialled at once. Throughput is the fastest member's, never
+	// the sum; the wire bytes and the sender's CPU grow with the member
+	// count. Dial and DialPacket refuse it with ErrProtocol until race is
+	// implemented.
+	ModeRace Mode = 3
 )
 
 // String returns "selector", "bond" or "mode(N)".

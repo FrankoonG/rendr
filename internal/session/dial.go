@@ -28,6 +28,19 @@ type DialSpec struct {
 	// and marked failed for the selector's Evaluate, so that it never
 	// becomes a quality target.
 	Eligible uint16
+
+	// Pool is the Peer's carrier pool (M3-D16): attempts on mux-eligible
+	// factories (carrier.Factory.Mux) go through it. nil: every attempt
+	// dials its own carrier (M2).
+	Pool *carrier.Pool
+	// Groups is the fate-group index of every factory (M3-D36, M3-D37):
+	// factories with the same non-empty Props.FateGroup share an index from
+	// 1 up; index 0 is a group of its own (an empty FateGroup), so a zero
+	// Groups keeps every factory independent.
+	Groups [16]uint8
+	// Coupled has bit i set when factory i's fate group is HoLCoupled
+	// (M3-D39).
+	Coupled uint16
 }
 
 // Dial creates a dialer session and runs its opening phase (design §6.6):
@@ -120,7 +133,8 @@ func dial(ctx context.Context, env *Env, spec DialSpec, h healthSource) (*Sessio
 		d.release = h.Hold()
 		d.unsub = h.Subscribe(&s.mb)
 	}
-	go a.run()
+	s.mb.actor.Store(a) // rings kick the actor from now on (R1-7)
+	a.kick()
 	select {
 	case err := <-d.result:
 		return dialReturn(s, err)

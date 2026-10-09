@@ -117,6 +117,11 @@ type lane struct {
 	finHere      bool       // (S) our unacknowledged FIN went out here
 	idle         bool       // (S) the writer found nothing in its last Fill
 
+	// Race lanes only (M3 design §A6).
+	rnext  uint64 // (S) stream race: the next offset this lane sends; Fill clamps it to sBase (M3-D30)
+	rpos   uint64 // (S) packet race: this lane's position in the tx ring (M3-D32)
+	goOwed bool   // (S) a dialer lane on a view of a started MUX trunk: the go frame is not yet placed (M3-D8)
+
 	// Packet lanes only (M2).
 	lastDgramAt  time.Time // (S) when this lane last placed a DGRAM (bond death counting, M2-D44)
 	capMarked    bool      // (S) its latest Fill left a queued datagram for want of capacity and marked the batch cap-blocked: the PONG that frees capacity wakes it (pktWakeCappedLocked)
@@ -210,6 +215,8 @@ type stream struct {
 	rxBytes   uint64 // in-order bytes received
 	delivered uint64 // bytes delivered to the application (discarded ones included)
 	retxBytes uint64 // DATA payload bytes retransmitted
+	copyBytes uint64 // race sender: payload bytes a lane placed below another lane's cursor (extra copies, M3-D35)
+	dupBytes  uint64 // receiver: bytes that arrived again (race copies, rescue duplicates) and were discarded (M3-D35)
 
 	order   []*lane   // lanes by srtt; refreshed when older than PingBusy or on lane changes
 	orderAt time.Time // when order was last refreshed

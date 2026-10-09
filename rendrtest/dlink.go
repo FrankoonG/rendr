@@ -490,6 +490,17 @@ func (l *DatagramLink) ForeignNext(d Dir) {
 	l.n.mu.Unlock()
 }
 
+// ReplayInto re-delivers the n-th datagram (0 = the first) the dialer end
+// of this link's latest carrier sent into dst's latest carrier, Up, as if
+// its own dialer had sent it: datagram replay into another carrier (M3
+// design §A9.2). It panics for a datagram the link no longer keeps.
+func (l *DatagramLink) ReplayInto(dst *DatagramLink, n int) { panic("unimplemented: M3") }
+
+// SpliceFrom makes this link's latest carrier deliver, Up, the datagrams
+// other's latest carrier sends from now on instead of n of its own: the
+// datagrams of two carriers spliced.
+func (l *DatagramLink) SpliceFrom(other *DatagramLink, n int) { panic("unimplemented: M3") }
+
 // Stats returns the link's counters.
 func (l *DatagramLink) Stats() DatagramStats { return l.n.stats() }
 

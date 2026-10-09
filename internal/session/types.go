@@ -1,6 +1,7 @@
 package session
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -16,6 +17,7 @@ type Mode uint8
 const (
 	ModeSelector Mode = 1
 	ModeBond     Mode = 2
+	ModeRace     Mode = 3 // every member carries every byte or datagram (M3-D28)
 )
 
 // Role is the session side (numerically equal to rendr.Role).
@@ -140,6 +142,13 @@ type Params struct {
 	Kind wire.CarrierKind
 	// Packet is the frozen packet configuration (packet sessions only).
 	Packet PacketParams
+
+	// ActorLinger: the actor parks after this long without a step that did
+	// work (M3-D42; 0 = 1 s; testhooks.ActorLinger).
+	ActorLinger time.Duration
+	// Actors is the Runtime's gauge of running actor goroutines
+	// (rendr.Status.Actors, M3-D44); nil: not counted.
+	Actors *atomic.Int64
 }
 
 // PacketParams is the frozen configuration of a packet session (M2-D1),

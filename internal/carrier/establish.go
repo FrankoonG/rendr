@@ -37,6 +37,10 @@ type Factory struct {
 	// transport's own Headroom and not counted. A carrier's cmtu offer is
 	// min(MTU, its transport's Limit) (M2-D50).
 	MTU int
+	// Mux: the factory is mux-eligible (M3-D2: !Props.CheapSubflow). Its
+	// session carriers set wire.OptMux and go through the Peer's Pool.
+	// False: every session dials its own carriers of it (M2).
+	Mux bool
 }
 
 // Established is a dialer carrier whose handshake completed: PREFACE_ACK(OK)
@@ -46,6 +50,10 @@ type Established struct {
 	Ack     wire.PrefaceAck // Status == PrefaceOK
 	Resp    wire.Header     // the passive's first frame: OPEN_ACK, JOIN_ACK, PONG, CLOSE or GOAWAY
 	Payload []byte          // a copy of the response payload (≤ 300 bytes)
+	// Fresh: Conn is view 1 of a new MUX trunk that the Pool publishes when
+	// the session starts it (M3-D19); false for a dedicated carrier and for
+	// a view opened on a live trunk.
+	Fresh bool
 }
 
 // EstablishError describes a failed attempt. It wraps the underlying error.

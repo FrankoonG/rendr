@@ -2,6 +2,7 @@ package session
 
 import (
 	"sync"
+	"sync/atomic"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
@@ -26,6 +27,10 @@ type mailbox struct {
 	closed  bool          // set by the actor at exit (close); post fails afterwards
 	started bool          // a passive session's Start ran (start)
 	bell    chan struct{} // cap 1: the doorbell (also rung for facts); made by init
+	// actor is the session's actor once Start published it (R1-7): every
+	// ring kicks it. nil before Start: a ring then only leaves the token,
+	// which the actor finds when it runs.
+	actor atomic.Pointer[actor]
 }
 
 // The mailbox is the session's carrier.Doorbell (carrier.Conn.Start,
@@ -68,12 +73,17 @@ func (m *mailbox) post(c command) bool {
 }
 
 // ring is a non-blocking, coalescing send on the doorbell: a token left
-// while the actor is busy makes it run one more step. It takes no lock, so
-// it may be called from any goroutine with any lock held.
+// while the actor is busy makes it run one more step. It then kicks the
+// published actor (R1-7), so every post, Ring, ringActor and health
+// notification reaches a parked actor. It takes no lock, so it may be
+// called from any goroutine with any lock held.
 func (m *mailbox) ring() {
 	select {
 	case m.bell <- struct{}{}:
 	default:
+	}
+	if a := m.actor.Load(); a != nil {
+		a.kick()
 	}
 }
 

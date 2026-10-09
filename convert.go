@@ -17,6 +17,7 @@ import (
 var (
 	_ [0]struct{} = [int(ModeSelector) - int(session.ModeSelector)]struct{}{}
 	_ [0]struct{} = [int(ModeBond) - int(session.ModeBond)]struct{}{}
+	_ [0]struct{} = [int(ModeRace) - int(session.ModeRace)]struct{}{}
 	_ [0]struct{} = [int(RoleDialer) - int(session.RoleDialer)]struct{}{}
 	_ [0]struct{} = [int(RolePassive) - int(session.RolePassive)]struct{}{}
 	_ [0]struct{} = [int(StatePending) - int(session.StatePending)]struct{}{}

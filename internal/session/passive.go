@@ -91,7 +91,8 @@ func (s *Session) Start() {
 	a.unconfirmed = append(a.unconfirmed, first)
 	a.acceptBy = first.since.Add(orDefault(s.p.AcceptTimeout, defAcceptTimeout))
 	first.c.Start(s.endpoint(first), &s.mb, carrier.StartOptions{Hold: true})
-	go a.run()
+	s.mb.actor.Store(a) // rings kick the actor from now on (R1-7)
+	a.kick()
 }
 
 // carriersLocked counts the lanes that are not dead plus the adopts posted
