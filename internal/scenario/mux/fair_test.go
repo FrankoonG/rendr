@@ -12,7 +12,6 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
-	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 )
 
 // stalledFull waits until the sender of a session whose receiving
@@ -141,13 +140,9 @@ func TestMuxReaderNeverBlocks_L15(t *testing.T) {
 // control frames): 16 selector sessions share the one carrier of a
 // one-factory Peer over a Link of 20 ms RTT shaped to 4 MiB/s (2 MiB/s
 // under -race, R1-11), with a 1-MiB Window on both ends (so the stalled
-// windows fill in seconds); every session sends open-ended bulk A → B.
-// Premise sizing (A11.5 rule 3): at the default 64-KiB DRR quantum an
-// active session's fair share is 4 quanta per second (2 under -race), and
-// at that granularity the writer's cap-limited rotation, not isolation,
-// decides the per-session shares (TestMuxCapLimitedSharesFair: 0.55 of the
-// fair share seen under -race); the quantum is 8 KiB on both ends
-// (testhooks MuxQuantum), as in TestMuxFairness_L15.
+// windows fill in seconds); every session sends open-ended bulk A → B, at
+// the default 64-KiB DRR quantum (an active session's fair share is 4
+// quanta per second, 2 under -race).
 //
 // Stimulus: the receiving applications of 8 sessions stop reading for 120
 // virtual s; their senders block once their windows are full. Load: the 8
@@ -167,10 +162,9 @@ func TestMuxStalledReaderIsolation_L15_L16(t *testing.T) {
 		rate = 2 << 20 // R1-11
 	}
 	synctest.Test(t, func(t *testing.T) {
-		const window, measure, stall, quantum = 1 << 20, 10 * time.Second, 120 * time.Second, 8 << 10
+		const window, measure, stall = 1 << 20, 10 * time.Second, 120 * time.Second
 		cfg := rendr.Config{Window: window}
-		ov := testhooks.Overrides{MuxQuantum: quantum}
-		w := newWorld(t, worldOpts{dcfg: cfg, pcfg: cfg, dov: ov, pov: ov}, linkSpec{name: "a", oneWay: 10 * time.Millisecond, rate: rate})
+		w := newWorld(t, worldOpts{dcfg: cfg, pcfg: cfg}, linkSpec{name: "a", oneWay: 10 * time.Millisecond, rate: rate})
 		peer := w.peer("a")
 		ps := w.openMany(peer, "S", 16, func(int) rendr.Mode { return rendr.ModeSelector })
 		requireShared(t, ps)
@@ -252,6 +246,79 @@ func TestMuxStalledReaderIsolation_L15_L16(t *testing.T) {
 			rx[i].waitSent(t, tx[i], time.Minute)
 		}
 		closeAll(t, ps[:8])
+		w.noViolation()
+		w.close()
+	})
+}
+
+// TestMuxCapLimitedSharesFair (M3 design §A5.3, M3-D10; L15): 8 selector
+// sessions share the one carrier of a one-factory Peer over a Link of
+// 20 ms RTT shaped to 1 MiB/s, each sending open-ended bulk B → A, so
+// every view is backlogged and the carrier runs at its capacity cap: a
+// PONG frees room for a few DRR quanta (64 KiB) and a writer round serves
+// one to four views before the cap stops it.
+//
+// PASS: deficit round robin over backlogged views serves them in turn, so
+// in any span of 8 quanta per view each view gets its 8 within ±2: in every
+// 4-s window (≈ 64 quanta in all, 8 per view at 128 KiB/s) starting each
+// second from 2 s to 14 s, every session receives the mean ± 2 quanta;
+// then every byte arrives verified with io.EOF after exactly what its
+// sender wrote, and the sessions close cleanly.
+//
+// Before WP DRR (m3 at 8a9b989) it failed at every GOMAXPROCS, with or
+// without a shallow bottleneck queue and under -race: windows where one
+// view got 3 quanta and another 12. The writer's round started at a
+// rotating cursor over the ready ring, whose order was the previous
+// rounds' visit order (the views a round served went back in scratch index
+// order, the PONG re-readied the cap-marked ones in the order the cap had
+// stopped them, wakes pushed others in between), so one view was served at
+// 6 of 7 consecutive PONGs while another waited; and a view the cap stopped
+// lost its deficit. TestMuxDRRRotationAfterCapStop and
+// TestMuxDRRDeficitKeptAtCapStop (internal/carrier) are the unit rows.
+func TestMuxCapLimitedSharesFair(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const n, rate, quantum = 8, 1 << 20, 64 << 10
+		w := newWorld(t, worldOpts{}, linkSpec{name: "a", oneWay: 10 * time.Millisecond, rate: rate})
+		peer := w.peer("a")
+		ps := w.openMany(peer, "S", n, func(int) rendr.Mode { return rendr.ModeSelector })
+		requireShared(t, ps)
+		b := w.startBulk(ps, openEnded, 0)
+		start := time.Now()
+		sleepUntil(start.Add(18 * time.Second))
+		var bad []string
+		for at := start.Add(2 * time.Second); !at.After(start.Add(14 * time.Second)); at = at.Add(time.Second) {
+			var xs []int64
+			var sum int64
+			for _, r := range b.rx {
+				x := r.bytesAt(at.Add(4*time.Second)) - r.bytesAt(at)
+				xs = append(xs, x)
+				sum += x
+			}
+			mean := sum / n
+			var qs []string
+			off := false
+			for _, x := range xs {
+				qs = append(qs, fmt.Sprintf("%.1f", float64(x)/quantum))
+				off = off || x < mean-2*quantum || x > mean+2*quantum
+			}
+			t.Logf("window +%v: quanta per view %v (mean %.1f)", at.Sub(start), qs, float64(mean)/quantum)
+			if off {
+				bad = append(bad, fmt.Sprintf("+%v: %v (mean %.1f)", at.Sub(start), qs, float64(mean)/quantum))
+			}
+		}
+		for _, s := range b.tx {
+			s.end()
+		}
+		for i, r := range b.rx {
+			r.waitSent(t, b.tx[i], 5*time.Minute)
+		}
+		for _, r := range b.up {
+			r.wait(t, time.Minute)
+		}
+		if len(bad) > 0 {
+			t.Errorf("4-s windows where a backlogged view's quanta left the mean ± 2: %v", bad)
+		}
+		closeAll(t, ps)
 		w.noViolation()
 		w.close()
 	})
@@ -384,51 +451,47 @@ func p99(ds []time.Duration) time.Duration {
 // TestMuxFairness_L15 (M3 design §A11.2, §A5.3; L15, M3-D10 DRR): 8 bulk
 // sessions (4 sending A → B, 4 B → A, open-ended) and 1 echo session share
 // the one carrier of a one-factory Peer over a Link of 20 ms RTT shaped to
-// 4 MiB/s per direction (under -race too, see fairness) with a bottleneck
+// 4 MiB/s per direction (under -race too, see below) with a bottleneck
 // queue of rate/16 (62.5 ms; rendrtest's default 2-MiB buffer is a 500-ms
 // queue at 4 MiB/s, and with it one direction of a carrier loaded both
-// ways collapses: TestMuxBulkBothWaysKeepsTheLink, DEFECT 2).
-//
-// Premise sizing (A11.5 rule 3; an amendment of A11.2 that needs the
-// owner's sign-off): fairness is measured as byte shares over 1-s windows,
-// and a share is counted in DRR quanta; at the default 64-KiB quantum a
-// session's 1 MiB/s is 16 quanta per window, and the
-// writer's cap-limited rotation (TestMuxCapLimitedSharesFair, DEFECT 1)
-// rather than DRR's quota decides the shares and the echo's wait at that
-// granularity. The quantum is 8 KiB on both ends (testhooks MuxQuantum);
-// the same row at the default quantum is TestMuxFairnessDefaultQuantum_L15,
-// a failing row until DEFECT 1 is fixed.
+// ways collapses: TestMuxBulkBothWaysKeepsTheLink), at the default 64-KiB
+// DRR quantum: a session's 1 MiB/s is 16 quanta per 1-s window.
 //
 // The echo session's dialer writes a 1-KiB request every 100 ms and times
 // its echo (pipelined, as G2's echo); its unloaded round trip (base) is
 // measured before the bulk starts. PASS: load — each direction's 4 bulk
 // sessions carry ≥ 0.85 of the link over the run; fairness — in every 1-s
 // window from 1 s after the bulk start to its end, Jain's index of the 4
-// bulk sessions' received bytes is ≥ 0.95 in each direction; the echo —
-// at least 90 % of one sample per 100 ms, and its P99 round trip under
-// load at most base + Cap/rate + 2·RTT (Cap: the largest Cap either end
-// of the shared carrier reported during the run): DRR keeps the echo a
-// round away from the head, never behind the 4 × 8-MiB send backlog of its
+// bulk sessions' received bytes is ≥ 0.95 in each direction, and every
+// bulk session receives its direction's mean ± 2 quanta (a deficit round
+// robin over 4 backlogged views keeps each within a quantum or two of the
+// others; formerly TestMuxFairnessDefaultQuantum_L15); the echo — at least
+// 90 % of one sample per 100 ms, and its P99 round trip under load at most
+// base + Cap/rate + 2·RTT (Cap: the largest Cap either end of the shared
+// carrier reported during the run): DRR serves the echo's view in the
+// round after its wake, never behind the 4 × 8-MiB send backlog of its
 // direction; integrity — every echo verified and every bulk byte verified
 // with io.EOF after exactly what its sender wrote; a clean end and nothing
 // left after Runtime.Close.
+//
+// Before WP DRR the carrier ran cap-limited and the writer's rotation, not
+// DRR's quota, decided who was served: windows of 10–13 quanta against a
+// mean near 16 in 24 of 24 runs, and echo P99 0.38–1.45 s (0.64 s under
+// -race) against a limit of about 0.54 s.
 func TestMuxFairness_L15(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) { fairness(t, 8<<10, false) })
+	synctest.Test(t, fairness)
 }
 
-// fairness runs TestMuxFairness_L15 with the DRR quantum on both ends;
-// with roundRobin every bulk session's 1-s window must also hold the
-// direction's mean ± 2 quanta (TestMuxFairnessDefaultQuantum_L15).
-func fairness(t *testing.T, quantum int, roundRobin bool) {
+func fairness(t *testing.T) {
 	// 4 MiB/s under -race too (not R1-11's quarter): at 2 MiB/s one
 	// direction of the carrier, loaded both ways, falls to 0.55–0.85 of the
 	// link with any bottleneck queue from 64 to 512 KiB, with or without
-	// the race detector (DEFECT 2, TestMuxBulkBothWaysKeepsTheLink); the
-	// row returns to R1-11's size once that is fixed.
+	// the race detector (TestMuxBulkBothWaysKeepsTheLink, the estimator's
+	// defect); the row returns to R1-11's size once that is fixed.
+	const quantum = 64 << 10 // the default DRR quantum (M3-D10)
 	const rate = float64(4 << 20)
 	const oneWay, run = 10 * time.Millisecond, 10 * time.Second
-	ov := testhooks.Overrides{MuxQuantum: quantum}
-	w := newWorld(t, worldOpts{dov: ov, pov: ov}, linkSpec{name: "a", oneWay: oneWay, rate: rate, buffer: int(rate) / 16})
+	w := newWorld(t, worldOpts{}, linkSpec{name: "a", oneWay: oneWay, rate: rate, buffer: int(rate) / 16})
 	peer := w.peer("a")
 	ps := w.openMany(peer, "S", 9, func(int) rendr.Mode { return rendr.ModeSelector })
 	requireShared(t, ps)
@@ -486,12 +549,10 @@ func fairness(t *testing.T, quantum int, roundRobin bool) {
 			if j < 0.95 {
 				t.Errorf("%s: Jain's index %.3f in the window at +%v (bytes %v), want ≥ 0.95", dir, j, at.Sub(start), xs)
 			}
-			if roundRobin {
-				mean := (xs[0] + xs[1] + xs[2] + xs[3]) / 4
-				for i, x := range xs {
-					if math.Abs(x-mean) > float64(2*quantum) {
-						t.Errorf("%s: session %d received %.1f quanta in the window at +%v, want the mean %.1f ± 2 (a round robin)", dir, i, x/float64(quantum), at.Sub(start), mean/float64(quantum))
-					}
+			mean := (xs[0] + xs[1] + xs[2] + xs[3]) / 4
+			for i, x := range xs {
+				if math.Abs(x-mean) > float64(2*quantum) {
+					t.Errorf("%s: session %d received %.1f quanta in the window at +%v, want the mean %.1f ± 2 (a round robin)", dir, i, x/float64(quantum), at.Sub(start), mean/float64(quantum))
 				}
 			}
 		}

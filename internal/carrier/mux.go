@@ -1,9 +1,11 @@
 package carrier
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -72,6 +74,7 @@ type muxState struct {
 	relList  []*Conn  // views with relMarked (each once)
 	wakeList []*Conn  // views with a pending WakeAt (each once)
 	touched  uint64   // views a round visited (ready scratch and wake lists): the cost gate's count (L54)
+	turn     uint64   // the service clock: one tick per DRR call that placed payload (viewExt.served)
 	post     postList // the writer's
 	rpost    postList // the reader's
 }
@@ -122,6 +125,8 @@ type viewExt struct {
 	detBound  int64  // ns after base: the DETACH bound (§A5.5)
 	detCseq   uint32 // datagram trunks: the cseq of our REL{DETACH}
 	relMarked bool   // its last Fill found no REL room
+	served    uint64 // the service clock at the end of the view's latest DRR turn (0: none): rounds serve the least recently served first
+	resume    bool   // its last DRR call was cut short by the batch's end or the capacity cap: the next call finishes that turn
 }
 
 // lastFrame is a view's last session frame (WriteAndClose on a view).
@@ -246,7 +251,9 @@ func (t *trunk) leaveLiveLocked(v *Conn) {
 }
 
 // The ready ring (R1-1): v.ready is true exactly while v is in the ring or
-// in the writer's round scratch.
+// in the writer's round scratch. The ring is a set: its order (wakes, PONG
+// and WakeAt re-readies, the round's returns) decides nothing, because
+// every round orders its scratch by service (drrRound).
 
 func (t *trunk) pushReadyLocked(v *Conn) {
 	n := len(t.readyRing)
@@ -697,8 +704,9 @@ func (t *trunk) takeReadyLocked() int {
 }
 
 // returnScratchLocked puts the scratch views the round left ready back
-// onto the ring in rotation order (R1-1 rule 4); views that ended
-// meanwhile leave it.
+// onto the ring (R1-1 rule 4: the views the DRR loop did not reach because
+// the batch filled); the next round orders them by service, so the order
+// of the push carries nothing. Views that ended meanwhile leave it.
 func (t *trunk) returnScratchLocked(n int) {
 	sc := t.ms.scratch
 	for i := 0; i < n; i++ {
@@ -718,18 +726,44 @@ func (t *trunk) returnScratchLocked(n int) {
 	}
 }
 
+// byService orders a round's views: the least recently served first
+// (viewExt.served; never-served views by handle).
+func byService(a, b *Conn) int {
+	if c := cmp.Compare(a.vx.served, b.vx.served); c != 0 {
+		return c
+	}
+	return cmp.Compare(a.handle, b.handle)
+}
+
 // drrRound runs the control pass and deficit round robin over the n
-// scratch views (M3-D10, R1-1).
+// scratch views (M3-D10, R1-1 as amended by WP DRR).
+//
+// Rotation: the round serves its views in service order, the least
+// recently served first. A view's turn that ends takes the next tick of
+// the trunk's service clock, so a view the round served goes behind every
+// view it did not reach, whatever order wakes, PONGs and returns pushed
+// them onto the ready ring in (a fixed ring order with a rotating start
+// served one view several PONGs in a row while another waited,
+// TestMuxCapLimitedSharesFair). A view that was idle comes back at the
+// head: an interactive view's frame waits at most one round.
+//
+// Deficit: a turn's quota is the deficit plus one quantum (at most two). A
+// call that places payload leaves the view q − used. A turn the shared
+// capacity cap or the batch's end cut short (the cap marked, or the batch
+// has less room than the turn has left) keeps its place and its deficit,
+// and the view's next call finishes it with a quota of that deficit (no new
+// quantum; if that rest is too small for what the view places next, the
+// turn ends and the view stays ready); a call the cap stopped before it
+// placed anything changes nothing. Any other call that places nothing
+// resets the deficit.
 func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 	sc := t.ms.scratch[:n]
-	start := t.cursor % n
-	t.cursor++
+	slices.SortFunc(sc, byService)
 	t.ms.touched += uint64(n)
 	quantum := t.tm.MuxQuantum
 	// Control pass: every ready view places its control frames (ACK, FIN,
 	// RST, SCHED, PACK, responses) before any view's payload (L16).
-	for i := 0; i < n; i++ {
-		v := sc[(start+i)%n]
+	for _, v := range sc {
 		if !v.vx.fillOK.Load() || b.Full() {
 			continue
 		}
@@ -739,13 +773,11 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 	// Deficit round robin over one shared capacity.
 	for {
 		progressed := false
-		for i := 0; i < n; i++ {
+		for k, v := range sc {
 			if b.budget-b.data <= 0 || b.Full() {
 				b.limit(-1)
 				return
 			}
-			k := (start + i) % n
-			v := sc[k]
 			if v == nil {
 				continue
 			}
@@ -755,16 +787,38 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 				continue
 			}
 			q := min(v.deficit+quantum, 2*quantum)
+			if v.vx.resume {
+				q = v.deficit // the rest of a turn the batch or the cap cut
+			}
 			b.limit(q)
 			v.ready.Store(false) // R1-1 rule 3: cleared before the call
-			appended, used := t.viewCall(v, b, rd, nowNs)
+			appended, used, capped := t.viewCall(v, b, rd, nowNs)
 			if hk := t.env.Hooks; hk != nil && hk.AfterViewFill != nil {
 				hk.AfterViewFill(t.id, v.handle)
 			}
-			if used > 0 {
+			ended := false // a cut turn's rest that placed nothing: the turn ends here
+			switch {
+			case used > 0:
 				v.deficit = max(q-used, 0)
-			} else {
-				v.deficit = 0
+				// Cut short by the shared capacity or the batch's end (its
+				// room fell below what the turn had left): the view keeps
+				// its place and finishes the turn first in a later round.
+				v.vx.resume = v.deficit > 0 && (capped || b.budget-b.data < v.deficit)
+				if !v.vx.resume {
+					t.ms.turn++
+					v.vx.served = t.ms.turn
+				}
+			case appended == 0 && !capped:
+				if v.vx.resume {
+					// The rest of a cut turn was smaller than what the view
+					// places next (a datagram is never cut): the turn ends,
+					// and the view, which may have marked itself idle with
+					// payload queued, gets a whole turn in the next round.
+					ended = true
+					t.ms.turn++
+					v.vx.served = t.ms.turn
+				}
+				v.deficit, v.vx.resume = 0, false // nothing placed, and not for want of capacity
 			}
 			if appended == 0 && v.vx.retireQ.Load() {
 				t.mx.Lock()
@@ -773,7 +827,7 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 				t.runPost(&t.ms.post)
 			}
 			switch {
-			case appended == 0 && b.nearFull(), appended > 0 && used == 0:
+			case appended == 0 && b.nearFull(), appended > 0 && used == 0, ended:
 				// The view stays ready for the next round, which the writer
 				// runs by itself (M2's self-continuation, per view; WP10):
 				// a call that placed control frames only, or nothing because
@@ -814,10 +868,11 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 // viewCall makes one Fill call of view v (quota set by the caller) and
 // keeps the view's state: per-view WakeAt, cap and REL marks, counters,
 // the go frame and the passive's first response. It returns the frames and
-// payload bytes the call appended.
-func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appended, used int) {
+// payload bytes the call appended and whether the call marked the batch
+// cap-blocked (the shared capacity stopped it).
+func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appended, used int, capped bool) {
 	if !v.enter() {
-		return 0, 0
+		return 0, 0, false
 	}
 	nb, pb, rb := b.n, b.payload(), b.retx
 	wake, capB, relB := b.wake, b.capBlocked, b.relBlocked
@@ -853,11 +908,12 @@ func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appende
 			wake = w
 		}
 	}
-	b.wake, b.capBlocked, b.relBlocked = wake, capB || b.capBlocked, relB || b.relBlocked
+	capped = b.capBlocked
+	b.wake, b.capBlocked, b.relBlocked = wake, capB || capped, relB || b.relBlocked
 	appended, used = b.n-nb, b.payload()-pb
 	t.countTx(v, b, nb, pb, rb)
 	if appended == 0 {
-		return 0, used
+		return 0, used, capped
 	}
 	if v.needGo.Load() {
 		v.needGo.Store(false) // the go frame is the lane's first frame (M3-D8)
@@ -870,7 +926,7 @@ func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appende
 			t.runPost(&ms.post)
 		}
 	}
-	return appended, used
+	return appended, used, capped
 }
 
 // reReadyLocked readies the views whose wake came (§A4.3): the views a
