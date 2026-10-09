@@ -195,13 +195,16 @@ func TestAdvDatagramFlipsAreLoss_L43(t *testing.T) {
 		time.Sleep(4 * time.Second)
 		w.flip.random(rendrtest.Up, 0)
 		w.flip.random(rendrtest.Down, 0)
-		fu, fd := w.flip.randomFlips(rendrtest.Up), w.flip.randomFlips(rendrtest.Down)
-		t.Logf("random flips: %d dialer → passive, %d back", fu, fd)
+		fu, nu := w.flip.randomFlips(rendrtest.Up)
+		fd, nd := w.flip.randomFlips(rendrtest.Down)
+		t.Logf("random flips: %d of %d datagrams dialer → passive, %d of %d back", fu, nu, fd, nd)
 		// The flips of a direction follow its own seeded draws, one per
-		// datagram: a session's 4,000 and 800 datagrams flip about 60 and 4
-		// to 5 (the few datagrams at the window's edges move the count by
-		// one); the floors leave that margin. The exact accounting below is
-		// the row's assertion.
+		// datagram written while its share is set: a session's about 4,000
+		// and 825 datagrams (a 1 % mean of 40 and 8) flip 62 and 4 to 5
+		// with these seeds — the few datagrams at the window's edges move
+		// the back count by one; the MUX rows' four sessions draw four
+		// times as many. The floors prove the stimulus with that margin;
+		// the exact accounting below is the row's assertion.
 		if fu < 20 || fd < 3 {
 			t.Fatalf("stimulus: %d flips dialer → passive and %d back", fu, fd)
 		}
@@ -571,7 +574,11 @@ func acrossCarriers(t testing.TB, w *world, xs []*ppair, rel bool) (src, dst *re
 	})
 	time.Sleep(time.Second) // the successor runs well past the replays' fseqs
 	sent := w.latestOn(name).written()
-	for i := 1; i < min(16, len(sent)) && len(picks) < 5; i++ {
+	// The first DGRAMs of the record (replayFrom re-sends any of it): a MUX
+	// trunk's first datagrams carry the other sessions' OPENs, SCHEDs and
+	// ACKs, so its first DGRAM may come after the 16 the link keeps (seen
+	// under -race).
+	for i := 1; i < len(sent) && len(picks) < 5; i++ {
 		d := inspect(sent[i])
 		switch {
 		case rel && !d.preface && len(d.rels) > 0:

@@ -619,7 +619,8 @@ type kill struct {
 // view's spans below the ACK edge its other member's copies moved are
 // trimmed (requeueLocked) — so each dialer counts at most that and its
 // passive none (it sent nothing of its own). Bond's data on the dead trunk
-// was its only copy: at least one session counts a death.
+// was its only copy: at least one session counts a death. Every bond or
+// race session gets two live members back on both ends.
 func migrated(t testing.TB, s setup, xs []*pair, k kill, d, own uint64) {
 	t.Helper()
 	if !s.mux {
@@ -685,6 +686,12 @@ func migrated(t testing.TB, s setup, xs []*pair, k kill, d, own uint64) {
 	}
 	var sum uint64
 	for i, x := range xs {
+		// Whatever the counts, each session replaced the member it lost
+		// on k: two live members again on both ends (liveOf excludes the
+		// dead trunk) — the load moved, not only finished on the survivor.
+		waitFor(t, 10*time.Second, fmt.Sprintf("session %d: two live members on both ends after the death of %d", i, k.id), func() bool {
+			return len(liveOf(x.d.Status())) == 2 && len(liveOf(x.p.Status())) == 2
+		})
 		dm, pm := x.d.Status().Migrations, x.p.Status().Migrations
 		if dm.Death > want[i] || pm.Death != 0 {
 			t.Fatalf("session %d: Death migrations: dialer %+v, passive %+v; want at most %d and 0", i, dm, pm, want[i])
@@ -1273,6 +1280,7 @@ type dflip struct {
 	// directions interleave.
 	rng   [2]*rand.Rand
 	flips [2]int // random flips done per direction
+	draws [2]int // datagrams drawn for a random flip per direction
 }
 
 func newDflip() *dflip {
@@ -1322,11 +1330,12 @@ func (f *dflip) random(d rendrtest.Dir, share float64) {
 	f.mu.Unlock()
 }
 
-// randomFlips returns the random flips done in direction d.
-func (f *dflip) randomFlips(d rendrtest.Dir) int {
+// randomFlips returns the random flips done in direction d and the
+// datagrams drawn for them (written while its share was set).
+func (f *dflip) randomFlips(d rendrtest.Dir) (flips, draws int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.flips[dirIndex(d)]
+	return f.flips[dirIndex(d)], f.draws[dirIndex(d)]
 }
 
 func dirIndex(d rendrtest.Dir) int {
@@ -1364,11 +1373,15 @@ func (f *dflip) apply(c *dflipConn, p []byte) []byte {
 			return q
 		}
 	}
-	if i := dirIndex(c.dir); f.rate[i] > 0 && f.rng[i].Float64() < f.rate[i] {
+	i := dirIndex(c.dir)
+	if f.rate[i] > 0 {
+		f.draws[i]++
+	}
+	if f.rate[i] > 0 && f.rng[i].Float64() < f.rate[i] {
 		q := slices.Clone(p)
 		b := f.rng[i].IntN(8 * len(q))
 		q[b/8] ^= 0x80 >> (b % 8)
-		f.flips[dirIndex(c.dir)]++
+		f.flips[i]++
 		return q
 	}
 	return nil

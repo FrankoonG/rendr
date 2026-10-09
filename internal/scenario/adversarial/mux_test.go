@@ -35,9 +35,16 @@ var confusions = []string{"open-used", "data-unopened", "detach-unknown", "after
 // (migrated) and its stream arrives intact; the fifth session of
 // "open-used" opens on another carrier and works. Datagram trunks: the
 // passive drops and counts the frame (the trunk's Dropped), nothing dies,
-// at most the rewritten DGRAM is lost, the fifth session of "open-used"
-// opens (its REL is retransmitted unchanged), and every verifier sees its
-// own datagrams once.
+// at most the rewritten DGRAM is lost, and every verifier sees its own
+// datagrams once. In "open-used" the REL that carries the rewritten OPEN or
+// JOIN is valid, so it is acknowledged (the dialer's trunk retransmits
+// nothing) and only its inner frame is dropped: the view waits for a
+// response until its attempt's bound and is abandoned, and the fifth
+// session opens anyway — a selector session on a fresh carrier of the
+// other link, a bond or race member on the trunk again with a new handle.
+// In "after-detach" the sixth session's open drops nothing: a reused
+// handle's OPEN or JOIN would be dropped and counted there (§A3.3) and
+// its attempt would retry with another handle.
 func TestAdvMuxHandleConfusion_L43_L14(t *testing.T) {
 	for _, kind := range confusions {
 		t.Run("stream/"+kind, func(t *testing.T) {
@@ -62,13 +69,41 @@ func handleOn(st rendr.SessionStatus, id rendr.CarrierID) uint32 {
 	return 0
 }
 
+// sharedOn returns the sessions on carrier id in the session's row of it
+// (status st; Shared): the views of that trunk end that are not gone.
+func sharedOn(st rendr.SessionStatus, id rendr.CarrierID) int {
+	c, _ := carrierOf(st, id)
+	return c.Shared
+}
+
+// retiredOn waits until a view of trunk id is gone on both ends: the trunk's
+// view count in a session's rows of it (dst at the dialer, pst at the
+// passive) dropped below nd and np, read before the view's session ended.
+// A view is gone once it left the trunk's view table (its handle retired:
+// both DETACHes, on a datagram trunk ours acknowledged too) — so a new
+// view opened after this cannot find the handle live, and a reused handle
+// (M3-D4) would be the dialer's choice, not a leftover.
+func retiredOn(t testing.TB, id rendr.CarrierID, dst, pst func() rendr.SessionStatus, nd, np int) {
+	t.Helper()
+	waitFor(t, 10*time.Second, fmt.Sprintf("the idle session's view of trunk %d gone on both ends", id), func() bool {
+		return sharedOn(dst(), id) < nd && sharedOn(pst(), id) < np
+	})
+}
+
+// carrierRetransmits returns the REL retransmissions of the dialer's end of
+// carrier id (its row in the session's status).
+func carrierRetransmits(x *ppair, id rendr.CarrierID) uint64 {
+	c, _ := carrierOf(x.d.Status(), id)
+	return c.Retransmits
+}
+
 // confusionWants are the details a stream trunk's passive may name for
 // each confusion: the trunk's handle rules.
 var confusionWants = map[string][]string{
-	"open-used":      {"handle"},
+	"open-used":      {"for a known handle", "not above every handle seen"},
 	"data-unopened":  {"never opened"},
-	"detach-unknown": {"handle"},
-	"after-detach":   {"handle"},
+	"detach-unknown": {"DETACH for an unknown handle"},
+	"after-detach":   {"no such view (ended)"},
 }
 
 // confuseStream is one stream row of TestAdvMuxHandleConfusion_L43_L14.
@@ -103,7 +138,7 @@ func confuseStream(t *testing.T, s setup, kind string) {
 			if k == 3 {
 				t.Fatalf("premise: four new sessions placed no OPEN or JOIN on trunk %d", id)
 			}
-			t.Logf("a new session placed no view on trunk %d: %+v", id, extra.d.Status().Carriers)
+			misplaced(t, w, x, id, extra)
 			extra.endClean(t)
 		}
 	case "data-unopened":
@@ -120,15 +155,17 @@ func confuseStream(t *testing.T, s setup, kind string) {
 		if h == 0 {
 			t.Fatalf("premise: the idle session has no view on trunk %d", id)
 		}
+		nd, np := sharedOn(x.d.Status(), id), sharedOn(x.p.Status(), id)
 		extra.endClean(t)
 		extra = nil
 		waitFor(t, 10*time.Second, "both DETACHes of the idle session's handle", func() bool {
 			return hasType(tm.Log(rendrtest.Up), rendrtest.FrameDetach) && hasType(tm.Log(rendrtest.Down), rendrtest.FrameDetach)
 		})
+		retiredOn(t, id, x.d.Status, x.p.Status, nd, np)
 		// A session opened within about a second of a retirement on the
 		// trunk tends to get a fresh trunk for one member (newViewOn).
 		time.Sleep(time.Second)
-		sixth := newViewOn(t, w, peer, id)
+		sixth := newViewOn(t, w, peer, x, id)
 		if h6 := handleOn(sixth.d.Status(), id); h6 <= h {
 			t.Fatalf("the sixth session's handle on trunk %d is %d, want one above the retired %d (handles are never reused)", id, h6, h)
 		}
@@ -163,14 +200,16 @@ func confuseStream(t *testing.T, s setup, kind string) {
 	w.close()
 }
 
-// newViewOn opens a session over peer that has a view on trunk id. The
-// pool may place a session's member on a freshly dialled trunk although
-// id has room (a race session opened right after a view on id retired:
-// most of the time; a second later about one in eight; a selector or bond
-// fifth session now and then — a placement question for the pool, not
-// this row's); such a session ends cleanly and another one is opened, at
-// most four in all.
-func newViewOn(t testing.TB, w *world, peer *rendr.Peer, id rendr.CarrierID) *pair {
+// newViewOn opens a session over peer that has a view on trunk id (ref is
+// a session that has one). The pool may place a session's member on a
+// freshly dialled trunk although id holds fewer views than the cap (a race
+// session opened right after a view on id retired: most of the time; a
+// second later about one in eight; a selector or bond fifth session now
+// and then). The trunk carries four bulk flows, so it may be write-blocked
+// at the pick, which M3-D17 excludes: a placement question for the pool,
+// not this row's (misplaced logs what the test can see of it). Such a
+// session ends cleanly and another one is opened, at most four in all.
+func newViewOn(t testing.TB, w *world, peer *rendr.Peer, ref *pair, id rendr.CarrierID) *pair {
 	t.Helper()
 	for range 4 {
 		y := w.open(peer)
@@ -180,11 +219,23 @@ func newViewOn(t testing.TB, w *world, peer *rendr.Peer, id rendr.CarrierID) *pa
 		if handleOn(y.d.Status(), id) != 0 {
 			return y
 		}
-		t.Logf("a new session has no view on trunk %d: %+v", id, y.d.Status().Carriers)
+		misplaced(t, w, ref, id, y)
 		y.endClean(t)
 	}
 	t.Fatalf("premise: four new sessions had no view on trunk %d", id)
 	return nil
+}
+
+// misplaced logs a new session y that got no view on trunk id: its rows,
+// the trunk's row at ref (a session on it: its views, and Inflight against
+// Cap — a trunk whose writer is blocked is not usable, M3-D17, and the
+// blocked state itself is not visible here) and the dialer Runtime's mux
+// counters.
+func misplaced(t testing.TB, w *world, ref *pair, id rendr.CarrierID, y *pair) {
+	t.Helper()
+	tr, _ := carrierOf(ref.d.Status(), id)
+	t.Logf("a new session has no view on trunk %d: %+v; trunk %d: %v, %d views, inflight %d of cap %d; dialer %+v",
+		id, y.d.Status().Carriers, id, tr.State, tr.Shared, tr.Inflight, tr.Cap, w.d.Status().Mux)
 }
 
 // hasType reports whether the frame tap log holds a frame of type typ.
@@ -217,7 +268,11 @@ func confuseDatagram(t *testing.T, s setup, kind string) {
 	switch kind {
 	case "open-used":
 		w.flip.rewrite(wire.TypeOpen, 1, id)
+		r0 := carrierRetransmits(x, id)
 		extra = w.openPacket(peer)
+		if r := carrierRetransmits(x, id); r != r0 {
+			t.Fatalf("the dialer's trunk %d retransmitted %d RELs while the fifth session opened, want none (the REL that carried the rewritten OPEN is acknowledged)", id, r-r0)
+		}
 		fe = startPacketFlow(t, "fifth", extra.d, extra.p, 4398, packetRate, 0)
 	case "data-unopened":
 		w.flip.rewrite(wire.TypeDgram, 9, id)
@@ -234,11 +289,21 @@ func confuseDatagram(t *testing.T, s setup, kind string) {
 		if h == 0 {
 			t.Fatalf("premise: the idle session has no view on trunk %d", id)
 		}
+		nd, np := sharedOn(x.d.Status(), id), sharedOn(x.p.Status(), id)
 		extra.endPacket(t, fe)
 		extra = nil
+		retiredOn(t, id, x.d.Status, x.p.Status, nd, np)
+		dr := carrierDropped(x, id)
 		sixth := w.openPacket(peer)
 		if h6 := handleOn(sixth.d.Status(), id); h6 <= h {
 			t.Fatalf("the sixth session's handle on trunk %d is %d, want one above the retired %d (handles are never reused)", id, h6, h)
+		}
+		// A reused handle's OPEN or JOIN is not above every handle the
+		// passive saw: dropped and counted (§A3.3), and the attempt then
+		// retries with another handle — so the handle check above alone
+		// would pass. A clean open drops nothing.
+		if d := carrierDropped(x, id) - dr; d != 0 {
+			t.Fatalf("the passive's trunk %d dropped %d frames while the sixth session opened, want none (a reused handle?)", id, d)
 		}
 		xs = append(xs, sixth)
 		ups = append(ups, startPacketFlow(t, "sixth", sixth.d, sixth.p, 4397, packetRate, 0))
