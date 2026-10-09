@@ -193,8 +193,8 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 	advanced, committed, answered := false, false, false
 	for len(data) > 0 {
 		f, n, err := wire.DecodeFrame(data)
-		if err != nil {
-			c.dgDropped(1) // the rest of this datagram (PA-1)
+		if err != nil || (!c.mux && !dedicatedOK(f.Type, f.Handle)) {
+			c.dgDropped(1) // the rest of this datagram (PA-1; a dedicated carrier: §A3.2)
 			break
 		}
 		data = data[n:]

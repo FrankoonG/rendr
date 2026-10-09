@@ -624,8 +624,8 @@ type dgResp struct {
 func (d *dgDial) frames(data []byte, rwin *wire.FseqWindow) (r dgResp, err error) {
 	for len(data) > 0 {
 		f, n, derr := wire.DecodeFrame(data)
-		if derr != nil {
-			dgEnvDropped(d.env) // the rest of this datagram (PA-1)
+		if derr != nil || !dedicatedOK(f.Type, f.Handle) {
+			dgEnvDropped(d.env) // the rest of this datagram (PA-1; only view 1 exists: §A3.2)
 			return r, nil
 		}
 		data = data[n:]
@@ -649,6 +649,9 @@ func (d *dgDial) frames(data []byte, rwin *wire.FseqWindow) (r dgResp, err error
 			h, inner, perr := wire.ParseRel(f.Payload)
 			if perr != nil {
 				return r, fmt.Errorf("REL: %w", perr)
+			}
+			if !dedicatedOK(h.Type, h.Handle) {
+				return r, fmt.Errorf("REL: %v with handle %d in the handshake", h.Type, h.Handle)
 			}
 			if h.Cseq != d.fcs {
 				dgEnvDropped(d.env) // a REL with another cseq (M2-D20)
@@ -734,7 +737,7 @@ func (d *dgDial) challenges(data []byte) error {
 	answered := false
 	for len(data) > 0 {
 		f, n, err := wire.DecodeFrame(data)
-		if err != nil {
+		if err != nil || !dedicatedOK(f.Type, f.Handle) {
 			break // the rest of this datagram (PA-1)
 		}
 		data = data[n:]

@@ -457,8 +457,12 @@ func muxed(opt uint32, ack *wire.PrefaceAck) bool {
 
 // responseAllowed reports whether h may answer a first frame of type t,
 // and bounds its length: OPEN_ACK answers OPEN, JOIN_ACK answers JOIN, a
-// PONG without pad answers PING; CLOSE and GOAWAY may answer any.
+// PONG without pad answers PING; CLOSE and GOAWAY may answer any. A
+// session response carries handle 1.
 func responseAllowed(t wire.Type, h wire.Header) bool {
+	if !dedicatedOK(h.Type, h.Handle) {
+		return false // a handshake answers view 1 (§A3.2)
+	}
 	switch h.Type {
 	case wire.TypeClose, wire.TypeGoAway:
 		return true
