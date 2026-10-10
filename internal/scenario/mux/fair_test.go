@@ -476,7 +476,12 @@ func p99(ds []time.Duration) time.Duration {
 // carrier reported during the run): DRR serves the echo's view after at
 // most one turn of each bulk view of its direction (§A5.3's echo bound;
 // 4 × 64 KiB fit one 256-KiB batch, so the round after its wake), never
-// behind the 4 × 8-MiB send backlog of its direction; integrity — every echo verified and every bulk byte verified
+// behind the 4 × 8-MiB send backlog of its direction. That per-round
+// bound is the writer's order (TestMuxDRREchoBound in internal/carrier);
+// on the wire the echo's frame still waits for what the trunk already has
+// in flight, which the estimator bounds by Cap, so the amended rule (§A5.3
+// as amended by WP16-MUX-3) is this row's: a view beside backlogged views
+// sees base + Cap/rate + 2·RTT at most; integrity — every echo verified and every bulk byte verified
 // with io.EOF after exactly what its sender wrote; a clean end and nothing
 // left after Runtime.Close.
 //

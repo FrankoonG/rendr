@@ -551,7 +551,16 @@ func waitUntilOK(within time.Duration, cond func() bool) bool {
 //     DeathObserved) until a load session's OPEN made the first redial of
 //     p1 and the next OPEN of the load waits for it: an OPEN claimant
 //     whose verdict outlasts its verdict grace, and an OPEN waiter whose
-//     grace runs out before the JOIN waiters'.
+//     grace runs out before the JOIN waiters'. The dialer's probe carriers
+//     are held across the kill's instant until the shared carrier's death
+//     record is set (probeHold): the kill also ends p1's probe carrier,
+//     and the health publication of that death rings every session actor;
+//     an actor it woke whose step missed the record in its reapDead but
+//     saw it in the same step's bond slot check redialled p1 at once,
+//     past the gate — a legitimate JOIN (M3-D37) that took the OPEN's
+//     place as the first call (WP16-MUX-2: 1 in 90 host -race runs in
+//     I3, 1 of 900 in one host -race -count=300 -cpu 1,2,4 pass; "25 of
+//     24 deaths held", calls [p1 long=true +0s]).
 //
 // PASS: recovery — every selector session active and every bond session
 // with two live members, none of them the dead carrier — within 10 s;
@@ -642,10 +651,74 @@ func (l *dialLog) in(from, to time.Time) []sessionDial {
 	return out
 }
 
+// probeHold holds what the dialer's probe carriers read and write while it
+// is engaged: every Read and Write of a probeConn returns only once the
+// hold is released (at once while it is not engaged). It orders the probe
+// carriers' evidence — above all the death of p1's probe carrier, which
+// the stimulus's Link.Kill ends together with p1's shared carrier — after
+// the death record of the shared carrier, so that the health publication
+// it causes, which rings every session actor, wakes no actor before that
+// record is set (WP16-MUX-2; idleFailover).
+type probeHold struct {
+	mu   sync.Mutex
+	on   chan struct{} // non-nil while engaged; closed by release
+	held atomic.Int64  // probe conn calls that waited
+}
+
+// engage starts holding (a no-op while engaged).
+func (h *probeHold) engage() {
+	h.mu.Lock()
+	if h.on == nil {
+		h.on = make(chan struct{})
+	}
+	h.mu.Unlock()
+}
+
+// release ends the hold and lets every held call return (idempotent).
+func (h *probeHold) release() {
+	h.mu.Lock()
+	if h.on != nil {
+		close(h.on)
+		h.on = nil
+	}
+	h.mu.Unlock()
+}
+
+// wait returns once the hold is not engaged.
+func (h *probeHold) wait() {
+	h.mu.Lock()
+	on := h.on
+	h.mu.Unlock()
+	if on != nil {
+		h.held.Add(1)
+		<-on
+	}
+}
+
+// probeConn is a probe carrier's conn under a probeHold: its Read and
+// Write return their result only after the hold, if engaged, is released.
+type probeConn struct {
+	net.Conn
+	h *probeHold
+}
+
+func (c *probeConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.h.wait()
+	return n, err
+}
+
+func (c *probeConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.h.wait()
+	return n, err
+}
+
 // slowPeer is world.peer over stream links whose session carriers of the
-// sessions slow reports true for are wrapped in slowVerdict; every session
-// factory call is also recorded in log.
-func (w *world) slowPeer(delay time.Duration, slow func(rendr.SessionID) bool, log *dialLog, names ...string) *rendr.Peer {
+// sessions slow reports true for are wrapped in slowVerdict and whose
+// probe carriers are wrapped in probeConn under hold (when hold is not
+// nil); every session factory call is also recorded in log.
+func (w *world) slowPeer(delay time.Duration, slow func(rendr.SessionID) bool, hold *probeHold, log *dialLog, names ...string) *rendr.Peer {
 	w.t.Helper()
 	var cs []rendr.Carrier
 	for _, n := range names {
@@ -657,6 +730,9 @@ func (w *world) slowPeer(delay time.Duration, slow func(rendr.SessionID) bool, l
 				log.add(sessionDial{at: time.Now(), factory: n, sid: di.Session})
 			}
 			c, err := l.Dial(ctx)
+			if err == nil && ok && di.Probe && hold != nil {
+				return &probeConn{Conn: c, h: hold}, nil
+			}
 			if err == nil && ok && !di.Probe && delay > 0 && slow(di.Session) {
 				return &slowVerdict{Conn: c, delay: delay}, nil
 			}
@@ -740,9 +816,11 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 		gateID atomic.Uint32 // the carrier whose death handling is held (0: none)
 		gate   = make(chan struct{})
 		held   atomic.Int64 // death handlings that reached the gate
+		hold   probeHold    // the dialer's probe carriers across the kill (open-first)
 	)
 	hooks := &testhooks.Hooks{DeathObserved: func(id uint32) {
 		if id != 0 && gateID.Load() == id {
+			hold.release() // the shared carrier's death record is set
 			held.Add(1)
 			<-gate
 		}
@@ -750,7 +828,7 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 	w := newWorld(t, worldOpts{dov: testhooks.Overrides{Hooks: hooks}},
 		linkSpec{name: "p1", oneWay: oneWay}, linkSpec{name: "p2", oneWay: oneWay})
 	var release sync.Once
-	open := func() { release.Do(func() { close(gate) }) }
+	open := func() { release.Do(func() { hold.release(); close(gate) }) }
 	t.Cleanup(open) // before the world's shutdown (LIFO): no actor stays held
 	var (
 		armed  atomic.Bool
@@ -759,11 +837,15 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 		log    = &dialLog{}
 		opened = &loadOpens{open: map[rendr.SessionID]time.Time{}}
 	)
+	var probes *probeHold
+	if openFirst {
+		probes = &hold
+	}
 	peer := w.slowPeer(slow, func(id rendr.SessionID) bool {
 		lmu.Lock()
 		defer lmu.Unlock()
 		return armed.Load() && (openFirst || long[id])
-	}, log, "p1", "p2")
+	}, probes, log, "p1", "p2")
 	ps := w.openMany(peer, "L", 24, func(i int) rendr.Mode {
 		if i%2 == 0 {
 			return rendr.ModeSelector
@@ -809,7 +891,23 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 	// every 50 ms from loadStart): without the gate the first redial is a
 	// session's JOIN, as in the regress runs where 22 long sessions each
 	// dialled their own carrier.
-	sleepUntil(loadStart.Add(time.Second + 25*time.Millisecond))
+	killAt := loadStart.Add(time.Second + 25*time.Millisecond)
+	if openFirst {
+		// The gate holds a session only in its death step, so no session
+		// actor may be running a step when the shared carrier's death is
+		// recorded: one that missed the record in its reapDead but sees it
+		// in the same step's bond slot check redials p1 at once, without
+		// passing the gate (WP16-MUX-2), and its JOIN, not an OPEN, makes
+		// the first call. The kill also ends p1's probe carrier, whose
+		// death the health layer publishes to every session actor: the
+		// probe carriers are held from just before the kill's instant
+		// (the bubble's clock moves only when every goroutine is blocked,
+		// so no step woken earlier still runs at the kill) until the first
+		// death handling reached the gate, when the record is set.
+		sleepUntil(killAt.Add(-time.Nanosecond))
+		hold.engage()
+	}
+	sleepUntil(killAt)
 
 	armed.Store(true)
 	if openFirst {
@@ -840,8 +938,8 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 				break
 			}
 			if !time.Now().Before(deadline) {
-				t.Fatalf("timed out after 2s waiting for the death of every long session held, a new session's OPEN dialling p1 and another OPEN waiting for it: %d of %d deaths held, Coalesced %d (at the kill %d), session factory calls %v",
-					h, len(ps), c, coalesced, calls)
+				t.Fatalf("timed out after 2s waiting for the death of every long session held, a new session's OPEN dialling p1 and another OPEN waiting for it: %d of %d deaths held, Coalesced %d (at the kill %d), session factory calls %v, probe carrier calls held %d",
+					h, len(ps), c, coalesced, calls, hold.held.Load())
 			}
 		}
 		open()

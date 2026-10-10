@@ -358,14 +358,35 @@ func (ln *Listener) passSignal(k int) {
 
 // Close stops the sources (closing every FromListener listener exactly
 // once, bounded; a FromPacketConn socket stops admitting and closes once
-// its last flow ended, M2-D58), answers every session that is still
-// pending — and every OPEN whose handshake on this Listener completes
-// afterwards — OPEN_ACK(CAPACITY, backlog), so the dialer's Dial returns
-// ErrCapacity, and makes Accept, AcceptPacket, Handle and HandlePacket
-// return net.ErrClosed; Confirm and Reject of a PendingConn or
-// PendingPacket it refused return net.ErrClosed. Confirmed sessions are not
-// affected (their carriers may arrive through any Listener), and the
-// Runtime keeps admitting through its other Listeners: a Listener's Close
+// its last flow ended, M2-D58) and makes Accept, AcceptPacket, Handle and
+// HandlePacket return net.ErrClosed; Confirm and Reject of a PendingConn
+// or PendingPacket it refused return net.ErrClosed. The OPENs it can no
+// longer take are answered by where they arrive:
+//
+//   - Every session that is still pending, and every OPEN that arrives
+//     afterwards as the first frame of a carrier of its own — a dedicated
+//     carrier, or handle 1 of a new rendr mux trunk — whose handshake on
+//     this Listener completes after Close, is answered
+//     OPEN_ACK(CAPACITY, CodeBacklog): the dialer's Dial returns
+//     ErrCapacity.
+//   - An OPEN for a new handle on a live rendr mux trunk this Listener
+//     accepted (a view of a carrier other sessions share) is answered
+//     OPEN_ACK(CAPACITY, CodeListenerClosed) (M3-D63, R1-10;
+//     TestMuxOpenAfterListenerClose_L50). That is a carrier refusal without
+//     penalty: the dialer's Peer stops OPENing on that trunk and its Dial
+//     goes on with another live trunk of the same factory or a new carrier
+//     of it, so the Dial does not return ErrCapacity from that answer.
+//     Where the new carrier reaches
+//     another Listener of the Runtime, the session is admitted there as
+//     usual; where it reaches only this Listener's closed source (its
+//     Handle and HandlePacket refuse it), the carrier fails as a path
+//     failure, the session redials, and the Dial returns ErrNoPath once its
+//     NoPathGrace ran out.
+//
+// JOINs on the live trunks this Listener accepted are still admitted.
+// Confirmed sessions are not affected (their carriers may arrive through
+// any Listener), and the Runtime keeps admitting through its other
+// Listeners. A Listener's Close
 // is not the instance going away, so it never answers GOING_AWAY, which
 // makes a dialer's Peer stop OPENing to the whole instance; only
 // Runtime.Close does. Idempotent.
