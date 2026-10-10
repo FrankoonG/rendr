@@ -47,12 +47,13 @@ import (
 // Receive charge (D13, V3). st.oooCap is the size-class capacity held by inq
 // and ooq together: exactly the Budget charge of the session's receive
 // buffers. Out-of-order data takes a new buffer only while the charge stays
-// within recvLimit, 2·W; bytes that would need more are dropped and counted
-// in oooDropped (never a violation). In-order data inside the advertised
-// window is always taken; when it pushes the charge above 2·W, out-of-order
-// segments are shed, highest first and counted the same way (shedLocked).
-// So between Data calls the charge is at most 2·W whenever out-of-order data
-// is held; a session's Budget footprint adds one run per lane (D29), while
+// within recvLimit: 2·W, or earlyRecvLimit (2·EarlyWindow) while a passive
+// session is pending (early_recv.go); bytes that would need more are dropped
+// and counted in oooDropped (never a violation). In-order data inside the
+// advertised window is always taken; when it pushes the charge above
+// recvLimit, out-of-order segments are shed, highest first and counted the
+// same way (shedLocked). So between Data calls the charge is at most
+// recvLimit whenever out-of-order data is held; a session's Budget footprint adds one run per lane (D29), while
 // its carriers' reader stages are charged to the separate stage account
 // outside MaxBufferedBytes (§0.14 B2). With nothing held out of order the
 // charge is the in-order queue's alone, which nothing can shed: the window

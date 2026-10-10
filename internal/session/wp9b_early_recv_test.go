@@ -227,21 +227,25 @@ func TestEarlyRecvRule(t *testing.T) {
 // TestEarlyOpenWindowFloor: Confirm's window is at least the early span for
 // a session that took an OPEN(EARLY) — also with no early byte arrived yet
 // and the Budget full (AdvertiseWindow 0) — and the normal window
-// otherwise (M4-D6).
+// otherwise (M4-D6). The floor is relative to Params.FirstOffset: with a
+// non-zero first offset the early end lies at FirstOffset + EarlyWindow,
+// not at the absolute EarlyWindow (§A5.1).
 func TestEarlyOpenWindowFloor(t *testing.T) {
-	for _, earlyOpen := range []bool{false, true} {
-		budget := carrier.NewBudget(1 << 30)
-		budget.Acquire(budget.Max())
-		s := ebPending(0, earlyOpen, budget)
-		w := ebConfirm(s)
-		switch {
-		case earlyOpen && w < wire.EarlyWindow:
-			t.Fatalf("EARLY under pressure: window %d, want ≥ %d", w, wire.EarlyWindow)
-		case !earlyOpen && w != 0:
-			t.Fatalf("premise: without EARLY under pressure the window is %d, want 0", w)
+	for _, first := range []uint64{0, 1<<40 + 12345} {
+		for _, earlyOpen := range []bool{false, true} {
+			budget := carrier.NewBudget(1 << 30)
+			budget.Acquire(budget.Max())
+			s := ebPending(first, earlyOpen, budget)
+			w := ebConfirm(s)
+			switch {
+			case earlyOpen && w < wire.EarlyWindow:
+				t.Fatalf("first %d: EARLY under pressure: window %d, want ≥ %d", first, w, wire.EarlyWindow)
+			case !earlyOpen && w != 0:
+				t.Fatalf("first %d: premise: without EARLY under pressure the window is %d, want 0", first, w)
+			}
+			budget.Release(budget.Max())
+			stEnd(s, errors.New("test over"))
 		}
-		budget.Release(budget.Max())
-		stEnd(s, errors.New("test over"))
 	}
 }
 
