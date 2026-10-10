@@ -275,11 +275,12 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 }
 
 // AttemptEarly is Attempt with the session's early span (M4 design §A4.3,
-// M4-D3, M4-D17; skeleton): early goes to a dial of the attempt's own
+// M4-D3, M4-D17, AM-2): early goes to a dial of the attempt's own
 // (EstablishEarly) only — a dedicated carrier, or handle 1 of a fresh
-// trunk —, never to a fast-path view or a coalesced wait, whose
-// Established.Early is 0. early must be nil for a JOIN. Until M4's WP8 it
-// is threaded to EstablishEarly, which ignores it.
+// trunk, also when a coalesced waiter dials in the claimant's place or
+// beside it —, never to a fast-path view or a coalesced wait: their OPEN
+// is the caller's payload unchanged (no EARLY flag) and their
+// Established.Early is 0. early is ignored for a JOIN.
 func (p *Pool) AttemptEarly(ctx context.Context, f int, cid uint32, kind wire.Type, payload []byte, check func(*wire.PrefaceAck) error, inst [16]byte, sess uintptr, dk wire.Type, early []byte) (*Established, error) {
 	fac := p.fs[f]
 	if !fac.Mux || (kind != wire.TypeOpen && kind != wire.TypeJoin) {

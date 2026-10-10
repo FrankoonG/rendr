@@ -136,6 +136,11 @@ type Conn struct {
 	needGo atomic.Bool                 // dialer view on a started trunk: its go frame is not yet placed (M3-D8)
 	calls  atomic.Int32                // reader, writer and watchdog calls into the endpoint in progress (M3-D13, R1-16)
 	ready  atomic.Bool                 // in the trunk's ready ring or the writer's round scratch (R1-1)
+	// retireCalled: Retire or GoAway was called on the view — on view 1 of
+	// a carrier whose first frame was an OPEN(EARLY), the early DATA its
+	// reader reads afterwards is the retirement drain's (Hooks.Drained,
+	// M4 R1-17).
+	retireCalled atomic.Bool
 
 	// The writer's DRR state of the view (MUX trunks; writer goroutine only).
 	deficit   int   // payload bytes owed from earlier rounds (≤ 2 quanta)
@@ -545,6 +550,7 @@ func (c *Conn) ring() {
 // A held carrier whose endpoint never placed a first frame writes its
 // CLOSE (after a GOAWAY, if requested) as its first frame.
 func (c *Conn) Retire(reason wire.CloseReason) {
+	c.retireCalled.Store(true)
 	if c.vx.own {
 		c.retireView(detachReasonOf(reason)) // DETACH (M3-D6, detach.go)
 		return
@@ -562,6 +568,7 @@ func (c *Conn) Retire(reason wire.CloseReason) {
 // GoAway queues GOAWAY(shutdown) ahead of any further frame and then
 // retires the carrier (Runtime.Close).
 func (c *Conn) GoAway() {
+	c.retireCalled.Store(true)
 	if c.vx.own {
 		c.goAwayView() // GOAWAY once on the trunk, the view retires (detach.go)
 		return
@@ -739,7 +746,7 @@ type closeMode uint8
 const (
 	closeKill         closeMode = iota // abrupt: SetDeadline(now) and Close (closeConn)
 	closeRetired                       // planned: CloseWrite (OwnedTCP only), then SetDeadline(now) and Close
-	closeWriteOne                      // WriteAndClose: write one frame, CloseWrite (OwnedTCP), bounded drain, then SetDeadline(now) and Close
+	closeWriteOne                      // WriteAndClose: a drain reader starts, then write one frame, CloseWrite (OwnedTCP), the drain ends (≤ drainMax), then SetDeadline(now) and Close
 	closeRetiredDrain                  // planned, an OwnedTCP carrier past the drain bound: CloseWrite, the reader ends (awaitReader, ≤ drainMax), then SetDeadline(now) and Close
 )
 
@@ -785,13 +792,57 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 		_ = callCloseWrite(c.owned)
 		c.awaitReader(drainMax)
 	case closeWriteOne:
-		_ = callSetWriteDeadline(c.nc, deadline)
-		if writeFull(c.nc, frame) == nil {
-			if c.owned != nil {
-				_ = callCloseWrite(c.owned)
-			}
-			drain(c.nc, time.Now().Add(drainMax))
+		c.writeOneDraining(frame, deadline)
+	}
+}
+
+// writeOneDraining is WriteAndClose's closer on an unstarted stream carrier
+// (M4-D58, R1-5): its drain reader — the carrier's reader part, which an
+// unstarted carrier does not use otherwise — starts before the answer is
+// written and reads and discards the peer's bytes until EOF, an error or
+// its read deadline (first deadline + drainMax, the write's and the
+// drain's bounds together), so the answer never waits for the peer's
+// first flight to be read: a dialer writes its whole hello — up to 64 KiB
+// of early DATA after an OPEN(EARLY) — before it reads the answer, which
+// on a synchronous conn or one with less buffering than that flight would
+// hold both ends until the deadline. After the frame was written the order
+// is M2's: CloseWrite on an OwnedTCP, then the drain's read deadline
+// becomes now + drainMax and the closer waits for the drain reader as it
+// waited for its own drain before; a failed write closes at once
+// (closeConn ends the reader). On a conn whose deadline setters wait for a
+// Read in progress (design §0.14 B3) that second deadline waits for the
+// first one at most: a peer that read the answer but never closes then
+// holds the refused carrier until deadline + drainMax (about 11 s after a
+// 10 s handshake deadline) rather than drainMax, a cost bounded like the
+// write itself and counted by the abandonment wait. The first deadline is
+// not shortened: the drain must outlast an answer write still in progress,
+// and after it no second drain runs. Bytes the drain discarded are reported through
+// Hooks.Drained (the stimulus proof of the refusal-drain rows, R1-17). A
+// drain reader stuck in a Read that ignores its deadline holds the closer
+// as the inline drain did: both are counted in the abandoned-call pool
+// with the conn closed as the last resort (abandonParts).
+func (c *Conn) writeOneDraining(frame []byte, deadline time.Time) {
+	c.jmu.Lock()
+	c.join.running |= partReader
+	c.jmu.Unlock()
+	_ = callSetReadDeadline(c.nc, deadline.Add(drainMax))
+	go c.drainReader()
+	_ = callSetWriteDeadline(c.nc, deadline)
+	if writeFull(c.nc, frame) == nil {
+		if c.owned != nil {
+			_ = callCloseWrite(c.owned)
 		}
+		_ = callSetReadDeadline(c.nc, time.Now().Add(drainMax))
+		c.awaitReader(0)
+	}
+}
+
+// drainReader is writeOneDraining's reader part.
+func (c *Conn) drainReader() {
+	defer c.partDone(partReader) // also on runtime.Goexit inside the embedder's Read
+	n := drainRead(c.nc)
+	if h := c.env.Hooks; n > 0 && h != nil && h.Drained != nil {
+		h.Drained(n)
 	}
 }
 
@@ -808,6 +859,9 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 // abandonment wait (AbandonWait + drainMax). No owner kills a carrier
 // whose CLOSE was written (the end phase and Runtime.Close kill only those
 // whose CLOSE is unwritten), and only such a carrier reaches this wait.
+//
+// d ≤ 0 waits without a bound of its own (writeOneDraining: the drain
+// reader's read deadline bounds it, the abandonment its conn).
 func (c *Conn) awaitReader(d time.Duration) {
 	c.jmu.Lock()
 	if c.join.running&partReader == 0 {
@@ -819,6 +873,10 @@ func (c *Conn) awaitReader(d time.Duration) {
 	}
 	exit := c.join.readerExit
 	c.jmu.Unlock()
+	if d <= 0 {
+		<-exit
+		return
+	}
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
@@ -864,13 +922,26 @@ func (c *Conn) closeConn() {
 // last frame).
 func drain(nc net.Conn, until time.Time) {
 	_ = callSetReadDeadline(nc, until)
+	drainRead(nc)
+}
+
+// drainRead reads and discards until EOF, an error or the read deadline
+// the caller set, and returns the bytes it discarded. It is bounded even
+// for a conn that ignores deadlines but keeps returning data: 4,096 Reads
+// (2 MiB, beyond the largest first flight of 69,746 bytes).
+func drainRead(nc net.Conn) int {
 	var buf [512]byte
-	for i := 0; i < 1<<12; i++ { // bounded even for a conn that ignores deadlines but keeps returning data
+	total := 0
+	for i := 0; i < 1<<12; i++ {
 		n, err := callRead(nc, buf[:])
+		if n > 0 && n <= len(buf) {
+			total += n
+		}
 		if err != nil || n <= 0 || n > len(buf) {
-			return
+			return total
 		}
 	}
+	return total
 }
 
 // partDone records that one goroutine of the carrier exited.
@@ -1036,7 +1107,10 @@ func (c *Conn) closeWritten() {
 // WriteAndClose writes one frame (the next tx fseq) on an unstarted Conn —
 // an admission verdict such as OPEN_ACK(CAPACITY), JOIN_ACK(UNKNOWN_SESSION)
 // or CLOSE(capacity) — bounded by deadline, then closes it in the L05 order
-// (CloseWrite on OwnedTCP only, bounded drain, Close). A zero deadline
+// (CloseWrite on OwnedTCP only, bounded drain, Close). The drain starts
+// before the frame is written and reads concurrently with it (M4-D58,
+// writeOneDraining), so a peer whose first flight is still unread never
+// blocks the answer. A zero deadline
 // means now + 1 s (the drain bound): the write is never unbounded, so the
 // conn is closed once the write gave up. It returns at once; the work runs
 // on a guarded goroutine. The death record becomes CauseLocalClose. On a

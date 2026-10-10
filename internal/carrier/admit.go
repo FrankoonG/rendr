@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"encoding/binary"
 	"errors"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
@@ -12,7 +13,8 @@ import (
 
 // admitMux handles an OPEN or JOIN for a new handle h on a started passive
 // MUX trunk, on the reader (§A5.6): the handle becomes the largest seen;
-// the view cap (views plus queued answers), the payload decode, our GOAWAY,
+// the view cap (views plus queued answers), the payload decode, an EARLY
+// OPEN (BAD_REQUEST CodeBadValue, M4-D3), our GOAWAY,
 // a retiring trunk and a Runtime without passive mux are refused through
 // the refusal ring; otherwise a new view (pending for an OPEN, joining for
 // a JOIN; shim endpoint) is inserted under mx and, with mx released,
@@ -30,7 +32,10 @@ func (t *trunk) admitMux(h uint32, hdr wire.Header, p []byte) {
 	switch {
 	case full:
 		ans.Status, ans.Code = wire.StatusCapacity, wire.CodeMuxFull
-	case decodeFirst(hdr.Type, p) != nil:
+	case decodeFirst(hdr.Type, p) != nil, earlyOpen(hdr.Type, p):
+		// An EARLY OPEN belongs only in a carrier's first frame (M4-D3):
+		// on a live trunk it is refused like a malformed one, through the
+		// ring; the trunk and its other views live.
 		ans.Status, ans.Code = wire.StatusBadRequest, wire.CodeBadValue
 	case t.dg != nil && hdr.Type == wire.TypeOpen && p[16] == byte(wire.KindStream):
 		// A datagram trunk carries packet sessions only (M3-D24; a JOIN's
@@ -68,6 +73,12 @@ func decodeFirst(typ wire.Type, p []byte) error {
 	}
 	_, err := wire.ParseOpen(p, wire.MaxMetadata)
 	return err
+}
+
+// earlyOpen reports an OPEN payload that decoded with wire.OpenFlagEarly
+// (payload bytes 18–19; decodeFirst checked the layout first).
+func earlyOpen(typ wire.Type, p []byte) bool {
+	return typ == wire.TypeOpen && binary.BigEndian.Uint16(p[18:20])&wire.OpenFlagEarly != 0
 }
 
 // refuseMux queues the refusal a for handle h, a handle that never becomes
