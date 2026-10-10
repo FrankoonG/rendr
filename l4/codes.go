@@ -28,17 +28,51 @@ const (
 	CodeDialFailed      RejectCode = 0x4C34000D // anything else
 )
 
+// codeTexts are the fixed class texts, in code order from CodeBadRequest
+// (M4 design §A6.5).
+var codeTexts = [...]string{
+	"bad request",
+	"unsupported version",
+	"unsupported command",
+	"bad address",
+	"not allowed",
+	"connection refused",
+	"network unreachable",
+	"host unreachable",
+	"connect timeout",
+	"name not found",
+	"name resolution failed",
+	"capacity",
+	"dial failed",
+}
+
+// known reports whether c is one of the Reject codes above.
+func (c RejectCode) known() bool {
+	return c >= CodeBadRequest && c <= CodeDialFailed
+}
+
 // String returns the code's fixed class text, which is also the Reject
-// message a Server sends.
+// message a Server sends; an unknown code reads "l4 code 0x…".
 func (c RejectCode) String() string {
-	return fmt.Sprintf("l4 code %#08x", uint32(c)) // M4 WP2: the fixed class texts
+	if c.known() {
+		return codeTexts[c-CodeBadRequest]
+	}
+	return fmt.Sprintf("l4 code %#08x", uint32(c))
 }
 
 // CodeOf returns the l4 code of err (a Dial error, or the first Read or
 // Write error after EarlyReturn); ok is false when err is not an l4
-// Server's refusal.
+// Server's refusal: not a *rendr.RejectError, or one whose code is not a
+// RejectCode above (an application's own code).
 func CodeOf(err error) (code RejectCode, ok bool) {
-	return 0, false // M4 WP2
+	var re *rendr.RejectError
+	if !errors.As(err, &re) {
+		return 0, false
+	}
+	if c := RejectCode(re.Code); c.known() {
+		return c, true
+	}
+	return 0, false
 }
 
 // Abort codes of a forwarded session (rendr.Conn.Abort).

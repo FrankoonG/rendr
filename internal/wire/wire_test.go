@@ -578,7 +578,9 @@ func TestPayloadErrors_L44(t *testing.T) {
 		{"open mode 0", ErrValue, e(ParseOpen(open(1, 0, 0, 0, 0, ""), 100))},
 		{"open mode 4", ErrValue, e(ParseOpen(open(1, 4, 0, 0, 0, ""), 100))},
 		{"open mode 3 decodes", nil, e(ParseOpen(open(1, 3, 0, 0, 0, ""), 100))},
-		{"open early flag", ErrReserved, e(ParseOpen(open(1, 1, OpenFlagEarly, 0, 0, ""), 100))},
+		{"open early flag decodes (M4)", nil, e(ParseOpen(open(1, 1, OpenFlagEarly, 0, 0, ""), 100))},
+		{"open early flag on a packet OPEN", ErrReserved, e(ParseOpen(open(2, 1, OpenFlagEarly, 1200, 0, ""), 100))},
+		{"open flag bit 1", ErrReserved, e(ParseOpen(open(1, 1, 1<<1, 0, 0, ""), 100))},
 		{"open undefined flag", ErrReserved, e(ParseOpen(open(1, 1, 0x8000, 0, 0, ""), 100))},
 		{"open stream pmtu", ErrReserved, e(ParseOpen(open(1, 1, 0, 1200, 0, ""), 100))},
 		// M2 (§A8.7): a packet OPEN's window is its cmtu offer; 1 MiB is no

@@ -337,8 +337,14 @@ const (
 	RstWithdrawn uint32 = 6 // the dialer abandoned Dial after its OPEN may have been admitted (L49)
 )
 
-// OpenFlagEarly is OPEN flag bit 0 (early data). It is reserved until M4 and
-// must be 0 (ErrReserved).
+// OpenFlagEarly is OPEN flag bit 0 (early data; M4 design §A3.1, M4-D1).
+// Reserved in M1–M3, it is legal on stream OPENs from M4: DATA frames for
+// the OPEN's handle, at offsets within [0, EarlyWindow), follow it on the
+// same carrier before the passive's OPEN_ACK. On a packet OPEN it is
+// ErrReserved, as is every other flag bit. It belongs only in a carrier's
+// first frame (a fresh dedicated carrier, or handle 1 of a fresh MUX trunk,
+// M4-D3); the codec cannot see that, so the admission refuses an EARLY
+// OPEN elsewhere (BAD_REQUEST CodeBadValue).
 const OpenFlagEarly uint16 = 1 << 0
 
 // EarlyWindow is the protocol's bound on early data (M4 design M4-D2): a
@@ -347,8 +353,7 @@ const OpenFlagEarly uint16 = 1 << 0
 // EarlyWindow bytes of the stream; DATA beyond it is a violation of that
 // carrier (it dies; the pending session survives). It is a constant, not
 // negotiated: no dialer may send more (Handshake.EarlyDataMax ≤ it), so the
-// two sides never disagree. ParseOpen keeps refusing OpenFlagEarly until
-// M4's wire work package accepts it.
+// two sides never disagree.
 const EarlyWindow = 1 << 16
 
 // CloseReason is the CLOSE payload.
