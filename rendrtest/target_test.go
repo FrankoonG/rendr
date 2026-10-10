@@ -8,16 +8,18 @@ import (
 	"io"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 )
 
-// Every test here runs inside a synctest bubble: a goroutine left blocked
-// in a TargetConn or a behaviour when the bubble ends fails the test
-// (synctest reports the deadlock), so each row also proves that nothing
-// leaks.
+// Every test here but the allocation gate (testing.AllocsPerRun) and the
+// real loopback dial runs inside a synctest bubble: a goroutine left
+// blocked in a TargetConn or a behaviour when the bubble ends fails the
+// test (synctest reports the deadlock), so each row also proves that
+// nothing leaks.
 
 // isReset reports whether err is ErrReset as callers see it: errors.Is
 // with syscall.ECONNRESET (errConnReset is that errno on every OS but
@@ -100,6 +102,9 @@ func TestTargetPipeHalfClose(t *testing.T) {
 		if _, err := c.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("Read after Close: %v; want net.ErrClosed", err)
 		}
+		if err := c.CloseWrite(); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("CloseWrite after Close: %v; want net.ErrClosed", err)
+		}
 	})
 }
 
@@ -129,6 +134,20 @@ func TestTargetPipeReset(t *testing.T) {
 			if err := s.Close(); err != nil {
 				t.Fatalf("server Close: %v", err)
 			}
+		})
+	})
+	t.Run("linger restored", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, s := TargetPipe(4096)
+			c.SetLinger(0)
+			if err := c.SetLinger(5); err != nil {
+				t.Fatal(err)
+			}
+			c.Close() // a graceful Close again: a FIN
+			if n, err := s.Read(make([]byte, 8)); n != 0 || err != io.EOF {
+				t.Fatalf("server Read: %d, %v; want EOF, not a reset", n, err)
+			}
+			s.Close()
 		})
 	})
 	t.Run("wakes a blocked Read", func(t *testing.T) {
@@ -242,9 +261,9 @@ func TestTargetPipeCloseAfterCloseWriteSilent(t *testing.T) {
 				t.Fatalf("counts after the client's Close: %+v; want the target still open, FIN in, no reset", k)
 			}
 			tg.Close()
-			if k := tg.Counts(); k.Open != 0 {
-				t.Fatalf("Open after Target.Close: %d", k.Open)
-			}
+			k = tg.Counts()
+			// The target's reset still leaves, although the client is gone.
+			checkConn(t, k.Conns[0], TargetConnCounts{Addr: "stall:1", BytesIn: 18, FINIn: true, RSTOut: true})
 		})
 	})
 	t.Run("unread bytes reset", func(t *testing.T) {
@@ -314,6 +333,47 @@ func TestTargetPipeBackpressure(t *testing.T) {
 			}
 			if n, err := c.Write(make([]byte, 100)); n != 100 || err != nil {
 				t.Fatalf("Write after clearing the deadline: %d, %v", n, err)
+			}
+			c.Close()
+			s.Close()
+		})
+	})
+	t.Run("past deadline wakes blocked calls", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, s := TargetPipe(4096)
+			rd := make(chan error, 1)
+			go func() {
+				_, err := s.Read(make([]byte, 8))
+				rd <- err
+			}()
+			w := writeAsync(s, make([]byte, 10_240), false) // c never reads
+			time.Sleep(time.Second)
+			synctest.Wait()
+			if len(rd) != 0 || len(w) != 0 {
+				t.Fatal("a Read without data or a Write beyond the buffer returned")
+			}
+			at := time.Now() // no timer fires from here on: virtual time stays
+			s.SetReadDeadline(at)
+			s.SetWriteDeadline(at)
+			synctest.Wait()
+			select {
+			case err := <-rd:
+				if !errors.Is(err, os.ErrDeadlineExceeded) {
+					t.Fatalf("blocked Read: %v; want a timeout", err)
+				}
+			default:
+				t.Fatal("a deadline in the past did not wake the blocked Read")
+			}
+			select {
+			case r := <-w:
+				if r.n != 4096 || !errors.Is(r.err, os.ErrDeadlineExceeded) {
+					t.Fatalf("blocked Write: %d, %v; want 4096, a timeout", r.n, r.err)
+				}
+			default:
+				t.Fatal("a deadline in the past did not wake the blocked Write")
+			}
+			if !time.Now().Equal(at) {
+				t.Fatalf("woken %v after the deadline; want at once", time.Since(at))
 			}
 			c.Close()
 			s.Close()
@@ -665,7 +725,7 @@ func TestScriptedDial(t *testing.T) {
 		if _, err, _, _, _ := call(time.Second); !errors.As(err, &de) || !de.IsNotFound || de.Name != "target.test" {
 			t.Fatalf("DNSNotFound: %v", err)
 		}
-		if _, err, _, _, _ := call(time.Second); !errors.As(err, &de) || de.IsNotFound {
+		if _, err, _, _, _ := call(time.Second); !errors.As(err, &de) || de.IsNotFound || !de.IsTemporary {
 			t.Fatalf("DNSFailure: %v", err)
 		}
 		if _, _, _, p, _ := call(time.Second); p == nil {
@@ -736,4 +796,156 @@ func TestTargetPipeSteadyStateAllocs(t *testing.T) {
 	}
 	c.Close()
 	s.Close()
+}
+
+// pipeStats gives the server end of a plain TargetPipe a Target's counters.
+func pipeStats(s *TargetConn) *connStats {
+	st := &connStats{mu: new(sync.Mutex), srv: s, hin: sha256.New(), hout: sha256.New(), open: true}
+	s.p.mu.Lock()
+	s.p.st[s.side] = st
+	s.p.mu.Unlock()
+	return st
+}
+
+// snapshot copies st's flags and byte counts under its lock.
+func (s *connStats) snapshot() TargetConnCounts {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return TargetConnCounts{BytesIn: s.bytesIn, BytesOut: s.bytesOut, FINIn: s.finIn, FINOut: s.finOut,
+		RSTIn: s.rstIn, RSTOut: s.rstOut, Open: s.open}
+}
+
+// TestTargetPipeCloseAfterPeerClosedCounts: a Close after the peer's Close
+// records what TCP would send (FIN, or RST with SetLinger(0) or unread
+// bytes), although the peer no longer observes it.
+func TestTargetPipeCloseAfterPeerClosedCounts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(c, s *TargetConn)
+		want TargetConnCounts
+	}{
+		{"fin", func(c, s *TargetConn) {
+			c.Close()
+			s.Read(make([]byte, 1))
+			s.Close()
+		}, TargetConnCounts{FINIn: true, FINOut: true}},
+		{"linger0", func(c, s *TargetConn) {
+			c.Close()
+			s.SetLinger(0)
+			s.Close()
+		}, TargetConnCounts{FINIn: true, RSTOut: true}},
+		{"unread bytes", func(c, s *TargetConn) {
+			c.Write([]byte("hello"))
+			c.CloseWrite()
+			c.Close() // silent: "hello" is still in flight
+			s.Close() // unread: an RST
+		}, TargetConnCounts{FINIn: true, RSTOut: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				c, s := TargetPipe(4096)
+				st := pipeStats(s)
+				tc.run(c, s)
+				if got := st.snapshot(); got != tc.want {
+					t.Fatalf("counts:\n got %+v\nwant %+v", got, tc.want)
+				}
+			})
+		})
+	}
+}
+
+// TestTargetRSTAfterCountsBufferedInput: TargetRSTAfter's reset reads what
+// the client's Writes accepted before it, so BytesIn does not depend on
+// when the discarding goroutine ran.
+func TestTargetRSTAfterCountsBufferedInput(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c, s := TargetPipe(4096)
+		st := pipeStats(s)
+		if n, err := c.Write([]byte("late")); n != 4 || err != nil { // nobody has read it
+			t.Fatalf("Write: %d, %v", n, err)
+		}
+		s.resetTakingInput()
+		if got := st.snapshot(); got != (TargetConnCounts{BytesIn: 4, RSTOut: true}) {
+			t.Fatalf("counts: %+v; want the 4 accepted bytes read, then RST out", got)
+		}
+		if _, err := c.Read(make([]byte, 8)); !isReset(err) {
+			t.Fatalf("client Read: %v; want ECONNRESET", err)
+		}
+		c.Close()
+	})
+}
+
+// released reports whether both of c's pipe buffers are gone.
+func released(c *TargetConn) bool {
+	c.p.mu.Lock()
+	defer c.p.mu.Unlock()
+	return c.p.dir[0].buf == nil && c.p.dir[1].buf == nil
+}
+
+// TestTargetPipeReleasesBuffers: a pipe keeps its buffers while an open
+// end may still read them, and drops them once both ends are closed; a
+// Target's record of a finished connection does not keep the pipe.
+func TestTargetPipeReleasesBuffers(t *testing.T) {
+	t.Run("graceful", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, s := TargetPipe(4096)
+			data := prngBytes(10, 1000)
+			c.Write(data)
+			c.CloseWrite()
+			c.Close() // silent; the 1,000 bytes stay readable
+			if released(s) {
+				t.Fatal("buffers released while the server end can still read them")
+			}
+			if got, err := io.ReadAll(s); err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("server read %d bytes, %v", len(got), err)
+			}
+			s.Close()
+			if !released(s) {
+				t.Fatal("buffers kept after both ends closed")
+			}
+		})
+	})
+	t.Run("reset", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			c, s := TargetPipe(4096)
+			c.Write([]byte("hello"))
+			s.Write([]byte("world"))
+			s.Close() // unread "hello": a reset
+			c.Close()
+			if !released(c) {
+				t.Fatal("buffers kept after a reset and both Closes")
+			}
+		})
+	})
+	t.Run("target", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			tg := NewTarget(TargetEcho(), 0)
+			var conns []*TargetConn
+			for range 3 {
+				c := dialTarget(t, tg, "echo")
+				w := writeAsync(c, prngBytes(11, 16<<10), true)
+				io.ReadAll(c)
+				<-w
+				c.Close()
+				conns = append(conns, c)
+			}
+			synctest.Wait()
+			tg.mu.Lock()
+			for k, s := range tg.conns {
+				if s.srv != nil {
+					t.Errorf("connection %d: the record still holds its closed server end", k)
+				}
+			}
+			tg.mu.Unlock()
+			for k, c := range conns {
+				if !released(c) {
+					t.Errorf("connection %d: buffers kept after both ends closed", k)
+				}
+			}
+			if k := tg.Counts(); k.Accepted != 3 || k.Open != 0 || k.BytesIn != 3*16<<10 {
+				t.Fatalf("counts: %+v", k)
+			}
+			tg.Close()
+		})
+	})
 }

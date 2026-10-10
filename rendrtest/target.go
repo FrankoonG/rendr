@@ -9,7 +9,6 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,7 +53,7 @@ const defaultTargetBuf = 64 << 10
 // discards the bytes in flight both ways, and every later Read and Write
 // of the reset end returns ErrReset. Calls on an end after its own Close
 // return net.ErrClosed. buf < 1 means 64 KiB; the buffers are allocated on
-// first use.
+// first use and released once both ends are closed.
 func TargetPipe(buf int) (client, server *TargetConn) {
 	if buf < 1 {
 		buf = defaultTargetBuf
@@ -227,12 +226,23 @@ func (c *TargetConn) Close() error {
 	e.closed = true
 	stopTimer(e.rt)
 	stopTimer(e.wt)
-	if !e.reset && !p.end[j].closed {
-		if e.linger0 || p.dir[j].n > 0 {
-			p.resetLocked(j)
-		} else {
+	if !e.reset {
+		switch {
+		case !e.linger0 && p.dir[j].n == 0:
 			p.finLocked(i)
+		case p.end[j].closed:
+			// The RST still leaves (as TCP), though nobody is there to
+			// observe it.
+			p.st[i].mark(flagRSTOut)
+		default:
+			p.resetLocked(j)
 		}
+	}
+	if p.end[j].closed {
+		// Both ends are gone: release the buffers (a Target keeps its
+		// connections' records).
+		p.dir[0] = half{fin: p.dir[0].fin}
+		p.dir[1] = half{fin: p.dir[1].fin}
 	}
 	p.st[i].mark(flagClosed)
 	onClose := p.onClose[i]
@@ -392,6 +402,16 @@ func (c *TargetConn) takeBuffered() {
 	p.cond.Broadcast()
 }
 
+// resetTakingInput resets the other end (SetLinger(0), Close) after it
+// read every byte buffered toward this end (TargetRSTAfter): what the
+// client's Writes accepted before the reset counts as read, however the
+// discarding goroutine was scheduled.
+func (c *TargetConn) resetTakingInput() {
+	c.takeBuffered()
+	c.SetLinger(0)
+	c.Close()
+}
+
 // setOnClose installs f, called once at this end's first Close.
 func (c *TargetConn) setOnClose(f func()) {
 	c.p.mu.Lock()
@@ -460,11 +480,16 @@ func (t *Target) Dial(ctx context.Context, addr string) (net.Conn, error) {
 func (t *Target) Close() {
 	t.mu.Lock()
 	t.closed = true
-	conns := slices.Clone(t.conns)
+	var held []*TargetConn
+	for _, s := range t.conns {
+		if s.srv != nil {
+			held = append(held, s.srv)
+		}
+	}
 	t.mu.Unlock()
-	for _, s := range conns {
-		s.srv.SetLinger(0)
-		s.srv.Close()
+	for _, c := range held {
+		c.SetLinger(0) // net.ErrClosed if it closed meanwhile
+		c.Close()
 	}
 	t.wg.Wait()
 }
@@ -516,8 +541,10 @@ type TargetCounts struct {
 // whether or not the behaviour read up to it. RSTIn: the target's end was
 // reset (the client reset it, or answered a write after its Close).
 // RSTOut: the target reset the client (SetLinger(0) or unread bytes at its
-// Close, or its stack answering a client write after that Close). Open:
-// the target has not closed its end yet.
+// Close, or its stack answering a client write after that Close). FINOut
+// and RSTOut also record what a target's Close sends after its client
+// closed (as TCP), although the client no longer observes it. Open: the
+// target has not closed its end yet.
 type TargetConnCounts struct {
 	Addr              string   // the address Dial was called with
 	BytesIn, BytesOut int64    // bytes the target read and wrote
@@ -563,6 +590,7 @@ func (s *connStats) mark(f int) {
 		s.rstOut = true
 	case flagClosed:
 		s.open = false
+		s.srv = nil // the record outlives the pipe
 	}
 	s.mu.Unlock()
 }
@@ -699,9 +727,7 @@ func (b TargetBehaviour) run(c *TargetConn) {
 		if sendN(c, PRNG(0), b.n) == nil {
 			c.waitDrained()
 		}
-		c.takeBuffered() // what arrived before the reset was read
-		c.SetLinger(0)
-		c.Close()
+		c.resetTakingInput()
 		<-done
 	case behHalf:
 		if discard(c) == io.EOF && sendN(c, PRNG(0), b.n) == nil {
