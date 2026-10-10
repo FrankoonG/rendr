@@ -146,15 +146,24 @@ func TestPendingContextDone(t *testing.T) {
 						t.Fatalf("a derived context's Err: %v, want %v", err, want)
 					}
 				}
-				// Registered after the exit: runs at once (its own goroutine).
+				// Registered after the exit through the context's AfterFunc
+				// method, as the context package does when the session leaves
+				// pending between its Done check and that call (with Done
+				// already closed, context.AfterFunc starts f itself and never
+				// calls the method): f runs once on its own goroutine and stop
+				// reports false.
 				var late atomic.Int32
-				if stop := context.AfterFunc(pc.Context(), func() { late.Add(1) }); stop() {
-					// stop may win the race with the goroutine; then f never runs.
-					late.Add(1)
+				af, ok := pc.Context().(interface{ AfterFunc(func()) func() bool })
+				if !ok {
+					t.Fatal("the pending context has no AfterFunc method")
 				}
+				stopLate := af.AfterFunc(func() { late.Add(1) })
 				synctest.Wait()
 				if late.Load() != 1 {
-					t.Fatalf("an AfterFunc registered after the exit: %d runs or stops, want 1", late.Load())
+					t.Fatalf("an AfterFunc registered after the exit ran %d times, want 1", late.Load())
+				}
+				if stopLate() {
+					t.Fatal("stop of an AfterFunc registered after the exit reported true")
 				}
 				rt.Close()
 				d.close()

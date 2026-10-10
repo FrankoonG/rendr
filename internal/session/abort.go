@@ -37,11 +37,15 @@ const noFinOff = math.MaxUint64
 // (terminationLocked: the incoming RST first, then st.abortReq).
 //
 // Under s.mu it records st.abortReq, closes the application side as Close
-// does (blocked and later calls return net.ErrClosed) but requests no FIN
-// (noFinOff), and rings the actor, whose next step ends the session with
-// the RST (terminationLocked's abort case; earlyCloseLocked's withdrawal
-// for a dialer still opening). The code range is the root's check; msg is
-// cut to wire.MaxMsg bytes.
+// does (blocked and later calls return net.ErrClosed: rwake, wwake and
+// s.closing) but requests no FIN (noFinOff), and rings the actor, whose
+// next step ends the session with the RST (terminationLocked's abort case;
+// earlyCloseLocked's withdrawal for a dialer still opening). Unlike Close it
+// does not enter discard mode: consumeAllLocked would count the buffered
+// bytes as delivered and acknowledge them (ACK = delivered), which the RST
+// contradicts; they are unreadable at once (st.closed) and released by the
+// end step. The code range is the root's check; msg is cut to wire.MaxMsg
+// bytes.
 func (s *Session) Abort(code uint32, msg string) error {
 	if s.pk != nil {
 		return errAbortPacket

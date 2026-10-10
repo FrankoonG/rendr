@@ -598,3 +598,191 @@ func TestIdleTimeoutNoMigration_L30(t *testing.T) {
 		}
 	})
 }
+
+// c4HoldActors holds the actor of each session in ss between two steps
+// (beforeWaitHook) from the next time it gets there until release is
+// called: the session cannot end meanwhile (only its actor ends it). It
+// rings each actor so that a parked one runs a step and gets held, and
+// returns once every one is held.
+func c4HoldActors(t *testing.T, ss ...*Session) (release func()) {
+	t.Helper()
+	held := make(chan *Session, len(ss))
+	gate := make(chan struct{})
+	var once [8]atomic.Bool
+	hook := func(s *Session) {
+		for i, x := range ss {
+			if x == s && once[i].CompareAndSwap(false, true) {
+				held <- s
+				<-gate
+			}
+		}
+	}
+	beforeWaitHook.Store(&hook)
+	for _, s := range ss {
+		s.ringActor()
+	}
+	for range ss {
+		c4Await(t, held, time.Second, "an actor held between steps")
+	}
+	var done atomic.Bool
+	return func() {
+		if done.CompareAndSwap(false, true) {
+			beforeWaitHook.CompareAndSwap(&hook, nil)
+			close(gate)
+		}
+	}
+}
+
+// TestAbortWakesCallsBeforeTheEndStep (M4-D20, §A7.6 "the same wakeups as
+// Close"): Abort itself wakes every blocked call with net.ErrClosed, not
+// the actor's terminating step, which is held here. On one session a Read
+// waits for data (rwake) and a Write for window (wwake); on another a
+// Write is held inside its copy (it owns the call semaphore) and a second
+// Write waits for that semaphore (s.closing). All three waiting calls
+// return net.ErrClosed while both actors are still held and neither
+// session has ended.
+func TestAbortWakesCallsBeforeTheEndStep(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := acNewWorld(t, nil)
+		defer w.teardown()
+		dx, _ := w.open(ModeSelector, nil, w.link("x"))
+		dy, _ := w.open(ModeSelector, nil, w.link("y"))
+
+		// dx: the peer neither writes nor reads.
+		rx, wx := make(chan c4IOResult, 1), make(chan c4IOResult, 1)
+		go func() { var b [8]byte; n, err := dx.Read(b[:]); rx <- c4IOResult{n, err} }()
+		go func() { n, err := dx.Write(make([]byte, 3<<20)); wx <- c4IOResult{n, err} }()
+
+		// dy: the first Write stops in its copy, the second waits for wsem.
+		inCopy, copyGate := make(chan struct{}, 1), make(chan struct{})
+		var copies atomic.Int32
+		stSetCopyHook(t, dy, func() {
+			if copies.Add(1) == 1 {
+				inCopy <- struct{}{}
+				<-copyGate
+			}
+		})
+		w1, w2 := make(chan c4IOResult, 1), make(chan c4IOResult, 1)
+		go func() { n, err := dy.Write([]byte("one")); w1 <- c4IOResult{n, err} }()
+		c4Await(t, inCopy, time.Second, "the first Write in its copy")
+		go func() { n, err := dy.Write([]byte("two")); w2 <- c4IOResult{n, err} }()
+		time.Sleep(time.Second) // let dx's windows fill
+		synctest.Wait()
+		if len(rx)+len(wx)+len(w1)+len(w2) != 0 {
+			t.Fatal("a call returned before the Abort: the premise (all blocked) failed")
+		}
+		if ok := stLocked(dx, func(st *stream) bool { return st.rwaiting && st.wwaiting }); !ok {
+			t.Fatal("dx's Read and Write do not wait on rwake and wwake: the premise failed")
+		}
+		if stLocked(dy, func(*stream) bool { return dy.closing == nil }) {
+			t.Fatal("dy's second Write does not wait for the call semaphore: the premise failed")
+		}
+
+		openCopy := sync.OnceFunc(func() { close(copyGate) })
+		defer openCopy()
+		release := c4HoldActors(t, dx, dy)
+		defer release()
+		for _, s := range []*Session{dx, dy} {
+			if err := s.Abort(0x4C34_0202, "now"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		synctest.Wait()
+		for _, c := range []struct {
+			what string
+			ch   chan c4IOResult
+		}{{"dx's Read (rwake)", rx}, {"dx's Write (wwake)", wx}, {"dy's waiting Write (closing)", w2}} {
+			select {
+			case r := <-c.ch:
+				if !errors.Is(r.err, net.ErrClosed) {
+					t.Fatalf("%s: (%d, %v), want net.ErrClosed", c.what, r.n, r.err)
+				}
+			default:
+				t.Fatalf("%s still blocked after the Abort while the actor is held", c.what)
+			}
+		}
+		if len(w1) != 0 {
+			t.Fatal("dy's first Write returned while held in its copy: the premise failed")
+		}
+		for _, s := range []*Session{dx, dy} {
+			if stLocked(s, func(st *stream) bool { return st.ended }) {
+				t.Fatal("a session ended while its actor was held: the premise failed")
+			}
+		}
+		openCopy()
+		// Its round was reserved before the Abort: it commits as it does
+		// across a Close (the call returns; the RST discards the bytes).
+		if r := c4Await(t, w1, time.Second, "dy's first Write after its copy"); !(r.n == 3 && r.err == nil) && !(r.n == 0 && errors.Is(r.err, net.ErrClosed)) {
+			t.Fatalf("dy's first Write: (%d, %v), want (3, nil) or (0, net.ErrClosed)", r.n, r.err)
+		}
+		release()
+		for _, s := range []*Session{dx, dy} {
+			acDone(t, s, 5*time.Second)
+			if err := s.Status().Err; !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("end error %v, want net.ErrClosed", err)
+			}
+		}
+	})
+}
+
+// TestPendingAfterFuncRegistrations (M4-D22, R1-8): a stopped registration
+// leaves the session's list at once (stop reports true once); a kept one
+// runs once at the exit from StatePending and its stop then reports false;
+// one registered after the exit, by a direct call (as the context package
+// may, when the session leaves pending between its Done check and its
+// AfterFunc call), runs once on its own goroutine and its stop reports
+// false.
+func TestPendingAfterFuncRegistrations(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := acNewWorld(t, nil)
+		defer w.teardown()
+		go func() { _, _ = w.dial(context.Background(), w.spec(ModeSelector, w.link("p")), nil) }()
+		b := <-w.b.pending
+		w.sess = append(w.sess, b)
+		hooks := func() int { return stLocked(b, func(*stream) int { return len(b.ctl.pendingHooks) }) }
+
+		var stoppedRan atomic.Int32
+		for i := range 100 {
+			stop := b.PendingAfterFunc(func() { stoppedRan.Add(1) })
+			if n := hooks(); n != 1 {
+				t.Fatalf("round %d: %d registrations listed, want 1", i, n)
+			}
+			if !stop() || stop() {
+				t.Fatalf("round %d: stop: want true once, then false", i)
+			}
+			if n := hooks(); n != 0 {
+				t.Fatalf("round %d: %d registrations listed after stop, want 0", i, n)
+			}
+		}
+		var kept atomic.Int32
+		stopKept := b.PendingAfterFunc(func() { kept.Add(1) })
+
+		if err := b.Reject(4000, "no"); err != nil {
+			t.Fatal(err)
+		}
+		c4Await(t, b.PendingDone(), time.Second, "the pending exit")
+		synctest.Wait()
+		if kept.Load() != 1 || stoppedRan.Load() != 0 {
+			t.Fatalf("the kept registration ran %d times, the stopped ones %d; want 1 and 0", kept.Load(), stoppedRan.Load())
+		}
+		if stopKept() {
+			t.Fatal("stop of a registration that ran reported true")
+		}
+		if n := hooks(); n != 0 {
+			t.Fatalf("%d registrations listed after the exit, want 0", n)
+		}
+
+		var late atomic.Int32
+		stopLate := b.PendingAfterFunc(func() { late.Add(1) })
+		synctest.Wait()
+		if late.Load() != 1 {
+			t.Fatalf("a registration after the exit ran %d times, want 1", late.Load())
+		}
+		if stopLate() {
+			t.Fatal("stop of a registration made after the exit reported true")
+		}
+		if b.PendingErr() != context.Canceled {
+			t.Fatalf("PendingErr %v, want context.Canceled", b.PendingErr())
+		}
+	})
+}
