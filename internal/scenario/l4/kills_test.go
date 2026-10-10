@@ -32,7 +32,7 @@ func startEcho(in *ingress, mode rendr.Mode, seed uint64, size int64, span time.
 	interval := time.Duration(int64(span) * chunk / size)
 	return &echoConn{in: in, mode: mode, seed: seed,
 		rx: startReceiver(in.cli, seed, size),
-		tx: startSender(in.cli, seed, size, chunk, interval, in.cli.CloseWrite)}
+		tx: startSender(in.cli, in.quit, seed, size, chunk, interval, in.cli.CloseWrite)}
 }
 
 // finish waits for both directions and the ingress Forward's clean end.

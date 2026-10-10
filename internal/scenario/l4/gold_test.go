@@ -99,24 +99,27 @@ func g1(t *testing.T, size int64) {
 // TestL4G2Miniature: gold/G2-l4 (B1.2; plan:732–738, plan:806; L65)
 // at reduced scale: Links of 50 Mbit/s; one L4 connection to an echo
 // target; the client sends a 1-KiB message every 100 ms (an absolute
-// schedule) for 10 virtual minutes, each message the next 1 KiB of
-// PRNG(seed), and reads the echo; then it half-closes.
+// schedule) for 11 virtual minutes, each message the next 1 KiB of
+// PRNG(seed), and reads the echo; then it half-closes. The run is longer
+// than the session's 10-min L4 idle default on both ends (l4.Dial and the
+// Server set it), so an idle clock that traffic did not move would fire
+// inside it.
 //
 // Stimulus: every 50 s the Link carrying the session's data is killed
-// (11 kills); each must end a session carrier.
+// (13 kills); each must end a session carrier.
 //
 // PASS: zero loss, duplicates and reordering by content (every echoed
 // message is the next one sent, then io.EOF); P99.9 of the echo latency
-// < 1 s (the gold's); one target connection; Death ≥ 11 on the dialer;
-// the idle timeout never fired on either end (the session's 10-min L4
-// default spans the whole run; every end is io.EOF); a clean ingress
-// Forward; nothing left after Runtime.Close.
+// < 1 s (the gold's); one target connection; Death ≥ 13 on the dialer;
+// the idle timeout never fired on either end (the session ends exactly
+// once on each end, with io.EOF); a clean ingress Forward; nothing left
+// after Runtime.Close.
 func TestL4G2Miniature(t *testing.T) {
 	synctest.Test(t, g2)
 }
 
 const (
-	g2Span   = 10 * time.Minute
+	g2Span   = 11 * time.Minute // longer than the 10-min L4 idle default
 	g2Every  = 100 * time.Millisecond
 	g2Msg    = 1 << 10
 	g2Kill   = 50 * time.Second
@@ -138,7 +141,10 @@ func g2(t *testing.T) {
 		src := rendrtest.PRNG(g2Seed)
 		msg := make([]byte, g2Msg)
 		for k := range g2Echoes {
-			sleepUntil(start.Add(time.Duration(k) * g2Every))
+			if !pace(in.quit, start.Add(time.Duration(k)*g2Every)) {
+				werr = fmt.Errorf("message %d: stopped by the world's shutdown", k)
+				return
+			}
 			src.Read(msg)
 			sent[k] = time.Now()
 			if _, err := in.cli.Write(msg); err != nil {
@@ -211,11 +217,20 @@ func g2(t *testing.T) {
 	if d := in.c.Status().Migrations.Death - deaths0; d < uint64(kills) {
 		t.Fatalf("the dialer counted %d death migrations for %d kills of the active carrier", d, kills)
 	}
+	waitFor(t, 10*time.Second, "both ends' EventSessionEnd", func() bool { return len(w.dev.ends()) > 0 && len(w.pev.ends()) > 0 })
 	for i, l := range []*eventLog{w.dev, w.pev} {
+		var n int
 		for _, ev := range l.ends() {
+			if ev.Session != in.c.ID() {
+				t.Fatalf("the %s ended a session %v that is not the run's %v", side(i), ev.Session, in.c.ID())
+			}
 			if ev.Err != io.EOF {
 				t.Fatalf("the %s's session ended with %v, want io.EOF (no idle expiry)", side(i), ev.Err)
 			}
+			n++
+		}
+		if n != 1 {
+			t.Fatalf("the %s recorded %d EventSessionEnd for the session, want 1", side(i), n)
 		}
 	}
 	waitFor(t, 10*time.Second, "the target connection closed", func() bool { return echo.Counts().Open == 0 })

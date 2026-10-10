@@ -81,7 +81,13 @@ type world struct {
 
 	live0, parked0 int64
 	shutOnce       sync.Once
-	closers        []func() // targets and tampers, closed after the Runtimes
+	// quit is closed first by shutdown: paced traffic goroutines (pace)
+	// stop at once, so that a row that failed mid-traffic ends cleanly
+	// (a synctest bubble cannot advance its clock for sleepers once its
+	// main goroutine has exited).
+	quit    chan struct{}
+	closers []func()                // targets and tampers, closed after the Runtimes
+	clients []*rendrtest.TargetConn // the ingresses' client ends, closed first
 
 	mu     sync.Mutex
 	routes map[string]dialFunc    // target dials by class
@@ -96,7 +102,7 @@ func newWorld(t testing.TB, o worldOpts, specs ...linkSpec) *world {
 	t.Helper()
 	w := &world{t: t, specs: specs, links: map[string]*rendrtest.Link{}, dev: &eventLog{}, pev: &eventLog{},
 		routes: map[string]dialFunc{}, calls: map[string][]time.Time{}, probes: map[string]int{},
-		live0: testhooks.LiveSessions.Load(), parked0: testhooks.ParkedSessions.Load()}
+		live0: testhooks.LiveSessions.Load(), parked0: testhooks.ParkedSessions.Load(), quit: make(chan struct{})}
 	o.dcfg.OnEvent, o.pcfg.OnEvent = w.dev.add, w.pev.add
 	w.d = newRuntime(t, o.dcfg, &o.dov)
 	w.p = newRuntime(t, o.pcfg, &o.pov)
@@ -263,13 +269,16 @@ func (w *world) peer(names ...string) *rendr.Peer {
 }
 
 // ingress is the dialer side of one forwarded L4 connection: the client
-// end of a TargetPipe that the test drives, the l4.Dial Conn and the
-// ingress Forward's result.
+// end of a TargetPipe that the test drives, the l4.Dial Conn, its State
+// when l4.Dial returned (StatePending: an EarlyReturn opening deferred to
+// the first Write, Read or CloseWrite) and the ingress Forward's result.
 type ingress struct {
-	addr string
-	cli  *rendrtest.TargetConn
-	c    *rendr.Conn
-	res  <-chan l4.ForwardResult
+	addr   string
+	cli    *rendrtest.TargetConn
+	c      *rendr.Conn
+	dialed rendr.State
+	res    <-chan l4.ForwardResult
+	quit   <-chan struct{} // the world's quit
 }
 
 // ingress dials addr through p with o and starts the ingress Forward
@@ -280,6 +289,7 @@ func (w *world) ingress(p *rendr.Peer, addr string, o rendr.DialOptions, idle ti
 	if err != nil {
 		return nil, err
 	}
+	dialed := c.Status().State
 	if idle > 0 {
 		if err := c.SetIdleTimeout(idle); err != nil {
 			c.Close()
@@ -287,9 +297,12 @@ func (w *world) ingress(p *rendr.Peer, addr string, o rendr.DialOptions, idle ti
 		}
 	}
 	cli, srv := rendrtest.TargetPipe(0)
+	w.mu.Lock()
+	w.clients = append(w.clients, cli)
+	w.mu.Unlock()
 	res := make(chan l4.ForwardResult, 1)
 	go func() { res <- l4.Forward(context.Background(), c, srv) }()
-	return &ingress{addr: addr, cli: cli, c: c, res: res}, nil
+	return &ingress{addr: addr, cli: cli, c: c, dialed: dialed, res: res, quit: w.quit}, nil
 }
 
 // mustIngress is ingress failing the test on an error.
@@ -312,14 +325,20 @@ func (in *ingress) result(within time.Duration) (l4.ForwardResult, error) {
 	}
 }
 
-// shutdown closes the Peers, both Runtimes (the dialer first), waits for
-// Serve, then closes the targets, tampers and links (once; also the
-// cleanup of a failed test).
+// shutdown closes quit and the ingresses' client ends (so that a row that
+// failed with traffic goroutines still pacing or blocked on them ends
+// cleanly instead of leaving the bubble deadlocked), the Peers, both
+// Runtimes (the dialer first), waits for Serve, then closes the targets,
+// tampers and links (once; also the cleanup of a failed test).
 func (w *world) shutdown() {
 	w.shutOnce.Do(func() {
+		close(w.quit)
 		w.mu.Lock()
-		peers := slices.Clone(w.peers)
+		peers, clients := slices.Clone(w.peers), slices.Clone(w.clients)
 		w.mu.Unlock()
+		for _, cli := range clients {
+			cli.Close()
+		}
 		for _, p := range peers {
 			p.Close()
 		}
@@ -478,6 +497,28 @@ func sleepUntil(at time.Time) {
 	}
 }
 
+// pace sleeps until at, or until quit is closed; it reports whether at
+// was reached (false: the world is shutting down).
+func pace(quit <-chan struct{}, at time.Time) bool {
+	d := time.Until(at)
+	if d <= 0 {
+		select {
+		case <-quit:
+			return false
+		default:
+			return true
+		}
+	}
+	tm := time.NewTimer(d)
+	defer tm.Stop()
+	select {
+	case <-tm.C:
+		return true
+	case <-quit:
+		return false
+	}
+}
+
 // Status helpers.
 
 // liveOf returns the attached live carriers (active or member).
@@ -534,8 +575,8 @@ type sender struct {
 
 // startSender writes size bytes of PRNG(seed) to wr in chunk-sized Writes,
 // one every interval (an absolute schedule; 0: back to back), then calls
-// fin (CloseWrite; nil: none).
-func startSender(wr io.Writer, seed uint64, size int64, chunk int, interval time.Duration, fin func() error) *sender {
+// fin (CloseWrite; nil: none). It stops when quit is closed.
+func startSender(wr io.Writer, quit <-chan struct{}, seed uint64, size int64, chunk int, interval time.Duration, fin func() error) *sender {
 	s := &sender{start: time.Now(), done: make(chan struct{})}
 	go func() {
 		defer close(s.done)
@@ -549,8 +590,9 @@ func startSender(wr io.Writer, seed uint64, size int64, chunk int, interval time
 				return
 			}
 			s.sent.Add(n)
-			if interval > 0 {
-				sleepUntil(s.start.Add(time.Duration(k) * interval))
+			if interval > 0 && !pace(quit, s.start.Add(time.Duration(k)*interval)) {
+				s.err = fmt.Errorf("stopped by the world's shutdown after %d bytes", s.sent.Load())
+				return
 			}
 		}
 		if fin != nil {
@@ -709,17 +751,23 @@ func abortOf(err error) (code rendr.AbortCode, remote, ok bool) {
 	return ae.Code, ae.Remote, true
 }
 
-// checkReject is nil when err is an l4 refusal with code. The message is
-// the code's fixed text, or empty: an OPEN retried after a kill took its
-// OPEN_ACK down is answered by the passive's tombstone, and on a view of
-// a shared trunk that answer is a fixed-size refusal record without the
+// checkReject is nil when err is an l4 refusal with code and the code's
+// fixed text as its message (a row without carrier kills).
+func checkReject(err error, code l4.RejectCode) error { return checkRefusal(err, code, false) }
+
+// checkRejectKilled is checkReject for a row with carrier kills: the
+// message may also be empty. An OPEN retried after a kill took its
+// OPEN_ACK down is answered by the passive's tombstone, and on a view of a
+// shared trunk that answer is a fixed-size refusal record without the
 // message (M3-D12); the code is the contract (l4's package doc).
-func checkReject(err error, code l4.RejectCode) error {
+func checkRejectKilled(err error, code l4.RejectCode) error { return checkRefusal(err, code, true) }
+
+func checkRefusal(err error, code l4.RejectCode, emptyMsg bool) error {
 	var re *rendr.RejectError
 	if !errors.As(err, &re) || !errors.Is(err, rendr.ErrRejected) {
 		return fmt.Errorf("got %v, want a refusal %#x (%v)", err, uint32(code), code)
 	}
-	if got, ok := l4.CodeOf(err); !ok || got != code || (re.Msg != code.String() && re.Msg != "") {
+	if got, ok := l4.CodeOf(err); !ok || got != code || (re.Msg != code.String() && (!emptyMsg || re.Msg != "")) {
 		return fmt.Errorf("got refusal %#x %q, want %#x %q", re.Code, re.Msg, uint32(code), code.String())
 	}
 	return nil
