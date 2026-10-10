@@ -14,8 +14,10 @@ import (
 // consuming every byte, then the payload parser of the frame's type); M2
 // adds "datagram" (rendr bytes of more than one element: a PREFACE or
 // PREFACE_ACK and frames, or several frames), "flow_header" (a bare valid
-// raw-UDP flow header) and "udp" (a flow header and valid rendr bytes). A
-// single element is its own decoder's, so the sets stay disjoint.
+// raw-UDP flow header) and "udp" (a flow header and valid rendr bytes); M3
+// decodes a JOIN_ACK on a later handle with the MUX parser when the
+// dedicated one refuses it (a coded view refusal). A single element is its
+// own decoder's, so the sets stay disjoint.
 func acceptors(b []byte) []string {
 	var out []string
 	if _, err := ParsePreface(b); err == nil {
@@ -25,7 +27,12 @@ func acceptors(b []byte) []string {
 		out = append(out, "preface_ack")
 	}
 	if f, n, err := DecodeFrame(b); err == nil && n == len(b) {
-		if _, err := decodeTyped(f.Type, f.Payload); err == nil {
+		_, err := decodeTyped(f.Type, f.Payload)
+		if err != nil && f.Type == TypeJoinAck && f.Handle > SessionHandle {
+			// A view's JOIN_ACK on a MUX trunk may carry a refusal code.
+			_, _, err = ParseJoinAckMux(f.Payload)
+		}
+		if err == nil {
 			out = append(out, "frame/"+f.Type.String())
 		}
 	}
