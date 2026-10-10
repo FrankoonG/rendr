@@ -98,6 +98,7 @@ type viewExt struct {
 	fin      atomic.Bool // ended: Done closes once the calls drain (M3-D13)
 	peerDet  atomic.Bool // the peer's DETACH(h) was dispatched
 	peerRst  bool        // passive: the dialer's withdrawal RST arrived before a session attached the view (R1-5; WP16 W1)
+	rstGiven bool        // passive: that RST was handed to the session at its Start (giveWithdrawal)
 	lingers  bool        // dialer: counted in muxState.linger (its Done closed, it is still in the table)
 	detSent  atomic.Bool // our DETACH(h) was placed
 	needResp atomic.Bool // passive: pending or joining, the first response not yet placed (the writer looks for it)
@@ -1149,6 +1150,13 @@ func (c *Conn) startView(ep Endpoint, bell Doorbell, o StartOptions) {
 		c.bell.Store(&ringer{bell})
 	}
 	t.mx.Lock()
+	// The dialer withdrew this OPEN before its session attached the view
+	// (R1-5; WP16 W1): the session gets the withdrawal now, once.
+	withdrawn := c.vx.peerRst && !c.vx.rstGiven && ep != nil
+	if withdrawn {
+		c.vx.rstGiven = true
+		go c.giveWithdrawal(ep, c.enter()) // counted while the view lives (M3-D13)
+	}
 	if c.vx.attached || !c.vx.inTable || c.vx.detQ || c.vx.fin.Load() || t.death.Load() != nil ||
 		(c.state != viewAttachedPending && c.state != viewPending && c.state != viewJoining) {
 		t.mx.Unlock()
@@ -1157,11 +1165,9 @@ func (c *Conn) startView(ep Endpoint, bell Doorbell, o StartOptions) {
 		}
 		return
 	}
-	if c.vx.peerRst {
-		// The dialer withdrew this OPEN before its session attached the
-		// view (R1-5): the view ends instead (a refusal answers the handle
-		// unless the dialer's DETACH came, abandonLocked), and its session
-		// sees it end like any lane whose carrier ended (WP16 W1).
+	if withdrawn {
+		// The view ends instead of going live (a refusal answers the
+		// handle unless the dialer's DETACH came, abandonLocked).
 		t.mx.Unlock()
 		c.killView(CauseRetired, "withdrawn by the dialer before its session attached the view (R1-5)")
 		return
@@ -1177,6 +1183,27 @@ func (c *Conn) startView(ep Endpoint, bell Doorbell, o StartOptions) {
 	t.readyLocked(c)
 	t.mx.Unlock()
 	t.wakeWriter()
+}
+
+// giveWithdrawal hands the session that attached view c the dialer's
+// withdrawal RST that arrived before the attach (classifyLocked recorded
+// it): one RST(AbortWithdrawn) for c's handle through ep.Control, as the
+// reader would have dispatched it (R1-5; WP16 W1). A pending session
+// withdraws only on that RST and survives the loss of its lanes (R1-5
+// rule 3), so the view's end alone would leave it pending until
+// AcceptTimeout when this view is its only lane. It runs on a goroutine of
+// its own: Start runs under the session's lock (its actor's adopt), which
+// Control takes; the goroutine lives until that lock is free, at most one
+// per view. counted: the call holds the view's Done open (enter); a view
+// that ended before its attach (the dialer's DETACH came first) has no
+// call to count, and its session gets the RST after its Done — the one
+// endpoint call after a view's Done, which carries no buffer.
+func (c *Conn) giveWithdrawal(ep Endpoint, counted bool) {
+	h := wire.Header{Type: wire.TypeRst, Len: uint32(len(rstWithdrawnPayload)), Handle: c.handle}
+	_ = ep.Control(c, h, rstWithdrawnPayload) // well-formed: no violation to report
+	if counted {
+		c.exit()
+	}
 }
 
 // The dialer's views (§A5.4, §A5.8).

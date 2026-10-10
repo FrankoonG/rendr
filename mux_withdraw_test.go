@@ -16,10 +16,26 @@ import (
 // which the passive admits through AttachOpen, attached only when the
 // session's actor adopts it — is cancelled while that actor is held before
 // the adopt. The dialer withdraws both OPENs (RST(AbortWithdrawn), then
-// DETACH): neither shared trunk dies (no protocol_violation), the bond
-// session that shares them keeps both members and moves data, and the
-// withdrawn session leaves no pending session once its actor runs.
+// DETACH): no shared trunk dies (no protocol_violation), the bond session
+// that shares them keeps its members and moves data, and the withdrawn
+// session leaves no pending session once its actor runs.
+//
+// Row "only lane": the first OPEN's carrier dies (refused for good) before
+// the cancel, so the second OPEN's view is the pending session's only lane
+// and the RST recorded before the attach is the only withdrawal it can
+// get: it must reach the session at its adopt, which then ends within 1 s
+// (L49's server-side bound) — not at AcceptTimeout (R1-5 rule 3).
 func TestMuxWithdrawAtAsyncAttach_R1_5(t *testing.T) {
+	for _, onlyLane := range []bool{false, true} {
+		name := "first lane alive"
+		if onlyLane {
+			name = "only lane"
+		}
+		t.Run(name, func(t *testing.T) { testMuxWithdrawAtAsyncAttach(t, onlyLane) })
+	}
+}
+
+func testMuxWithdrawAtAsyncAttach(t *testing.T, onlyLane bool) {
 	synctest.Test(t, func(t *testing.T) {
 		var (
 			mu    sync.Mutex
@@ -91,6 +107,21 @@ func TestMuxWithdrawAtAsyncAttach_R1_5(t *testing.T) {
 		if ps := e.p.Status(); ps.Sessions.Pending != 1 {
 			t.Fatalf("passive %+v, want the dialled session pending", ps.Sessions)
 		}
+		want := 2 // the passive trunks that must live
+		if onlyLane {
+			// The first OPEN's carrier (and the bond's member on it) dies
+			// and stays down: the second OPEN's view is the pending
+			// session's only lane.
+			e.links[0].SetRefuse(true)
+			e.links[0].Kill()
+			mxWait(t, 10*time.Second, "trunk a gone", func() bool { return len(mxTrunkSet(e.p)) == 1 })
+			trunks = mxTrunkSet(e.p)
+			want = 1
+			synctest.Wait()
+			if ps := e.p.Status(); ps.Sessions.Pending != 1 {
+				t.Fatalf("passive %+v, want the dialled session pending (it survives its lanes)", ps.Sessions)
+			}
+		}
 		cancel()
 		if r := <-ch; r.err == nil {
 			t.Fatal("the cancelled Dial returned a session")
@@ -104,17 +135,17 @@ func TestMuxWithdrawAtAsyncAttach_R1_5(t *testing.T) {
 					t.Fatalf("%s: a shared trunk died: %v %s", what, cause, detail)
 				}
 			}
-			if n := len(mxTrunkSet(e.p)); n != 2 {
-				t.Fatalf("%s: %d passive trunks, want 2", what, n)
+			if n := len(mxTrunkSet(e.p)); n != want {
+				t.Fatalf("%s: %d passive trunks, want %d", what, n, want)
 			}
 		}
 		alive("after the withdrawal")
 		release()
 		synctest.Wait()
-		mxWait(t, 10*time.Second, "the withdrawn session gone", func() bool { return e.p.Status().Sessions.Pending == 0 })
+		mxWait(t, time.Second, "the withdrawn session gone", func() bool { return e.p.Status().Sessions.Pending == 0 })
 		alive("after the adopt")
-		if n := mxMembers(s0); n != 2 {
-			t.Fatalf("the bond holds %d members, want 2", n)
+		if n := mxMembers(s0); n != want {
+			t.Fatalf("the bond holds %d members, want %d", n, want)
 		}
 		e2eExchange(t, s0, q0, 64<<10, 5)
 		e2eFinish(t, s0, q0)

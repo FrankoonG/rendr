@@ -70,6 +70,7 @@ type Runtime struct {
 	pools  map[*carrier.Pool]struct{}
 
 	muxFull atomic.Uint64 // CAPACITY CodeMuxFull answers of the passive trunks (carrier.Env.MuxFull; Status.Mux.MuxFull)
+	muxGone MuxStatus     // the counters (FastPaths, Coalesced, MuxFull) of the pools pruned (carrier.Pool.Fold; mu)
 }
 
 // Join bounds of Runtime.Close (design §3.1, §6.8).
@@ -234,18 +235,21 @@ func (rt *Runtime) Status() Status {
 }
 
 // muxStatus returns Status.Mux: the Peers' pools (dialer) and the trunk set
-// of passive MUX trunks. Zero while the Runtime has no MUX trunk. Carriers
-// counts the live MUX trunks of both roles, Views the views on them that
-// are not gone (Σ over those trunks, TestStatusMuxIdentities); MuxFull the
-// CodeMuxFull answers the pools received and the passive trunks placed.
+// of passive MUX trunks. Carriers counts the live MUX trunks of both roles
+// and Views the views on them that are not gone (Σ over those trunks,
+// TestStatusMuxIdentities): both are zero while the Runtime has no MUX
+// trunk. FastPaths, Coalesced and MuxFull are cumulative over the
+// Runtime's life: the pools' counters, those of pools already pruned
+// included (muxGone), and for MuxFull also the CodeMuxFull answers the
+// passive trunks placed.
 func (rt *Runtime) muxStatus() MuxStatus {
 	rt.mu.Lock()
 	pools := mapKeys(rt.pools)
 	trunks := mapKeys(rt.trunks)
+	m := rt.muxGone
 	rt.mu.Unlock()
-	var m MuxStatus
 	for _, p := range pools {
-		st := p.Stats()
+		st := p.Unfolded()
 		m.Carriers += st.Carriers
 		m.Views += st.Views
 		m.FastPaths += st.FastPaths
@@ -409,12 +413,17 @@ func (rt *Runtime) addPool(p *carrier.Pool) {
 	rt.mu.Unlock()
 }
 
-// prunePoolsLocked drops the pools that are closed and track no trunk.
+// prunePoolsLocked drops the pools that are closed and track no trunk; their
+// counters stay in Status.Mux (muxGone).
 func (rt *Runtime) prunePoolsLocked() {
 	done, cancel := context.WithCancel(context.Background())
 	cancel()
 	for p := range rt.pools {
 		if p.Wait(done) == nil {
+			g := p.Fold()
+			rt.muxGone.FastPaths += g.FastPaths
+			rt.muxGone.Coalesced += g.Coalesced
+			rt.muxGone.MuxFull += g.MuxFull
 			delete(rt.pools, p)
 		}
 	}

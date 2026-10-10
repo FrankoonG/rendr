@@ -619,6 +619,13 @@ func (t *trunk) onDetachLocked(d wire.Detach, una uint32, p *postList) string {
 	v := t.lookupLocked(d.Handle)
 	if v == nil {
 		if t.toleratedLocked(d.Handle, wire.TypeDetach, true) {
+			if t.dialer {
+				// The passive's DETACH for a handle we retired at its
+				// DETACH bound: its view ended, its place is free, so a
+				// CodeMuxFull answer that came after ours left the table
+				// marks the trunk full no longer (WP16 MUX-1).
+				t.ms.full = false
+			}
 			return ""
 		}
 		return "DETACH for an unknown handle"

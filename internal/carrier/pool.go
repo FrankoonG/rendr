@@ -58,6 +58,7 @@ type Pool struct {
 	idle    chan struct{}       // Wait's: closed (and reset) when Close runs, a trunk is done or a watcher ends
 	closed  bool
 	stats   PoolStats
+	folded  PoolStats // the counters the owner took (Fold): Unfolded leaves them out
 
 	// Tests only (nil in production). afterPick runs under mu between the
 	// pick and openView: the E3 window (TestPoolPickThenDeath). watchEnd
@@ -808,7 +809,40 @@ func (p *Pool) idleLocked() {
 func (p *Pool) Stats() PoolStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.statsLocked(p.stats)
+}
+
+// Unfolded is Stats with the counters (FastPaths, Coalesced, MuxFull) less
+// what Fold took: an owner that keeps the folded counters of a pool it
+// dropped adds these, so a pool that comes back (Env.PoolLive) is never
+// counted twice.
+func (p *Pool) Unfolded() PoolStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	s := p.stats
+	s.FastPaths -= p.folded.FastPaths
+	s.Coalesced -= p.folded.Coalesced
+	s.MuxFull -= p.folded.MuxFull
+	return p.statsLocked(s)
+}
+
+// Fold returns the counters (FastPaths, Coalesced, MuxFull) that grew since
+// the previous Fold and marks them taken: the owner keeps them when it
+// drops the pool, so its totals stay cumulative (rendr.Status.Mux).
+func (p *Pool) Fold() PoolStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	d := PoolStats{
+		FastPaths: p.stats.FastPaths - p.folded.FastPaths,
+		Coalesced: p.stats.Coalesced - p.folded.Coalesced,
+		MuxFull:   p.stats.MuxFull - p.folded.MuxFull,
+	}
+	p.folded.FastPaths, p.folded.Coalesced, p.folded.MuxFull = p.stats.FastPaths, p.stats.Coalesced, p.stats.MuxFull
+	return d
+}
+
+// statsLocked returns s with the live trunks and their views counted.
+func (p *Pool) statsLocked(s PoolStats) PoolStats {
 	count := func(c *Conn) {
 		if c.death.Load() == nil {
 			s.Carriers++

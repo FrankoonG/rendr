@@ -70,6 +70,13 @@ func TestMuxKillThenOpenAtCap(t *testing.T) {
 				defer release()
 				d.view(2).c.Kill(CauseLocalClose, "session 2 ended")
 				synctest.Wait()
+				// View 2's Done closed, but it holds its place until the
+				// passive's DETACH(2) (held) takes it out of the table: the
+				// pool's usable rule must not pick the trunk meanwhile.
+				waitDone(t, d.view(2).c.Done(), "dialer view 2")
+				if d.c.usableForMux(wire.TypeDgram, [16]byte{}, 0) {
+					t.Fatalf("the trunk is usable while killed view 2 still holds its place (dialer views %d)", d.c.Views())
+				}
 				payload := mOpenPayload(4, row.dg)
 				if kind == wire.TypeJoin {
 					payload = mJoinPayload(4)
@@ -179,6 +186,58 @@ func TestMuxFullClearsWhenRetiringViewLeaves(t *testing.T) {
 		}
 		if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
 			t.Fatalf("the trunk died: %v %s", cause, detail)
+		}
+	})
+}
+
+// TestMuxFullClearsAtLateDetach (§A5.5, §A5.8, M3-D12; WP16 MUX-1
+// residual): a dialer view retired at its DETACH bound leaves the view
+// table while the passive may still hold its own view, so a CodeMuxFull
+// answer can come after it left, with no view left to clear the mark. The
+// peer's late DETACH for that handle (its tolerated entry) says the
+// passive freed the place: the mark clears there, for the trunk and for a
+// pool that marked it, instead of lasting until some other view leaves.
+func TestMuxFullClearsAtLateDetach(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := muxRawDialer(t, nil)
+		v2, res2 := s.openRaw(t, wire.TypeOpen, 2)
+		synctest.Wait()
+		_ = p.send(wire.TypeOpenAck, 0, v2.Handle(), okAck(wire.TypeOpenAck))
+		if est, err := res2(); err != nil || !isOK(est) {
+			t.Fatalf("view 2: %v", err)
+		}
+		s.attach(v2)
+		synctest.Wait()
+		v2.Kill(CauseLocalClose, "session 2 ended")
+		waitDone(t, v2.Done(), "view 2")
+		// No DETACH(2) from the peer: view 2 expires at its DETACH bound
+		// (at most 1 s on a stream trunk) and leaves the table.
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+		v3, res3 := s.openRaw(t, wire.TypeOpen, 3)
+		synctest.Wait()
+		full := make([]byte, wire.OpenAckFixedLen)
+		n := wire.PutOpenAck(full, &wire.OpenAck{Status: wire.StatusCapacity, Code: wire.CodeMuxFull})
+		_ = p.send(wire.TypeOpenAck, 0, v3.Handle(), full[:n])
+		if est, err := res3(); err != nil || isOK(est) {
+			t.Fatalf("view 3: %v, want the CodeMuxFull refusal", err)
+		}
+		synctest.Wait()
+		pool := NewPool(s.env, []Factory{{Name: "f0", Mux: true}})
+		pool.full = map[*trunk]bool{s.c.trunk: true} // as fastPathRetry marks it
+		if s.c.usableForMux(wire.TypeData, [16]byte{}, 0) || pool.usable(s.c, 9) {
+			t.Fatal("the full trunk is usable")
+		}
+		_ = p.send(wire.TypeDetach, 0, 0, detachPayload(v2.Handle(), wire.DetachEnded))
+		synctest.Wait()
+		if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
+			t.Fatalf("the trunk died at the late DETACH: %v %s", cause, detail)
+		}
+		if !s.c.usableForMux(wire.TypeData, [16]byte{}, 0) {
+			t.Fatalf("the peer's late DETACH(2) freed its place (views %d) and the trunk stays full", s.c.Views())
+		}
+		if !pool.usable(s.c, 9) {
+			t.Fatal("the trunk's mark cleared and the pool's stays")
 		}
 	})
 }
