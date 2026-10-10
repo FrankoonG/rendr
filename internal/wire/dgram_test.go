@@ -1054,11 +1054,12 @@ func TestControlFrameSizes_L37(t *testing.T) {
 	if rows[len(rows)-1].got == 0 || len(rows) < 40 {
 		t.Fatalf("size table incomplete: %d rows", len(rows))
 	}
-	// M4: the largest first flight fits the stream write batch (256 KiB,
-	// the carrier's default batch budget) and one frame payload limit; its
-	// DATA payload (8 + EarlyWindow) is one frame (§A3.2: never split).
-	if flight := PrefaceLen + 4145 + 65561; flight > 256<<10 || flight > MaxFramePayload || DataPrefixLen+EarlyWindow > MaxFramePayload {
-		t.Errorf("largest first flight %d bytes, MaxFramePayload %d", flight, MaxFramePayload)
+	// M4: the first flight's DATA payload (8 + EarlyWindow) is one frame
+	// (§A3.2: never split). That the whole flight leaves in one write of
+	// the carrier's batch budget (carrier/batch.go defaultBatchBudget) is
+	// the carrier's test (TestEarlyFirstFlightOneWrite_L41, WP8).
+	if DataPrefixLen+EarlyWindow > MaxFramePayload {
+		t.Errorf("first-flight DATA payload %d bytes > MaxFramePayload %d", DataPrefixLen+EarlyWindow, MaxFramePayload)
 	}
 
 	// The largest REL payload after the handshake (every wrappable type

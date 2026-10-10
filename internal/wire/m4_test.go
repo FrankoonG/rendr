@@ -83,8 +83,9 @@ func TestOpenEarlyRules_L44(t *testing.T) {
 		t.Fatalf("OpenFlagEarly %#x, EarlyWindow %d", OpenFlagEarly, EarlyWindow)
 	}
 
-	// The checks before the flags keep their errors; the flag check comes
-	// before the PMTU checks (a packet EARLY OPEN with a bad PMTU is
+	// The checks before the flags keep their errors, also when EARLY sits
+	// on a packet OPEN or bit 1 is set; the flag check comes before the
+	// PMTU checks (a packet EARLY OPEN with a bad PMTU is
 	// ErrReserved, a stream EARLY OPEN with a PMTU too).
 	early := stream
 	early.Flags = OpenFlagEarly
@@ -92,6 +93,16 @@ func TestOpenEarlyRules_L44(t *testing.T) {
 	zeroSID.SID = [16]byte{}
 	kind3.Kind = 3
 	mode4.Mode = MaxMode + 1
+	// The packet-EARLY and the other-flag checks come after the kind and
+	// mode checks: a bad mode stays ErrValue (root answers CodeBadMode,
+	// not CodeBadValue) whatever the flags say.
+	mode0 := early
+	mode0.Mode = 0
+	packetMode0, packetMode4 := packet, packet
+	packetMode0.Flags, packetMode0.Mode = OpenFlagEarly, 0
+	packetMode4.Flags, packetMode4.Mode = OpenFlagEarly, MaxMode+1
+	bit1Kind3, bit1Mode0, bit1Mode4 := kind3, mode0, mode4
+	bit1Kind3.Flags, bit1Mode0.Flags, bit1Mode4.Flags = 1<<1, 1<<1, 1<<1
 	streamPMTU.PMTU = MinPacketPayload
 	packetBadPMTU.Flags, packetBadPMTU.PMTU = OpenFlagEarly, 0
 	packetBadWindow.Flags, packetBadWindow.Window = OpenFlagEarly, 1
@@ -107,6 +118,12 @@ func TestOpenEarlyRules_L44(t *testing.T) {
 		{"zero SID", enc(zeroSID), 0, ErrReserved},
 		{"kind 3", enc(kind3), 0, ErrValue},
 		{"mode 4", enc(mode4), 0, ErrValue},
+		{"mode 0", enc(mode0), 0, ErrValue},
+		{"packet, mode 0", enc(packetMode0), 0, ErrValue},
+		{"packet, mode 4", enc(packetMode4), 0, ErrValue},
+		{"bit 1, kind 3", enc(bit1Kind3), 0, ErrValue},
+		{"bit 1, mode 0", enc(bit1Mode0), 0, ErrValue},
+		{"bit 1, mode 4", enc(bit1Mode4), 0, ErrValue},
 		{"stream with a PMTU", enc(streamPMTU), 0, ErrReserved},
 		{"packet, PMTU 0", enc(packetBadPMTU), 0, ErrReserved},
 		{"packet, window 1", enc(packetBadWindow), 0, ErrReserved},
@@ -304,7 +321,16 @@ func FuzzOpen_L44(f *testing.F) {
 	packet := gPacketOpen()
 	packet.Flags = OpenFlagEarly
 	seeds = append(seeds, encodeTyped(TypeOpen, packet))
-	if len(seeds) < 12 {
+	// Check order against the kind and mode checks: a bad mode or kind
+	// with EARLY on a packet OPEN, or with bit 1, is still ErrValue.
+	for _, fl := range []uint16{OpenFlagEarly, 1 << 1} {
+		for _, km := range [][2]byte{{byte(KindDatagram), 0}, {byte(KindDatagram), MaxMode + 1}, {byte(KindStream), 0}, {3, 1}} {
+			o := gPacketOpen()
+			o.Flags, o.Kind, o.Mode = fl, CarrierKind(km[0]), km[1]
+			seeds = append(seeds, encodeTyped(TypeOpen, o))
+		}
+	}
+	if len(seeds) < 20 {
 		f.Fatalf("only %d OPEN seeds", len(seeds))
 	}
 	for _, s := range seeds {
