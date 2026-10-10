@@ -373,23 +373,23 @@ func (ln *Listener) passSignal(k int) {
 //     accepted (a view of a carrier other sessions share) is answered
 //     OPEN_ACK(CAPACITY, CodeListenerClosed) (M3-D63, R1-10;
 //     TestMuxOpenAfterListenerClose_L50). That is a carrier refusal without
-//     penalty: the dialer's Peer stops OPENing on that trunk and its Dial
-//     goes on with another live trunk of the same factory or a new carrier
-//     of it, so the Dial does not return ErrCapacity from that answer.
-//     Where the new carrier reaches
-//     another Listener of the Runtime, the session is admitted there as
-//     usual; where it reaches only this Listener's closed source (its
-//     Handle and HandlePacket refuse it), the carrier fails as a path
-//     failure, the session redials, and the Dial returns ErrNoPath once its
-//     NoPathGrace ran out.
+//     penalty: that dial attempt does not OPEN on that trunk again and goes
+//     on with another live trunk of the same factory or a new carrier of
+//     it, so the Dial does not return ErrCapacity from that answer. No
+//     lasting mark is kept: each later attempt, of this Dial or another,
+//     is refused there once more while the trunk lives. Where the new
+//     carrier reaches another Listener of the Runtime, the session is
+//     admitted there as usual; where it reaches only this Listener's
+//     closed source (its Handle and HandlePacket refuse it), the carrier
+//     fails as a path failure, the session redials, and the Dial returns
+//     ErrNoPath once its NoPathGrace ran out.
 //
 // JOINs on the live trunks this Listener accepted are still admitted.
 // Confirmed sessions are not affected (their carriers may arrive through
 // any Listener), and the Runtime keeps admitting through its other
-// Listeners. A Listener's Close
-// is not the instance going away, so it never answers GOING_AWAY, which
-// makes a dialer's Peer stop OPENing to the whole instance; only
-// Runtime.Close does. Idempotent.
+// Listeners. A Listener's Close is not the instance going away, so it
+// never answers GOING_AWAY, which makes a dialer's Peer stop OPENing to
+// the whole instance; only Runtime.Close does. Idempotent.
 func (ln *Listener) Close() error {
 	if refuse := ln.shut(); len(refuse) > 0 {
 		st, code := ln.refusal() // GOING_AWAY only when Runtime.Close runs concurrently
@@ -458,9 +458,11 @@ func (ln *Listener) refusal() (wire.AckStatus, uint32) {
 // viewRefusal is refusal for an OPEN; view reports an OPEN for a new handle
 // on a live MUX trunk this Listener accepted (M3-D63, R1-10): there a
 // closed Listener answers CAPACITY CodeListenerClosed — a carrier refusal
-// that makes the dialer's pool stop OPENing on that trunk and dial instead
-// (the dial then reaches the closed listening socket), without touching
-// its Peer's gone-away set; JOINs on the trunk are still admitted.
+// after which that dial attempt does not OPEN on that trunk again and
+// takes another live trunk or dials instead (the dial then reaches the
+// closed listening socket), without touching its Peer's gone-away set or
+// marking the trunk for later attempts; JOINs on the trunk are still
+// admitted.
 func (ln *Listener) viewRefusal(view bool) (wire.AckStatus, uint32) {
 	st, code := ln.refusal()
 	if view && st == wire.StatusCapacity {

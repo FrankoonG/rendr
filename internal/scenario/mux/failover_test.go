@@ -570,9 +570,13 @@ func waitUntilOK(within time.Duration, cond func() bool) bool {
 // two when a slow OPEN claims — the claimant and the one JOIN that dials
 // in its place); Status.Mux.Carriers on the dialer at most one per factory
 // (plus the OPEN claimant's in open-first) right after the recovery and
-// once the load stopped; every long session's exchange after the
-// recovery verified both ways; a clean end and nothing left after
-// Runtime.Close. Observed before WP DIALSTORM (slow-verdict): each
+// once the load stopped; in open-first, the premise of its stimulus — the
+// kill ended p1's probe carrier, and no probe carrier error after the kill
+// reached the dialer before the shared carrier's death record was set
+// (probeHold; without the hold, or with it released at the kill, this
+// fails in most runs, where the race it closes made 1 in 900 fail); every
+// long session's exchange after the recovery verified both ways; a clean
+// end and nothing left after Runtime.Close. Observed before WP DIALSTORM (slow-verdict): each
 // coalesced waiter whose verdict grace ran out while the claimant's JOIN
 // awaited its verdict dialled its own carrier — 16 calls, 13 carriers —
 // and the extra carriers stayed with their one session; after its first
@@ -658,11 +662,36 @@ func (l *dialLog) in(from, to time.Time) []sessionDial {
 // the stimulus's Link.Kill ends together with p1's shared carrier — after
 // the death record of the shared carrier, so that the health publication
 // it causes, which rings every session actor, wakes no actor before that
-// record is set (WP16-MUX-2; idleFailover).
+// record is set (WP16-MUX-2; idleFailover). It also checks that order:
+// once the kill is marked (killed), every probe conn call that returns an
+// error is counted (errs), and counted as early if it returned before the
+// death record was marked set (recorded), so the row fails if the hold is
+// lost or released before the record exists.
 type probeHold struct {
 	mu   sync.Mutex
 	on   chan struct{} // non-nil while engaged; closed by release
 	held atomic.Int64  // probe conn calls that waited
+
+	kill, dead  atomic.Bool  // the kill happened; the death record is set
+	errs, early atomic.Int64 // probe conn errors after the kill; of them before the record
+}
+
+// killed marks the kill: probe conn errors from now on are checked.
+func (h *probeHold) killed() { h.kill.Store(true) }
+
+// recorded marks the death record of the shared carrier as set; it must
+// come before the release that record allows.
+func (h *probeHold) recorded() { h.dead.Store(true) }
+
+// check counts a probe conn call's error returned to the dialer.
+func (h *probeHold) check(err error) {
+	if err == nil || !h.kill.Load() {
+		return
+	}
+	h.errs.Add(1)
+	if !h.dead.Load() {
+		h.early.Add(1)
+	}
 }
 
 // engage starts holding (a no-op while engaged).
@@ -705,12 +734,14 @@ type probeConn struct {
 func (c *probeConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	c.h.wait()
+	c.h.check(err)
 	return n, err
 }
 
 func (c *probeConn) Write(p []byte) (int, error) {
 	n, err := c.Conn.Write(p)
 	c.h.wait()
+	c.h.check(err)
 	return n, err
 }
 
@@ -820,7 +851,8 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 	)
 	hooks := &testhooks.Hooks{DeathObserved: func(id uint32) {
 		if id != 0 && gateID.Load() == id {
-			hold.release() // the shared carrier's death record is set
+			hold.recorded() // the shared carrier's death record is set
+			hold.release()
 			held.Add(1)
 			<-gate
 		}
@@ -914,10 +946,15 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 		gateID.Store(uint32(target.ID))
 	}
 	coalesced := w.d.Status().Mux.Coalesced
+	probesKilled := w.link("p1").Stats().Probe.Killed
 	killed := time.Now()
+	if openFirst {
+		hold.killed()
+	}
 	if n := w.link("p1").Kill(); n == 0 {
 		t.Fatal("stimulus: the kill of p1 ended no carrier")
 	}
+	probesKilled = w.link("p1").Stats().Probe.Killed - probesKilled
 	if openFirst {
 		// Every session on the dead carrier is held at its death; the
 		// load's next OPEN finds no trunk of p1 and claims its redial, and
@@ -1001,6 +1038,17 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 	}
 	if m.Carriers > maxCarriers || after.Carriers > maxCarriers {
 		t.Errorf("dialer Status.Mux.Carriers %d right after the recovery and %d once the load stopped, want ≤ %d", m.Carriers, after.Carriers, maxCarriers)
+	}
+	if openFirst {
+		// The premise the stimulus rests on (WP16-MUX-2): the kill ended
+		// p1's probe carrier, and the dialer saw that carrier fail only
+		// once the shared carrier's death record was set.
+		if probesKilled == 0 || hold.errs.Load() == 0 {
+			t.Errorf("stimulus: the kill ended %d probe carriers of p1 and the dialer's probe carriers returned %d errors after it, want at least one each", probesKilled, hold.errs.Load())
+		}
+		if e := hold.early.Load(); e != 0 {
+			t.Errorf("premise: %d of %d probe carrier errors after the kill reached the dialer before the shared carrier's death record was set, want none (probeHold)", e, hold.errs.Load())
+		}
 	}
 	exchangeAll(t, ps, 64<<10, 100)
 	if t.Failed() {
