@@ -135,13 +135,13 @@ type RaceCounters struct {
 type PacketCounters struct {
 	Sent          uint64 // handed to a carrier and not refused by it
 	Received      uint64 // accepted from carriers (distinct)
-	Duplicates    uint64 // received again inside the dedup window
+	Duplicates    uint64 // received again inside the dedup window (the 16,384 datagrams behind the newest received), also after ReadFrom returned io.EOF; in a race session the members' copies of a datagram while they arrive inside the window (copies beyond it count in DropLate)
 	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
 	DropAge       uint64 // send side: not handed to a carrier within Packet.MaxAge while one existed
 	DropTooLarge  uint64 // send side: no live carrier could carry it, a carrier refused it as too large, or a budget shrink left it on a member too small for it while every member that can carry it was write-blocked or at its capacity
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no carrier
 	DropRecvQueue uint64 // receive side: evicted from a full receive queue (the application did not read)
-	DropLate      uint64 // receive side: older than the dedup window, or arrived after ReadFrom already returned io.EOF
+	DropLate      uint64 // receive side: older than the dedup window, or new and arrived after ReadFrom already returned io.EOF; in a race session also a member's copy of a datagram already received that arrives 16,384 datagrams or more behind the newest (members more than about 330 ms apart at 50,000 datagrams/s): no loss, the datagram was delivered once
 	PeerReceived  uint64 // the peer's Received, as last reported by its accounting frames
 }
 
