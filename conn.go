@@ -12,24 +12,30 @@ import (
 // are safe for concurrent use; concurrent Writes are serialized and never
 // interleave, as are concurrent Reads.
 type Conn struct {
-	s      *session.Session
-	local  Addr
-	remote Addr
-	props  *peerProps // dialer: the Peer's Props (CarrierStatus.FateGroup); nil on the passive
+	s     *session.Session
+	local Addr
+	props *peerProps // dialer: the Peer's Props (CarrierStatus.FateGroup); nil on the passive
 }
 
 var _ net.Conn = (*Conn)(nil)
 
-// newConn wraps the session s of rt. The peer instance is bound before a
-// session is handed to the application (dialer: the first OPEN_ACK(OK);
-// passive: the OPEN's PREFACE), so both addresses are fixed here.
+// newConn wraps the session s of rt. The local address is fixed here; the
+// remote one is the session's bound peer instance (remote).
 func newConn(rt *Runtime, s *session.Session) *Conn {
-	sid := SessionID(s.ID())
-	return &Conn{
-		s:      s,
-		local:  Addr{Instance: rt.id, Session: sid},
-		remote: Addr{Instance: InstanceID(s.PeerInstance()), Session: sid},
+	return &Conn{s: s, local: Addr{Instance: rt.id, Session: SessionID(s.ID())}}
+}
+
+// remote is Addr{peer instance, session}. The session binds its peer
+// instance once (passive: the OPEN's PREFACE; dialer: the first
+// OPEN_ACK(OK), before Dial returns unless EarlyReturn) and never rebinds
+// it (L38, M4-D15), so the address is read from the session: the zero
+// InstanceID until an EarlyReturn session's peer answered, then fixed.
+func (c *Conn) remote() Addr {
+	a := Addr{Session: c.local.Session}
+	if c.s.PeerBound() {
+		a.Instance = InstanceID(c.s.PeerInstance())
 	}
+	return a
 }
 
 // Read reads delivered bytes. io.EOF is returned only when the peer's FIN
@@ -65,8 +71,10 @@ func (c *Conn) CloseWrite() error { return c.s.CloseWrite() }
 // LocalAddr returns Addr{this Runtime, session}.
 func (c *Conn) LocalAddr() net.Addr { return c.local }
 
-// RemoteAddr returns Addr{peer instance, session}.
-func (c *Conn) RemoteAddr() net.Addr { return c.remote }
+// RemoteAddr returns Addr{peer instance, session}. With
+// DialOptions.EarlyReturn its Instance is zero until the peer accepted the
+// session; it never changes afterwards.
+func (c *Conn) RemoteAddr() net.Addr { return c.remote() }
 
 // SetDeadline sets the read and the write deadline, as SetReadDeadline and
 // SetWriteDeadline do (net.Conn semantics).
@@ -91,8 +99,10 @@ func (c *Conn) SetWriteDeadline(t time.Time) error { return c.s.SetWriteDeadline
 // ID returns the session ID.
 func (c *Conn) ID() SessionID { return c.local.Session }
 
-// PeerInstance returns the peer InstanceID the session is bound to.
-func (c *Conn) PeerInstance() InstanceID { return c.remote.Instance }
+// PeerInstance returns the peer InstanceID the session is bound to: with
+// DialOptions.EarlyReturn the zero InstanceID until the peer accepted the
+// session, then fixed for the session's life.
+func (c *Conn) PeerInstance() InstanceID { return c.remote().Instance }
 
 // Metadata returns the session's OPEN metadata (do not modify).
 func (c *Conn) Metadata() []byte { return c.s.Metadata() }

@@ -34,10 +34,11 @@ releases, their API or their wire format. The current checkpoint is M2:
 the 2.0 core of M1 (stream sessions, selector and bond scheduling, the wire
 format, admission) plus packet sessions, datagram carriers (the raw UDP
 carrier `carrier/udp` and embedder `net.PacketConn` carriers) and the QUIC
-stream and datagram carriers of the nested `quic` module. Milestone M3 is
-in progress: race scheduling, carrier properties (`Props`), shared
-carriers (rendr mux) and parked idle sessions. The API may still change
-before v2.0.0. An L4 TCP module (M4) follows.
+stream and datagram carriers of the nested `quic` module. Milestone M3
+(race scheduling, carrier properties (`Props`), shared carriers (rendr
+mux) and parked idle sessions) and milestone M4 (the L4 TCP module `l4`,
+`examples/socks5` and early return with early data) are in progress. The
+API may still change before v2.0.0.
 
 Supported platforms are Linux and Windows; Windows has no real-network
 regression in 2.0.0 (see [Not in 2.0.0](#not-in-200)). macOS and arm64 are
@@ -67,6 +68,10 @@ transport layer meant to run inside the embedder's own protocol:
 - [`examples/mtls`](examples/mtls) shows mutually authenticated TLS carriers
   built with the standard library's `crypto/tls`: the passive side verifies
   the client certificate before a carrier ever reaches rendr.
+- An `l4.Server` dials whatever target a dialer names, its own loopback and
+  private networks included, unless its `Dial` hook refuses; anyone who can
+  open a session to it can reach every address the passive host can (see
+  [L4 TCP forwarding](#l4-tcp-forwarding-package-l4)).
 
 Every frame on every carrier carries a frame sequence number and a CRC32C,
 and every carrier is bound to one peer instance. A carrier that violates the
@@ -244,6 +249,85 @@ Semantics in brief:
   datagram counters count each unit once; in race mode
   `SessionStatus.Race` (sender) and `DupBytes` (receiver) count the copies,
   and each `CarrierStatus` counts what its carrier moved, copies included.
+
+### Early return
+
+`DialOptions{EarlyReturn: true}` gives `Peer.Dial` the semantics of TCP Fast
+Open, for protocols whose client speaks first (a TLS ClientHello, an HTTP
+request):
+
+```go
+conn, err := peer.Dial(ctx, rendr.DialOptions{EarlyReturn: true}) // no network I/O yet
+_, err = conn.Write(clientHello) // opens the session; up to 64 KiB travel with the OPEN
+_, err = conn.Read(buf)          // a refusal or ErrNoPath arrives here instead of from Dial
+```
+
+- `Dial` returns after its local checks, before any network I/O and
+  without the cold-start wait for probe samples. The session opens with
+  its first `Write`, `Read` or `CloseWrite`; a `Close` before any of them
+  sends nothing.
+- The first bytes written, up to `Handshake.EarlyDataMax` (64 KiB; 0–64 KiB),
+  leave in the same carrier write as the OPEN when the session dials a
+  carrier of its own, so the first answer arrives about one round trip
+  sooner. Until the peer answers, `Write` accepts at most `EarlyDataMax`
+  bytes in all and then waits (deadlines apply).
+- Every outcome `Dial` would have returned (`*RejectError`, `ErrCapacity`,
+  `ErrNoPath`, ...) becomes the error of the next `Read` and `Write`, ends
+  the session (`Done` closes) and is reported in `EventSessionEnd`; the early
+  bytes are then discarded on both sides. The passive application reads
+  them only after it confirmed the session; the passive holds at most
+  64 KiB of them per pending session.
+- Write before you read: a `Read` that comes first opens the session
+  without early bytes. Do not use it when the peer must answer before your
+  first byte (a SOCKS5 reply, for example).
+- Until the peer answers, `Status().State` is `StatePending` and
+  `PeerInstance` and `RemoteAddr` report the zero `InstanceID`; the bound
+  instance never changes afterwards. `Status().EarlyBytes` shows how many
+  bytes travelled early on both ends.
+- A session that opens on a carrier shared with other sessions of the Peer
+  (rendr mux) sends no early data: its bytes follow the answer, which costs
+  the same round trip as early data on a fresh carrier. `DialPacket`
+  refuses `EarlyReturn` with `ErrProtocol`.
+
+### L4 TCP forwarding (package l4)
+
+Package [`l4`](l4) carries TCP connections over stream sessions. The
+dialer names the target in the OPEN's metadata; the passive dials it while
+the session is still pending, confirms only once the target connected and
+rejects with a typed code otherwise (refused, unreachable, timeout, name
+not found, ...); then both ends forward:
+
+```go
+// Passive side: serve the L4 sessions of a Listener.
+go l4.Serve(ctx, ln) // or (&l4.Server{Dial: policyDial, MaxConns: 1000}).Serve(ctx, ln)
+
+// Dialer side: one session per accepted TCP connection.
+local, err := tcpListener.Accept()
+conn, err := l4.Dial(ctx, peer, "example.com:443", rendr.DialOptions{EarlyReturn: true})
+if err != nil { // with EarlyReturn: a local error only; l4.CodeOf tells the refusals
+	local.Close()
+	return
+}
+res := l4.Forward(ctx, conn, local) // both directions, then closes both; res tells how it ended
+```
+
+- Half-closes cross in both directions; a reset or failure on either side
+  becomes a reset on the other, never a clean end of stream; a carrier
+  change is invisible to both sockets. When a session ends, its socket is
+  released at once, also when the socket's peer ignores FIN or never reads.
+- Sessions made by `l4.Dial` and served by `l4.Server` are idle-limited to
+  `l4.DefaultIdleTimeout` (10 minutes) unless changed (`Conn.SetIdleTimeout`,
+  `Server.IdleTimeout`).
+- A domain is resolved by the passive. The destination travels only in the
+  OPEN; the whole metadata stays within `Handshake.MaxMetadata`.
+- The Server has no authentication and no address policy of its own: give
+  it a `Dial` hook that refuses what must not be reached (`l4.ErrDenied`)
+  and checks the resolved address (`net.Dialer.Control`). Its `MaxConns`
+  (10,000 by default) bounds the forwarded connections; each costs three
+  goroutines and 64 KiB of buffers on top of its session's windows.
+- [`examples/socks5`](examples/socks5) is a loopback-only, no-auth SOCKS5
+  CONNECT front end; it dials without `EarlyReturn`, because the SOCKS
+  reply must wait for the passive's answer.
 
 ### Carrier properties
 
