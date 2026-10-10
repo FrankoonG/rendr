@@ -709,6 +709,7 @@ func migrated(t testing.TB, s setup, xs []*pair, k kill, d, own uint64) {
 		return
 	}
 	var sum uint64
+	lostAny := false
 	for i, x := range xs {
 		// Whatever the counts, each session replaced the member it lost
 		// on k: two live members again on both ends (liveOf excludes the
@@ -716,14 +717,32 @@ func migrated(t testing.TB, s setup, xs []*pair, k kill, d, own uint64) {
 		waitFor(t, 10*time.Second, fmt.Sprintf("session %d: two live members on both ends after the death of %d", i, k.id), func() bool {
 			return len(liveOf(x.d.Status())) == 2 && len(liveOf(x.p.Status())) == 2
 		})
-		dm, pm := x.d.Status().Migrations, x.p.Status().Migrations
+		dst, pst := x.d.Status(), x.p.Status()
+		dm, pm := dst.Migrations, pst.Migrations
 		if dm.Death > want[i] || pm.Death != 0 {
 			t.Fatalf("session %d: Death migrations: dialer %+v, passive %+v; want at most %d and 0", i, dm, pm, want[i])
 		}
 		sum += dm.Death
+		// The session's payload the dialer wrote on k that the passive
+		// never received (both rows are final: k is dead): a bond session
+		// that lost some had unacknowledged data on k and must requeue it,
+		// a Death migration (plan:216, M3-D34); one that lost none had
+		// nothing to requeue (I3: on the pool's race lane a splice met an
+		// idle k, every byte written on it already delivered).
+		dk, _ := carrierOf(dst, k.id)
+		pk, _ := carrierOf(pst, k.id)
+		if dk.TxBytes > pk.RxBytes {
+			lostAny = true
+			if s.mode == rendr.ModeBond && dm.Death == 0 {
+				t.Fatalf("session %d: %d bytes written on the dead trunk %d never arrived, yet the dialer counted no Death migration", i, dk.TxBytes-pk.RxBytes, k.id)
+			}
+		}
 	}
 	if s.mode == rendr.ModeBond && sum == 0 {
-		t.Fatal("no bond session counted the death of the trunk that carried their unacknowledged data")
+		if lostAny {
+			t.Fatal("no bond session counted the death of the trunk that carried their unacknowledged data")
+		}
+		t.Logf("no bond session had payload in flight on the dead trunk %d: nothing to requeue, no Death migration", k.id)
 	}
 }
 
