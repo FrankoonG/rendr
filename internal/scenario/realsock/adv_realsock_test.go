@@ -195,16 +195,46 @@ func (n *advNet) close() {
 	}
 }
 
-// advFlow is size bytes of PRNG(seed) dialer → passive, verified up to EOF.
+// advGate holds the flows' senders after their first quarter until a
+// row armed its stimulus: a session's whole stream fits its send window
+// (8 MiB; 4 MiB per session on the trunk, 4 MiB in all under -race), so
+// without it every frame may have passed the relay before the stimulus
+// is armed, and a stimulus that acts on the frames that follow (the next
+// DATA frame, the next frames to splice, the bytes to the fresh upstream)
+// never fires. Opened by the row, or at its cleanup when it failed first.
+type advGate struct {
+	ch   chan struct{}
+	once sync.Once
+}
+
+func newAdvGate(t testing.TB) *advGate {
+	g := &advGate{ch: make(chan struct{})}
+	t.Cleanup(g.open)
+	return g
+}
+
+func (g *advGate) open() { g.once.Do(func() { close(g.ch) }) }
+
+// advFlow is size bytes of PRNG(seed) dialer → passive, verified up to EOF:
+// the first quarter at once, the rest once the gate opens.
 type advFlow struct {
 	got  atomic.Int64
+	sent atomic.Int64 // bytes the sender wrote
 	done chan error
 }
 
-func advStart(dc, pc *rendr.Conn, size int64, seed uint64) *advFlow {
+func advStart(dc, pc *rendr.Conn, size int64, seed uint64, g *advGate) *advFlow {
 	f := &advFlow{done: make(chan error, 2)}
 	go func() {
-		_, err := io.Copy(struct{ io.Writer }{dc}, io.LimitReader(rendrtest.PRNG(seed), size))
+		w := struct{ io.Writer }{dc}
+		src := io.LimitReader(rendrtest.PRNG(seed), size)
+		k, err := io.CopyN(w, src, size/4)
+		f.sent.Add(k)
+		if err == nil {
+			<-g.ch
+			k, err = io.Copy(w, src)
+			f.sent.Add(k)
+		}
 		if err == nil {
 			err = dc.CloseWrite()
 		}
@@ -249,12 +279,34 @@ func (f *advFlow) wait(t testing.TB, what string) {
 // advUntil polls cond every millisecond for at most 5 s.
 func advUntil(t testing.TB, what string, cond func() bool) {
 	t.Helper()
+	advUntilDiag(t, what, cond, nil)
+}
+
+// advUntilDiag is advUntil that adds diag's state to the failure.
+func advUntilDiag(t testing.TB, what string, cond func() bool, diag func() string) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
+			if diag != nil {
+				t.Fatalf("not within 5 s: %s; %s", what, diag())
+			}
 			t.Fatalf("not within 5 s: %s", what)
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// advStimulusDiag describes a stimulus that did not land: the tamper's
+// counters and frames, and each flow's bytes written and received.
+func advStimulusDiag(tm *rendrtest.Tamper, fs []*advFlow) func() string {
+	return func() string {
+		var b strings.Builder
+		fmt.Fprintf(&b, "tamper %+v, %d frames up", tm.Stats(), len(tm.Log(rendrtest.Up)))
+		for i, f := range fs {
+			fmt.Fprintf(&b, "; session %d: %d bytes sent, %d received", i, f.sent.Load(), f.got.Load())
+		}
+		return b.String()
 	}
 }
 
@@ -363,11 +415,17 @@ func advRows(t *testing.T, size int64, mux bool) {
 		n := newAdvNet(t)
 		defer n.close()
 		ds, ps := n.openK(n.peer(mux), k)
-		fs := advStartAll(ds, ps, size, 1)
+		g := newAdvGate(t)
+		fs := advStartAll(ds, ps, size, 1, g)
 		advUntil(t, "a quarter of the transfer", func() bool { return fs[0].got.Load() >= size/4 })
 		id, tm := n.shared(ds)
+		// Armed before the gate lets the other three quarters go: the next
+		// DATA frame up the carrier is one of a live session (any of the
+		// trunk's) with most of its stream still to come.
 		tm.FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameData), 13*8+20)
-		advUntil(t, "the flip (stimulus)", func() bool { return tm.Stats().Flipped == 1 })
+		advHeld(t, g, fs, size)
+		g.open()
+		advUntilDiag(t, "the flip (stimulus)", func() bool { return tm.Stats().Flipped == 1 }, advStimulusDiag(tm, fs))
 		for i, pc := range ps {
 			if c := advDead(t, pc.Status, id); c.DeathCause != rendr.CauseProtocolViolation || !strings.Contains(c.DeathDetail, "crc mismatch") {
 				t.Fatalf("session %d: the flipped carrier died of %v %q, want protocol_violation crc mismatch", i, c.DeathCause, c.DeathDetail)
@@ -388,12 +446,16 @@ func advRows(t *testing.T, size int64, mux bool) {
 		}
 		xd, xp := n.openK(px, k)
 		yd, yp := n.openK(py, k)
-		fx, fy := advStartAll(xd, xp, size, 2), advStartAll(yd, yp, size, 20)
+		g := newAdvGate(t)
+		fx, fy := advStartAll(xd, xp, size, 2, g), advStartAll(yd, yp, size, 20, g)
 		advUntil(t, "a quarter of both", func() bool { return fx[0].got.Load() >= size/4 && fy[0].got.Load() >= size/4 })
 		_, tx := n.shared(xd)
 		id, ty := n.shared(yd)
+		// Armed before the gate: X's remaining quarters are frames to splice.
 		ty.Splice(rendrtest.Up, tx, 0)
-		advUntil(t, "X's frames in Y's carrier (stimulus)", func() bool { return ty.Stats().SplicedBytes > 0 })
+		advHeld(t, g, slices.Concat(fx, fy), size)
+		g.open()
+		advUntilDiag(t, "X's frames in Y's carrier (stimulus)", func() bool { return ty.Stats().SplicedBytes > 0 }, advStimulusDiag(ty, slices.Concat(fx, fy)))
 		for i, pc := range yp {
 			if c := advDead(t, pc.Status, id); c.DeathCause != rendr.CauseProtocolViolation || !strings.Contains(c.DeathDetail, "fseq") {
 				t.Fatalf("Y %d: the spliced carrier died of %v %q, want protocol_violation fseq", i, c.DeathCause, c.DeathDetail)
@@ -416,7 +478,8 @@ func advRows(t *testing.T, size int64, mux bool) {
 		n := newAdvNet(t)
 		defer n.close()
 		ds, ps := n.openK(n.peer(mux), k)
-		fs := advStartAll(ds, ps, size, 4)
+		g := newAdvGate(t)
+		fs := advStartAll(ds, ps, size, 4, g)
 		advUntil(t, "a quarter of the transfer", func() bool { return fs[0].got.Load() >= size/4 })
 		id, tm := n.shared(ds)
 		var fresh *advReadRec
@@ -431,6 +494,13 @@ func advRows(t *testing.T, size int64, mux bool) {
 		if tm.Stats().Switched != 1 || fresh == nil {
 			t.Fatalf("stimulus: %+v", tm.Stats())
 		}
+		// Opened after the switch: the remaining quarters go into the fresh
+		// connection, whose first bytes the passive's handshake rejects.
+		// The switch lands between quarters, so the fresh connection's
+		// first bytes usually start a frame; the cut in the middle of a
+		// write is TestTamperSwitchUpstreamCut's.
+		advHeld(t, g, fs, size)
+		g.open()
 		// The passive closed the fresh connection without a byte back (no
 		// PREFACE_ACK: its first bytes are not "RND2", L48): the relay's
 		// read of it ended in EOF or a reset, not in its own close.
@@ -479,11 +549,30 @@ func (n *advNet) shared(ds []*rendr.Conn) (rendr.CarrierID, *rendrtest.Tamper) {
 	return id, tm
 }
 
-// advStartAll starts a flow on every session (seeds seed, seed+1, ...).
-func advStartAll(ds, ps []*rendr.Conn, size int64, seed uint64) []*advFlow {
+// advHeld, called right after a row armed its stimulus, asserts that the
+// stimulus was armed while the senders were held: the gate is still
+// closed and no sender went past its first quarter, so the rest of every
+// stream is still to come through the relay, after the stimulus.
+func advHeld(t testing.TB, g *advGate, fs []*advFlow, size int64) {
+	t.Helper()
+	select {
+	case <-g.ch:
+		t.Fatalf("premise: the gate opened before the stimulus was armed")
+	default:
+	}
+	for i, f := range fs {
+		if k := f.sent.Load(); k > size/4 {
+			t.Fatalf("premise: session %d's sender wrote %d bytes before the stimulus, past its quarter (%d)", i, k, size/4)
+		}
+	}
+}
+
+// advStartAll starts a flow on every session (seeds seed, seed+1, ...),
+// all held by g after their first quarter.
+func advStartAll(ds, ps []*rendr.Conn, size int64, seed uint64, g *advGate) []*advFlow {
 	fs := make([]*advFlow, len(ds))
 	for i := range ds {
-		fs[i] = advStart(ds[i], ps[i], size, seed+uint64(i))
+		fs[i] = advStart(ds[i], ps[i], size, seed+uint64(i), g)
 	}
 	return fs
 }
