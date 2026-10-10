@@ -119,9 +119,13 @@ func refusalPayload(typ wire.Type, st wire.AckStatus, code uint32) []byte {
 
 // retireView is Retire on a view of a started MUX trunk (§A5.5): a live
 // view keeps its Fill until a call places nothing, then its DETACH(r)
-// follows (M2's CLOSE rule, per view); a view that carries no session
-// frames yet (opening, awaiting, attached-pending, pending, joining, held)
-// is abandoned at once. The view's end record becomes CauseRetired when
+// follows (M2's CLOSE rule, per view); so does a held passive view (OK
+// placed, no go frame yet) once the go frame ended its hold, so that its
+// session's last frames — the RST of a session that ended right after its
+// Confirm — reach the dialer (M4 checkpoint C-L; its session's close bound
+// Kills it, DETACH(ended) only, when the go frame never comes); a view
+// that carries no session frames yet (opening, awaiting, attached-pending,
+// pending, joining) is abandoned at once. The view's end record becomes CauseRetired when
 // the DETACH exchange completes or at the DETACH bound.
 func (c *Conn) retireView(r wire.DetachReason) {
 	t := c.trunk
@@ -141,6 +145,13 @@ func (c *Conn) retireView(r wire.DetachReason) {
 			c.vx.retireQ.Store(true)
 			t.markWorkLocked()
 			t.readyLocked(c)
+		}
+	case c.state == viewHeld:
+		// Retired after the go frame (the hold's end readies it).
+		if !c.vx.retireQ.Load() {
+			c.vx.reason = r
+			c.vx.retireQ.Store(true)
+			t.markWorkLocked()
 		}
 	default:
 		t.abandonLocked(c, r, &p)
