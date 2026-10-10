@@ -826,17 +826,24 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 		// the OPEN after it waits for that dial. Only then do the held
 		// sessions go on: that OPEN waiter's verdict grace runs out before
 		// any JOIN waiter's.
-		waitFor(t, 2*time.Second, "the death of every long session held, a new session's OPEN dialling p1 and another OPEN waiting for it", func() bool {
-			if held.Load() < int64(len(ps)) || w.d.Status().Mux.Coalesced <= coalesced {
-				return false
-			}
+		// The stimulus's three parts are reported if it does not come
+		// (I3: it timed out once in 3 Linux race passes, cause unknown).
+		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(time.Millisecond) {
+			var calls []string
+			p1Open := false
 			for _, d := range log.in(killed, time.Now().Add(time.Nanosecond)) {
-				if d.factory == "p1" && !long[d.sid] {
-					return true
-				}
+				calls = append(calls, fmt.Sprintf("%s long=%v +%v", d.factory, long[d.sid], d.at.Sub(killed)))
+				p1Open = p1Open || (d.factory == "p1" && !long[d.sid])
 			}
-			return false
-		})
+			h, c := held.Load(), w.d.Status().Mux.Coalesced
+			if h >= int64(len(ps)) && c > coalesced && p1Open {
+				break
+			}
+			if !time.Now().Before(deadline) {
+				t.Fatalf("timed out after 2s waiting for the death of every long session held, a new session's OPEN dialling p1 and another OPEN waiting for it: %d of %d deaths held, Coalesced %d (at the kill %d), session factory calls %v",
+					h, len(ps), c, coalesced, calls)
+			}
+		}
 		open()
 	}
 	recovered := func() bool {
