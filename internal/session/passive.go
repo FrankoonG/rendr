@@ -23,7 +23,8 @@ type PassiveSpec struct {
 	MaxPayload int
 	// Early: the OPEN carried wire.OpenFlagEarly (a stream OPEN, the
 	// carrier's first frame; M4-D5): the first lane accepts early DATA
-	// within wire.EarlyWindow before the verdict. M4's WP9b records it.
+	// within wire.EarlyWindow before the verdict (earlyDataLocked), and
+	// Confirm advertises at least wire.EarlyWindow (M4-D6).
 	Early bool
 }
 
@@ -70,7 +71,7 @@ func NewPending(env *Env, spec PassiveSpec, first *carrier.Conn) *Session {
 	s.ctl.pendingDone = make(chan struct{})
 	l := &lane{s: s, c: first, port: first, id: first.ID(), factory: -1, gen: 1, since: now}
 	l.state = LaneJoining
-	l.early = spec.Early // M4-D5: recorded here; earlyDataLocked reads it (WP9b)
+	l.early = spec.Early // M4-D5: earlyDataLocked reads it
 	s.st.earlyOpen = spec.Early
 	l.schedSent = s.ctl.epoch
 	l.echoRel = s.ctl.epoch - 1 // the first epoch echo placed on l is reliable (M2-D39)
@@ -83,11 +84,12 @@ func NewPending(env *Env, spec PassiveSpec, first *carrier.Conn) *Session {
 
 // Start launches the actor of a session made by NewPending and starts its
 // first carrier: the reader runs (it notices the dialer closing the carrier
-// or sending RST(AbortWithdrawn)); the writer is held (StartOptions.Hold)
-// until the verdict. Called exactly once, by the admission that inserted
-// the session. Commands posted before Start (AttachOpen, Join, Confirm,
-// Reject, RefusePending, Shutdown) wait in the mailbox and are handled in
-// order once the actor runs.
+// or sending RST(AbortWithdrawn), and takes the early DATA that follows an
+// OPEN(EARLY) into the pending session, M4-D5); the writer is held
+// (StartOptions.Hold) until the verdict. Called exactly once, by the
+// admission that inserted the session. Commands posted before Start
+// (AttachOpen, Join, Confirm, Reject, RefusePending, Shutdown) wait in the
+// mailbox and are handled in order once the actor runs.
 func (s *Session) Start() {
 	if !s.mb.start() {
 		return // a second Start: the actor already runs
