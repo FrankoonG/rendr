@@ -22,6 +22,14 @@ import (
 // receive queue DropRecvQueue; after this side's Close an accepted
 // datagram is discarded uncounted (M2-D37).
 //
+// The window keeps no record of a seq older than its width, so a race
+// member's copy of a datagram that was delivered, arriving DedupBits seqs
+// or more behind the newest accepted seq, counts as DropLate, not as
+// Duplicates (KL-15): DropLate attributes a loss only to a datagram that
+// was actually missing. A race keeps its copies in Duplicates while
+// DedupBits exceeds packets/s × the members' skew (16,384 by default:
+// 1.6 s at 10 kpps, about 330 ms at 50 kpps).
+//
 // The idle clock (M2-D41) moves on an accepted datagram without a clock
 // read per datagram: the first unreported datagram reads the clock for
 // the PACK cadence and sets lastData; the PACK that reports the rest sets

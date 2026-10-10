@@ -561,6 +561,20 @@ func waitUntilOK(within time.Duration, cond func() bool) bool {
 //     place as the first call (WP16-MUX-2: 1 in 90 host -race runs in
 //     I3, 1 of 900 in one host -race -count=300 -cpu 1,2,4 pass; "25 of
 //     24 deaths held", calls [p1 long=true +0s]).
+//   - "open-first-forced": "open-first" with that interleaving forced
+//     whenever a bond session's step can run inside the probe hold's
+//     window (KL-26, WP16-MUX-2): the error results of the dialer's
+//     session carrier conns over p1 (the shared trunk's reads and writes
+//     after the kill) are held (trunkErrHold) until the first bond
+//     session's step after the kill finished its death steps
+//     (Hooks.AfterReap), or 1 ms; that hook releases them and waits
+//     until a death handling reached the gate (the shared carrier's death
+//     record is set), so the step's actions see the death its reapDead
+//     missed. With the probe hold no step runs in that window and the row
+//     is "open-first"; without it (the hold not engaged, released at the
+//     kill, the probe conns not wrapped, or a wait that does not hold)
+//     the probe carrier's death wakes the bond actors there and the row
+//     fails in every run.
 //
 // PASS: recovery — every selector session active and every bond session
 // with two live members, none of them the dead carrier — within 10 s;
@@ -587,9 +601,15 @@ func TestMuxIdleFailoverCoalesces_L10_L27(t *testing.T) {
 		name      string
 		slow      time.Duration
 		openFirst bool
-	}{{"prompt", 0, false}, {"slow-verdict", 300 * time.Millisecond, false}, {"open-first", 300 * time.Millisecond, true}} {
+		forced    bool
+	}{
+		{"prompt", 0, false, false},
+		{"slow-verdict", 300 * time.Millisecond, false, false},
+		{"open-first", 300 * time.Millisecond, true, false},
+		{"open-first-forced", 300 * time.Millisecond, true, true},
+	} {
 		t.Run(v.name, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) { idleFailover(t, v.slow, v.openFirst) })
+			synctest.Test(t, func(t *testing.T) { idleFailover(t, v.slow, v.openFirst, v.forced) })
 		})
 	}
 }
@@ -745,11 +765,64 @@ func (c *probeConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// trunkErrHold holds the error results of the dialer's session carrier
+// conns over p1 (trunkConn) while it is on, until release or for 1 ms: the
+// shared trunk's death record waits for the release (the forced
+// open-first row, KL-26).
+type trunkErrHold struct {
+	on   atomic.Bool
+	mu   sync.Mutex
+	rel  chan struct{}
+	done bool
+}
+
+func newTrunkErrHold() *trunkErrHold { return &trunkErrHold{rel: make(chan struct{})} }
+
+// release lets every held result return (idempotent).
+func (h *trunkErrHold) release() {
+	h.mu.Lock()
+	if !h.done {
+		h.done = true
+		close(h.rel)
+	}
+	h.mu.Unlock()
+}
+
+// wait holds an error result while the hold is on.
+func (h *trunkErrHold) wait(err error) {
+	if err != nil && h.on.Load() {
+		select {
+		case <-h.rel:
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// trunkConn is a session carrier's conn under a trunkErrHold.
+type trunkConn struct {
+	net.Conn
+	h *trunkErrHold
+}
+
+func (c *trunkConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.h.wait(err)
+	return n, err
+}
+
+func (c *trunkConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.h.wait(err)
+	return n, err
+}
+
 // slowPeer is world.peer over stream links whose session carriers of the
 // sessions slow reports true for are wrapped in slowVerdict and whose
 // probe carriers are wrapped in probeConn under hold (when hold is not
-// nil); every session factory call is also recorded in log.
-func (w *world) slowPeer(delay time.Duration, slow func(rendr.SessionID) bool, hold *probeHold, log *dialLog, names ...string) *rendr.Peer {
+// nil); the session carriers over p1 are wrapped in trunkConn under trunk
+// (when trunk is not nil); every session factory call is also recorded in
+// log.
+func (w *world) slowPeer(delay time.Duration, slow func(rendr.SessionID) bool, hold *probeHold, trunk *trunkErrHold, log *dialLog, names ...string) *rendr.Peer {
 	w.t.Helper()
 	var cs []rendr.Carrier
 	for _, n := range names {
@@ -763,6 +836,9 @@ func (w *world) slowPeer(delay time.Duration, slow func(rendr.SessionID) bool, h
 			c, err := l.Dial(ctx)
 			if err == nil && ok && di.Probe && hold != nil {
 				return &probeConn{Conn: c, h: hold}, nil
+			}
+			if err == nil && ok && !di.Probe && n == "p1" && trunk != nil {
+				c = &trunkConn{Conn: c, h: trunk}
 			}
 			if err == nil && ok && !di.Probe && delay > 0 && slow(di.Session) {
 				return &slowVerdict{Conn: c, delay: delay}, nil
@@ -841,14 +917,22 @@ func (w *world) openLoad(p *rendr.Peer, prefix string, interval time.Duration, s
 	}
 }
 
-func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
+func idleFailover(t *testing.T, slow time.Duration, openFirst, forced bool) {
 	const oneWay = 5 * time.Millisecond
 	var (
 		gateID atomic.Uint32 // the carrier whose death handling is held (0: none)
 		gate   = make(chan struct{})
 		held   atomic.Int64 // death handlings that reached the gate
 		hold   probeHold    // the dialer's probe carriers across the kill (open-first)
+		trunk  *trunkErrHold
+		fired  atomic.Bool // forced: a bond step's AfterReap released the trunk's errors
+		early  atomic.Bool // forced: it did so before the shared carrier's death record was set
+		bmu    sync.Mutex
+		bondOf = map[[16]byte]bool{} // forced: the long bond sessions (dialer IDs)
 	)
+	if forced {
+		trunk = newTrunkErrHold()
+	}
 	hooks := &testhooks.Hooks{DeathObserved: func(id uint32) {
 		if id != 0 && gateID.Load() == id {
 			hold.recorded() // the shared carrier's death record is set
@@ -856,11 +940,37 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 			held.Add(1)
 			<-gate
 		}
+	}, AfterReap: func(sid [16]byte) {
+		if trunk == nil || !trunk.on.Load() || fired.Load() {
+			return
+		}
+		bmu.Lock()
+		b := bondOf[sid]
+		bmu.Unlock()
+		if !b || !fired.CompareAndSwap(false, true) {
+			return
+		}
+		early.Store(held.Load() == 0)
+		// The shared carrier dies between this step's reapDead and its
+		// actions: the death record is set once a death handling reached
+		// the gate.
+		trunk.release()
+		for i := 0; i < 1000 && held.Load() == 0; i++ {
+			time.Sleep(time.Microsecond)
+		}
 	}}
 	w := newWorld(t, worldOpts{dov: testhooks.Overrides{Hooks: hooks}},
 		linkSpec{name: "p1", oneWay: oneWay}, linkSpec{name: "p2", oneWay: oneWay})
 	var release sync.Once
-	open := func() { release.Do(func() { hold.release(); close(gate) }) }
+	open := func() {
+		release.Do(func() {
+			hold.release()
+			if trunk != nil {
+				trunk.release()
+			}
+			close(gate)
+		})
+	}
 	t.Cleanup(open) // before the world's shutdown (LIFO): no actor stays held
 	var (
 		armed  atomic.Bool
@@ -877,7 +987,7 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 		lmu.Lock()
 		defer lmu.Unlock()
 		return armed.Load() && (openFirst || long[id])
-	}, probes, log, "p1", "p2")
+	}, probes, trunk, log, "p1", "p2")
 	ps := w.openMany(peer, "L", 24, func(i int) rendr.Mode {
 		if i%2 == 0 {
 			return rendr.ModeSelector
@@ -892,6 +1002,9 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 			sel = append(sel, s)
 		} else {
 			bond = append(bond, s)
+			bmu.Lock()
+			bondOf[s.d.ID()] = true
+			bmu.Unlock()
 		}
 	}
 	lmu.Unlock()
@@ -938,6 +1051,9 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 		// death handling reached the gate, when the record is set.
 		sleepUntil(killAt.Add(-time.Nanosecond))
 		hold.engage()
+		if trunk != nil {
+			trunk.on.Store(true)
+		}
 	}
 	sleepUntil(killAt)
 
@@ -1049,6 +1165,9 @@ func idleFailover(t *testing.T, slow time.Duration, openFirst bool) {
 		if e := hold.early.Load(); e != 0 {
 			t.Errorf("premise: %d of %d probe carrier errors after the kill reached the dialer before the shared carrier's death record was set, want none (probeHold)", e, hold.errs.Load())
 		}
+	}
+	if forced && early.Load() {
+		t.Errorf("forced: a bond session's step ran between the kill and the shared carrier's death record (its AfterReap released the trunk's errors), want none (probeHold)")
 	}
 	exchangeAll(t, ps, 64<<10, 100)
 	if t.Failed() {
