@@ -52,11 +52,11 @@ func FuzzL4Metadata_L44(f *testing.F) {
 			if err != nil {
 				t.Fatalf("AppendMetadata(%+v): %v", r, err)
 			}
-			if !bytes.Equal(append(enc, r.App...), md) {
-				t.Fatalf("re-encoding %x gave %x", md, append(enc, r.App...))
+			if !bytes.Equal(enc, md) {
+				t.Fatalf("re-encoding %x gave %x", md, enc)
 			}
-			back, err := ParseMetadata(append(enc, r.App...))
-			if err != nil || back.Addr != r.Addr || !bytes.Equal(back.App, r.App) {
+			back, err := ParseMetadata(enc)
+			if err != nil || back.Cmd != r.Cmd || back.Addr != r.Addr || !bytes.Equal(back.App, r.App) {
 				t.Fatalf("ParseMetadata(AppendMetadata(%+v)) = %+v, %v", r, back, err)
 			}
 		}

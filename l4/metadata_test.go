@@ -120,12 +120,9 @@ func TestL4MetadataGolden_L44(t *testing.T) {
 			if err != nil {
 				t.Fatalf("AppendMetadata: %v", err)
 			}
-			if hdr := len(v.md) - len(v.app); !bytes.Equal(enc, v.md[:hdr]) {
-				t.Fatalf("AppendMetadata = %x, want the header %x", enc, v.md[:hdr])
-			}
-			// The application's metadata follows the header (l4.Dial's use).
-			if full := append(enc, v.app...); !bytes.Equal(full, v.md) {
-				t.Fatalf("header ‖ app = %x, want %x", full, v.md)
+			// The whole vector: the header, then the application's metadata.
+			if !bytes.Equal(enc, v.md) {
+				t.Fatalf("AppendMetadata = %x, want %x", enc, v.md)
 			}
 			hdr := len(v.md) - len(v.app)
 			_, err = ParseMetadata(v.md[:hdr-1])
@@ -263,7 +260,10 @@ func TestL4MetadataRoundTrip(t *testing.T) {
 			if string(buf[:3]) != "pre" {
 				t.Fatalf("AppendMetadata(%q) overwrote dst", addr)
 			}
-			md := append(buf[3:], app...)
+			md := buf[3:]
+			if !bytes.HasSuffix(md, app) {
+				t.Fatalf("AppendMetadata(%+v) = %x: App is not the tail", r, md)
+			}
 			got, err := ParseMetadata(md)
 			if err != nil {
 				t.Fatalf("ParseMetadata(AppendMetadata(%q)): %v", addr, err)
@@ -293,18 +293,19 @@ var (
 	sinkErr     error
 )
 
-// TestL4MetadataAllocs: AppendMetadata allocates nothing into a sized dst;
-// ParseMetadata allocates only the address string (M4 design §A12.6).
+// TestL4MetadataAllocs: AppendMetadata allocates nothing into a dst sized
+// for the header and the application's metadata; ParseMetadata allocates
+// only the address string (M4 design §A12.6).
 func TestL4MetadataAllocs(t *testing.T) {
 	addrs := []string{"127.0.0.1:443", "[::ffff:192.0.2.1]:80", "[2001:db8::1]:8080", "localhost:8080", "example.com.:443"}
-	dst := make([]byte, 0, maxHeader)
+	app := bytes.Repeat([]byte("app"), 100)
+	dst := make([]byte, 0, maxHeader+len(app))
 	for _, addr := range addrs {
-		r := Request{Cmd: CmdConnect, Addr: addr}
+		r := Request{Cmd: CmdConnect, Addr: addr, App: app}
 		md, err := AppendMetadata(nil, r)
 		if err != nil {
 			t.Fatal(err)
 		}
-		md = append(md, "app"...)
 		a := testing.AllocsPerRun(100, func() { sinkBytes, sinkErr = AppendMetadata(dst[:0], r) })
 		p := testing.AllocsPerRun(100, func() { sinkRequest, sinkErr = ParseMetadata(md) })
 		if sinkErr != nil {

@@ -44,11 +44,12 @@ const (
 	maxHeader = metaFixed + 1 + maxNameLen + 1 + 2
 )
 
-// AppendMetadata appends the canonical L4 metadata (version 1) of r to dst.
-// An IP host is encoded as an address (an IPv4-mapped IPv6 address as
-// IPv4), any other host as a domain; the dialer resolves nothing. Errors
-// wrap ErrBadAddress, except for a Cmd other than CmdConnect; dst is
-// returned unchanged with an error.
+// AppendMetadata appends the canonical L4 metadata (version 1) of r to dst:
+// the header for r.Addr, then r.App. An IP host is encoded as an address
+// (an IPv4-mapped IPv6 address as IPv4), any other host as a domain; the
+// dialer resolves nothing. Errors wrap ErrBadAddress, except for a Cmd
+// other than CmdConnect (the zero value included); dst is returned
+// unchanged with an error.
 func AppendMetadata(dst []byte, r Request) ([]byte, error) {
 	if r.Cmd != CmdConnect {
 		return dst, fmt.Errorf("l4: unsupported command %d", r.Cmd)
@@ -69,7 +70,8 @@ func AppendMetadata(dst []byte, r Request) ([]byte, error) {
 		dst = append(dst, head[:]...)
 		dst = append(dst, CmdConnect, atypDomain, byte(len(host)))
 		dst = append(dst, host...)
-		return append(dst, byte(port>>8), byte(port)), nil
+		dst = append(dst, byte(port>>8), byte(port))
+		return append(dst, r.App...), nil
 	}
 	ip, err := netip.ParseAddr(host)
 	if err != nil {
@@ -92,7 +94,8 @@ func AppendMetadata(dst []byte, r Request) ([]byte, error) {
 		dst = append(dst, CmdConnect, atypIPv6)
 		dst = append(dst, a[:]...)
 	}
-	return append(dst, byte(port>>8), byte(port)), nil
+	dst = append(dst, byte(port>>8), byte(port))
+	return append(dst, r.App...), nil
 }
 
 // ParseMetadata decodes L4 metadata strictly. The error is a
