@@ -283,11 +283,12 @@ func TestEarlyBytesWinnerOnly(t *testing.T) {
 	})
 }
 
-// TestEarlyBondAndRace (M4-D7, M3-D30): bond — the early span is in flight
-// on the winner (not resent while it lives, no duplicate at the passive)
-// when the second member joins; race — the second member sends its own
-// copies of the span from its cursor (counted as race copies). Every byte
-// is delivered once.
+// TestEarlyBondAndRace (M4-D7, M3-D30, R1-2): bond — the early span is in
+// flight on the winner (not resent while it lives, no duplicate at the
+// passive) when the second member joins; race — the winner's cursor starts
+// at kw and the second member sends its own copy of the span from its
+// cursor: exactly one copy (counted as race copies, dropped once as
+// duplicates at the passive). Every byte is delivered once.
 func TestEarlyBondAndRace(t *testing.T) {
 	for _, mode := range []Mode{ModeBond, ModeRace} {
 		t.Run(eaModeName(mode), func(t *testing.T) {
@@ -318,8 +319,10 @@ func TestEarlyBondAndRace(t *testing.T) {
 						t.Fatalf("passive duplicates %d in bond, want 0 (the span is in flight on the winner)", pt.DupBytes)
 					}
 				case ModeRace:
-					if st.Race.CopyBytes < uint64(len(msg)) {
-						t.Fatalf("race copies %d, want ≥ %d (the second member's own copy)", st.Race.CopyBytes, len(msg))
+					// The winner's cursor starts at kw: only the second
+					// member sends its own copy of the span (R1-2 rule 3).
+					if st.Race.CopyBytes != uint64(len(msg)) || pt.DupBytes != uint64(len(msg)) {
+						t.Fatalf("race copies %d, passive duplicates %d: want %d and %d (the second member's own copy only)", st.Race.CopyBytes, pt.DupBytes, len(msg), len(msg))
 					}
 				}
 				eaFinish(t, s, p, msg)
@@ -371,8 +374,9 @@ func TestEarlyFseqContinuity_L14(t *testing.T) {
 }
 
 // TestEarlySnapshotAllocs (R1-2, §A12.6): fixing the early span and its
-// copy cost one allocation per session; a Write admitted before the
-// verdict allocates nothing.
+// copy cost one allocation per session, shared by every later attempt (a
+// second earlySpanLocked and bytes return the same copy); a Write admitted
+// before the verdict allocates nothing.
 func TestEarlySnapshotAllocs(t *testing.T) {
 	s := stSession(stOpt{})
 	s.p.EarlyDataMax = 64 << 10
@@ -399,7 +403,14 @@ func TestEarlySnapshotAllocs(t *testing.T) {
 		s.mu.Lock()
 		e := a.earlySpanLocked()
 		s.mu.Unlock()
-		return e.bytes()
+		b := e.bytes()
+		s.mu.Lock()
+		e2 := a.earlySpanLocked() // a second attempt: the same span
+		s.mu.Unlock()
+		if b2 := e2.bytes(); e2 != e || len(b2) != len(b) || (len(b) > 0 && &b2[0] != &b[0]) {
+			t.Fatal("a second attempt got another span or another copy")
+		}
+		return b
 	}
 	extra := int(s.Status().TxBytes-uint64(len(msg))) / 10 // the measured Writes (none under -race)
 	if got, want := span(), append(slices.Clone(msg), bytes.Repeat(msg[:10], extra)...); !bytes.Equal(got, want) {

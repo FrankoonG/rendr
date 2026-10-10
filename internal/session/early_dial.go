@@ -34,7 +34,9 @@ import (
 
 // triggerOpen starts the opening of a session that Dial returned with
 // EarlyReturn: the first caller to clear dialer.deferred posts startOpen
-// (M4-D9). Read and CloseWrite call it first; Write calls it right after a
+// (M4-D9). After Close or Abort (dialer.closed is closed) it does nothing,
+// so a Read or CloseWrite that follows them opens nothing (M4-D12). Read
+// and CloseWrite call it first; Write calls it right after a
 // round's bytes were committed, so the first attempt's early span
 // includes them (R1-15), and earlyCapLocked calls it when the cap holds a
 // Write back. It never blocks and takes only the mailbox's leaf lock, so
@@ -48,7 +50,18 @@ func (s *Session) triggerOpen() {
 	if a == nil || a.d == nil {
 		return
 	}
-	if d := a.d; d.deferred.Load() && d.deferred.CompareAndSwap(true, false) {
+	d := a.d
+	if !d.deferred.Load() {
+		return
+	}
+	select {
+	case <-d.closed:
+		// Close or Abort came first: the session ends locally and sends
+		// nothing (M4-D12); earlyCloseLocked claims deferred.
+		return
+	default:
+	}
+	if d.deferred.CompareAndSwap(true, false) {
 		s.mb.post(&startOpen{}) // false only after the actor exited: nothing to open
 	}
 }
@@ -85,8 +98,9 @@ func earlyMax(p *Params) int {
 //   - never triggered (dialer.deferred still set): the session ends
 //     locally with net.ErrClosed — nothing was sent, nothing is;
 //   - triggered but startOpen not handled yet (a Write committed its
-//     bytes and Close followed before this step): the opening starts now,
-//     so those bytes keep Close's meaning;
+//     bytes, or a Read or CloseWrite ran, and Close followed before this
+//     step): the opening starts now, so those bytes keep Close's meaning
+//     (a trigger after the Close is none: triggerOpen);
 //   - Abort: the opening is withdrawn at once (RST(AbortWithdrawn) where
 //     an OPEN was written: the end withdraws every attempt, C25);
 //   - Close: Linger counts from the Close; at closeAt + Linger the

@@ -279,6 +279,10 @@ func TestEarlyFirstWriteRidesFirstFlight(t *testing.T) {
 		defer w.teardown()
 		l := w.eaLink("a")
 		s := w.eaDial(w.eaSpec(ModeSelector, 64<<10, l))
+		// Time passes before the first Write: a session that opened at
+		// Dial would have fixed an empty span by now (M4-D9).
+		time.Sleep(time.Second)
+		synctest.Wait()
 		msg := []byte("hello")
 		if _, err := s.Write(msg); err != nil {
 			t.Fatal(err)
@@ -352,30 +356,57 @@ func TestEarlyReturnReadTriggersOpen(t *testing.T) {
 
 // TestEarlyCloseBeforeTriggerSendsNothing (M4-D12, M4-D20): Close — or
 // Abort — before any trigger ends the session locally: no factory call,
-// Done closes, every later call returns net.ErrClosed, and the end is
-// reported once (EventSessionEnd).
+// no admitted session, Done closes, every later call returns
+// net.ErrClosed, and the end is reported once (EventSessionEnd). A Read or
+// CloseWrite right after the Close or Abort (before the actor's next step)
+// is no trigger either.
 func TestEarlyCloseBeforeTriggerSendsNothing(t *testing.T) {
-	for _, abort := range []bool{false, true} {
-		name := "close"
-		if abort {
-			name = "abort"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		abort bool
+		then  string // "", "read" or "closewrite": called right after
+	}{
+		{"close", false, ""},
+		{"abort", true, ""},
+		{"close+read", false, "read"},
+		{"close+closewrite", false, "closewrite"},
+		{"abort+read", true, "read"},
+		{"abort+closewrite", true, "closewrite"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				w := eaNewWorld(t, nil)
 				defer w.teardown()
 				l := w.eaLink("a")
 				s := w.eaDial(w.eaSpec(ModeSelector, 64<<10, l))
-				if abort {
+				if tc.abort {
 					if err := s.Abort(0x1000, "bye"); err != nil {
 						t.Fatal(err)
 					}
 				} else if err := s.Close(); err != nil {
 					t.Fatal(err)
 				}
+				switch tc.then {
+				case "read":
+					if _, err := s.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+						t.Fatalf("Read right after Close: %v, want net.ErrClosed", err)
+					}
+				case "closewrite":
+					if err := s.CloseWrite(); err != nil {
+						t.Fatal(err)
+					}
+				}
 				acDone(t, s, time.Second)
+				time.Sleep(60 * time.Second) // anything the trigger started would have run
+				synctest.Wait()
 				if d := l.Stats().Dials; d != 0 {
 					t.Fatalf("%d factory calls, want 0", d)
+				}
+				select {
+				case p := <-w.b.pending:
+					w.sess = append(w.sess, p)
+					t.Fatal("the passive admitted a session")
+				default:
 				}
 				if _, err := s.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
 					t.Fatalf("Write after Close: %v, want net.ErrClosed", err)

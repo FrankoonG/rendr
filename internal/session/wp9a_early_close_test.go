@@ -72,6 +72,12 @@ func TestEarlyCloseWhileOpeningDelivers_L03(t *testing.T) {
 					if err := p.Confirm(); err != nil {
 						t.Fatal(err)
 					}
+					// A4.1: a Close before the verdict makes the opened
+					// session closing at its first OPEN_ACK(OK).
+					acWaitFor(t, time.Second, "the dialer's verdict", func() bool { return s.State() != StatePending })
+					if st := s.State(); st != StateClosing {
+						t.Fatalf("state %v after the verdict of a closed session, want closing", st)
+					}
 					if got := eaReadAll(t, p); !bytes.Equal(got, msg) {
 						t.Fatalf("the passive read %d bytes, want the %d written before Close", len(got), len(msg))
 					}
@@ -162,52 +168,104 @@ func TestEarlyAbortWithdraws_L49(t *testing.T) {
 }
 
 // TestEarlyDataSurvivesCarrierDeath_L10 (M4-D7, L10): after the verdict
-// the early span [0, k) is in flight on the winner's lane: nothing is sent
-// twice while that lane lives (no retransmission, no duplicate at the
-// passive); when the lane dies before the bytes were acknowledged they are
-// requeued and resent on the next lane, and every byte is delivered once,
-// in order.
+// the early span [0, kw) is in flight on the winner's lane. Two rows:
+//   - "held": the passive holds the span when the winner dies (no ACK yet,
+//     its application has not read): nothing was sent twice while the
+//     lane lived (no retransmission, no duplicate at the passive); the
+//     JOIN_ACK's rxNext trims the requeued span, so the row asserts the
+//     failover and that every byte is delivered once, in order;
+//   - "unarrived": the winner (a slow DialEarly link) dies while its early
+//     DATA frame is still on the wire: the passive holds nothing at the
+//     kill, so the span is requeued from the lane's in-flight entry and
+//     resent on the next lane (RetransmittedBytes ≥ the span), and every
+//     byte is delivered once, in order.
 func TestEarlyDataSurvivesCarrierDeath_L10(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		w := eaNewWorld(t, nil)
-		defer w.teardown()
-		l1, l2 := w.eaLink("a"), w.eaLink("b")
-		s := w.eaDial(w.eaSpec(ModeSelector, 64<<10, l1, l2))
-		msg := stPattern(0, 4000)
-		if _, err := s.Write(msg); err != nil {
-			t.Fatal(err)
-		}
-		p := w.eaPending()
-		eaWaitEarly(t, p, uint64(len(msg)))
-		if err := p.Confirm(); err != nil {
-			t.Fatal(err)
-		}
-		acWaitFor(t, time.Second, "the dialer opened", func() bool { return s.State() == StateOpen })
-		time.Sleep(100 * time.Millisecond)
-		synctest.Wait()
-		if r, d := s.Status().RetransmittedBytes, p.Status().DupBytes; r != 0 || d != 0 {
-			t.Fatalf("retransmitted %d, passive duplicates %d while the winner lives: want 0 and 0", r, d)
-		}
-		if l2.Stats().Dials != 0 {
-			t.Fatal("the second factory was dialled before the first answered")
-		}
-		l1.Kill() // the winner dies before the passive application read (no ACK)
-		more := stPattern(uint64(len(msg)), 50<<10)
-		if _, err := s.Write(more); err != nil {
-			t.Fatal(err)
-		}
-		if err := s.CloseWrite(); err != nil {
-			t.Fatal(err)
-		}
-		if got := eaReadAll(t, p); !bytes.Equal(got, append(slices.Clone(msg), more...)) {
-			t.Fatalf("the passive read %d bytes, want %d once and in order", len(got), len(msg)+len(more))
-		}
-		// Stimulus: the winner's carrier died and another one carried the
-		// rest (the JOIN_ACK's rxNext trimmed the requeued span: L10).
-		st := s.Status()
-		if st.MigDeath+st.Rejoins == 0 || l1.Stats().Session.Killed == 0 {
-			t.Fatalf("no failover after the kill: %+v", st)
-		}
+	t.Run("held", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := eaNewWorld(t, nil)
+			defer w.teardown()
+			l1, l2 := w.eaLink("a"), w.eaLink("b")
+			s := w.eaDial(w.eaSpec(ModeSelector, 64<<10, l1, l2))
+			msg := stPattern(0, 4000)
+			if _, err := s.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+			p := w.eaPending()
+			eaWaitEarly(t, p, uint64(len(msg)))
+			if err := p.Confirm(); err != nil {
+				t.Fatal(err)
+			}
+			acWaitFor(t, time.Second, "the dialer opened", func() bool { return s.State() == StateOpen })
+			time.Sleep(100 * time.Millisecond)
+			synctest.Wait()
+			if r, d := s.Status().RetransmittedBytes, p.Status().DupBytes; r != 0 || d != 0 {
+				t.Fatalf("retransmitted %d, passive duplicates %d while the winner lives: want 0 and 0", r, d)
+			}
+			if l2.Stats().Dials != 0 {
+				t.Fatal("the second factory was dialled before the first answered")
+			}
+			l1.Kill() // the winner dies before the passive application read (no ACK)
+			more := stPattern(uint64(len(msg)), 50<<10)
+			if _, err := s.Write(more); err != nil {
+				t.Fatal(err)
+			}
+			if err := s.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			if got := eaReadAll(t, p); !bytes.Equal(got, append(slices.Clone(msg), more...)) {
+				t.Fatalf("the passive read %d bytes, want %d once and in order", len(got), len(msg)+len(more))
+			}
+			// Stimulus: the winner's carrier died and another one carried
+			// the rest.
+			st := s.Status()
+			if st.MigDeath+st.Rejoins == 0 || l1.Stats().Session.Killed == 0 {
+				t.Fatalf("no failover after the kill: %+v", st)
+			}
+		})
+	})
+	t.Run("unarrived", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := eaNewWorld(t, nil)
+			defer w.teardown()
+			l1, l2 := w.eaLink("a"), w.eaLink("b")
+			l1.SetRate(16 << 10) // the 60 KiB early DATA frame needs about 4 s
+			spec := w.eaSpec(ModeSelector, 64<<10, l1, l2)
+			spec.Factories[0].DialEarly = l1.DialEarly
+			s := w.eaDial(spec)
+			msg := stPattern(0, 60<<10)
+			if _, err := s.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+			p := w.eaPending()
+			if err := p.Confirm(); err != nil {
+				t.Fatal(err)
+			}
+			acWaitFor(t, time.Second, "the dialer opened", func() bool { return s.State() == StateOpen })
+			if e := s.Status().EarlyBytes; e != uint64(len(msg)) {
+				t.Fatalf("dialer EarlyBytes %d, want %d (the winner carried the span)", e, len(msg))
+			}
+			p.mu.Lock()
+			held := p.st.rTail - p.p.FirstOffset
+			p.mu.Unlock()
+			if held >= uint64(len(msg)) {
+				t.Fatalf("the passive holds %d bytes before the kill: the row needs the DATA frame still on the wire", held)
+			}
+			l1.Kill() // the winner dies with its early DATA frame on the wire
+			if err := s.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			if got := eaReadAll(t, p); !bytes.Equal(got, msg) {
+				t.Fatalf("the passive read %d bytes, want %d once and in order", len(got), len(msg))
+			}
+			st := s.Status()
+			if st.RetransmittedBytes < uint64(len(msg))-held {
+				t.Fatalf("retransmitted %d, want ≥ %d (the span the passive did not hold at the kill)", st.RetransmittedBytes, uint64(len(msg))-held)
+			}
+			if st.MigDeath+st.Rejoins == 0 || l1.Stats().Session.Killed == 0 || l2.Stats().Dials == 0 {
+				t.Fatalf("no failover after the kill: %+v", st)
+			}
+			eaNoViolation(t, "passive", p)
+		})
 	})
 }
 

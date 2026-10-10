@@ -125,8 +125,11 @@ type dialer struct {
 	// closed): Linger counts from it (earlyCloseLocked, M4-D12). early is
 	// the session's one early span [0, k0) (R1-2): fixed by the actor at
 	// the first OPEN attempt after the trigger, read-only afterwards,
-	// shared by every OPEN attempt (earlySpanLocked).
+	// shared by every OPEN attempt (earlySpanLocked). closed is the
+	// session's s.closing, made by Dial for an EarlyReturn session and
+	// closed by Close and Abort: a trigger after either is a no-op.
 	deferred atomic.Bool
+	closed   <-chan struct{}
 	started  bool
 	closeAt  time.Time
 	early    earlySpan

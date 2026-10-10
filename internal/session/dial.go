@@ -158,6 +158,12 @@ func dial(ctx context.Context, env *Env, spec DialSpec, h healthSource) (*Sessio
 	s.ctl.echoed = p.FirstEpoch - 1
 	s.ctl.rescuedBase = ^uint64(0)
 	s.initialSnapLocked()
+	if spec.EarlyReturn {
+		// M4-D12: Close and Abort close s.closing, so a Read or CloseWrite
+		// after them sees it closed and triggers nothing (triggerOpen).
+		s.closing = make(chan struct{})
+		d.closed = s.closing
+	}
 	s.mu.Unlock()
 	d.open = openPayload(s, win)
 	if h != nil {
