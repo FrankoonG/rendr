@@ -951,10 +951,12 @@ func TestPacketWindowSplit(t *testing.T) {
 }
 
 // TestControlFrameSizes_L37: every row of the size table of M2 design
-// §A3.9, and its consequences: the largest control frame after the
-// handshake fits ControlFloor, every datagram carrier carries MaxPayload ≥
-// 512, MaxPayload on one carrier is budget − 25 and the metadata an OPEN
-// carries is budget − 99 (L37; plan:331, plan:358).
+// §A3.9 (M3 design §A3.6 and M4 design §A3.3 add theirs), and its
+// consequences: the largest control frame after the handshake fits
+// ControlFloor, every datagram carrier carries MaxPayload ≥ 512,
+// MaxPayload on one carrier is budget − 25, the metadata an OPEN carries is
+// budget − 99, and M4's largest first flight fits the stream write batch
+// (L37; plan:331, plan:358).
 func TestControlFrameSizes_L37(t *testing.T) {
 	size := func(ty Type, v any) int { return FrameOverhead + len(encodeTyped(ty, v)) }
 	rel := func(ty Type, flags uint8, v any) int {
@@ -981,6 +983,11 @@ func TestControlFrameSizes_L37(t *testing.T) {
 		return s
 	}
 	h1 := len(goldenByName(t, "h1_open").b)
+	earlyOpen := func(m []byte) Open {
+		o := gEarlyOpen()
+		o.Metadata = m
+		return o
+	}
 	type row struct {
 		name      string
 		got, want int
@@ -1018,6 +1025,16 @@ func TestControlFrameSizes_L37(t *testing.T) {
 		{"H2p: PREFACE_ACK ‖ PONG", len(goldenByName(t, "h2_probe").b), 77},
 		{"PREFACE-level refusal", len(goldenByName(t, "refusal_version").b), 40},
 		{"raw-UDP flow carriers: + 9", len(goldenByName(t, "udp_h1_open").b), h1 + 9},
+		// M4 (design §A3.3; the l4 metadata are hand-built byte layouts,
+		// R1-28: the l4 encoder's bound is proven in package l4).
+		{"l4 metadata header, IPv4", len(l4MetaIPv4()), 11},
+		{"l4 metadata header, longest domain (253 + trailing dot)", len(l4MetaLongestDomain()), 262},
+		{"OPEN(EARLY) with l4 metadata (IPv4, no app)", size(TypeOpen, earlyOpen(l4MetaIPv4())), 13 + 32 + 11 + 4},
+		{"OPEN(EARLY), longest domain, no app", size(TypeOpen, earlyOpen(l4MetaLongestDomain())), 13 + 32 + 262 + 4},
+		{"OPEN(EARLY) with 4 KiB of l4 metadata", size(TypeOpen, earlyOpen(l4MetaMax())), 4145},
+		{"first-flight DATA, 1 byte", size(TypeData, dataVal{Body: make([]byte, 1)}), 13 + 8 + 1 + 4},
+		{"first-flight DATA, EarlyWindow bytes", size(TypeData, dataVal{Body: make([]byte, EarlyWindow)}), 65561},
+		{"largest first flight (PREFACE ‖ OPEN 4 KiB ‖ DATA 64 KiB)", PrefaceLen + size(TypeOpen, earlyOpen(l4MetaMax())) + size(TypeData, dataVal{Body: make([]byte, EarlyWindow)}), 69746},
 	}
 	for n := 1; n <= MaxSchedIDs; n++ {
 		rows = append(rows, row{"REL{SCHED} n", rel(TypeSched, 0, sched(n)), 56 + 4*n})
@@ -1036,6 +1053,12 @@ func TestControlFrameSizes_L37(t *testing.T) {
 	}
 	if rows[len(rows)-1].got == 0 || len(rows) < 40 {
 		t.Fatalf("size table incomplete: %d rows", len(rows))
+	}
+	// M4: the largest first flight fits the stream write batch (256 KiB,
+	// the carrier's default batch budget) and one frame payload limit; its
+	// DATA payload (8 + EarlyWindow) is one frame (§A3.2: never split).
+	if flight := PrefaceLen + 4145 + 65561; flight > 256<<10 || flight > MaxFramePayload || DataPrefixLen+EarlyWindow > MaxFramePayload {
+		t.Errorf("largest first flight %d bytes, MaxFramePayload %d", flight, MaxFramePayload)
 	}
 
 	// The largest REL payload after the handshake (every wrappable type
