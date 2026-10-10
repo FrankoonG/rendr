@@ -9,7 +9,6 @@ import (
 	"os"
 	"slices"
 	"sync"
-	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -1234,7 +1233,7 @@ func TestDatagramLinkReadFaults_L58(t *testing.T) {
 		r := newDRig(t, DatagramLinkConfig{Name: "faults"})
 		defer r.l.Close()
 		c := r.dial()
-		icmp := &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvfrom", syscall.ECONNREFUSED)}
+		icmp := &net.OpError{Op: "read", Net: "udp", Err: os.NewSyscallError("recvfrom", errConnRefused)}
 		perm := errors.New("permanent")
 		c.up(t, []byte("queued"))
 		r.l.ReadFaults(Down, icmp, perm)
@@ -1291,9 +1290,8 @@ func TestDatagramLinkTruncation_L58(t *testing.T) {
 		if n, from, err := c.srv.ReadFrom(buf); n != 64 || from != c.cliAddr || err != nil || !bytes.Equal(buf[:10], d) || buf[63] != 0 {
 			t.Fatalf("Linux style: (%d, %v, %v)", n, from, err)
 		}
-		var errno syscall.Errno
 		var op *net.OpError
-		if n, from, err := c.srv.ReadFrom(buf); n != 64 || from != nil || !errors.As(err, &op) || !errors.As(err, &errno) || errno != 10040 {
+		if n, from, err := c.srv.ReadFrom(buf); n != 64 || from != nil || !errors.As(err, &op) || !errors.Is(err, errWSAEMSGSIZE) {
 			t.Fatalf("Windows style: (%d, %v, %v)", n, from, err)
 		}
 		if got, _ := dRecv(t, c.srv); !bytes.Equal(got, d) {

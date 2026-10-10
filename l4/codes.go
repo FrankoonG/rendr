@@ -24,7 +24,7 @@ const (
 	CodeTimeout         RejectCode = 0x4C340009 // the connect timed out (DialTimeout or the pending deadline)
 	CodeDNSNotFound     RejectCode = 0x4C34000A // the name does not exist
 	CodeDNSFailure      RejectCode = 0x4C34000B // resolution failed or timed out
-	CodeCapacity        RejectCode = 0x4C34000C // the Server's MaxConns or abandoned cap; the host's fds or ports
+	CodeCapacity        RejectCode = 0x4C34000C // the Server's MaxConns or its cap on running Dial hook calls (R1-9); the host's fds or ports
 	CodeDialFailed      RejectCode = 0x4C34000D // anything else
 )
 
