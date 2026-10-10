@@ -154,7 +154,10 @@ func TestHeldAfterResponseFill(t *testing.T) {
 // first frame of a stream session's view opened on a started trunk is an
 // ACK, a packet session's on a stream trunk a plain PACK — and
 // passive-first data of a view on a started datagram trunk (whose go frame
-// is REL{PACK}) reaches the dialer.
+// is REL{PACK}) reaches the dialer. A stream trunk carries sessions of one
+// kind (KINDSPLIT): the packet session's view opens on the started stream
+// trunk of an earlier packet session, beside the stream session's own
+// trunk.
 func TestLaneGoFrameE2E(t *testing.T) {
 	t.Run("packet on a stream trunk", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -163,6 +166,33 @@ func TestLaneGoFrameE2E(t *testing.T) {
 			defer taps.close()
 			p := e.mxPeer(mxTapCarrier(e.links[0], &taps))
 			d1, p1 := e2eOpen(t, p, e.ln, DialOptions{})
+			openPkt := func() (dc, sc *PacketConn) {
+				t.Helper()
+				res := make(chan *PacketConn, 1)
+				go func() {
+					c, err := p.DialPacket(context.Background(), DialOptions{})
+					if err != nil {
+						t.Error(err)
+					}
+					res <- c
+				}()
+				pend, err := e.ln.AcceptPacket(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				sc, err = pend.Confirm()
+				if err != nil {
+					t.Fatal(err)
+				}
+				return <-res, sc
+			}
+			dc0, sc0 := openPkt() // view 1 of the packet sessions' stream trunk
+			if dc0 == nil {
+				t.FailNow()
+			}
+			if n, m := taps.count(), e.d.Status().Mux; n != 2 || m.Carriers != 2 || m.Views != 2 {
+				t.Fatalf("%d trunks dialled, dialer Mux %+v; want a stream trunk per session kind", n, m)
+			}
 			res := make(chan *PacketConn, 1)
 			go func() {
 				c, err := p.DialPacket(context.Background(), DialOptions{})
@@ -191,8 +221,11 @@ func TestLaneGoFrameE2E(t *testing.T) {
 			if n, _, err := dc.ReadFrom(buf); err != nil || string(buf[:n]) != "first" {
 				t.Fatalf("dialer ReadFrom: %q, %v", buf[:n], err)
 			}
+			if n, m := taps.count(), e.d.Status().Mux; n != 2 || m.Carriers != 2 || m.Views != 3 || m.FastPaths != 1 {
+				t.Fatalf("%d trunks dialled, dialer Mux %+v; want the second packet session as a fast path on the packet sessions' trunk", n, m)
+			}
 			var up2 []rendrtest.FrameType
-			for _, rec := range taps.tap(t, 0).Log(rendrtest.Up) {
+			for _, rec := range taps.tap(t, 1).Log(rendrtest.Up) {
 				if rec.Handle == 2 {
 					up2 = append(up2, rec.Type)
 				}
@@ -202,6 +235,8 @@ func TestLaneGoFrameE2E(t *testing.T) {
 			}
 			dc.Close()
 			sc.Close()
+			dc0.Close()
+			sc0.Close()
 			e2eFinish(t, d1, p1)
 			e.close()
 		})

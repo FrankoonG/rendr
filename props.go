@@ -19,10 +19,11 @@ type Props struct {
 	// CheapSubflow: opening a carrier of this factory is cheap (a native
 	// subflow such as a new stream of an existing connection), so every
 	// session dials its own carriers of it. When false (the default) the
-	// sessions of one Peer share the live carriers of this factory: a new
-	// session or a failover JOIN uses a live carrier instead of dialling,
-	// sessions on one carrier share its head-of-line blocking and its fate,
-	// and the carrier closes when its last session ends.
+	// sessions of one Peer share the live carriers of this factory, a
+	// carrier carrying sessions of one kind (stream or packet): a new
+	// session or a failover JOIN uses a live carrier of its kind instead of
+	// dialling, sessions on one carrier share its head-of-line blocking and
+	// its fate, and the carrier closes when its last session ends.
 	CheapSubflow bool
 	// HoLCoupled: the carriers of this factory's FateGroup share one
 	// in-order pipe (for example streams of one TCP or TLS connection), so a

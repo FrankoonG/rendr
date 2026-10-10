@@ -1326,6 +1326,9 @@ func (t *trunk) usableForMux(kind wire.Type, inst [16]byte, sess uintptr) bool {
 	if kind == wire.TypeData && t.dg != nil {
 		return false // a stream session needs a stream trunk (M3-D24)
 	}
+	if t.kinds != 0 && t.kinds != kind {
+		return false // a pooled trunk carries sessions of one kind (KINDSPLIT)
+	}
 	if inst != ([16]byte{}) && inst != t.peer {
 		return false
 	}

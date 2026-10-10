@@ -227,9 +227,20 @@ func (pt *poolT) attemptOn(ctx context.Context, p *Pool, f int, kind wire.Type, 
 	return pt.attemptCheck(ctx, p, f, kind, sid, inst, nil)
 }
 
-// attemptCheck is attemptOn with the session's PREFACE_ACK check.
+// attemptCheck is attemptOn with the session's PREFACE_ACK check (a stream
+// session).
 func (pt *poolT) attemptCheck(ctx context.Context, p *Pool, f int, kind wire.Type, sid byte, inst [16]byte, check func(*wire.PrefaceAck) error) (*Established, error) {
-	est, err := p.Attempt(ctx, f, pt.env.IDs.Next(), kind, poolPayload(kind, sid), check, inst, uintptr(sid))
+	return pt.attemptKind(ctx, p, f, kind, sid, inst, check, wire.TypeData)
+}
+
+// attemptKind is attemptCheck for a session of kind dk (wire.TypeData: a
+// stream session, wire.TypeDgram: a packet session, whose OPEN says so).
+func (pt *poolT) attemptKind(ctx context.Context, p *Pool, f int, kind wire.Type, sid byte, inst [16]byte, check func(*wire.PrefaceAck) error, dk wire.Type) (*Established, error) {
+	payload := poolPayload(kind, sid)
+	if kind == wire.TypeOpen && dk == wire.TypeDgram {
+		payload = mOpenPayload(sid, true)
+	}
+	est, err := p.Attempt(ctx, f, pt.env.IDs.Next(), kind, payload, check, inst, uintptr(sid), dk)
 	if est != nil {
 		pt.mu.Lock()
 		pt.ests = append(pt.ests, est)
@@ -304,11 +315,12 @@ func (p *Pool) listed(f int) []*Conn {
 	return append([]*Conn(nil), p.trunks[f]...)
 }
 
-// inFlight reports whether factory f has a dial in flight.
+// inFlight reports whether factory f has a dial in flight (of either
+// session kind).
 func (p *Pool) inFlight(f int) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.dialing[f] != nil
+	return p.dialing[dialSlot(f, wire.TypeData)] != nil || p.dialing[dialSlot(f, wire.TypeDgram)] != nil
 }
 
 // usable reports whether the pool would put a stream OPEN of session sess

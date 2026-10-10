@@ -47,7 +47,7 @@ type MuxStatus struct {
 	Carriers  int    // live carriers that negotiated mux (both roles)
 	Views     int    // sessions attached to them (a session counts once per such carrier)
 	FastPaths uint64 // dialer: OPENs and JOINs placed on a live carrier instead of dialling
-	Coalesced uint64 // dialer: attempts that waited for another session's dial of the same factory
+	Coalesced uint64 // dialer: attempts that waited for another session's dial of the same factory (for a session of the same kind)
 	MuxFull   uint64 // CAPACITY answers because a carrier held its maximum of sessions (both roles)
 }
 

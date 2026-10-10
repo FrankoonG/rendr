@@ -59,9 +59,12 @@
 // FateGroup, and factories of one group that disagree on HoLCoupled.
 //
 // Shared carriers (rendr mux): unless a factory sets Props.CheapSubflow,
-// the sessions of one Peer share the live carriers of that factory. A new
-// session or a failover uses a live carrier instead of dialling one, and a
-// carrier closes when its last session ends; there is no idle retention.
+// the sessions of one Peer share the live carriers of that factory, each
+// carrier sessions of one kind: on a stream factory the packet sessions
+// share carriers apart from the stream sessions' (so a datagram never
+// waits behind a stream session's backlog). A new session or a failover
+// uses a live carrier of its kind instead of dialling one, and a carrier
+// closes when its last session ends; there is no idle retention.
 // Sessions on one carrier share its head-of-line blocking and its fate: its
 // death migrates each of them, as it would a session of its own. On a
 // carrier that was already live, the passive's first bytes for a session

@@ -39,7 +39,11 @@ func mxInject(ctx context.Context, p *Peer, f int, kind wire.Type, payload []byt
 // places it only on a trunk of that instance; zero: any trunk that takes an
 // OPEN).
 func mxInjectTo(ctx context.Context, p *Peer, f int, kind wire.Type, payload []byte, inst [16]byte) (*carrier.Established, wire.AckStatus, uint32, error) {
-	est, err := p.pool.Attempt(ctx, f, p.rt.cenv.IDs.Next(), kind, payload, nil, inst, mxSessKey.Add(1))
+	dk := wire.TypeData // a JOIN: of a stream session (every JOIN these tests inject)
+	if o, err := wire.ParseOpen(payload, len(payload)); kind == wire.TypeOpen && err == nil && o.Kind == wire.KindDatagram {
+		dk = wire.TypeDgram
+	}
+	est, err := p.pool.Attempt(ctx, f, p.rt.cenv.IDs.Next(), kind, payload, nil, inst, mxSessKey.Add(1), dk)
 	if err != nil {
 		return nil, 0, 0, err
 	}
@@ -335,7 +339,7 @@ func TestMuxOneViewPerSession(t *testing.T) {
 		// a carrier of its own instead, where its JOIN is admitted.
 		trunk := mxCarrier(t, s, "a").ID
 		est, err := p.pool.Attempt(context.Background(), 0, p.rt.cenv.IDs.Next(), wire.TypeJoin, wpJoin(s.ID(), 1, 0), nil,
-			e.p.InstanceID(), uintptr(unsafe.Pointer(s.s)))
+			e.p.InstanceID(), uintptr(unsafe.Pointer(s.s)), wire.TypeData)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -105,6 +105,12 @@ type trunk struct {
 	// The mux state (M3-D1 … M3-D13).
 	mux   bool  // OptMux negotiated: both PREFACE and PREFACE_ACK carried it (M3-D3); immutable after the handshake
 	owner *Pool // dialer MUX trunks: the pool that publishes and closes it; nil on the passive side
+	// kinds is the session kind a dialer MUX trunk carries, as the data
+	// frame type (wire.TypeData: stream sessions, wire.TypeDgram: packet
+	// sessions): its claimant's, set by the pool under Pool.mu before the
+	// trunk is published and read under Pool.mu (KINDSPLIT). Zero on a
+	// trunk no pool owns: no kind restriction beyond M3-D24.
+	kinds wire.Type
 
 	// last is the last-hit dispatch cache (M3-D9): the reader tries it
 	// before the view table. Written under mx, read lock-free.
@@ -309,7 +315,8 @@ func (t *trunk) onViewDone(f func(*Conn)) {
 // usableFor reports whether a new view of a session sess of kind kind may
 // be opened on the trunk (M3-D17): OptMux negotiated; started; not dying,
 // retiring, peer-closed, gone-away, write-blocked or sealed; fewer views
-// than MuxMaxViews; a stream session needs a stream trunk; for a JOIN
+// than MuxMaxViews; a stream session needs a stream trunk, and a pooled
+// trunk takes sessions of its own kind only (KINDSPLIT); for a JOIN
 // (inst not zero) the trunk's peer instance is inst; sess holds no view on
 // the trunk that is not yet reaped (R1-6). The caller holds Pool.mu.
 func (t *trunk) usableFor(kind wire.Type, inst [16]byte, sess uintptr) bool {

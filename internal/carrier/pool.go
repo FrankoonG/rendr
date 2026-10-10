@@ -19,6 +19,17 @@ import (
 // crosses Peers, keeps no idle trunk, never pre-dials, and closes a trunk
 // at its last view.
 //
+// One session kind per trunk (M3 amendment KINDSPLIT to M3-D17, M3-D24):
+// the pool keys its trunks and its dials in flight by (factory, session
+// kind). A trunk carries the kind of the session that dialled it
+// (trunk.kinds) and takes views of that kind only, and an attempt waits
+// only for a dial of its own kind, so a stream factory serves its stream
+// and its packet sessions on separate trunks: a packet session never
+// shares a stream trunk's in-flight cap with a bulk stream session, whose
+// backlog would age its datagrams out before placement (Packet.MaxAge). A
+// datagram factory carries packet sessions only (M3-D24), one kind
+// already.
+//
 // Lifecycle of a trunk in the pool: the claimant's Establish returns view 1
 // of a fresh MUX trunk (Established.Fresh); the factory's dial stays "in
 // flight" for later attempts until the session starts view 1 (Conn.Start
@@ -49,8 +60,8 @@ type Pool struct {
 	joinStall   time.Duration // least wait of a JOIN claimant's waiters for its verdict (dialWait)
 
 	mu      sync.Mutex
-	trunks  [][]*Conn           // per factory: view 1 of each published trunk, oldest first
-	dialing []*dialWait         // per factory: the dial in flight that later attempts wait for (nil: none)
+	trunks  [][]*Conn           // per factory: view 1 of each published trunk (of either session kind, trunk.kinds), oldest first
+	dialing []*dialWait         // per factory and session kind (dialSlot): the dial in flight that later attempts wait for (nil: none)
 	full    map[*trunk]bool     // published trunks that answered CAPACITY CodeMuxFull, until a view leaves (§A5.8)
 	extra   map[*Conn]*dialWait // fresh trunks of dials outside dialing (dialWait: a verdict grace ran out), until settled
 	live    int                 // fresh trunks whose Done is still open (Wait)
@@ -78,8 +89,10 @@ type dialWait struct {
 	err     error // the claimant's failure, counted once by each waiter (a transport or PREFACE failure)
 	release bool  // the waiters retry at once without a failure (a session-level refusal, no mux, a discarded fresh trunk, a cancelled claimant)
 
-	f     int   // the factory slot
-	fresh *Conn // view 1 of the claimant's fresh trunk awaiting its Start (M3-D19); nil while dialing and once settled
+	f     int       // the factory slot
+	k     int       // its index in Pool.dialing (dialSlot of f and dk)
+	dk    wire.Type // the session kind it serves: wire.TypeData (stream) or wire.TypeDgram (packet)
+	fresh *Conn     // view 1 of the claimant's fresh trunk awaiting its Start (M3-D19); nil while dialing and once settled
 
 	// The claimant's path proof (WP10): proven closes when its PREFACE_ACK
 	// passed the check — the path works and only its session's verdict on
@@ -122,11 +135,21 @@ type dialWait struct {
 // verdict on handle 1 once the claimant's path was proven (dialWait).
 const minVerdictGrace = 100 * time.Millisecond
 
-// newDialWait returns the dial of factory f an attempt with first frame
-// kind claims.
-func newDialWait(f int, kind wire.Type) *dialWait {
-	return &dialWait{done: make(chan struct{}), f: f, proven: make(chan struct{}), kick: make(chan struct{}),
+// newDialWait returns the dial of factory f an attempt of session kind dk
+// with first frame kind claims.
+func newDialWait(f int, dk, kind wire.Type) *dialWait {
+	return &dialWait{done: make(chan struct{}), f: f, k: dialSlot(f, dk), dk: dk, proven: make(chan struct{}), kick: make(chan struct{}),
 		open: kind == wire.TypeOpen, start: time.Now(), inEst: true}
+}
+
+// dialSlot is the index in Pool.dialing of factory f's dial in flight for
+// sessions of kind dk (KINDSPLIT: one coalesced dial per factory and
+// session kind).
+func dialSlot(f int, dk wire.Type) int {
+	if dk == wire.TypeDgram {
+		return 2*f + 1
+	}
+	return 2 * f
 }
 
 // kickLocked wakes the waiters of w to decide again (a waiter took w's
@@ -141,7 +164,7 @@ func (w *dialWait) kickLocked() {
 // the JOINs decide again.
 func (p *Pool) leaveLocked(w *dialWait) {
 	w.joins--
-	if w.joins == 0 && w.open && w.inEst && p.dialing[w.f] == w {
+	if w.joins == 0 && w.open && w.inEst && p.dialing[w.k] == w {
 		w.kickLocked()
 	}
 }
@@ -201,7 +224,7 @@ func NewPool(env *Env, fs []Factory) *Pool {
 		dialTimeout: env.Timing.withDefaults().DialTimeout,
 		joinStall:   env.Timing.withDefaults().DeadMin,
 		trunks:      make([][]*Conn, len(fs)),
-		dialing:     make([]*dialWait, len(fs)),
+		dialing:     make([]*dialWait, 2*len(fs)),
 	}
 }
 
@@ -217,8 +240,12 @@ func NewPool(env *Env, fs []Factory) *Pool {
 // kind and payload are the first frame (OPEN or JOIN); check verifies the
 // PREFACE_ACK as for Establish; inst is the session's bound instance for a
 // JOIN (zero for an OPEN); sess identifies the session (one unreaped view
-// per trunk, R1-6). Errors are Establish's; a fast path that fails before
-// its first frame was placed continues with a dial and counts no failure.
+// per trunk, R1-6); dk is the session's kind as its data frame type,
+// wire.TypeDgram for a packet session and wire.TypeData (any other value)
+// for a stream session — a JOIN does not carry it: the attempt uses only
+// trunks of that kind and waits only for a dial of that kind (KINDSPLIT).
+// Errors are Establish's; a fast path that fails before its first frame
+// was placed continues with a dial and counts no failure.
 //
 // Further contracts of this implementation: a fast path refused with
 // CAPACITY CodeMuxFull (the trunk is then full until a view leaves) or,
@@ -242,12 +269,15 @@ func NewPool(env *Env, fs []Factory) *Pool {
 // happened — counts for every waiter. Close changes nothing
 // here: the sessions that survive Peer.Close keep their fast paths and
 // coalescing.
-func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, payload []byte, check func(*wire.PrefaceAck) error, inst [16]byte, sess uintptr) (*Established, error) {
+func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, payload []byte, check func(*wire.PrefaceAck) error, inst [16]byte, sess uintptr, dk wire.Type) (*Established, error) {
 	fac := p.fs[f]
 	if !fac.Mux || (kind != wire.TypeOpen && kind != wire.TypeJoin) {
 		return Establish(ctx, p.env, fac, cid, kind, payload, check)
 	}
-	dk := sessionDataType(kind, payload)
+	if dk != wire.TypeDgram {
+		dk = wire.TypeData
+	}
+	k := dialSlot(f, dk)
 	begin := time.Now() // a claimant's dial timeout counts for this attempt only if the dial began no earlier
 	var (
 		skip     []*trunk    // trunks this attempt does not try again (openView failed, refused, died)
@@ -292,7 +322,7 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 			p.releaseCID(cid)
 			return est, err
 		}
-		w := p.dialing[f]
+		w := p.dialing[k]
 		if w != nil && !p.ownDialLocked(w, kind, graceOut) {
 			if !counted {
 				p.stats.Coalesced++
@@ -345,14 +375,14 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 				return nil, &EstablishError{Stage: "dial", Cause: CauseTransportError, Err: fmt.Errorf("%w (waiting for the factory's dial in flight)", errDialTimeout)}
 			}
 		}
-		nw := newDialWait(f, kind)
+		nw := newDialWait(f, dk, kind)
 		if w == nil || !w.open || kind == wire.TypeJoin {
 			// The factory's dial in flight: the first, or in the place of a
 			// claimant whose verdict grace ran out (w keeps its claimant;
 			// claimed puts its fresh trunk in extra), whose waiters wait for
 			// this dial now. An OPEN beside a slow OPEN claimant leaves it in
 			// place.
-			p.dialing[f] = nw
+			p.dialing[k] = nw
 			if w != nil {
 				w.kickLocked()
 			}
@@ -411,24 +441,10 @@ func awaitDial(ctx context.Context, w *dialWait, proven <-chan struct{}, graceEn
 	}
 }
 
-// sessionDataType returns the data frame type of the session an attempt
-// is for (usableFor's kind, M3-D24): wire.TypeDgram for a packet session,
-// wire.TypeData for a stream session. An OPEN carries the session kind; a
-// JOIN does not, and needs no kind check: every trunk of a factory has the
-// factory's kind, and a stream session dials no datagram factory, so a
-// JOIN is treated as a packet session's (no trunk excluded by kind).
-func sessionDataType(kind wire.Type, payload []byte) wire.Type {
-	if kind == wire.TypeOpen {
-		if o, err := wire.ParseOpen(payload, len(payload)); err == nil && o.Kind == wire.KindStream {
-			return wire.TypeData
-		}
-	}
-	return wire.TypeDgram
-}
-
 // pickLocked returns view 1 of the trunk of factory f a new view of session
-// sess goes on (M3-D17): among the usable published trunks the one with the
-// most views below the cap, then the oldest; nil when none is usable.
+// sess of kind dk goes on (M3-D17): among the usable published trunks,
+// which are those of kind dk only (KINDSPLIT), the one with the most views
+// below the cap, then the oldest; nil when none is usable.
 func (p *Pool) pickLocked(f int, dk wire.Type, inst [16]byte, sess uintptr, skip []*trunk) *Conn {
 	var best *Conn
 	bestN := -1
@@ -567,11 +583,12 @@ func (p *Pool) claimed(ctx context.Context, w *dialWait, est *Established, err e
 			c := est.Conn
 			est.Fresh = true
 			c.owner = p
+			c.kinds = w.dk // set before its publication, read under mu (KINDSPLIT)
 			c.bindSession(sess)
 			f := w.f
 			c.onViewDone(func(v *Conn) { p.viewGone(f, c, v) })
 			w.fresh = c
-			if p.dialing[f] != w {
+			if p.dialing[w.k] != w {
 				// An OPEN waiter's own dial beside the claimant, or a
 				// claimant another waiter took the place of (a verdict grace
 				// ran out): not the factory's dial in flight, but published
@@ -596,8 +613,8 @@ func (p *Pool) claimed(ctx context.Context, w *dialWait, est *Established, err e
 			return
 		}
 	}
-	if p.dialing[w.f] == w {
-		p.dialing[w.f] = nil
+	if p.dialing[w.k] == w {
+		p.dialing[w.k] = nil
 	}
 	if err != nil && !claimantReleases(ctx, err) {
 		w.err = err
@@ -688,8 +705,8 @@ func (p *Pool) settle(w *dialWait, c *Conn) {
 		return
 	}
 	delete(p.extra, c)
-	if p.dialing[w.f] == w {
-		p.dialing[w.f] = nil
+	if p.dialing[w.k] == w {
+		p.dialing[w.k] = nil
 	}
 	w.fresh, w.release = nil, true
 	retire := false
