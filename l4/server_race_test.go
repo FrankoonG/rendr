@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -459,15 +459,33 @@ func TestServerRuntimeCloseReleasesTargets_L52(t *testing.T) {
 	})
 }
 
+// p10Rate is the links' rate in P10: the OPEN storm and its answers share
+// the bottleneck with the echo session, so a ping sent during the storm
+// queues behind its frames, while the storm's bytes still clear well
+// within one baseline round trip (2 × kitOneWay) when nothing stalls.
+const p10Rate = 32 << 20
+
+// pingSample is one ping of P10's loaded phase.
+type pingSample struct {
+	at  time.Time // when the ping was written
+	rtt time.Duration
+}
+
 // TestServerDialConcurrencyBounded_L48 (P10, M4-D28): 1,000 OPENs at once
 // with a hanging hook and AcceptBacklog 128: at most 128 hook calls run at
 // once, the rest are answered CAPACITY at once, and an established L4
-// echo through the same Server keeps its P99 round trip within twice its
-// baseline.
+// echo through the same Server and the same rate-limited link keeps its
+// round trip within twice its baseline while the storm lasts: P99 over
+// every ping from the storm's start to its last answer, and every ping
+// written before the last CAPACITY answer. The pings run back to back
+// behind the storm's queued OPENs, and at least one of the burst's pings
+// must show queueing behind the storm's frames (the stimulus proof). The bubble has
+// no CPU contention: this row proves protocol-level head-of-line isolation
+// (a full backlog or the Server's dials never hold the shared carrier).
 func TestServerDialConcurrencyBounded_L48(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const n, backlog = 1000, 128
-		w := newSrvWorld(t, srvOpts{worldOpts: worldOpts{n: n}, backlog: backlog})
+		w := newSrvWorld(t, srvOpts{worldOpts: worldOpts{n: n, rate: p10Rate}, backlog: backlog})
 		echo := rendrtest.NewTarget(rendrtest.TargetEcho(), 0)
 		hang, _ := rendrtest.ScriptedDial(rendrtest.OutcomeHang())
 		hl := newHookLog(func(ctx context.Context, r Request) (net.Conn, error) {
@@ -483,16 +501,16 @@ func TestServerDialConcurrencyBounded_L48(t *testing.T) {
 			t.Fatalf("Dial echo: %v", err)
 		}
 		const pings = 200
-		p99 := func() time.Duration {
-			rtts := make([]time.Duration, pings)
-			for i := range rtts {
-				rtts[i] = ping(t, c, 512)
-				time.Sleep(10 * time.Millisecond)
-			}
-			sort.Slice(rtts, func(i, j int) bool { return rtts[i] < rtts[j] })
-			return rtts[pings*99/100-1]
+		rtts := make([]time.Duration, pings)
+		for i := range rtts {
+			rtts[i] = ping(t, c, 512)
+			time.Sleep(10 * time.Millisecond)
 		}
-		base := p99()
+		base := p99(rtts)
+
+		// The storm's OPENs are queued at the bottleneck first (every Dial
+		// is blocked waiting for its answer), then the pinger runs back to
+		// back behind them until the storm's last answer.
 		start := time.Now()
 		results := make(chan dialRes, n)
 		for range n {
@@ -501,15 +519,37 @@ func TestServerDialConcurrencyBounded_L48(t *testing.T) {
 				results <- dialRes{c, err, time.Now()}
 			}()
 		}
-		loaded := p99()
+		synctest.Wait()
+		stopPing := make(chan struct{})
+		pinged := make(chan []pingSample, 1)
+		go func() {
+			var ss []pingSample
+			defer func() { pinged <- ss }()
+			for {
+				select {
+				case <-stopPing:
+					return
+				default:
+				}
+				at := time.Now()
+				d, err := pingErr(c, 512)
+				if err != nil {
+					t.Errorf("ping under the storm: %v", err)
+					return
+				}
+				ss = append(ss, pingSample{at, d})
+			}
+		}()
 		capacity, timeouts := 0, 0
-		var slowest time.Duration
+		var lastCapacity time.Time
 		for range n {
 			r := <-results
 			switch {
 			case errors.Is(r.err, rendr.ErrCapacity):
 				capacity++
-				slowest = max(slowest, r.at.Sub(start))
+				if r.at.After(lastCapacity) {
+					lastCapacity = r.at
+				}
 			case r.err != nil:
 				if code, ok := CodeOf(r.err); ok && code == CodeTimeout {
 					timeouts++
@@ -520,23 +560,55 @@ func TestServerDialConcurrencyBounded_L48(t *testing.T) {
 				t.Fatalf("a Dial to a hanging target succeeded")
 			}
 		}
+		end := time.Now()
+		close(stopPing)
+		samples := <-pinged
+		var loaded, burst []time.Duration
+		for _, p := range samples {
+			if p.at.Before(end) {
+				loaded = append(loaded, p.rtt)
+			}
+			if p.at.Before(lastCapacity) {
+				burst = append(burst, p.rtt)
+			}
+		}
 		calls, peak, _, _ := hl.snapshot()
-		t.Logf("%d CAPACITY (slowest %v), %d CodeTimeout; %d hook calls, peak %d; P99 %v → %v", capacity, slowest, timeouts, calls, peak, base, loaded)
+		st := w.links[0].Stats()
+		t.Logf("%d CAPACITY (last %v), %d CodeTimeout (last %v); %d hook calls, peak %d; link bytes %d; P99 %v → %v over %d pings; burst %d pings, max %v",
+			capacity, lastCapacity.Sub(start), timeouts, end.Sub(start), calls, peak, st.Throttled, base, p99(loaded), len(loaded), len(burst), slices.Max(append([]time.Duration{0}, burst...)))
 		if peak > backlog { // the echo session's call ended before the storm
 			t.Fatalf("%d hook calls at once, want ≤ %d", peak, backlog)
 		}
 		if timeouts == 0 || capacity == 0 || capacity+timeouts != n {
 			t.Fatalf("stimulus: %d CAPACITY, %d CodeTimeout of %d", capacity, timeouts, n)
 		}
-		if slowest > time.Second {
-			t.Fatalf("a CAPACITY answer took %v, want at once", slowest)
+		if el := lastCapacity.Sub(start); el > time.Second {
+			t.Fatalf("a CAPACITY answer took %v, want at once", el)
 		}
-		if loaded > 2*base {
-			t.Fatalf("echo P99 %v under the OPEN storm, baseline %v", loaded, base)
+		if len(burst) < 3 || len(loaded) < 100 {
+			t.Fatalf("stimulus: %d pings during the CAPACITY burst (want ≥ 3), %d under the storm (want ≥ 100)", len(burst), len(loaded))
+		}
+		if slices.Max(burst) <= base {
+			t.Fatalf("stimulus: no burst ping queued behind the storm (max %v, baseline %v)", slices.Max(burst), base)
+		}
+		if l := p99(loaded); l > 2*base {
+			t.Fatalf("echo P99 %v under the OPEN storm, baseline %v", l, base)
+		}
+		if m := slices.Max(burst); m > 2*base {
+			t.Fatalf("an echo ping took %v during the CAPACITY burst, baseline P99 %v", m, base)
 		}
 		echoRoundTrip(t, c, 64<<10, 9)
 		c.Close()
 		sv.stop(t)
 		w.shutdown()
 	})
+}
+
+// p99 returns the 99th percentile of rtts (it sorts them).
+func p99(rtts []time.Duration) time.Duration {
+	if len(rtts) == 0 {
+		return 0
+	}
+	slices.Sort(rtts)
+	return rtts[max(len(rtts)*99/100-1, 0)]
 }

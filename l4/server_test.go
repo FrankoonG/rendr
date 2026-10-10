@@ -314,10 +314,12 @@ func TestServerIdleDefault(t *testing.T) {
 // TestServerAllocsPerConn (§A12.6, recorded ceiling): the Server's own
 // allocations per accepted, dialled, confirmed and forwarded connection —
 // Serve and Handle against a hand-written Accept, Confirm and Forward loop
-// over the same Runtimes, links and target — stay at most 64.
+// over the same Runtimes, links and target — stay at most 64. The ceiling
+// applies to that difference, not to the end-to-end total (about 470 per
+// connection, mostly the core's session setup; recorded in the log).
 func TestServerAllocsPerConn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		const k = 100
+		const k = 400 // enough connections that the difference of two totals is stable
 		w := newSrvWorld(t, srvOpts{})
 		target := rendrtest.NewTarget(rendrtest.TargetEcho(), 0)
 		one := func() {

@@ -43,6 +43,13 @@ var (
 	errAbandoned = fmt.Errorf("l4: Dial hook still running %v after its budget: %w", abandonAfter, context.DeadlineExceeded)
 )
 
+// dialTCP is the target dial of a Server without a Dial hook. It is a
+// variable only so that tests can observe the context the Server gives the
+// default dialer (its budget and its cancellation); nothing else sets it.
+var dialTCP = func(ctx context.Context, addr string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+}
+
 // hookPanic is the error of a hook call that panicked or called
 // runtime.Goexit (v is nil then). It wraps nothing, so it classifies as
 // CodeDialFailed whatever the panic value is.
@@ -65,7 +72,9 @@ type Server struct {
 	// by policy (CodeNotAllowed). A panic is answered CodeDialFailed. ctx
 	// bounds the dial only; it is cancelled after the dial returns, and the
 	// returned conn must not depend on it. At most 192 calls run at
-	// once, abandoned ones included.
+	// once, abandoned ones included. A conn the Server closes on the hook's
+	// behalf (returned with an error, or late) is closed under recover; a
+	// conn the Server forwards must not panic.
 	Dial func(ctx context.Context, r Request) (net.Conn, error)
 	// DialTimeout bounds one target dial (0: DefaultDialTimeout; clamped to
 	// 0.5–30 s) and never runs past the pending session's AcceptTimeout
@@ -195,7 +204,7 @@ func (s *Server) connect(ctx context.Context, p *rendr.PendingConn, r Request) n
 	if custom {
 		t, err = s.callHook(dctx, r, deadline)
 	} else {
-		t, err = (&net.Dialer{}).DialContext(dctx, "tcp", r.Addr)
+		t, err = dialTCP(dctx, r.Addr)
 	}
 	stop()
 	cancel()
@@ -263,35 +272,58 @@ func (s *Server) callHook(ctx context.Context, r Request, deadline time.Time) (n
 
 // runHook is the hook call's goroutine. A panic or runtime.Goexit is
 // recovered into hookPanic; (nil, nil) becomes errNilConn; the conn of a
-// (conn, err) result is closed once and err kept.
+// (conn, err) result is closed once and err kept. The result is handed to
+// the handler first; a conn to drop (of a (conn, err) result, or late) is
+// closed after that, under recover, and the hook count is released last
+// even if that Close calls runtime.Goexit.
 func (s *Server) runHook(h *hookCall, ctx context.Context, r Request) {
+	defer s.hooks.Add(-1)
+	var conn net.Conn
+	var err error
 	returned := false
 	defer func() {
 		if !returned {
-			h.conn, h.err = nil, hookPanic{v: recover()} // recover is nil under Goexit, which then goes on
+			conn, err = nil, hookPanic{v: recover()} // recover is nil under Goexit, which then goes on
 			s.panics.Add(1)
 		}
-		if !h.state.CompareAndSwap(hookRunning, hookReturned) {
+		var drop net.Conn
+		switch {
+		case err != nil && conn != nil:
+			drop, conn = conn, nil
+		case err == nil && conn == nil:
+			err = errNilConn
+		}
+		h.conn, h.err = conn, err
+		if h.state.CompareAndSwap(hookRunning, hookReturned) {
+			close(h.done)
+		} else {
 			// Abandoned: the handler answered CodeTimeout already.
-			if h.conn != nil {
-				h.conn.Close()
+			if conn != nil {
+				drop = conn
 			}
 			s.abandoned.Add(-1)
-		} else {
-			close(h.done)
 		}
-		s.hooks.Add(-1)
+		if drop != nil {
+			s.closeHookConn(drop)
+		}
 	}()
-	conn, err := s.Dial(ctx, r)
+	conn, err = s.Dial(ctx, r)
 	returned = true
-	switch {
-	case err != nil && conn != nil:
-		conn.Close()
-		conn = nil
-	case err == nil && conn == nil:
-		err = errNilConn
-	}
-	h.conn, h.err = conn, err
+}
+
+// closeHookConn closes a conn the Dial hook supplied and the Server drops.
+// A panic or runtime.Goexit in its Close is counted in Panics; a panic is
+// recovered (L51: nothing a hook supplies brings the process down).
+func (s *Server) closeHookConn(c net.Conn) {
+	closed := false
+	defer func() {
+		if !closed {
+			recover()
+			s.panics.Add(1)
+		}
+	}()
+	c.Close()
+	closed = true
 }
 
 // acquire takes one unit of the counter n below limit; it reports false at

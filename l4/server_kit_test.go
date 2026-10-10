@@ -56,6 +56,9 @@ func newSrvWorld(t testing.TB, o srvOpts) *world {
 		name := string(rune('a' + i))
 		l := rendrtest.NewLink(rendrtest.LinkConfig{Name: name, Accept: ln.Handle})
 		l.SetDelay(kitOneWay, 0)
+		if o.rate > 0 {
+			l.SetRate(o.rate)
+		}
 		w.links = append(w.links, l)
 		cs = append(cs, rendr.StreamCarrier{Name: name, Dial: l.Dial, Props: rendr.Props{CheapSubflow: o.dedicated}})
 	}
