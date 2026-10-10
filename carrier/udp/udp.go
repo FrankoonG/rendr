@@ -21,10 +21,14 @@
 //
 // The flow ID keeps blind off-path injection out: a sender must guess 64
 // random bits to reach a carrier at all. It is the only barrier, and it is
-// no secret from anyone who sees the traffic: the frame CRC is public and
-// any frame number ahead of the receive window is accepted, so a holder of a
-// flow ID can kill its carrier with one forged datagram that breaks the
-// protocol, or retire it with a forged CLOSE. Replies move to a new client
+// no secret from anyone who sees the traffic. The frame CRC is public, and
+// a frame inside the receive window is accepted on its CRC alone. A frame a
+// window or more ahead moves the window only when its datagram also proves
+// the jump — a PONG answering a PING of this carrier that is still
+// outstanding, or the answer to the receiver's rebind challenge — and is
+// dropped and counted otherwise. So a holder of a flow ID can still kill its
+// carrier with one forged in-window frame that breaks the protocol, or
+// retire it with a forged CLOSE. Replies move to a new client
 // address only after that address answered a random nonce (NAT rebinding,
 // L59), so a replayed or blindly spoofed datagram never redirects them —
 // but an on-path attacker that receives at the address it forges can answer,

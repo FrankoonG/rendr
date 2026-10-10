@@ -141,6 +141,18 @@ func (st *carrierState) find(id uint32) int {
 	return -1
 }
 
+// pingOutstanding reports whether a PONG with id and nonce answers a PING
+// of this incarnation that is still outstanding: its record is in the ring
+// (a PONG removes it, and every older one) with that nonce. A PONG to an
+// already-answered PING, replayed or delayed, answers nothing (m3 W2).
+func (t *trunk) pingOutstanding(id uint32, nonce uint64) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := &t.st
+	i := st.find(id)
+	return i >= 0 && st.record(i).nonce == nonce
+}
+
 // decay returns the decaying-max filter factor for an interval dt.
 func decay(dt time.Duration) float64 {
 	return math.Pow(0.95, float64(dt)/float64(rateDecayStep))

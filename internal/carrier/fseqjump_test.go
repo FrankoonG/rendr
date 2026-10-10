@@ -361,8 +361,8 @@ func TestDatagramJumpBothWaysWithRebind_L59(t *testing.T) {
 // from its candidate, before its expiry. The right nonce from a third
 // source proves nothing, nor does it from the candidate once the challenge
 // expired while the writer was held (an expired challenge stays recorded
-// until the writer runs); the frames are dropped. A PONG to a PING of the
-// carrier still proves the jump afterwards.
+// until the writer runs); the frames are dropped. A PONG to an outstanding
+// PING of the carrier still proves the jump afterwards.
 func TestDatagramJumpChallengeProof_L59(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, p := rawPairWith(t, 1200, false, func(env *Env) { env.Timing.WriteStall = 3 * time.Second })
@@ -401,10 +401,23 @@ func TestDatagramJumpChallengeProof_L59(t *testing.T) {
 		if st := s.c.Stats(); st.Rebinds != 0 {
 			t.Fatalf("rebinds %d after a misdirected and an expired answer", st.Rebinds)
 		}
-		p.send(dgramFrame(52, 100), pingFrame(wire.TypePong, wire.Ping{ID: 77, Nonce: s.c.salt ^ 77}))
+		// The PONG to the carrier's newest PING, still outstanding: the one
+		// the unproven jump asked for (m3 W2: a PONG to an answered PING
+		// proves nothing).
+		s.c.mu.Lock()
+		var ours wire.Ping
+		if st := &s.c.st; st.n > 0 {
+			r := st.record(st.n - 1)
+			ours = wire.Ping{ID: r.id, Nonce: r.nonce}
+		}
+		s.c.mu.Unlock()
+		if ours.ID == 0 {
+			t.Fatal("stimulus: no PING of the carrier is outstanding")
+		}
+		p.send(dgramFrame(52, 100), pingFrame(wire.TypePong, ours))
 		synctest.Wait()
 		if got := fjDelivered(s.ep); !slices.Equal(got, []uint64{52}) {
-			t.Fatalf("delivered %v, want [52]: a PONG with the carrier's salt did not prove the jump", got)
+			t.Fatalf("delivered %v, want [52]: the PONG to the carrier's outstanding PING %d did not prove the jump", got, ours.ID)
 		}
 		if dead, cause, detail, _ := s.c.Death(); dead {
 			t.Fatalf("carrier died: %v %q", cause, detail)

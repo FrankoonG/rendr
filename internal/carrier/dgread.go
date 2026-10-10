@@ -248,9 +248,13 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 // dgJumpProof reports whether the datagram from src whose frame f is a
 // window or more ahead proves that it comes from this direction's sender:
 // f or a frame after it (rest) is a PONG only that sender sends — the
-// answer to a PING of this incarnation (id ≠ 0, nonce salt ^ id; L23) or to
-// the rebind challenge in flight (id 0, its nonce, from its candidate;
-// M2-D27). The sender jumps that far after an outage cost a window of
+// answer to a PING of this incarnation that is still outstanding (id ≠ 0,
+// nonce salt ^ id, its record in the ring; L23) or to the rebind challenge
+// in flight (id 0, its nonce, from its candidate; M2-D27). A PONG to an
+// answered PING proves nothing: the fseq window compares in serial
+// arithmetic, so a datagram of this direction replayed 2^31 to 2^32−1024
+// frames later reads a window or more ahead, and its old PONG would move
+// the window behind every genuine frame (m3 W2). The sender jumps that far after an outage cost a window of
 // frames, and the PONG to the PING the outage left outstanding, retried at
 // the RTO, or asked for by dgJumpClaim, arrives within a round trip of its
 // end. A datagram of another carrier direction or session, whose fseqs
@@ -285,7 +289,7 @@ func (c *Conn) dgProves(t wire.Type, p []byte, src PeerKey, now time.Time) bool 
 	case err != nil:
 		return false
 	case pg.ID != 0:
-		return pg.Nonce == c.salt^uint64(pg.ID)
+		return c.pingOutstanding(pg.ID, pg.Nonce) // its record holds nonce salt ^ id
 	}
 	c.mu.Lock()
 	ch := &c.dg.chal
