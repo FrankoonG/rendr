@@ -453,9 +453,17 @@ func TestPoolSealAtZero(t *testing.T) {
 			pt.goAttempt(context.Background(), wire.TypeOpen, 2, ch) // waits for the fresh trunk
 			synctest.Wait()
 			tr := est1.Conn.trunk
+			// Start publishes on a goroutine of its own (poolStarted), which
+			// takes Pool.mu: holding it until view 1's Done closed makes the
+			// publication find no view. Without the hold the publication
+			// could run first, the waiter's retry then opened view 2 on the
+			// published trunk, and the trunk rightly stayed (a premise race,
+			// about 1 in 1200 host -race runs under load).
+			pt.p.mu.Lock()
 			est1.Conn.Start(&dEP{}, &hBell{}, StartOptions{})
 			est1.Conn.Kill(CauseLocalClose, "session 1 ended") // its only view ends before the publication
 			waitDone(t, est1.Conn.Done(), "view 1")
+			pt.p.mu.Unlock()
 			synctest.Wait()
 			est1.Conn.poolStarted()
 			synctest.Wait()
