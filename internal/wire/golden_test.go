@@ -381,6 +381,8 @@ func encodeTyped(t Type, v any) []byte {
 		n = PutJoin(b, &v)
 	case JoinAck:
 		n = PutJoinAck(b, &v)
+	case joinAckMuxVal:
+		n = PutJoinAckMux(b, &v.A, v.Code)
 	case dataVal:
 		PutDataOffset(b, v.Off)
 		n = DataPrefixLen + copy(b[DataPrefixLen:], v.Body)
@@ -443,7 +445,15 @@ func checkVector(v vector) error {
 		if f.Header != v.hdr {
 			return fmt.Errorf("header %+v, want %+v", f.Header, v.hdr)
 		}
-		if got, err = decodeTyped(f.Type, f.Payload); err != nil {
+		if _, ok := v.val.(joinAckMuxVal); ok {
+			// A view's JOIN_ACK: the MUX parser (a dedicated carrier's
+			// rejects a coded refusal).
+			a, code, err := ParseJoinAckMux(f.Payload)
+			if err != nil {
+				return err
+			}
+			got = joinAckMuxVal{A: a, Code: code}
+		} else if got, err = decodeTyped(f.Type, f.Payload); err != nil {
 			return err
 		}
 	case "datagram":
@@ -598,6 +608,7 @@ func TestGolden_L44(t *testing.T) {
 		"udp_h1_open_optmux", "detach_handle_0", "detach_reason_0", "detach_reason_3", "detach_trailing",
 		"detach_short", "open_mode_4", "data_handle_0", "open_ack_capacity_listener_closed",
 		"rel_open_ack_capacity_listener_closed", "open_ack_capacity_mux_full", "open_ack_bad_request_duplicate_view",
+		"join_ack_mux_capacity_muxfull",
 	} {
 		if _, ok := enc[want]; !ok {
 			t.Errorf("golden file lacks %q", want)
@@ -606,7 +617,7 @@ func TestGolden_L44(t *testing.T) {
 	// M1's and M2's vectors keep their positions and bytes (M3 design
 	// §A3: no existing encoding changes); the resent H1 is byte-identical
 	// to the first (PA-21).
-	if names[0] != "preface" || names[len(names)-1] != "open_ack_bad_request_duplicate_view" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
+	if names[0] != "preface" || names[len(names)-1] != "join_ack_mux_capacity_muxfull" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
 		t.Errorf("golden order or H1 resend: first %q, last %q", names[0], names[len(names)-1])
 	}
 	m1, m12 := 0, 0

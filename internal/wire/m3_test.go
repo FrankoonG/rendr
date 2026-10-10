@@ -67,7 +67,19 @@ func goldenVectorsM3() []vector {
 	add(relVec("rel_open_ack_capacity_listener_closed", 16, RelHead{Cseq: 8, Type: TypeOpenAck, Handle: 2}, OpenAck{Status: StatusCapacity, Code: CodeListenerClosed}))
 	add(frameVec("open_ack_capacity_mux_full", TypeOpenAck, 0, 5, 3, OpenAck{Status: StatusCapacity, Code: CodeMuxFull}))
 	add(frameVec("open_ack_bad_request_duplicate_view", TypeOpenAck, 0, 5, 2, OpenAck{Status: StatusBadRequest, Code: CodeDuplicateView}))
+
+	// A carrier-placed JOIN_ACK refusal on a later handle of a MUX trunk
+	// may carry a reason code in the low 32 bits of RxNext (WP16 W3):
+	// CAPACITY CodeMuxFull, the view cap's refusal.
+	add(frameVec("join_ack_mux_capacity_muxfull", TypeJoinAck, 0, 5, 2, joinAckMuxVal{A: JoinAck{Status: StatusCapacity}, Code: CodeMuxFull}))
 	return vs
+}
+
+// joinAckMuxVal is a JOIN_ACK of a view (handle ≥ 2) of a MUX trunk with
+// its reason code, encoded by PutJoinAckMux and decoded by ParseJoinAckMux.
+type joinAckMuxVal struct {
+	A    JoinAck
+	Code uint32
 }
 
 // TestRefusalCodesM3: the reason codes M3 adds keep their values and
