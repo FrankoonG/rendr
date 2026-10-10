@@ -162,6 +162,11 @@ type Hooks struct {
 	// through carrier.Env.PoolLive) is joined by Close's second check
 	// (KL-25).
 	ClosePools func()
+	// AfterReap runs on a session actor's goroutine in each step right
+	// after its death steps (reapDead) and before the step takes the
+	// session lock again for its actions, with no lock held (KL-26: a
+	// carrier death landing between the two).
+	AfterReap func(session [16]byte)
 }
 
 // Session registry gauges (M3 design Revision 1, R1-24): always compiled,
