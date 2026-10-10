@@ -156,6 +156,12 @@ type Hooks struct {
 	// It runs under the carrier's lock: it must not block or call into
 	// rendr.
 	PingTS func(carrier uint32, ts uint64) uint64
+	// ClosePools runs in Runtime.Close right after its first snapshot of
+	// the Runtime's pools (step 1), with no lock held: a closed Peer's
+	// pool that registers again after it (a surviving session's redial
+	// through carrier.Env.PoolLive) is joined by Close's second check
+	// (KL-25).
+	ClosePools func()
 }
 
 // Session registry gauges (M3 design Revision 1, R1-24): always compiled,
