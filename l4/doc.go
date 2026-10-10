@@ -17,6 +17,53 @@
 // observable (TCP sends nothing for it): such a session ends when the far
 // side ends it, at its idle limit, or when ctx ends.
 //
-// Not implemented yet: this is the M4 skeleton; every function returns
-// errors.ErrUnsupported (or its zero result) until its work package lands.
+// # Metadata
+//
+// The OPEN's metadata is the L4 header, version 1, followed by the
+// application's own metadata (Request.App, DialOptions.Metadata on Dial):
+//
+//	"L4" | version 1 | command 1 (CONNECT) | atyp | address | port (u16, big-endian) | app
+//
+// with SOCKS5's address types: 1 IPv4 (4 bytes), 4 IPv6 (16 bytes), 3 a
+// domain (a length byte, then the name). Every target has exactly one
+// encoding and ParseMetadata accepts nothing else: an IPv4-mapped IPv6
+// address travels as IPv4; unspecified, multicast and limited-broadcast
+// addresses, IPv6 zones and port 0 are refused; a domain is labels of 1–63
+// bytes from [A-Za-z0-9_-] joined by single dots, at most 253 bytes plus an
+// optional trailing dot (kept as given), whose last label is neither all
+// digits nor 0x-hex (names resolvers would read as an IPv4 address, such as
+// "127.1"). The dialer resolves nothing: a name is resolved by the passive,
+// with its DNS view. The header is at most 262 bytes, and the whole
+// metadata stays within Handshake.MaxMetadata (4 KiB by default, checked
+// before any network I/O). The destination travels only in the OPEN, never
+// in a JOIN, a migration or a retry. Match tells L4 sessions apart on a
+// Listener shared with other sessions; Server.Handle serves those.
+//
+// # Ends of a forwarded connection
+//
+//	At either end                         Forward does                      The far end sees
+//	local read → io.EOF (FIN)              Conn.CloseWrite                   FIN after every byte
+//	local read or write → other error      Conn.Abort(AbortReset); reset     RST
+//	session read → io.EOF                  CloseWrite on local (if offered)  FIN after every byte
+//	session error (abort, idle, no path)   reset local                       RST
+//	ctx done                               Conn.Abort(AbortShutdown); reset  RST at both far ends
+//	carrier death, migration               nothing                           nothing
+//
+// A reset is SetLinger(0) and Close where the local conn offers it, else a
+// plain Close. A dial that fails reaches the dialer as a *rendr.RejectError
+// whose CodeOf is the class of the failure (refused, unreachable, timeout,
+// name not found, …); its message is the code's fixed text, never the raw
+// error, which stays on the passive (ServerStatus.LastErr).
+//
+// # Bounds and memory
+//
+// Target dials in flight are bounded by the Listener's AcceptBacklog, each
+// by Server.DialTimeout and the pending session's AcceptTimeout; a Server
+// dials for and forwards at most Server.MaxConns connections and runs at
+// most 192 custom Dial hook calls at once, abandoned ones included. A
+// forwarded connection costs three goroutines and 64 KiB of pooled
+// buffers on top of its session's windows: at the default MaxConns of
+// 10,000 that is ≈ 880 MiB, so deployments size MaxConns to their memory.
+// A silent connection ends at its idle limit (DefaultIdleTimeout, on both
+// ends).
 package l4
