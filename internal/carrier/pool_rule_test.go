@@ -142,6 +142,33 @@ func TestPoolUsableRule(t *testing.T) {
 			}
 		})
 	})
+	t.Run("one kind per stream trunk", func(t *testing.T) {
+		// KINDSPLIT: a pooled stream trunk takes sessions of its own kind
+		// only, for an OPEN and for a JOIN alike.
+		synctest.Test(t, func(t *testing.T) {
+			d, _ := muxPair(t, nil)
+			synctest.Wait()
+			p := pool(d.env, d.c)
+			for _, c := range []struct {
+				kinds          wire.Type
+				stream, packet bool
+			}{
+				{0, true, true}, // no pool keyed it: M3-D24 only
+				{wire.TypeData, true, false},
+				{wire.TypeDgram, false, true},
+			} {
+				d.c.kinds = c.kinds
+				for _, inst := range [][16]byte{zero, mPassiveInst} {
+					if got := pick(p, wire.TypeData, inst, 5) == d.c; got != c.stream {
+						t.Fatalf("a trunk of kind %v usable for a stream session (instance %x): %v, want %v", c.kinds, inst[0], got, c.stream)
+					}
+					if got := pick(p, wire.TypeDgram, inst, 5) == d.c; got != c.packet {
+						t.Fatalf("a trunk of kind %v usable for a packet session (instance %x): %v, want %v", c.kinds, inst[0], got, c.packet)
+					}
+				}
+			}
+		})
+	})
 	t.Run("instance", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			d, _ := muxPair(t, nil)

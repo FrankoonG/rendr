@@ -28,8 +28,11 @@ import (
 // share their carriers) carries 8 selector, 4 bond and 4 race stream
 // sessions and 4 packet sessions (selector, bond, race, selector) for 60
 // virtual seconds, while every 10 s the Link of a or b is killed in turn
-// (Link.Kill closes both ends of every carrier on it: the shared trunk of
-// that factory with all its views, and the probe carrier). Beside them a
+// (Link.Kill closes both ends of every carrier on it: the shared trunks of
+// that factory with all their views, and the probe carrier). A stream
+// trunk carries sessions of one kind (KINDSPLIT), so each Link carries two
+// shared trunks: one for the stream sessions, one for the packet sessions.
+// Beside them a
 // churn of 200 short stream sessions (selector, bond, race in turn), one
 // started every 300 ms, each moving 16 KiB each way, opens and closes on
 // the shared trunks.
@@ -42,10 +45,11 @@ import (
 // duplicated datagram; losses only near a kill or counted; race ≤ 1 %);
 // every churn session's exchange verifies. Counters: TxBytes, AckedBytes
 // and DeliveredBytes exact in both directions (race copies counted once,
-// M3-D35); PacketCounters add up. rendr mux: ≤ 1 dial per factory per
-// kill — the session carriers a Link ever carried are at most 1 + the
-// kills of that Link (the pool's coalescing, M3-D18) —; Status.Mux on both
-// Runtimes counts the live trunks (one per Link) and as many views as the
+// M3-D35); PacketCounters add up. rendr mux: ≤ 1 dial per factory and
+// session kind per kill — the session carriers a Link ever carried are at
+// most 2 × (1 + the kills of that Link) (the pool's coalescing, M3-D18,
+// per session kind) —; Status.Mux on both Runtimes counts the live trunks
+// (two per Link, one per session kind) and as many views as the
 // sessions hold live carriers, and every live carrier reports Shared equal
 // to the views of its trunk (M3-D49); fast paths were taken. After every
 // session closed, the trunks close at their last view (M3-D20: Status.Mux
@@ -331,13 +335,47 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 		}
 		return out
 	}
-	identities := func(when string) {
+	// identities checks Status.Mux on both Runtimes against the sessions'
+	// live carriers, and one shared trunk per Link and session kind
+	// (KINDSPLIT): the live trunks are exactly the (Link, kind) pairs the
+	// dialer's sessions hold live carriers on — streamLinks of them for the
+	// stream sessions, both Links for the packet sessions.
+	identities := func(when string, streamLinks int) {
 		t.Helper()
+		type linkKind struct {
+			link   string
+			packet bool
+		}
+		trunks := func() string {
+			pairs := map[linkKind]bool{}
+			for i, st := range statuses(true) {
+				for _, cs := range st.Carriers {
+					if cs.State != rendr.CarrierDead {
+						pairs[linkKind{cs.Name, i >= ns}] = true
+					}
+				}
+			}
+			nStream, nPacket := 0, 0
+			for k := range pairs {
+				if k.packet {
+					nPacket++
+				} else {
+					nStream++
+				}
+			}
+			if dm, pm := d.Status().Mux, p.Status().Mux; nStream != streamLinks || nPacket != 2 || dm.Carriers != len(pairs) || pm.Carriers != len(pairs) {
+				return fmt.Sprintf("dialer %+v, passive %+v; the sessions hold live carriers on %d Links (stream sessions) and %d (packet sessions), want %d and 2, with one shared trunk per Link and session kind", dm, pm, nStream, nPacket, streamLinks)
+			}
+			return ""
+		}
 		var why string
 		for deadline := time.Now().Add(10 * time.Second); ; {
 			why = cmMuxIdentity(d, statuses(true))
 			if why == "" {
 				why = cmMuxIdentity(p, statuses(false))
+			}
+			if why == "" {
+				why = trunks()
 			}
 			if why == "" || time.Now().After(deadline) {
 				break
@@ -347,14 +385,11 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 		if why != "" {
 			t.Fatalf("Status.Mux identities %s: %s", when, why)
 		}
-		if dm, pm := d.Status().Mux, p.Status().Mux; dm.Carriers != 2 || pm.Carriers != 2 {
-			t.Fatalf("Status.Mux %s: dialer %+v, passive %+v; want one shared trunk per Link", when, dm, pm)
-		}
 	}
-	identities("before the run")
+	identities("before the run", 2)
 	for i, l := range links {
-		if all, _ := cmSessionCarriers(l); all != 1 {
-			t.Fatalf("Link %d carried %d session carriers for %d sessions, want 1 shared trunk", i, all, ns+np)
+		if all, _ := cmSessionCarriers(l); all != 2 {
+			t.Fatalf("Link %d carried %d session carriers for %d sessions, want 2 shared trunks (one per session kind)", i, all, ns+np)
 		}
 	}
 
@@ -457,11 +492,21 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	if got := downs.Load(); got < int64(len(kills)) {
 		t.Errorf("stimulus: %d CarrierDown events for %d kills", got, len(kills))
 	}
-	// ≤ 1 dial per factory per kill.
+	// ≤ 1 dial per factory and session kind per kill. The bound counts per
+	// Link, not per kind: a Link's log cannot tell a JOIN's kind (its
+	// payload does not carry it). It is still tight per kind here: the
+	// identities before the run require both kinds' trunks on every Link,
+	// the stream sessions pace until cmDuration and the packet sessions run
+	// until stop, and every kill comes before cmDuration, so each kill ends
+	// one trunk of each kind and each kind is owed at most one redial. The
+	// bound has slack for a double dial of one kind only after a kill at
+	// which the other kind did not redial on that Link; the root-level
+	// per-kind rows (internal/carrier TestPoolKindSplitCoalescing,
+	// internal/scenario/mux TestMuxMixedKinds) pin one dial per kind.
 	for i, l := range links {
 		all, _ := cmSessionCarriers(l)
-		if all > 1+killsOf[i] {
-			t.Errorf("Link %d carried %d session carriers with %d kills, want ≤ 1 + %d (one dial per factory per kill)", i, all, killsOf[i], killsOf[i])
+		if all > 2*(1+killsOf[i]) {
+			t.Errorf("Link %d carried %d session carriers with %d kills, want ≤ 2 × (1 + %d) (one dial per factory and session kind per kill)", i, all, killsOf[i], killsOf[i])
 		}
 	}
 	if churned.Load() != cmChurn {
@@ -476,7 +521,9 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 		}
 		return true
 	})
-	identities("after the run")
+	// The stream sessions ended (both directions reached io.EOF): their
+	// trunks closed at their last view, the packet sessions' remain.
+	identities("after the run", 0)
 
 	// Stream counters and SHA sums.
 	for i, mode := range cmStreamModes {

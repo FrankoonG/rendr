@@ -2,6 +2,7 @@ package mux
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -161,21 +162,25 @@ func TestMuxPacketSessions_L39_L40(t *testing.T) {
 	})
 }
 
-// TestMuxMixedKinds (M3 design §A11.2, §A5.10; M3-D24): one Peer with a
-// stream factory s (Link, 20 ms RTT) and a datagram factory u
-// (DatagramLink, 20 ms RTT) carries two selector stream sessions and two
-// bond packet sessions. A stream carrier carries both kinds (packet
-// sessions as DGRAM inside it), a datagram carrier packet sessions only:
-// so s's one carrier holds all four sessions (Shared 4 on both ends) and
-// u's one carrier the two packet sessions (Shared 2), one session factory
-// call each.
+// TestMuxMixedKinds (M3 design §A11.2, §A5.10; M3-D24 and amendment
+// KINDSPLIT): one Peer with a stream factory s (Link, 20 ms RTT) and a
+// datagram factory u (DatagramLink, 20 ms RTT) carries two selector stream
+// sessions and two bond packet sessions. Both kinds run on s (packet
+// sessions as DGRAM inside a stream carrier), but a stream carrier carries
+// sessions of one kind (KINDSPLIT): s has one carrier for the two stream
+// sessions and another for the two packet sessions (Shared 2 each, two
+// session factory calls on s, one per kind); a datagram carrier carries
+// packet sessions only, so u's one carrier holds the two packet sessions
+// (Shared 2, one call). Status.Mux counts exactly these three carriers on
+// both ends.
 //
 // Load: each stream session sends 4 MiB each way paced over the run, each
 // packet session 500 datagrams/s each way. Stimulus: midway s is killed
-// (Link.Kill): all four sessions lose their s view at once. The two kinds
-// recover side by side on one new s carrier (at most one session factory
-// call on s from the kill on, Shared 4 again on both ends), while the
-// packet sessions keep their u member.
+// (Link.Kill): all four sessions lose their s view at once (both of s's
+// carriers end). The two kinds recover side by side on two new s carriers,
+// again one per kind (at most one session factory call per kind on s from
+// the kill on: at most two, Shared 2 each again), while the packet
+// sessions keep their u member.
 // PASS: every stream byte verified with io.EOF at the end and no
 // zero-delivery gap above 2 s; packet flows: PacketIntegrity, losses only
 // in the kill's window, DeliveryRatio ≥ 0.95; every session ends cleanly
@@ -202,31 +207,41 @@ func TestMuxMixedKinds(t *testing.T) {
 			}
 			return true
 		})
-		shares := func(when string, notS rendr.CarrierID) rendr.CarrierID {
+		// shares checks the carriers of s per kind: the stream sessions on
+		// one carrier, the packet sessions on another (Shared 2 each), none
+		// of them among not; it returns the stream and the packet carrier.
+		shares := func(when string, not ...rendr.CarrierID) (sID, pID rendr.CarrierID) {
 			t.Helper()
-			var sID rendr.CarrierID
-			check := func(key string, st rendr.SessionStatus, name string, want int) {
+			check := func(key string, st rendr.SessionStatus, name string, want int, id *rendr.CarrierID) {
 				cs, ok := liveNamed(st, name)
-				if !ok || cs.Shared != want || (name == "s" && (cs.ID == notS || (sID != 0 && cs.ID != sID))) {
-					t.Fatalf("%s: session %s's carrier of %s: %+v (found %v), want one shared with Shared %d", when, key, name, cs, ok, want)
+				if !ok || cs.Shared != want || slices.Contains(not, cs.ID) || (id != nil && *id != 0 && cs.ID != *id) {
+					t.Fatalf("%s: session %s's carrier of %s: %+v (found %v), want one shared with Shared %d (not %v)", when, key, name, cs, ok, want, not)
 				}
-				if name == "s" {
-					sID = cs.ID
+				if id != nil {
+					*id = cs.ID
 				}
 			}
 			for _, s := range ss {
-				check(s.key, s.d.Status(), "s", 4)
+				check(s.key, s.d.Status(), "s", 2, &sID)
 			}
 			for _, pf := range pk {
-				check(pf.s.key, pf.s.d.Status(), "s", 4)
-				check(pf.s.key, pf.s.d.Status(), "u", 2)
+				check(pf.s.key, pf.s.d.Status(), "s", 2, &pID)
+				check(pf.s.key, pf.s.d.Status(), "u", 2, nil)
 			}
-			return sID
+			if sID == pID {
+				t.Fatalf("%s: the stream and the packet sessions share carrier %v of s, want one carrier per session kind", when, sID)
+			}
+			return sID, pID
 		}
 		w.identities("after the opens", ss, pk[0].s, pk[1].s)
-		sTrunk := shares("after the opens", 0)
-		if got, gotU := w.dials("s"), w.dials("u"); got != 1 || gotU != 1 {
-			t.Fatalf("premise: %d session factory calls on s and %d on u, want 1 each", got, gotU)
+		for i, rt := range []*rendr.Runtime{w.d, w.p} {
+			if m := rt.Status().Mux; m.Carriers != 3 || m.Views != 6 {
+				t.Fatalf("premise: %s Status.Mux %+v, want 3 carriers (s per kind, u) with 6 views", side(i), m)
+			}
+		}
+		sTrunk, pTrunk := shares("after the opens")
+		if got, gotU := w.dials("s"), w.dials("u"); got != 2 || gotU != 1 {
+			t.Fatalf("premise: %d session factory calls on s and %d on u, want 2 (one per session kind) and 1", got, gotU)
 		}
 
 		var rx []*receiver
@@ -257,22 +272,28 @@ func TestMuxMixedKinds(t *testing.T) {
 				t.Fatalf("%s: a zero-delivery gap of %v at +%v", r.name, g, at.Sub(start))
 			}
 		}
-		for _, s := range append(append([]statuser{}, ss[0].d, ss[1].d), pk[0].s.d, pk[1].s.d) {
-			if cs, ok := carrierOf(s.Status(), sTrunk); !ok || cs.State != rendr.CarrierDead {
-				t.Fatalf("stimulus: a session does not list the killed carrier %d dead: %+v", sTrunk, cs)
+		for i, s := range []statuser{ss[0].d, ss[1].d, pk[0].s.d, pk[1].s.d} {
+			id := sTrunk
+			if i >= 2 {
+				id = pTrunk
+			}
+			if cs, ok := carrierOf(s.Status(), id); !ok || cs.State != rendr.CarrierDead {
+				t.Fatalf("stimulus: a session does not list the killed carrier %d dead: %+v", id, cs)
 			}
 		}
 		waitFor(t, 10*time.Second, "the bond members to rejoin s", func() bool {
 			for _, pf := range pk {
-				if cs, ok := liveNamed(pf.s.d.Status(), "s"); !ok || cs.ID == sTrunk {
+				if cs, ok := liveNamed(pf.s.d.Status(), "s"); !ok || cs.ID == pTrunk {
 					return false
 				}
 			}
 			return true
 		})
-		shares("after the kill", sTrunk)
-		if got := w.dialsIn("s", killed, time.Now()); got > 1 {
-			t.Fatalf("%d session factory calls on s after the kill, want ≤ 1 (coalesced)", got)
+		shares("after the kill", sTrunk, pTrunk)
+		if got := w.dialsIn("s", killed, time.Now()); got > 2 {
+			// With the two distinct new carriers shares found, ≤ 2 is
+			// exactly one call per session kind.
+			t.Fatalf("%d session factory calls on s after the kill, want ≤ 2 (coalesced: one per session kind)", got)
 		}
 
 		for _, pf := range pk {

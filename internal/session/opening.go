@@ -513,12 +513,17 @@ func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, 
 	if p := a.d.spec.Pool; p != nil {
 		// Through the Peer's pool (M3-D16): a live trunk's new view, a
 		// coalesced wait or a dial of its own. A JOIN uses only trunks of
-		// the bound instance (M3-D17; s.peer is final once a JOIN starts).
+		// the bound instance (M3-D17; s.peer is final once a JOIN starts),
+		// and every attempt only trunks of the session's kind (KINDSPLIT).
 		var inst [16]byte
 		if at.kind == wire.TypeJoin {
 			inst = s.peer
 		}
-		est, err = p.Attempt(ctx, f.Index, at.cid, at.kind, payload, check, inst, s.poolKey())
+		dk := wire.TypeData
+		if s.pk != nil {
+			dk = wire.TypeDgram
+		}
+		est, err = p.Attempt(ctx, f.Index, at.cid, at.kind, payload, check, inst, s.poolKey(), dk)
 	} else {
 		est, err = carrier.Establish(ctx, s.env.Carrier, f, at.cid, at.kind, payload, check)
 	}
