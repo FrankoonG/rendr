@@ -18,8 +18,15 @@ import (
 
 // reapDead handles every lane whose carrier ended, one death per critical
 // section. Hooks.DeathObserved runs before each, outside the lock (a test
-// may hold the actor there, L21, L27). It returns now, refreshed after a
-// hook held the actor (migration timestamps are publication times, L09).
+// may hold the actor there, L21, L27). Each death step reads the clock
+// again after it saw the death and returns that time: the step's clock was
+// read when the step began, and the carrier may have died after that —
+// while the step handled its commands and facts, or while it waited for
+// the session lock — so its EventCarrierDown, the lane's end, the failed
+// mark and the migration it causes are dated at the death step, never
+// before the death record (event and migration times are publication
+// times, L09; DGDOWN: a kill's records selected by time missed a session
+// whose step began before the kill).
 //
 // A GOAWAY the peer sent on the dying carrier is reconciled first, in the
 // same critical section: GOAWAY ends the session whether or not its lane
@@ -46,8 +53,8 @@ func (a *actor) reapDead(now time.Time) time.Time {
 		}
 		if h := s.env.Hooks; h != nil && h.DeathObserved != nil {
 			h.DeathObserved(l.id)
-			now = time.Now()
 		}
+		now = time.Now() // at or after the death record: Death reported it above
 		s.mu.Lock()
 		if l.c.PeerGoAway() {
 			a.peerGoAwayLocked(now)
