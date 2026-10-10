@@ -166,9 +166,12 @@ func (t *trunk) responsePlacedLocked(v *Conn, typ wire.Type, st wire.AckStatus, 
 		// A planned retirement requested while the OK was due (its session
 		// ended, with an RST to place) waits for the go frame: the hold
 		// ends there, the session's Fill places its last frames and the
-		// DETACH follows (retireDrainedLocked). A dialer that never
-		// answers is bounded by its session's close bound (a Kill: the
-		// DETACH(ended) only). M4 checkpoint C-L.
+		// DETACH follows (retireDrainedLocked); without a go frame it is
+		// abandoned at the hold bound (boundHeldRetireLocked). M4
+		// checkpoint C-L.
+		if v.vx.retireQ.Load() && !killed {
+			t.boundHeldRetireLocked(v)
+		}
 	}
 }
 
