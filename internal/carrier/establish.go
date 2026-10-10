@@ -207,7 +207,7 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 }
 
 // EstablishEarly is Establish with the session's early span (M4 design
-// §A3.2, M4-D4, R1-4): for an OPEN on a stream factory with a non-empty
+// §A3.2, M4-D4, R1-4): for a stream OPEN on a stream factory with a non-empty
 // early (at most wire.EarlyWindow bytes), the OPEN carries
 // wire.OpenFlagEarly — payload is the plain OPEN (flags 0) and
 // EstablishEarly sets the flag in its own copy, so the caller's payload
@@ -226,8 +226,8 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 // (L42). A failed or partial first flight is the stage "preface" transport
 // failure of Establish.
 //
-// early is ignored (Established.Early 0) for a JOIN, a PING and a datagram
-// factory; more than wire.EarlyWindow bytes is a programming error
+// early is ignored (Established.Early 0) for a JOIN, a PING, a packet
+// OPEN (EARLY is reserved there, M4-D3) and a datagram factory; more than wire.EarlyWindow bytes is a programming error
 // (panic). The caller keeps early unmodified until the call returns.
 // Hooks.BeforeFirstFlight(len(early)) runs right before an early first
 // flight is written (before the DialEarly factory call).
@@ -235,8 +235,8 @@ func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.
 	if f.Kind == wire.KindDatagram {
 		return establishDatagram(ctx, env, f, id, t, payload, check)
 	}
-	if t != wire.TypeOpen {
-		early = nil
+	if t != wire.TypeOpen || len(payload) < wire.OpenFixedLen || payload[16] != byte(wire.KindStream) {
+		early = nil // only a stream OPEN carries early data (M4-D3)
 	}
 	if len(early) > wire.EarlyWindow {
 		panic("rendr/carrier: EstablishEarly: early data beyond wire.EarlyWindow")

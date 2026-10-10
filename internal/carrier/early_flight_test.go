@@ -184,7 +184,14 @@ func TestFirstFlightGolden(t *testing.T) {
 				const id = 7
 				sp := runPassive(b, func(wire.Preface, wire.Frame) []byte { return efOKAnswer(id) })
 				f := Factory{Name: "pipe", Dial: func(context.Context) (net.Conn, error) { return rec, nil }}
-				est, err := EstablishEarly(context.Background(), env, f, id, wire.TypeOpen, openPayload(0), early, tc.check)
+				payload := openPayload(0)
+				orig := bytes.Clone(payload)
+				est, err := EstablishEarly(context.Background(), env, f, id, wire.TypeOpen, payload, early, tc.check)
+				if !bytes.Equal(payload, orig) {
+					// AM-1: EARLY is set in EstablishEarly's own copy; the
+					// caller's payload serves fast-path views unchanged.
+					t.Fatalf("EstablishEarly changed the caller's OPEN payload: got %x, want %x", payload, orig)
+				}
 				if tc.check == nil {
 					if err != nil || est.Early != len(early) || !isOK(est) {
 						t.Fatalf("EstablishEarly: %v (Early %d), want OPEN_ACK(OK) with %d early bytes in flight", err, est.Early, len(early))
@@ -209,6 +216,58 @@ func TestFirstFlightGolden(t *testing.T) {
 				}
 				if sp.err != nil || !bytes.Equal(sp.after, got[len(got)-len(sp.after):]) {
 					t.Fatalf("the passive read %d bytes after the OPEN (%v)", len(sp.after), sp.err)
+				}
+			})
+		})
+	}
+}
+
+// TestEstablishEarlyIgnoredOutsideStreamOpen (M4-D3): early data belongs
+// to a stream OPEN only. For a packet OPEN (EARLY is reserved there) and a
+// JOIN on a stream factory, EstablishEarly sends the plain first frame
+// (flags 0) with no DATA frame behind it, reports Established.Early 0, and
+// the carrier's tx fseq continues at first + 1.
+func TestEstablishEarlyIgnoredOutsideStreamOpen(t *testing.T) {
+	pkt := openPayload(0)
+	pkt[16] = byte(wire.KindDatagram) // a packet session
+	var jp [wire.JoinLen]byte
+	wire.PutJoin(jp[:], &wire.Join{SID: [16]byte{3, 15: 3}, Mode: 1, RxNext: 9})
+	var ja [wire.JoinAckLen]byte
+	wire.PutJoinAck(ja[:], &wire.JoinAck{Status: wire.StatusOK})
+	for _, tc := range []struct {
+		name    string
+		typ     wire.Type
+		resp    wire.Type
+		payload []byte
+		answer  []byte
+	}{
+		{"packet OPEN", wire.TypeOpen, wire.TypeOpenAck, pkt, efOKAnswer(9)},
+		{"JOIN", wire.TypeJoin, wire.TypeJoinAck, jp[:], append(hPrefaceAck(wire.PrefaceOK, 9), frameAt(wire.TypeJoinAck, 0, wire.FirstFseq, wire.SessionHandle, ja[:])...)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				env := hEnv()
+				a, b := net.Pipe()
+				sp := runPassive(b, func(wire.Preface, wire.Frame) []byte { return tc.answer })
+				f := Factory{Name: "pipe", Dial: func(context.Context) (net.Conn, error) { return a, nil }}
+				est, err := EstablishEarly(context.Background(), env, f, 9, tc.typ, tc.payload, efEarly(1000), nil)
+				if err != nil || est.Early != 0 || est.Resp.Type != tc.resp {
+					t.Fatalf("EstablishEarly: %v (%+v), want %v with no early bytes in flight", err, est, tc.resp)
+				}
+				if est.Conn.wr.fseq != wire.FirstFseq+1 {
+					t.Fatalf("tx fseq continues at %d, want %d (no DATA frame)", est.Conn.wr.fseq, wire.FirstFseq+1)
+				}
+				est.Conn.Kill(CauseLocalClose, "test end")
+				hWait(t, est.Conn)
+				<-sp.done
+				if sp.err != nil || sp.first.Type != tc.typ || !bytes.Equal(sp.first.Payload, tc.payload) {
+					t.Fatalf("the passive read %v %x (%v), want the caller's %v unchanged (flags 0)", sp.first.Type, sp.first.Payload, sp.err, tc.typ)
+				}
+				fs, _ := efFrames(t, sp.after)
+				for _, fr := range fs {
+					if fr.Type == wire.TypeData {
+						t.Fatalf("a DATA frame at fseq %d followed the first frame", fr.Fseq)
+					}
 				}
 			})
 		})
@@ -853,7 +912,13 @@ func TestPoolEarlyOnlyOnFreshDial(t *testing.T) {
 		return r
 	}
 	attempt := func(r *rig, sid byte) (*Established, error) {
-		est, err := r.pt.p.AttemptEarly(context.Background(), 0, r.pt.env.IDs.Next(), wire.TypeOpen, poolPayload(wire.TypeOpen, sid), nil, [16]byte{}, uintptr(sid), wire.TypeData, early)
+		payload := poolPayload(wire.TypeOpen, sid)
+		orig := bytes.Clone(payload)
+		est, err := r.pt.p.AttemptEarly(context.Background(), 0, r.pt.env.IDs.Next(), wire.TypeOpen, payload, nil, [16]byte{}, uintptr(sid), wire.TypeData, early)
+		if !bytes.Equal(payload, orig) {
+			// AM-1: the caller's OPEN stays plain for the views that reuse it.
+			err = errors.Join(err, errors.New("AttemptEarly changed the caller's OPEN payload"))
+		}
 		if est != nil {
 			r.pt.mu.Lock()
 			r.pt.ests = append(r.pt.ests, est)

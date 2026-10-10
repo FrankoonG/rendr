@@ -6,8 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -35,12 +38,28 @@ import (
 // trunk: (a) admission refusals — a full backlog, oversized metadata,
 // GOING_AWAY; (b) an application Reject while the passive's carrier
 // reader is held before the early DATA (Hooks.BeforeEarlyRead); (c)
-// AcceptTimeout, the reader held the same way. Stimulus proof per run:
-// the passive reported drained bytes (Hooks.Drained: the refusal's
-// concurrent drain, or the early DATA its reader read only after the
-// refusal); a run without it is not counted, and a variant fails unless
-// at least erMinCounted of its erRuns runs were counted. Helpers carry
-// the er prefix: the package's other files belong to other work packages.
+// AcceptTimeout, the reader held the same way. Stimulus proof: a refused
+// carrier that discarded bytes after the refusal reports Hooks.Drained
+// exactly once (the refusal's concurrent drain, or its reader's exit after
+// it read early DATA past the refusal), and each run makes one passive
+// carrier; once a variant's runs ended and its passives closed (every
+// carrier joined), the number of reports is the number of counted runs —
+// a late report is never credited to another run — and a variant fails
+// unless at least erMinCounted of its erRuns runs were counted.
+//
+// Footprint (A12.7): an invocation opens about 2,000 loopback connections
+// (10 variants × 200 runs). Wherever the passive closes on its own — every
+// row but the session refusals on a fresh trunk, whose trunk outlives the
+// refused view — the dialer reads the passive's EOF before it half-closes,
+// so TIME_WAIT lands on the listener's side and not on the dialer's
+// ephemeral ports: about 400 dialer-side TIME_WAITs per invocation (a
+// session refusal on a dedicated carrier then costs the passive's
+// retirement bound, 2·srtt + 100 ms, per run: the raw dialer sends no
+// CLOSE; about 2.5 s per such variant on loopback). A dial
+// that fails for ephemeral-port exhaustion (EADDRINUSE, EADDRNOTAVAIL,
+// WSAENOBUFS) is an invalid run: not counted, never a FAIL by itself.
+// Helpers carry the er prefix: the package's other files belong to other
+// work packages.
 
 const (
 	erRuns       = 200
@@ -79,6 +98,8 @@ type erPassive struct {
 	rt      *rendr.Runtime
 	ln      *rendr.Listener
 	drained atomic.Int64                  // bytes Hooks.Drained reported
+	reports atomic.Int64                  // Hooks.Drained reports (one per refused carrier that drained)
+	fin     sync.Once                     // finish
 	hold    atomic.Pointer[chan struct{}] // BeforeEarlyRead waits on it while set
 	held    atomic.Int64                  // BeforeEarlyRead calls that waited
 
@@ -118,7 +139,12 @@ func newErPassive(t testing.TB, kind erKind, denv *carrier.Env) *erPassive {
 	}
 	p.l, p.addr = l, l.Addr().String()
 	hooks := &testhooks.Hooks{
-		Drained: func(n int) { p.drained.Add(int64(n)) },
+		Drained: func(n int) {
+			if n > 0 {
+				p.reports.Add(1)
+				p.drained.Add(int64(n))
+			}
+		},
 		BeforeEarlyRead: func() {
 			if ch := p.hold.Load(); ch != nil {
 				p.held.Add(1)
@@ -130,7 +156,7 @@ func newErPassive(t testing.TB, kind erKind, denv *carrier.Env) *erPassive {
 		p.cenv = erEnv(0xcd, hooks)
 		p.wg.Add(1)
 		go p.serveGoingAway()
-		t.Cleanup(p.closeGoingAway)
+		t.Cleanup(p.finish)
 		return p
 	}
 	cfg := rendr.Config{}
@@ -148,13 +174,7 @@ func newErPassive(t testing.TB, kind erKind, denv *carrier.Env) *erPassive {
 		t.Fatal(err)
 	}
 	p.rt = rt.(*rendr.Runtime)
-	t.Cleanup(func() {
-		if p.occCancel != nil {
-			p.occCancel(carrier.ErrWithdrawn)
-			<-p.occDone
-		}
-		p.rt.Close()
-	})
+	t.Cleanup(p.finish)
 	if p.ln, err = p.rt.Listen(lc); err != nil {
 		l.Close()
 		t.Fatal(err)
@@ -163,6 +183,23 @@ func newErPassive(t testing.TB, kind erKind, denv *carrier.Env) *erPassive {
 		p.occupy(denv)
 	}
 	return p
+}
+
+// finish closes the passive and joins its carriers (idempotent): their
+// Drained reports are final afterwards. Runtime.Close joins every
+// goroutine of the Runtime; the GOING_AWAY passive waits for its conns.
+func (p *erPassive) finish() {
+	p.fin.Do(func() {
+		if p.kind == erGoingAway {
+			p.closeGoingAway()
+			return
+		}
+		if p.occCancel != nil {
+			p.occCancel(carrier.ErrWithdrawn)
+			<-p.occDone
+		}
+		p.rt.Close()
+	})
 }
 
 // occupy fills the backlog of one with a plain OPEN that stays pending
@@ -258,9 +295,22 @@ func erFactory(addr string, mux bool, got *net.Conn) carrier.Factory {
 	}}
 }
 
-// erRun is one refused first flight; it reports whether the run was
-// counted (the passive drained bytes after the refusal).
-func erRun(p *erPassive, env *carrier.Env, kind erKind, mux bool, i int, early []byte) (counted bool, err error) {
+// erAddrExhausted reports a dial that failed for ephemeral-port
+// exhaustion, an environmental condition of the host (an invalid run).
+func erAddrExhausted(err error) bool {
+	var en syscall.Errno
+	if !errors.As(err, &en) {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return en == 10048 || en == 10049 || en == 10055 // WSAEADDRINUSE, WSAEADDRNOTAVAIL, WSAENOBUFS
+	}
+	return en == syscall.EADDRINUSE || en == syscall.EADDRNOTAVAIL
+}
+
+// erRun is one refused first flight; invalid reports a dial that failed
+// for ephemeral-port exhaustion (the run is not counted).
+func erRun(p *erPassive, env *carrier.Env, kind erKind, mux bool, i int, early []byte) (invalid bool, err error) {
 	sid := [16]byte{0xe8, 1: byte(i >> 8), 2: byte(i), 15: byte(kind)}
 	meta := 0
 	if kind == erMetadata {
@@ -277,7 +327,7 @@ func erRun(p *erPassive, env *carrier.Env, kind erKind, mux bool, i int, early [
 	case erAcceptTimeout:
 		want = wire.OpenAck{Status: wire.StatusCapacity, Code: wire.CodeAcceptTimeout}
 	}
-	drained0, held0 := p.drained.Load(), p.held.Load()
+	held0 := p.held.Load()
 	release := make(chan struct{})
 	var once sync.Once
 	free := func() { once.Do(func() { close(release) }) }
@@ -288,12 +338,12 @@ func erRun(p *erPassive, env *carrier.Env, kind erKind, mux bool, i int, early [
 	}
 	estDone := make(chan struct{})
 	decided := make(chan error, 1)
+	actx, acancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer acancel()
 	switch kind {
 	case erReject:
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			pc, err := p.ln.Accept(ctx)
+			pc, err := p.ln.Accept(actx)
 			if err == nil {
 				// The premise: the passive's reader is held before the
 				// early DATA (its goroutine may run after Accept returned).
@@ -322,6 +372,11 @@ func erRun(p *erPassive, env *carrier.Env, kind erKind, mux bool, i int, early [
 	defer cancel()
 	est, err := carrier.EstablishEarly(ctx, env, erFactory(p.addr, mux, &raw), env.IDs.Next(), wire.TypeOpen, erOpen(sid, meta), early, nil)
 	close(estDone)
+	if err != nil && erAddrExhausted(err) {
+		acancel() // no OPEN reaches the passive: its Accept ends
+		<-decided
+		return true, nil
+	}
 	if derr := <-decided; derr != nil {
 		return false, fmt.Errorf("the passive's verdict: %w", derr)
 	}
@@ -341,22 +396,24 @@ func erRun(p *erPassive, env *carrier.Env, kind erKind, mux bool, i int, early [
 			return false, err
 		}
 	}
-	// The dialer half-closes and reads the rest until the passive closed:
-	// a clean EOF, never a reset.
-	if cw, ok := raw.(interface{ CloseWrite() error }); ok {
+	// The dialer reads the rest until the passive closed — a clean EOF,
+	// never a reset — and half-closes: after that EOF where the passive
+	// closes on its own (TIME_WAIT then stays off the dialer's ephemeral
+	// ports), before it on a fresh trunk refused by the session, which
+	// the passive keeps until the dialer's EOF.
+	cw, _ := raw.(interface{ CloseWrite() error })
+	passiveCloses := !mux || (kind != erReject && kind != erAcceptTimeout)
+	if !passiveCloses && cw != nil {
 		_ = cw.CloseWrite()
 	}
 	_ = raw.SetReadDeadline(time.Now().Add(10 * time.Second))
 	if _, err := io.Copy(io.Discard, raw); err != nil {
 		return false, fmt.Errorf("after the refusal the dialer read %w, want EOF", err)
 	}
-	// The stimulus: the passive drained bytes for this run (its reader
-	// reports them as it exits, which may follow the close).
-	deadline := time.Now().Add(time.Second)
-	for p.drained.Load() == drained0 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	if passiveCloses && cw != nil {
+		_ = cw.CloseWrite()
 	}
-	return p.drained.Load() > drained0, nil
+	return false, nil
 }
 
 // erWaitHeld waits until the passive's BeforeEarlyRead held a reader since
@@ -385,13 +442,15 @@ func TestEarlyRefusalDrain_L05(t *testing.T) {
 				name = kind.String() + ", fresh trunk"
 			}
 			t.Run(name, func(t *testing.T) {
-				var next, counted atomic.Int64
+				var next, invalid atomic.Int64
 				var failed atomic.Bool
 				var wg sync.WaitGroup
 				start := time.Now()
+				var ps []*erPassive
 				for w := 0; w < erWorkers; w++ {
 					denv := erEnv(0xd0+byte(w), nil)
 					p := newErPassive(t, kind, denv)
+					ps = append(ps, p)
 					wg.Add(1)
 					go func() {
 						defer wg.Done()
@@ -400,14 +459,14 @@ func TestEarlyRefusalDrain_L05(t *testing.T) {
 							if i > erRuns {
 								return
 							}
-							c, err := erRun(p, denv, kind, mux, i, early)
+							inv, err := erRun(p, denv, kind, mux, i, early)
 							if err != nil {
 								failed.Store(true)
 								t.Errorf("run %d: %v", i, err)
 								return
 							}
-							if c {
-								counted.Add(1)
+							if inv {
+								invalid.Add(1)
 							}
 						}
 					}()
@@ -421,11 +480,45 @@ func TestEarlyRefusalDrain_L05(t *testing.T) {
 				if failed.Load() {
 					return
 				}
-				t.Logf("%d of %d runs counted (stimulus: drained bytes after the refusal) in %v", counted.Load(), erRuns, time.Since(start).Round(time.Millisecond))
-				if counted.Load() < erMinCounted {
-					t.Fatalf("%d of %d runs counted, want at least %d", counted.Load(), erRuns, erMinCounted)
+				// Every carrier joined: the reports are final, one per
+				// refused carrier that drained, one carrier per valid run.
+				var counted int64
+				for _, p := range ps {
+					p.finish()
+					counted += p.reports.Load()
+				}
+				valid := erRuns - invalid.Load()
+				t.Logf("%d of %d runs counted (stimulus: drained bytes after the refusal), %d invalid (ephemeral ports exhausted), in %v", counted, erRuns, invalid.Load(), time.Since(start).Round(time.Millisecond))
+				if counted > valid {
+					t.Fatalf("%d Drained reports for %d valid runs: a refused carrier reported more than once", counted, valid)
+				}
+				if counted < erMinCounted {
+					t.Fatalf("%d of %d runs counted, want at least %d (%d runs invalid: ephemeral ports exhausted)", counted, erRuns, erMinCounted, invalid.Load())
 				}
 			})
+		}
+	}
+}
+
+// TestErAddrExhausted: the invalid-run rule of TestEarlyRefusalDrain_L05
+// recognises a dial that failed for ephemeral-port exhaustion through
+// EstablishError's chain, and nothing else.
+func TestErAddrExhausted(t *testing.T) {
+	exhausted := []syscall.Errno{syscall.EADDRINUSE, syscall.EADDRNOTAVAIL}
+	if runtime.GOOS == "windows" {
+		exhausted = []syscall.Errno{10048, 10049, 10055}
+	}
+	wrap := func(e error) error {
+		return &carrier.EstablishError{Stage: "dial", Cause: carrier.CauseTransportError, Err: &net.OpError{Op: "dial", Net: "tcp", Err: os.NewSyscallError("connect", e)}}
+	}
+	for _, en := range exhausted {
+		if !erAddrExhausted(wrap(en)) {
+			t.Errorf("errno %d: not recognised as port exhaustion", int(en))
+		}
+	}
+	for _, err := range []error{wrap(syscall.ECONNREFUSED), wrap(syscall.ECONNRESET), io.EOF, context.DeadlineExceeded} {
+		if erAddrExhausted(err) {
+			t.Errorf("%v: taken for port exhaustion", err)
 		}
 	}
 }

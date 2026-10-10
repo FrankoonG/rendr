@@ -811,7 +811,12 @@ func (c *Conn) closer(mode closeMode, frame []byte, deadline time.Time) {
 // waited for its own drain before; a failed write closes at once
 // (closeConn ends the reader). On a conn whose deadline setters wait for a
 // Read in progress (design §0.14 B3) that second deadline waits for the
-// first one at most. Bytes the drain discarded are reported through
+// first one at most: a peer that read the answer but never closes then
+// holds the refused carrier until deadline + drainMax (about 11 s after a
+// 10 s handshake deadline) rather than drainMax, a cost bounded like the
+// write itself and counted by the abandonment wait. The first deadline is
+// not shortened: the drain must outlast an answer write still in progress,
+// and after it no second drain runs. Bytes the drain discarded are reported through
 // Hooks.Drained (the stimulus proof of the refusal-drain rows, R1-17). A
 // drain reader stuck in a Read that ignores its deadline holds the closer
 // as the inline drain did: both are counted in the abandoned-call pool
