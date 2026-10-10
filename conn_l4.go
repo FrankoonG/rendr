@@ -1,7 +1,7 @@
 package rendr
 
 import (
-	"errors"
+	"fmt"
 	"time"
 )
 
@@ -15,19 +15,17 @@ import (
 // Close it replaces the linger with the reset; on a session dialled with
 // EarlyReturn that has no answer yet it withdraws the OPEN. Abort, Close,
 // CloseWrite and a peer's RST racing resolve to one end.
-//
-// Not implemented yet: it returns errors.ErrUnsupported and does nothing.
 func (c *Conn) Abort(code AbortCode, msg string) error {
-	return errors.ErrUnsupported // M4 WP1
+	if code < 256 {
+		return fmt.Errorf("rendr: Abort code %d is reserved (codes below 256 are rendr's)", uint32(code))
+	}
+	return c.s.Abort(uint32(code), msg)
 }
 
 // SetIdleTimeout overrides Config.IdleTimeout for this session from now on,
 // with the same meaning and clamp: 0 turns idle expiry off, other values are
 // clamped to 10 s–24 h. The idle clock is not restarted. Both roles. It
 // returns net.ErrClosed once the session has ended.
-//
-// Not implemented yet: it returns errors.ErrUnsupported and changes
-// nothing.
 func (c *Conn) SetIdleTimeout(d time.Duration) error {
-	return errors.ErrUnsupported // M4 WP1
+	return c.s.SetIdleTimeout(d)
 }
