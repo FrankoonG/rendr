@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -349,17 +350,28 @@ func l4rIsL4Reset(err error) bool {
 }
 
 // l4rFDs returns the number of this process's open file descriptors on
-// Linux (-1 elsewhere: no portable fd count).
+// Linux that are not pipes (-1 elsewhere: no portable fd count). Pipes are
+// left out instead of forcing a garbage collection first: Go pools the
+// pipe pairs of splice and closes them only from a finalizer, and a
+// collection would also run the finalizer of a socket Forward dropped
+// without closing it, hiding the leak this count is meant to see.
 func l4rFDs() int {
 	if runtime.GOOS != "linux" {
 		return -1
 	}
-	runtime.GC() // pooled splice pipes are closed by a finalizer (rendrtest.AssertNoLeak)
 	es, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		return -1
 	}
-	return len(es)
+	n := 0
+	for _, e := range es {
+		l, err := os.Readlink("/proc/self/fd/" + e.Name())
+		if err != nil || strings.HasPrefix(l, "pipe:") {
+			continue // closed since the listing, or a pipe
+		}
+		n++
+	}
+	return n
 }
 
 // l4rDone waits (at most within) for c's end.
@@ -715,8 +727,11 @@ func TestL4RealTargetResetMapsToAbort(t *testing.T) {
 // the session ends clean (DONE both ways) once the passive application
 // read the last byte (R1-1), so a Forward that reset the target at the
 // session's end would destroy the tail and the FIN (the gate opens 50 ms
-// after the end, so that such a reset lands first). Stimulus: the gated
-// Write was blocked when the passive's session ended. Integrity: the
+// after the end, so that such a reset lands first). Stimulus: the
+// request's tail had not reached the target when the passive's session
+// ended (the gated Write had not completed; whether pump B was already
+// blocked in it or called it later in the window is logged: a reset at the
+// end fails that Write either way). Integrity: the
 // target read all 1 MiB (SHA-256, PRNG content) and then io.EOF; the
 // client read the answer and io.EOF; both ends ended io.EOF; Forward closed
 // the target socket without SO_LINGER 0.
@@ -784,9 +799,10 @@ func TestForwardCleanCloseNoReset_L05(t *testing.T) {
 	if ends := n.passiveEnds(); len(ends) != 1 || ends[0].Err != io.EOF {
 		t.Errorf("the passive's session ends %+v, want one with io.EOF", ends)
 	}
-	if !gate.heldAtEnd.Load() {
-		t.Errorf("stimulus: Forward's last Write to the target was not blocked when the passive's session ended")
+	if !gate.tailOutAtEnd.Load() {
+		t.Errorf("stimulus: the request's tail had reached the target before the passive's session ended")
 	}
+	t.Logf("at the passive's session end the tail Write was %s", map[bool]string{true: "blocked in the gate", false: "not yet called"}[gate.waitingAtEnd.Load()])
 	if gate.lingered.Load() {
 		t.Errorf("Forward set SO_LINGER 0 on the target socket after a clean exchange")
 	}
@@ -795,17 +811,19 @@ func TestForwardCleanCloseNoReset_L05(t *testing.T) {
 }
 
 // l4rGate is a target socket whose Write carrying byte total is held until
-// release (the passive's session end), and which records whether that
-// Write was waiting at the release and whether SetLinger(0) was called.
+// l4rGateWindow after release (the passive's session end). It records
+// whether the tail was still outstanding at the release, whether that
+// Write was already waiting then, and whether SetLinger(0) was called.
 type l4rGate struct {
 	*net.TCPConn
-	total     int64
-	written   atomic.Int64
-	waiting   atomic.Bool
-	heldAtEnd atomic.Bool
-	lingered  atomic.Bool
-	open      chan struct{}
-	once      sync.Once
+	total        int64
+	written      atomic.Int64
+	waiting      atomic.Bool
+	tailOutAtEnd atomic.Bool
+	waitingAtEnd atomic.Bool
+	lingered     atomic.Bool
+	open         chan struct{}
+	once         sync.Once
 }
 
 // release opens the gate l4rGateWindow after the passive's session end:
@@ -814,7 +832,8 @@ type l4rGate struct {
 // depend on it.
 func (g *l4rGate) release() {
 	g.once.Do(func() {
-		g.heldAtEnd.Store(g.waiting.Load())
+		g.waitingAtEnd.Store(g.waiting.Load())
+		g.tailOutAtEnd.Store(g.written.Load() < g.total)
 		time.AfterFunc(l4rGateWindow, func() { close(g.open) })
 	})
 }
@@ -849,9 +868,11 @@ func (g *l4rGate) SetLinger(sec int) error {
 // answers 1 MiB and FINs at once while the client is still sending; the
 // client reads the answer to EOF, sends on (its second 32 KiB) and
 // half-closes later. Stimulus: the first FIN of each order crossed while
-// the other direction was still open (the target read its EOF before it
-// wrote a byte; the client read its EOF before it wrote its second half,
-// which the target had not read). Integrity: SHA-256 and PRNG content both
+// the other direction was still open: in "client first" the target read
+// its EOF before it wrote a byte (checked); in "target first" the client
+// reads the answer to its EOF before it writes its second half (by
+// construction), and the target then reads that half (the integrity
+// check). Integrity: SHA-256 and PRNG content both
 // ways, each direction ended by io.EOF after its last byte; one target
 // connection; both ends of the session end io.EOF.
 func TestL4RealHalfClose_L04(t *testing.T) {
@@ -917,9 +938,6 @@ func TestL4RealHalfClose_L04(t *testing.T) {
 		resp.read, resp.readErr = l4rRecv(c, respSize, respSeed, &resp.got)
 		if resp.readErr != nil {
 			t.Fatalf("the answer before the request's second half: %v", resp.readErr)
-		}
-		if got := req.got.Load(); got >= reqSize {
-			t.Fatalf("stimulus: the target read %d request bytes before the client's second half", got)
 		}
 		_, sendErr := io.CopyN(struct{ io.Writer }{c}, src, reqSize-reqSize/2)
 		if sendErr == nil {
@@ -1241,14 +1259,17 @@ func TestIdleSessionExpires(t *testing.T) {
 
 // TestL4RealReclaim (§A12.4; L52): 200 L4 sessions over carrier/tcp, eight
 // at a time, each a 16 KiB echo through a real loopback target with a
-// half-close at both ends. Load and integrity: every echo verified
-// (PRNG content) and ended by io.EOF; 200 target connections, 200
-// confirmed, no refusal. Reclaim: afterwards both Runtimes hold no
-// session, buffered byte or shared carrier, the Server forwards nothing,
-// the goroutine count is back at its baseline taken after one warm-up
-// session, and on Linux /proc/self/fd is back at its baseline; Windows has
-// no portable fd count, so that check runs on Linux only (the goroutine
-// and Status checks run everywhere).
+// half-close at both ends; the Server's Dial hook (l4rTracker) hands
+// Forward each real target socket and records its release. Load and
+// integrity: every echo verified (PRNG content) and ended by io.EOF; 200
+// target connections, 200 confirmed, no refusal. Reclaim: afterwards both
+// Runtimes hold no session, buffered byte or shared carrier, the Server
+// forwards nothing, Forward closed every target socket it was handed
+// (plainly: a clean end never sets SO_LINGER 0), the goroutine count is
+// back at its baseline taken after one warm-up session, and on Linux the
+// non-pipe entries of /proc/self/fd are back at their baseline (l4rFDs);
+// Windows has no portable fd count, so that check runs on Linux only (the
+// tracked closes, the goroutine and the Status checks run everywhere).
 func TestL4RealReclaim(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	const (
@@ -1268,14 +1289,14 @@ func TestL4RealReclaim(t *testing.T) {
 			}
 			if err != nil {
 				if err == io.EOF {
-					c.CloseWrite()
-					io.Copy(io.Discard, c) // until the forward closes the socket
+					c.CloseWrite() // the forwarded FIN arrived: answer with ours, then close
 				}
 				return
 			}
 		}
 	})
-	n := newL4rNet(t, l4rOpts{})
+	tr := &l4rTracker{}
+	n := newL4rNet(t, l4rOpts{srv: &l4.Server{Dial: tr.dial}})
 	echo := func(seed uint64) error {
 		c, err := n.dial(tg.addr(), rendr.DialOptions{})
 		if err != nil {
@@ -1351,9 +1372,28 @@ func TestL4RealReclaim(t *testing.T) {
 	if got := tg.accepted.Load(); got != sessions+1 {
 		t.Errorf("the target accepted %d connections, want %d", got, sessions+1)
 	}
+	// The target closes its own socket after the FINs, so its handler and
+	// the goroutine count do not depend on Forward's close: the tracked
+	// sockets prove it on every OS.
+	tracks := tr.all()
+	if len(tracks) != sessions+1 {
+		t.Errorf("the Server's Dial hook dialed %d target sockets, want %d", len(tracks), sessions+1)
+	}
+	open, lingered := 0, 0
+	for _, k := range tracks {
+		if k.closedAt.Load() == nil {
+			open++
+		}
+		if k.lingered.Load() {
+			lingered++
+		}
+	}
+	if open != 0 || lingered != 0 {
+		t.Errorf("Forward left %d of %d target sockets open and set SO_LINGER 0 on %d after clean ends; want every socket closed plainly", open, len(tracks), lingered)
+	}
 	msUntil(t, 10*time.Second, "the goroutine count back at its baseline", func() bool { return runtime.NumGoroutine() <= g0 })
 	if fd0 >= 0 {
-		msUntil(t, 10*time.Second, "/proc/self/fd back at its baseline", func() bool { return l4rFDs() <= fd0 })
+		msUntil(t, 10*time.Second, "the non-pipe fds of /proc/self/fd back at their baseline", func() bool { return l4rFDs() <= fd0 })
 	} else {
 		t.Logf("no portable fd count on %s: the fd check runs on Linux only", runtime.GOOS)
 	}

@@ -140,9 +140,13 @@ func efCheckFirstFlight(b []byte, mux bool, addr string, early []byte) error {
 // (the 1 KiB request at offset 0), one physical write with nothing after
 // it. Twenty sessions per variant, one at a time, each on a carrier of its
 // own (a MUX trunk closes at its last view before the next session
-// dials). Stimulus: l4.Dial returned before any network I/O (no carrier
-// accepted yet), and the dialer's BeforeFirstFlight hook saw 1,024 early
-// bytes for every session. Integrity: the target echoes the request, the
+// dials). Stimulus: the session opened with its first Write (EarlyReturn):
+// the OPEN carries the EARLY flag and the DATA at offset 0 holds the
+// request's bytes (the first-flight check), and the dialer's
+// BeforeFirstFlight hook ran once per session and saw 1,024 early bytes.
+// (Whether a carrier was accepted before the first Write is not checked:
+// the Listener accepts asynchronously, so its count cannot prove that
+// l4.Dial did no network I/O.) Integrity: the target echoes the request, the
 // client reads it back (PRNG content) and io.EOF, the session ends clean,
 // and its dialer reports EarlyBytes == 1,024.
 func TestL4RealEarlyFirstFlight(t *testing.T) {
@@ -183,13 +187,10 @@ func TestL4RealEarlyFirstFlight(t *testing.T) {
 			})
 			for i := range runs {
 				seed := uint64(100 + i)
-				before := len(fr.reads())
+				before := len(fr.reads()) // every earlier run's carrier was accepted and checked
 				c, err := n.dial(tg.addr(), rendr.DialOptions{EarlyReturn: true})
 				if err != nil {
 					t.Fatalf("run %d: l4.Dial: %v", i, err)
-				}
-				if got := len(fr.reads()); got != before {
-					t.Fatalf("stimulus: run %d: the passive accepted a carrier before the first Write (EarlyReturn opened at Dial)", i)
 				}
 				req, _ := io.ReadAll(io.LimitReader(rendrtest.PRNG(seed), size))
 				if _, err := c.Write(req); err != nil {
