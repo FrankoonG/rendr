@@ -5,6 +5,8 @@ import (
 	"net"
 	"runtime"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
@@ -106,9 +108,24 @@ type DatagramLink struct {
 	dialBeh DialBehavior
 	release chan struct{} // closed by Release (then renewed) and by Close (for good)
 	live    []*dcarrier   // carriers with at least one end not closed or killed
+	last    *dcarrier     // the newest carrier, live or not (ReplayInto's source)
 	created int
 	queued  [2]int // datagrams in the link per direction
+
+	done             chan struct{} // closed by Close: ends the SpliceFrom goroutines
+	replayed, splice atomic.Uint64 // datagrams ReplayInto and SpliceFrom delivered into this link
+
+	// afterCheck, tests only (nil otherwise), runs in an ordinary dial
+	// between its Refuse check and the carrier's creation.
+	afterCheck func()
 }
+
+// Datagrams of a carrier's dialer that ReplayInto can repeat: the first
+// dlinkKeepFirst and the latest dlinkKeepLast.
+const (
+	dlinkKeepFirst = 16
+	dlinkKeepLast  = 128
+)
 
 // dcarrier is one carrier of a DatagramLink: the dialer's end ep[0]
 // (receives Down) and the passive's end ep[1] (receives Up).
@@ -118,11 +135,91 @@ type dcarrier struct {
 	ep    [2]*endpoint
 	kind  int32 // n.mu; classified by the dialer's first datagram
 	typed bool
+
+	// n.mu: the dialer's datagrams kept for ReplayInto, the SpliceFrom
+	// copies its dialer's datagrams feed, and how many of its dialer's own
+	// datagrams a SpliceFrom still replaces.
+	rec     drec
+	tees    []*dsplice
+	dropOwn int
+}
+
+// drec keeps the first dlinkKeepFirst datagrams of a sender and a ring of
+// its latest dlinkKeepLast (buffers reused).
+type drec struct {
+	first [][]byte
+	last  [][]byte
+	n     int // datagrams recorded
+}
+
+func (r *drec) add(p []byte) {
+	if r.n < dlinkKeepFirst {
+		r.first = append(r.first, slices.Clone(p))
+	} else {
+		if r.last == nil {
+			r.last = make([][]byte, dlinkKeepLast)
+		}
+		k := r.n % dlinkKeepLast
+		r.last[k] = append(r.last[k][:0], p...)
+	}
+	r.n++
+}
+
+// get returns datagram k (0 = the first) if it is still kept.
+func (r *drec) get(k int) ([]byte, bool) {
+	switch {
+	case k < 0 || k >= r.n:
+		return nil, false
+	case k < dlinkKeepFirst:
+		return r.first[k], true
+	case r.n-k <= dlinkKeepLast:
+		return r.last[k%dlinkKeepLast], true
+	}
+	return nil, false
+}
+
+// dsplice carries the datagrams one SpliceFrom copies from the source
+// carrier's dialer to the goroutine that delivers them.
+type dsplice struct {
+	mu     sync.Mutex
+	q      [][]byte
+	left   int // datagrams still to copy
+	closed bool
+	wake   chan struct{} // cap 1
+}
+
+// push queues a copy of p; false once the splice has all its datagrams
+// or ended (the source drops it then).
+func (s *dsplice) push(p []byte) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed || s.left <= 0 {
+		return false
+	}
+	s.q = append(s.q, slices.Clone(p))
+	s.left--
+	signal(s.wake)
+	return s.left > 0
+}
+
+// take removes the queued copies; more is false once the last was queued.
+func (s *dsplice) take() (q [][]byte, more bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	q, s.q = s.q, nil
+	return q, s.left > 0
+}
+
+func (s *dsplice) stop() {
+	s.mu.Lock()
+	s.closed, s.q = true, nil
+	s.mu.Unlock()
 }
 
 // NewDatagramLink returns a link; nothing runs until the first Dial.
 func NewDatagramLink(cfg DatagramLinkConfig) *DatagramLink {
-	return &DatagramLink{cfg: cfg, n: newDnet(cfg.Name, cfg.Queue, cfg.MTU, 3), release: make(chan struct{})}
+	return &DatagramLink{cfg: cfg, n: newDnet(cfg.Name, cfg.Queue, cfg.MTU, 3), release: make(chan struct{}),
+		done: make(chan struct{})}
 }
 
 // Name returns the link's name.
@@ -174,7 +271,7 @@ func (l *DatagramLink) Dial(ctx context.Context) (net.PacketConn, net.Addr, erro
 	case DialLateSuccess:
 		<-rel
 	case DialNilAddr:
-		pc, _, err := l.open()
+		pc, _, err := l.open(false)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -184,12 +281,19 @@ func (l *DatagramLink) Dial(ctx context.Context) (net.PacketConn, net.Addr, erro
 		if err := ctx.Err(); err != nil {
 			return fail(err)
 		}
+		if h := l.afterCheck; h != nil {
+			h()
+		}
+		return l.open(true)
 	}
-	return l.open()
+	return l.open(false)
 }
 
-// open creates a carrier and starts its Accept call.
-func (l *DatagramLink) open() (net.PacketConn, net.Addr, error) {
+// open creates a carrier and starts its Accept call. refusable (an
+// ordinary dial) refuses it when Refuse came after the dial's check, under
+// the lock Kill snapshots the carriers with: "Refuse, then Kill" leaves no
+// carrier of a dial that raced them.
+func (l *DatagramLink) open(refusable bool) (net.PacketConn, net.Addr, error) {
 	n := l.n
 	n.mu.Lock()
 	if n.closed {
@@ -197,12 +301,18 @@ func (l *DatagramLink) open() (net.PacketConn, net.Addr, error) {
 		n.dialFails.Add(1)
 		return nil, nil, net.ErrClosed
 	}
+	if refusable && l.refuse {
+		n.mu.Unlock()
+		n.dialFails.Add(1)
+		return nil, nil, errRefused
+	}
 	k := l.created
 	l.created++
 	c := &dcarrier{l: l, seq: k, kind: kindUnknown}
 	c.ep[0] = n.newEndpoint(fakeAddr(1, k), Down.index(), 0, &c.kind, c)
 	c.ep[1] = n.newEndpoint(fakeAddr(2, k), Up.index(), 1, &c.kind, c)
 	l.live = append(l.live, c)
+	l.last = c
 	n.carriers.Add(1)
 	n.wg.Add(1)
 	accept := l.cfg.Accept
@@ -223,11 +333,25 @@ func (c *dcarrier) first(e *endpoint, p []byte) {
 }
 
 // out routes a datagram to the carrier's other end; any other address is
-// a datagram to nowhere.
+// a datagram to nowhere. A datagram its dialer sends to the passive end
+// within the MTU is kept for ReplayInto and copied to the SpliceFrom
+// splices it feeds; while a SpliceFrom replaces this carrier's own
+// datagrams, it is lost (Sent and Lost, as UDP to nowhere).
 func (c *dcarrier) out(e *endpoint, p []byte, addr net.Addr) (droute, bool) {
 	i := e.side // the dialer's end sends Up (0), the passive's Down (1)
 	peer := c.ep[1-i]
-	return droute{dst: peer, src: e.laddr, dir: i, cls: c.kind, q: &c.l.queued[i]}, sameAddr(addr, peer.laddr)
+	ok := sameAddr(addr, peer.laddr)
+	if i == 0 && ok && len(p) <= c.l.n.mtu {
+		c.rec.add(p)
+		if len(c.tees) > 0 {
+			c.tees = slices.DeleteFunc(c.tees, func(s *dsplice) bool { return !s.push(p) })
+		}
+		if c.dropOwn > 0 {
+			c.dropOwn--
+			return droute{cls: c.kind}, false
+		}
+	}
+	return droute{dst: peer, src: e.laddr, dir: i, cls: c.kind, q: &c.l.queued[i]}, ok
 }
 
 func (c *dcarrier) arrive(_ *endpoint, dg *dgram) ([]byte, bool) { return dg.b, true }
@@ -400,28 +524,35 @@ func (l *DatagramLink) CorruptNext(d Dir) {
 // the path's controls (counted as Injected). Without a carrier, or when
 // the newest carrier's receiving end is closed, nothing happens.
 func (l *DatagramLink) InjectRaw(d Dir, b []byte) {
-	n := l.n
-	n.mu.Lock()
-	defer n.mu.Unlock()
-	if len(l.live) == 0 {
-		return
+	l.n.mu.Lock()
+	defer l.n.mu.Unlock()
+	if len(l.live) > 0 {
+		l.injectLocked(l.live[len(l.live)-1], d.index(), b)
 	}
-	c, i := l.live[len(l.live)-1], d.index()
+}
+
+// injectLocked makes b arrive at once in direction i of carrier c, from
+// the sending end's address, counted as Injected (and Lost when the
+// direction's queue is full); false when c's receiving end is closed.
+// n.mu held.
+func (l *DatagramLink) injectLocked(c *dcarrier, i int, b []byte) bool {
+	n := l.n
 	dst, src := c.ep[1-i], c.ep[i]
 	if dst.closed || dst.killed {
-		return
+		return false
 	}
 	n.count(c.kind, dcInjected, 1)
 	q := &l.queued[i]
 	if *q >= n.queue {
 		n.count(c.kind, dcLost, 1)
-		return
+		return true
 	}
 	dg := n.newDgram(len(b))
 	copy(dg.b, b)
 	dg.src, dg.cls, dg.q, dg.dir = src.laddr, c.kind, q, i
 	*q++
 	dst.inject(time.Now(), dg)
+	return true
 }
 
 // CaptureNext returns a copy of the next datagram of direction d that
@@ -490,8 +621,108 @@ func (l *DatagramLink) ForeignNext(d Dir) {
 	l.n.mu.Unlock()
 }
 
+// ReplayInto re-delivers the n-th datagram (0 = the first) the dialer end
+// of this link's latest carrier sent into dst's latest carrier, Up, as if
+// its own dialer had sent it: datagram replay into another carrier (M3
+// design §A9.2). The copy arrives at once, untouched by dst's path
+// controls, and counts as Injected in dst's carrier class and in dst's
+// Stats().Replayed (dst may be l: a replay into the carrier itself).
+// Without a live carrier on dst nothing happens. The link keeps the first
+// 16 and the latest 128 datagrams each carrier's dialer sent (within the
+// MTU, to its passive end, lost or not); ReplayInto panics for any other.
+func (l *DatagramLink) ReplayInto(dst *DatagramLink, n int) {
+	l.n.mu.Lock()
+	var b []byte
+	ok := false
+	if c := l.last; c != nil {
+		var p []byte
+		if p, ok = c.rec.get(n); ok {
+			b = slices.Clone(p)
+		}
+	}
+	l.n.mu.Unlock()
+	if !ok {
+		panic("rendrtest: ReplayInto: no such datagram (the first 16 and the latest 128 of the newest carrier are kept)")
+	}
+	dst.n.mu.Lock()
+	defer dst.n.mu.Unlock()
+	if len(dst.live) > 0 && dst.injectLocked(dst.live[len(dst.live)-1], Up.index(), b) {
+		dst.replayed.Add(1)
+	}
+}
+
+// SpliceFrom makes this link's latest carrier deliver, Up, the datagrams
+// other's latest carrier sends from now on instead of n of its own: the
+// datagrams of two carriers spliced. Copies of the next n datagrams other's
+// dialer sends (within the MTU, to its passive end) arrive at once at this
+// carrier's passive end from its dialer's address, counted as Injected and
+// in Stats().Spliced; other's carrier delivers them as usual. The next n
+// datagrams this carrier's dialer sends are lost (Sent and Lost). Without
+// a live carrier on either link nothing happens; Close of this link ends
+// a splice that did not get its n datagrams. It panics when other is l.
+func (l *DatagramLink) SpliceFrom(other *DatagramLink, n int) {
+	if other == l || other == nil {
+		panic("rendrtest: SpliceFrom: needs another link")
+	}
+	if n <= 0 {
+		return
+	}
+	other.n.mu.Lock()
+	var src *dcarrier
+	if !other.n.closed && len(other.live) > 0 {
+		src = other.live[len(other.live)-1]
+	}
+	other.n.mu.Unlock()
+	if src == nil {
+		return
+	}
+	l.n.mu.Lock()
+	if l.n.closed || len(l.live) == 0 {
+		l.n.mu.Unlock()
+		return
+	}
+	c := l.live[len(l.live)-1]
+	c.dropOwn += n
+	s := &dsplice{left: n, wake: make(chan struct{}, 1)}
+	l.n.wg.Add(1)
+	l.n.mu.Unlock()
+	other.n.mu.Lock()
+	src.tees = append(src.tees, s)
+	other.n.mu.Unlock()
+	go l.spliceLoop(c, s)
+}
+
+// spliceLoop delivers a splice's copies into carrier c until it has all of
+// them or the link closes.
+func (l *DatagramLink) spliceLoop(c *dcarrier, s *dsplice) {
+	defer l.n.wg.Done()
+	defer s.stop()
+	for {
+		select {
+		case <-s.wake:
+		case <-l.done:
+			return
+		}
+		q, more := s.take()
+		l.n.mu.Lock()
+		for _, b := range q {
+			if l.injectLocked(c, Up.index(), b) {
+				l.splice.Add(1)
+			}
+		}
+		l.n.mu.Unlock()
+		if !more {
+			return
+		}
+	}
+}
+
 // Stats returns the link's counters.
-func (l *DatagramLink) Stats() DatagramStats { return l.n.stats() }
+func (l *DatagramLink) Stats() DatagramStats {
+	s := l.n.stats()
+	s.Replayed, s.Spliced = l.replayed.Load(), l.splice.Load()
+	return s
+}
 
 // Close kills every carrier and joins every goroutine the link started; it
 // releases hanging Dials, and later Dials fail. Idempotent.
@@ -501,6 +732,7 @@ func (l *DatagramLink) Close() error {
 	if !n.closed {
 		n.closed = true
 		close(l.release)
+		close(l.done)
 		l.kill(false)
 	}
 	n.mu.Unlock()
@@ -526,4 +758,9 @@ type DatagramStats struct {
 	Dials, DialFailures uint64
 	Carriers            int // carriers created
 	Rebinds, Spoofed    uint64
+	// Replayed counts the datagrams DatagramLink.ReplayInto and
+	// DatagramHub.ReplayFlow delivered into this link or hub, Spliced the
+	// ones DatagramLink.SpliceFrom delivered (M3 design §A9.2); each also
+	// counts as Injected in its carrier's class.
+	Replayed, Spliced uint64
 }

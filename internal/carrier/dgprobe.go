@@ -189,13 +189,20 @@ func (c *Conn) onChallengePing(p *wire.Ping) {
 	ch.pong, ch.pongDue = *p, true
 	ch.pong.Pad = 0
 	c.mu.Unlock()
-	c.Wake()
+	c.wakeWriter()
 }
 
 // rebindCandidate starts a challenge to src at now (M2-D27, §A5.13): a
 // datagram from a new source of which a frame was newly accepted, or a copy
 // of the stored H1 while the passive's first REL is unacknowledged (R1-14,
-// wave 4). One challenge is in flight at a time, challenges are created at
+// wave 4). A datagram from a new source whose frames were all a window or
+// more ahead (dgJumpClaim; m3 FSEQJUMP) may start one too — an outage that
+// cost the sender a window of frames may also have moved its NAT mapping,
+// and the challenge's answer proves the jump (dgJumpProof) — but never
+// retargets one (retarget false): a datagram of another carrier direction
+// or session replayed from a new address therefore can make the carrier
+// send challenge PINGs to that address, within the spacing and rate limits
+// below. One challenge is in flight at a time, challenges are created at
 // least max(RTO, 1 s) apart and at most chalCommitsMax rebinds commit per
 // minute.
 //
@@ -234,7 +241,7 @@ func (c *Conn) rebindCandidate(src PeerKey, now time.Time, retarget bool) {
 			ch.sends = min(ch.sends, 1)
 		}
 		c.mu.Unlock()
-		c.Wake()
+		c.wakeWriter()
 		return
 	}
 	if !ch.last.IsZero() && now.Sub(ch.last) < max(c.relRTOLocked(), chalSpacingMin) {
@@ -247,7 +254,7 @@ func (c *Conn) rebindCandidate(src PeerKey, now time.Time, retarget bool) {
 	}
 	ch.active, ch.cand, ch.nonce, ch.at, ch.moved, ch.sentAt, ch.sends, ch.last = true, src, newNonce(), now, false, time.Time{}, 0, now
 	c.mu.Unlock()
-	c.Wake()
+	c.wakeWriter()
 }
 
 // newNonce returns a challenge nonce (≠ 0) from crypto/rand.

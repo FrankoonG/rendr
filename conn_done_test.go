@@ -208,7 +208,9 @@ func TestConnDone(t *testing.T) {
 				var dev, pev eventLog
 				e := e2eNew(t, Config{OnEvent: dev.add}, Config{OnEvent: pev.add}, nil, ListenConfig{}, "a")
 				e.links[0].SetDelay(25*time.Millisecond, 0)
-				dc, sc := e2eOpen(t, e.peer(), e.ln, DialOptions{Mode: mode})
+				// Done joins the session's own carriers: dedicated (M3-D2;
+				// with mux it joins its views, TestViewGoneJoin_L52).
+				dc, sc := e2eOpen(t, e.dedicatedPeer(), e.ln, DialOptions{Mode: mode})
 				dw, sw := cdWatchEnd("dialer", dc), cdWatchEnd("passive", sc)
 				cdOpen(t, "opened", dw, sw)
 				e2eExchange(t, dc, sc, 1<<20, 1)

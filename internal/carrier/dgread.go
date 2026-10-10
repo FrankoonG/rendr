@@ -55,7 +55,7 @@ func (c *Conn) dgReadLoop() {
 	normal := false
 	defer func() {
 		if !normal { // runtime.Goexit inside an embedder ReadFrom (L51)
-			c.Kill(CauseTransportError, "conn ReadFrom called runtime.Goexit")
+			c.killCarrier(CauseTransportError, "conn ReadFrom called runtime.Goexit")
 		}
 		// The embedder call returned or unwound: only this goroutine pools
 		// its buffer (§4.1), and it returns a flow buffer it may still hold
@@ -165,11 +165,16 @@ func (c *Conn) dgPause(rd *dgReader, d time.Duration) bool {
 // new source also starts a challenge, R1-14 as amended by wave 4) and
 // dropped otherwise;
 // a frame that fails to decode drops the rest of the datagram (PA-1); a
-// window duplicate or late frame is dropped; after the peer's CLOSE every
-// later frame but a RACK or a REL is dropped (M2-D30). A ReadCandidate
-// datagram of which a frame was newly accepted starts a rebind challenge
-// (M2-D27), or retargets the one in flight unless it carried a challenge
-// answer that committed nothing. It reports whether the reader continues.
+// window duplicate or late frame is dropped; a frame a window or more ahead
+// moves the window only when its datagram proves it (dgJumpProof), and is
+// dropped otherwise (dgJumpClaim; m3 FSEQJUMP); after the peer's CLOSE
+// every later frame but a RACK or a REL is dropped (M2-D30). A
+// ReadCandidate datagram of which a frame was newly accepted starts a
+// rebind challenge (M2-D27), or retargets the one in flight unless it
+// carried a challenge answer that committed nothing; one whose frames were
+// only ahead may start one but never retargets (a jump with a NAT move
+// proves itself with the challenge's answer). It reports whether the
+// reader continues.
 func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) bool {
 	dg := c.dg
 	if wire.IsPreface(data) {
@@ -181,7 +186,7 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 			// was released while H3 is still on its way (W4-REL-3).
 			early := dg.rel.una == c.env.Presets.firstCseq()
 			c.mu.Unlock()
-			c.Wake()
+			c.wakeWriter()
 			if ev == ReadCandidate && (early || dg.held.Load()) {
 				c.rebindCandidate(src, now, true) // a rebound handshake (R1-14)
 			}
@@ -190,15 +195,32 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 		}
 		return true
 	}
-	advanced, committed, answered := false, false, false
+	advanced, committed, answered, claimed := false, false, false, false
+	proof := 0 // whether the datagram proves a jump: 0 not checked yet, 1 yes, -1 no
 	for len(data) > 0 {
 		f, n, err := wire.DecodeFrame(data)
-		if err != nil {
-			c.dgDropped(1) // the rest of this datagram (PA-1)
+		if err != nil || (!c.mux && !dedicatedOK(f.Type, f.Handle)) {
+			c.dgDropped(1) // the rest of this datagram (PA-1; a dedicated carrier: §A3.2)
 			break
 		}
 		data = data[n:]
-		if dg.rwin.Accept(f.Fseq) != wire.WindowNew {
+		switch dg.rwin.Accept(f.Fseq) {
+		case wire.WindowNew:
+		case wire.WindowAhead:
+			if proof == 0 {
+				proof = -1
+				if c.dgJumpProof(&f, data, src, now) {
+					proof = 1
+				}
+			}
+			if proof < 0 {
+				c.dgDropped(1)
+				c.dgJumpClaim(&f, now)
+				claimed = true
+				continue
+			}
+			dg.rwin.Jump(f.Fseq)
+		default:
 			c.dgDropped(1)
 			continue
 		}
@@ -217,10 +239,106 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 		committed = committed || ans == chalCommitted
 		answered = answered || ans == chalRefused
 	}
-	if ev == ReadCandidate && advanced && !committed {
-		c.rebindCandidate(src, now, !answered)
+	if ev == ReadCandidate && (advanced || claimed) && !committed {
+		c.rebindCandidate(src, now, advanced && !answered)
 	}
 	return true
+}
+
+// dgJumpProof reports whether the datagram from src whose frame f is a
+// window or more ahead proves that it comes from this direction's sender:
+// f or a frame after it (rest) is a PONG only that sender sends — the
+// answer to a PING of this incarnation that is still outstanding (id ≠ 0,
+// nonce salt ^ id, its record in the ring; L23) or to the rebind challenge
+// in flight (id 0, its nonce, from its candidate; M2-D27). A PONG to an
+// answered PING proves nothing: the fseq window compares in serial
+// arithmetic, so a datagram of this direction replayed 2^31 to 2^32−1024
+// frames later reads a window or more ahead, and its old PONG would move
+// the window behind every genuine frame (m3 W2). The sender jumps that far after an outage cost a window of
+// frames, and the PONG to the PING the outage left outstanding, retried at
+// the RTO, or asked for by dgJumpClaim, arrives within a round trip of its
+// end. A datagram of another carrier direction or session, whose fseqs
+// start elsewhere (§0.13 A6), lands ahead about half the time, but its
+// PONGs answer another salt or another challenge: it never moves the
+// window (m3 FSEQJUMP; §A9.1, R1-35).
+func (c *Conn) dgJumpProof(f *wire.Frame, rest []byte, src PeerKey, now time.Time) bool {
+	if c.dgProves(f.Type, f.Payload, src, now) {
+		return true
+	}
+	for len(rest) > 0 {
+		g, n, err := wire.DecodeFrame(rest)
+		if err != nil || (!c.mux && !dedicatedOK(g.Type, g.Handle)) {
+			return false
+		}
+		rest = rest[n:]
+		if c.dgProves(g.Type, g.Payload, src, now) {
+			return true
+		}
+	}
+	return false
+}
+
+// dgProves reports whether a frame of type t with payload p from src is a
+// PONG of the kinds dgJumpProof names.
+func (c *Conn) dgProves(t wire.Type, p []byte, src PeerKey, now time.Time) bool {
+	if t != wire.TypePong {
+		return false
+	}
+	pg, err := wire.ParsePing(p)
+	switch {
+	case err != nil:
+		return false
+	case pg.ID != 0:
+		return c.pingOutstanding(pg.ID, pg.Nonce) // its record holds nonce salt ^ id
+	}
+	c.mu.Lock()
+	ch := &c.dg.chal
+	ok := ch.active && !c.chalExpiredLocked(now) && pg.Nonce == ch.nonce && src == ch.cand
+	c.mu.Unlock()
+	return ok
+}
+
+// dgJumpClaim handles a frame a window or more ahead whose datagram proved
+// nothing (dgJumpProof; the caller drops and counts it). An outage costs
+// frames both ways, so the peer may have jumped as well and wait for the
+// same proof: a PING the frame carries is answered — a challenge PING in a
+// free challenge-PONG slot, any other in a free PONG slot, so a frame of
+// another carrier never displaces a genuine answer, and a PONG of ours
+// that answers another carrier's PING matches nothing at the peer — and a
+// PING of ours is asked for, at most one per RTO, whose PONG proves the
+// jump. Nothing else of the frame is applied.
+func (c *Conn) dgJumpClaim(f *wire.Frame, now time.Time) {
+	var p wire.Ping
+	ping := false
+	if f.Type == wire.TypePing {
+		var err error
+		p, err = wire.ParsePing(f.Payload)
+		ping = err == nil
+	}
+	dg, st := c.dg, &c.st
+	wake := false
+	c.mu.Lock()
+	switch {
+	case !ping:
+	case p.ID == 0:
+		if ch := &dg.chal; !ch.pongDue {
+			ch.pong, ch.pongDue = p, true
+			ch.pong.Pad = 0
+			wake = true
+		}
+	case !st.pongDue:
+		st.pong, st.pongDue = p, true
+		wake = true
+	}
+	if dg.jumpPing.IsZero() || now.Sub(dg.jumpPing) >= c.relRTOLocked() {
+		dg.jumpPing = now
+		st.pingReq = true
+		wake = true
+	}
+	c.mu.Unlock()
+	if wake {
+		c.wakeWriter()
+	}
 }
 
 // chalAnswer is what one frame did to the rebind challenge (dgDispatch).
@@ -276,13 +394,35 @@ func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) 
 	case wire.TypeRack:
 		return c.relOnRack(f.Payload, now), chalNone
 	case wire.TypeDgram:
-		return c.dgOnDgram(f.Payload, now), chalNone
+		return c.dgOnDgram(f.Handle, f.Payload, now), chalNone
 	case wire.TypePack:
-		if c.ep == nil {
+		var v *Conn
+		if c.mux {
+			act, mv, _ := c.classify(f.Type, f.Handle)
+			if act != actDispatch {
+				if act == actIllegal {
+					c.dgDropped(1) // §A3.3 on a datagram trunk: dropped and counted (PA-1)
+				}
+				return true, chalNone
+			}
+			v = mv
+		} else {
+			v = c.route(f.Handle) // a one-view trunk: a compare with view 1's handle
+		}
+		if v == nil {
+			c.violation("PACK for handle %d: no such view", f.Handle)
+			return false, chalNone
+		}
+		if v.ep == nil {
 			c.violation("PACK on a carrier without a session")
 			return false, chalNone
 		}
-		if err := c.ep.Control(c, f.Header, f.Payload); err != nil {
+		if !v.enter() {
+			return true, chalNone // the view's Done closed after our DETACH: not delivered
+		}
+		err := v.ep.Control(v, f.Header, f.Payload)
+		v.exit()
+		if err != nil {
 			c.violation("PACK: %v", err)
 			return false, chalNone
 		}
@@ -295,20 +435,38 @@ func (c *Conn) dgDispatch(f *wire.Frame, src PeerKey, cand bool, now time.Time) 
 	return false, chalNone
 }
 
-// dgOnDgram hands one DGRAM to the packet endpoint (§A5.3): below BigData
+// dgOnDgram hands one DGRAM for handle h to the packet endpoint of its view
+// (route; §A5.3): below BigData
 // the payload is valid during the call (the session copies it); BigData or
 // more is copied first into a Buf of its own (TryGet against the Budget,
 // outside every lock; refused: the datagram is dropped and counted) whose
 // ownership moves to the endpoint. A DGRAM that makes an idle carrier
 // packet-active wakes the writer (PacketPing cadence, M2-D23).
-func (c *Conn) dgOnDgram(p []byte, now time.Time) bool {
+func (c *Conn) dgOnDgram(h uint32, p []byte, now time.Time) bool {
 	seq, data, err := wire.ParseDgram(p)
 	if err != nil {
 		c.violation("DGRAM: %v", err)
 		return false
 	}
-	if c.pep == nil {
-		if c.ep == nil {
+	var v *Conn
+	if c.mux {
+		act, mv, _ := c.classify(wire.TypeDgram, h)
+		if act != actDispatch {
+			if act == actIllegal {
+				c.dgDropped(1) // §A3.3 on a datagram trunk: dropped and counted (PA-1)
+			}
+			return true
+		}
+		v = mv
+	} else {
+		v = c.route(h)
+	}
+	if v == nil {
+		c.violation("DGRAM for handle %d: no such view", h)
+		return false
+	}
+	if v.pep == nil {
+		if v.ep == nil {
 			c.violation("DGRAM on a carrier without a session")
 		} else {
 			c.violation("DGRAM on a stream session")
@@ -318,9 +476,14 @@ func (c *Conn) dgOnDgram(p []byte, now time.Time) bool {
 	active := c.packetActive(now)
 	c.dg.lastDgram.Store(c.dgSince(now))
 	if !active {
-		c.Wake()
+		c.wakeWriter()
 	}
 	c.rxBytes.Add(uint64(len(data)))
+	if !v.enter() {
+		return true // the view's Done closed after our DETACH: not delivered (M3-D13)
+	}
+	defer v.exit()
+	v.countRx(len(data))
 	var buf *Buf
 	if len(data) >= BigData {
 		buf = c.env.Bufs.TryGet(len(data), c.env.Budget)
@@ -331,7 +494,7 @@ func (c *Conn) dgOnDgram(p []byte, now time.Time) bool {
 		n := copy(buf.B, data)
 		data = buf.B[:n]
 	}
-	if err := c.pep.Datagram(c, seq, data, buf); err != nil {
+	if err := v.pep.Datagram(v, seq, data, buf); err != nil {
 		c.violation("DGRAM: %v", err)
 		return false
 	}

@@ -294,6 +294,14 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		MTUProbeEvery:    k.mtuProbeEvery,
 		MTUProbeFails:    k.mtuProbeFails,
 	}
+	if ov != nil {
+		// M3 mux constants (M3-D50): internal, overridden by tests only; a
+		// zero field keeps carrier.Timing's default.
+		e.timing.MuxMaxViews = ov.MuxMaxViews
+		e.timing.MuxMaxViewsDatagram = ov.MuxMaxViewsDatagram
+		e.timing.MuxQuantum = ov.MuxQuantum
+		e.timing.MuxRefusalRing = ov.MuxRefusalRing
+	}
 	e.health = carrier.HealthParams{
 		Interval:      c.Probe.Interval,
 		Fresh:         c.Probe.Fresh,
@@ -325,6 +333,11 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		FirstOffset:       k.firstOffset,
 		OffsetLimit:       k.offsetLimit,
 		FirstEpoch:        k.firstEpoch,
+	}
+	if ov != nil {
+		// The parked actor's linger (M3-D42, M3-D50): internal, overridden
+		// by tests only; zero keeps the session's default (1 s).
+		e.params.ActorLinger = ov.ActorLinger
 	}
 	e.packet = session.PacketParams{
 		MaxPayload: c.Packet.MaxPayload,
@@ -440,7 +453,7 @@ func applyOverrides(c *Config, e *effective, k *internalConstants, ov *testhooks
 		e.rand = ov.Rand
 	}
 	e.hooks = ov.Hooks
-	e.presets = carrier.Presets{FirstFseq: ov.FirstFseq, FirstPingID: ov.FirstPingID, FirstCseq: ov.FirstCseq}
+	e.presets = carrier.Presets{FirstFseq: ov.FirstFseq, FirstPingID: ov.FirstPingID, FirstCseq: ov.FirstCseq, FirstHandle: ov.FirstHandle}
 
 	override(&k.ackEvery, ov.AckEvery)
 	override(&k.ackDelay, ov.AckDelay)
@@ -500,7 +513,7 @@ func (e *effective) passiveRetain(grace time.Duration) time.Duration {
 // clamped to 3 s–300 s when non-zero, the Runtime's NoPathGrace when zero;
 // BackoffMax = min(RejoinBackoffMax, grace/2) (constraint 3 per session);
 // Retain = PassiveRetain(grace). mode 0 selects ModeSelector; the caller
-// rejects modes other than 0, 1 and 2 before (ErrProtocol).
+// rejects modes other than 0 to 3 before (ErrProtocol).
 func (e *effective) dialerParams(mode Mode, grace time.Duration) session.Params {
 	g := e.cfg.NoPathGrace
 	if grace != 0 {

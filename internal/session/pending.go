@@ -100,7 +100,33 @@ func (a *actor) pendingFactsLocked(now time.Time) {
 func (a *actor) withdrawnLocked(now time.Time) {
 	a.decided = true
 	a.verdict = Verdict{Status: wire.StatusUnknownSession}
+	// A view of a MUX trunk whose OPEN awaits a response must get one
+	// (R1-9): the tombstone's UNKNOWN_SESSION, which the withdrawing dialer
+	// ignores — never the carrier's CAPACITY CodeBacklog, which says the
+	// backlog is full (m3 BACKLOG). A dedicated carrier retires without an
+	// answer (§6.2).
+	for _, l := range a.s.lanes {
+		if l.state != LaneDead && !l.firstSent && l.first.t == 0 && trunkView(l.c) {
+			l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusUnknownSession}}
+		}
+	}
 	a.terminateLocked(now, ErrSessionLost, nil, false)
+}
+
+// trunkView reports a view of a started MUX trunk (a handle above 1): a
+// refusal placed as its first frame ends the handle (M3-D7), and a Retire
+// while it awaits its response lets the carrier answer for the session
+// (R1-9). A dedicated carrier, and a trunk's handle 1, are neither.
+func trunkView(c *carrier.Conn) bool {
+	return c != nil && c.Mux() && c.Handle() > wire.SessionHandle
+}
+
+// firstOwedOnViewLocked reports a lane on a trunk view whose first
+// response (an OPEN_ACK or JOIN_ACK, any status) is set and not yet
+// placed: the end procedure wakes it instead of retiring it
+// (terminateLocked).
+func firstOwedOnViewLocked(l *lane) bool {
+	return !l.firstSent && l.first.t != 0 && trunkView(l.c)
 }
 
 // refusePendingLocked executes a refusing verdict: ack becomes the first
@@ -152,7 +178,7 @@ func (a *actor) onConfirmLocked(now time.Time, c *confirm) {
 		}
 		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: win}}
 		if s.aliveLocked(l) {
-			if s.p.Mode == ModeBond {
+			if s.p.Mode.members() {
 				l.data = true
 				l.state = LaneMember
 			} else if sender == nil {
@@ -256,13 +282,13 @@ func (a *actor) refuseAdopt(ad *adopt) {
 	if ad.kind == adoptJoin {
 		var p [wire.JoinAckLen]byte
 		n := wire.PutJoinAck(p[:], &wire.JoinAck{Status: wire.StatusUnknownSession})
-		ad.conn.WriteAndClose(wire.TypeJoinAck, 0, wire.SessionHandle, p[:n], time.Time{})
+		ad.conn.WriteAndClose(wire.TypeJoinAck, 0, ad.conn.Handle(), p[:n], time.Time{})
 		return
 	}
 	oa := a.verdict.OpenAck()
 	p := make([]byte, wire.OpenAckFixedLen+len(oa.Msg))
 	n := wire.PutOpenAck(p, &oa)
-	ad.conn.WriteAndClose(wire.TypeOpenAck, 0, wire.SessionHandle, p[:n], time.Time{})
+	ad.conn.WriteAndClose(wire.TypeOpenAck, 0, ad.conn.Handle(), p[:n], time.Time{})
 }
 
 // lanesConfirmedLocked handles factLaneConfirmed on the passive: a lane

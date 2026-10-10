@@ -16,7 +16,7 @@ import (
 type Open struct {
 	SID      [16]byte    // chosen by the dialer from crypto/rand; all-zero is invalid (ErrReserved)
 	Kind     CarrierKind // session kind: 1 stream, 2 packet (M2)
-	Mode     uint8       // 1 selector, 2 bond (3 race decodes; answered BAD_REQUEST until M3)
+	Mode     uint8       // 1 selector, 2 bond, 3 race (ModeRace, M3; an M2 build answers it BAD_REQUEST CodeBadMode)
 	Flags    uint16      // OpenFlagEarly reserved until M4: all bits must be 0
 	RetainMs uint32      // the dialer's PassiveRetain in milliseconds
 	Window   uint32      // stream: the dialer's initial receive window (0 is legal: memory pressure); packet: the cmtu offer, 0 or MinFrameBudget..MaxDatagram
@@ -46,12 +46,12 @@ func PutOpen(dst []byte, o *Open) int {
 
 // ParseOpen decodes an OPEN payload. The explicit mlen must equal the
 // remaining bytes exactly; mlen > maxMeta returns ErrLength before the
-// metadata is touched. Kind must be 1 or 2, mode 1..3 (ErrValue); flags
+// metadata is touched. Kind must be 1 or 2, mode 1..MaxMode (ErrValue); flags
 // must be 0 and a stream session's PMTU 0 (ErrReserved); a packet session's
 // PMTU must lie in MinPacketPayload..MaxPacketPayload and its Window be 0
 // or in MinFrameBudget..MaxDatagram (ErrValue; M2 design §A3.5). Semantic
 // acceptance (the session kind on this carrier kind, a Window that fits the
-// carrier kind, mode not race) is the admission's job.
+// carrier kind, a mode this build serves) is the admission's job.
 //
 // Check order: fixed part present (ErrShort), mlen > maxMeta (ErrLength),
 // mlen against the remaining bytes (ErrShort/ErrTrailing), zero SID
@@ -84,7 +84,7 @@ func ParseOpen(p []byte, maxMeta int) (Open, error) {
 		return Open{}, ErrReserved
 	case o.Kind != KindStream && o.Kind != KindDatagram:
 		return Open{}, ErrValue
-	case o.Mode < 1 || o.Mode > 3:
+	case o.Mode < 1 || o.Mode > MaxMode:
 		return Open{}, ErrValue
 	case o.Flags != 0:
 		return Open{}, ErrReserved
@@ -185,8 +185,8 @@ func PutJoin(dst []byte, j *Join) int {
 }
 
 // ParseJoin decodes a JOIN payload (exactly JoinLen bytes, non-zero SID,
-// mode 1..3). Errors: ErrShort/ErrTrailing, ErrReserved (zero SID), ErrValue
-// (mode).
+// mode 1..MaxMode). Errors: ErrShort/ErrTrailing, ErrReserved (zero SID),
+// ErrValue (mode).
 func ParseJoin(p []byte) (Join, error) {
 	if err := exactTail(len(p), JoinLen); err != nil {
 		return Join{}, err
@@ -196,7 +196,7 @@ func ParseJoin(p []byte) (Join, error) {
 	switch {
 	case j.SID == ([16]byte{}):
 		return Join{}, ErrReserved
-	case j.Mode < 1 || j.Mode > 3:
+	case j.Mode < 1 || j.Mode > MaxMode:
 		return Join{}, ErrValue
 	}
 	return j, nil
@@ -235,6 +235,46 @@ func ParseJoinAck(p []byte) (JoinAck, error) {
 		return JoinAck{}, ErrReserved
 	}
 	return a, nil
+}
+
+// The JOIN_ACK of a view of a MUX trunk (M3; both ends negotiated OptMux,
+// so both are M3 and invariant 3 holds): a refusal carries its reason code
+// — the Code* values of OPEN_ACK, CodeMuxFull above all — in the RxNext
+// field, which a refusal leaves zero on a dedicated carrier: the code is
+// the field's low 32 bits, its high 32 bits stay zero. An OK JOIN_ACK is
+// unchanged. Handle 1's JOIN_ACK (the handshake's, any carrier) keeps
+// ParseJoinAck's rule.
+
+// PutJoinAckMux writes a into dst as a view's JOIN_ACK on a MUX trunk and
+// returns JoinAckLen: PutJoinAck, with code in the RxNext field of a
+// refusal (code is ignored for OK).
+func PutJoinAckMux(dst []byte, a *JoinAck, code uint32) int {
+	n := PutJoinAck(dst, a)
+	if a.Status != StatusOK {
+		binary.BigEndian.PutUint64(dst[1:9], uint64(code))
+	}
+	return n
+}
+
+// ParseJoinAckMux decodes a view's JOIN_ACK on a MUX trunk: ParseJoinAck,
+// except that a refusal's RxNext field is its code (returned; the
+// JoinAck's RxNext is 0), whose high 32 bits must be zero (ErrReserved).
+// code is 0 for OK.
+func ParseJoinAckMux(p []byte) (a JoinAck, code uint32, err error) {
+	if err := exactTail(len(p), JoinAckLen); err != nil {
+		return JoinAck{}, 0, err
+	}
+	a = JoinAck{Status: AckStatus(p[0]), RxNext: binary.BigEndian.Uint64(p[1:9])}
+	switch {
+	case a.Status > StatusGoingAway:
+		return JoinAck{}, 0, ErrValue
+	case a.Status == StatusOK:
+		return a, 0, nil
+	case a.RxNext>>32 != 0:
+		return JoinAck{}, 0, ErrReserved
+	}
+	code, a.RxNext = uint32(a.RxNext), 0
+	return a, code, nil
 }
 
 // PutDataOffset writes the DATA prefix (stream offset) into dst[:DataPrefixLen].

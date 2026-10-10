@@ -159,9 +159,12 @@ func TestUnknownSessionIsSessionLost_L19(t *testing.T) {
 		if st := pc.Status(); !errors.Is(st.Err, rendr.ErrIdleTimeout) {
 			t.Fatalf("passive ended with %v, want ErrIdleTimeout", st.Err)
 		}
-		if n := e.p.Status().Sessions.Tombstones; n != 1 {
-			t.Fatalf("passive tombstones: %d", n)
-		}
+		// The Runtime records the tombstone when the ended session leaves
+		// its tables, just after the session's Done (a premise flake of the
+		// Linux race lane read it at once).
+		waitFor(t, time.Second, time.Millisecond, "the passive's tombstone", func() bool {
+			return e.p.Status().Sessions.Tombstones == 1
+		})
 		if st := dc.Status(); st.State != rendr.StateOpen || !st.InNoPath {
 			t.Fatalf("dialer while cut off: %+v", st)
 		}

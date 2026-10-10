@@ -32,8 +32,22 @@ import (
 // reader, carrier.SourceChecker). It
 // reports whether it refused the carrier itself (an answer written with
 // WriteAndClose, which the handshake goroutine then awaits).
+//
+// The same path admits an OPEN for a new handle on a live passive MUX trunk
+// (admitView, M3-D21): c is then the new view (handle above 1), ln the
+// Listener that accepted the trunk, its refusals go through the trunk's
+// refusal ring (answerOpen; R1-4), a closed Listener answers CAPACITY
+// CodeListenerClosed instead of CodeBacklog (R1-10: never GOING_AWAY, which
+// would make the dialer's Peer give up the instance), and a packet OPEN
+// keeps the trunk's budget (no SetBudget after Start, M3-D24). The OPEN
+// carrier of a new MUX trunk (handle 1) enters the Runtime trunk set before
+// its session starts it (addTrunk).
 func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time, limit int, fl *udpflow.Flow) (refused bool) {
 	c := h.Conn
+	view := isView(c)
+	if c.Mux() && !view {
+		rt.addTrunk(c, ln)
+	}
 	if h.MetaTooLarge {
 		answerOpen(c, wire.OpenAck{Status: wire.StatusBadRequest, Code: wire.CodeMetadataSize}, deadline)
 		return true
@@ -48,13 +62,22 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 	if packet {
 		var cmtu int
 		cmtu, maxPayload = packetAccept(&o, limit, rt.eff.cfg.Packet.MaxPayload)
-		c.SetBudget(cmtu) // a no-op on a stream carrier
+		if !view {
+			c.SetBudget(cmtu) // a no-op on a stream carrier
+		}
 	}
 	key := passiveKey(InstanceID(h.Preface.Instance), SessionID(o.SID))
+	if view {
+		// §A5.6 step 5: on a live trunk the closed Listener answers first.
+		if st, code := ln.viewRefusal(true); st != wire.StatusOK {
+			answerOpen(c, wire.OpenAck{Status: st, Code: code}, deadline)
+			return true
+		}
+	}
 	if r := rt.table.lookup(key, time.Now()); r.found {
 		return rt.routeOpen(r, c, fl, o.Kind, deadline)
 	}
-	if st, code := ln.refusal(); st != wire.StatusOK {
+	if st, code := ln.viewRefusal(view); st != wire.StatusOK {
 		answerOpen(c, wire.OpenAck{Status: st, Code: code}, deadline)
 		return true
 	}
@@ -66,7 +89,7 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 	switch ln.reserve(k) {
 	case reserveClosed:
 		rt.table.unreserve()
-		st, code := ln.refusal()
+		st, code := ln.viewRefusal(view)
 		answerOpen(c, wire.OpenAck{Status: st, Code: code}, deadline)
 		return true
 	case reserveFull:
@@ -116,7 +139,8 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 // inconsistent lengths, a packet OPEN's pmtu or window out of range); a
 // stream OPEN on a datagram carrier is CodeBadKind; a packet OPEN whose
 // window (the carrier's cmtu offer) is non-zero on a stream carrier or zero
-// on a datagram carrier is CodeBadValue; mode race (M3) is CodeBadMode.
+// on a datagram carrier is CodeBadValue. Modes 1 to 3 (selector, bond and
+// race, M3-D28) are admitted.
 func openBadRequest(payload []byte, o *wire.Open, err error, carrierKind wire.CarrierKind) (code uint32, bad bool) {
 	if err != nil {
 		if errors.Is(err, wire.ErrValue) && len(payload) >= wire.OpenFixedLen {
@@ -135,7 +159,7 @@ func openBadRequest(payload []byte, o *wire.Open, err error, carrierKind wire.Ca
 		return wire.CodeBadKind, true
 	case o.Kind == wire.KindDatagram && (o.Window == 0) == dgCarrier:
 		return wire.CodeBadValue, true
-	case Mode(o.Mode) != ModeSelector && Mode(o.Mode) != ModeBond:
+	case Mode(o.Mode) < ModeSelector || Mode(o.Mode) > ModeRace:
 		return wire.CodeBadMode, true
 	}
 	return 0, false
@@ -204,8 +228,17 @@ func (rt *Runtime) routeOpen(r lookupResult[*session.Session], c *carrier.Conn, 
 // cmtu_acc = min(rxNext, limit) as for an OPEN (M2 design §A5.4, M2-D50).
 // An accepted JOIN's raw-UDP flow leaves its source's admitting quota
 // (M2-D59). It reports whether it answered the carrier itself.
-func (rt *Runtime) admitJoin(h *carrier.Hello, deadline time.Time, limit int, fl *udpflow.Flow) (refused bool) {
+//
+// ln is the Listener that accepted the carrier: the JOIN carrier of a new
+// MUX trunk enters the Runtime trunk set with it (addTrunk), so OPENs that
+// later arrive on that trunk are admitted to its queues. A JOIN for a new
+// handle on a live trunk (admitView) takes the same path; its refusals go
+// through the trunk's refusal ring (answerJoin).
+func (rt *Runtime) admitJoin(ln *Listener, h *carrier.Hello, deadline time.Time, limit int, fl *udpflow.Flow) (refused bool) {
 	c := h.Conn
+	if c.Mux() && !isView(c) {
+		rt.addTrunk(c, ln)
+	}
 	j, err := wire.ParseJoin(h.Payload)
 	if err != nil {
 		answerJoin(c, wire.StatusBadRequest, deadline)
@@ -226,6 +259,56 @@ func (rt *Runtime) admitJoin(h *carrier.Hello, deadline time.Time, limit int, fl
 	}
 	answerJoin(c, st, deadline)
 	return true
+}
+
+// admitView is the Runtime's carrier.Env.Admit (M3-D21, §A5.6): an OPEN or
+// JOIN for a new handle on a started passive MUX trunk, on the trunk's
+// reader. v is the new view (pending or joining, shim endpoint), already
+// counted against the trunk's view cap; the carrier checked the cap, the
+// payload decode and our GOAWAY. The rest is the handshake admission's path
+// (admitOpen, admitJoin) with v as the carrier: JOINs never wait behind
+// OPENs (they take no backlog or MaxSessions check, L48), the OPEN pools
+// are the trunk's Listener's, and every refusal decided here is an answer
+// in the trunk's refusal ring (R1-4). It never blocks: table lookups,
+// leaf-lock sections, a session's NewPending/Start, and posts to a
+// session's mailbox. p is valid only during the call: what outlives it is
+// copied (the session copies its metadata and JOIN).
+func (rt *Runtime) admitView(v *carrier.Conn, hdr wire.Header, p []byte) {
+	rec, _ := v.OwnerTag().(*trunkRec)
+	if rec == nil {
+		// Not in the trunk set (cannot happen: a MUX trunk is registered
+		// before its session starts it): refuse without a penalty.
+		v.Refuse(v.Handle(), carrier.Answer{Type: respType(hdr.Type), Status: wire.StatusCapacity, Code: wire.CodeMuxFull})
+		return
+	}
+	rec.viewAdded()
+	h := &carrier.Hello{Conn: v, First: hdr, Payload: p}
+	h.Preface.Instance = v.PeerInstance()
+	h.Preface.CarrierID = v.ID()
+	switch hdr.Type {
+	case wire.TypeOpen:
+		if o, err := wire.ParseOpen(p, wire.MaxMetadata); err == nil && len(o.Metadata) > rt.eff.cfg.Handshake.MaxMetadata {
+			h.MetaTooLarge = true
+		}
+		rt.admitOpen(rec.ln, h, time.Time{}, v.MTU(), nil)
+	case wire.TypeJoin:
+		rt.admitJoin(rec.ln, h, time.Time{}, v.MTU(), nil)
+	default:
+		v.Refuse(v.Handle(), carrier.Answer{Type: respType(hdr.Type), Status: wire.StatusBadRequest, Code: wire.CodeBadValue})
+	}
+}
+
+// isView reports whether c is a view admitted on a started MUX trunk (a
+// handle above 1) rather than the first carrier of a handshake (handle 1;
+// a bare Conn's 0 is no view either: it has no trunk to refuse through).
+func isView(c *carrier.Conn) bool { return c.Handle() > wire.SessionHandle }
+
+// respType is the response type of a first frame type.
+func respType(t wire.Type) wire.Type {
+	if t == wire.TypeJoin {
+		return wire.TypeJoinAck
+	}
+	return wire.TypeOpenAck
 }
 
 // joinOffer bounds a JOIN's cmtu offer by the transport limit of the

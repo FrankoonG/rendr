@@ -57,6 +57,7 @@ type dgDial struct {
 	pingID uint32
 	salt   uint64
 	fcs    uint32 // the first REL cseq of each direction
+	opt    uint32 // the PREFACE's optional bits (prefaceOpt: OptMux on a session carrier of a mux-eligible factory)
 
 	pc       net.PacketConn // the factory's conn until io owns it
 	io       PacketIO
@@ -137,7 +138,7 @@ func establishDatagram(ctx context.Context, env *Env, f Factory, id uint32, t wi
 	_, _ = rand.Read(sb[:])
 	d := &dgDial{
 		ctx: ctx, env: env, tm: env.Timing.withDefaults(), f: f, id: id, t: t,
-		pingID: env.Presets.firstPingID(), salt: binary.LittleEndian.Uint64(sb[:]), fcs: env.Presets.firstCseq(),
+		pingID: env.Presets.firstPingID(), salt: binary.LittleEndian.Uint64(sb[:]), fcs: env.Presets.firstCseq(), opt: prefaceOpt(f, t),
 		left: make(chan struct{}), abortCh: make(chan struct{}),
 	}
 	returned := false
@@ -507,7 +508,7 @@ func stageOf(ack []byte) string {
 func (d *dgDial) buildH1(payload []byte, offer int) ([]byte, uint32) {
 	hr := d.io.Headroom()
 	h1 := make([]byte, hr+wire.PrefaceLen, hr+wire.PrefaceLen+wire.FrameOverhead+wire.RelHeadLen+max(len(payload), wire.PingFixedLen))
-	wire.PutPreface(h1[hr:], &wire.Preface{Minor: wire.Minor, Kind: wire.KindDatagram, Instance: d.env.Local, CarrierID: d.id})
+	wire.PutPreface(h1[hr:], &wire.Preface{Minor: wire.Minor, Kind: wire.KindDatagram, Instance: d.env.Local, CarrierID: d.id, Opt: d.opt})
 	first := d.env.Presets.fseqFrom(h1[hr:])
 	if d.t == wire.TypePing {
 		var pp [wire.PingFixedLen]byte
@@ -593,6 +594,10 @@ func (d *dgDial) prefaceAck(ab []byte, check func(*wire.PrefaceAck) error) (*wir
 		est, err := d.fail(e)
 		return nil, true, est, err
 	}
+	if err := ackOptErr(d.opt, &ack); err != nil {
+		est, ferr := d.failed("preface", CauseProtocolViolation, false, [16]byte{}, err, false)
+		return nil, true, est, ferr
+	}
 	if check != nil {
 		if err := check(&ack); err != nil {
 			est, ferr := d.failed("preface", CauseInstanceMismatch, true, ack.Instance, err, true)
@@ -619,8 +624,8 @@ type dgResp struct {
 func (d *dgDial) frames(data []byte, rwin *wire.FseqWindow) (r dgResp, err error) {
 	for len(data) > 0 {
 		f, n, derr := wire.DecodeFrame(data)
-		if derr != nil {
-			dgEnvDropped(d.env) // the rest of this datagram (PA-1)
+		if derr != nil || !dedicatedOK(f.Type, f.Handle) {
+			dgEnvDropped(d.env) // the rest of this datagram (PA-1; only view 1 exists: §A3.2)
 			return r, nil
 		}
 		data = data[n:]
@@ -644,6 +649,9 @@ func (d *dgDial) frames(data []byte, rwin *wire.FseqWindow) (r dgResp, err error
 			h, inner, perr := wire.ParseRel(f.Payload)
 			if perr != nil {
 				return r, fmt.Errorf("REL: %w", perr)
+			}
+			if !dedicatedOK(h.Type, h.Handle) {
+				return r, fmt.Errorf("REL: %v with handle %d in the handshake", h.Type, h.Handle)
 			}
 			if h.Cseq != d.fcs {
 				dgEnvDropped(d.env) // a REL with another cseq (M2-D20)
@@ -729,7 +737,7 @@ func (d *dgDial) challenges(data []byte) error {
 	answered := false
 	for len(data) > 0 {
 		f, n, err := wire.DecodeFrame(data)
-		if err != nil {
+		if err != nil || !dedicatedOK(f.Type, f.Handle) {
 			break // the rest of this datagram (PA-1)
 		}
 		data = data[n:]
@@ -810,6 +818,7 @@ func (d *dgDial) established(ack *wire.PrefaceAck, ackBytes []byte, rwin *wire.F
 	_ = d.io.SetDeadline(time.Time{})
 	c := newDatagramConn(d.env, d.io, d.id, ack.Instance, d.f.Index, d.f.Name, true)
 	c.salt = d.salt
+	c.mux = muxed(d.opt, ack)
 	c.SetBudget(offer)
 	dg := c.dg
 	dg.rwin = *rwin
@@ -840,5 +849,5 @@ func (d *dgDial) established(ack *wire.PrefaceAck, ackBytes []byte, rwin *wire.F
 			c.st.nextPingID = 1 // id 0 is the rebind challenge (L14)
 		}
 	}
-	return &Established{Conn: c, Ack: *ack, Resp: r.hdr, Payload: bytes.Clone(r.payload)}, nil
+	return &Established{Conn: c, Ack: *ack, Resp: r.hdr, Payload: bytes.Clone(r.payload), Fresh: c.mux}, nil
 }

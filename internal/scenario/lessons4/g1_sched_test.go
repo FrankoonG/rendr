@@ -55,6 +55,7 @@ func g1ForgedSched(t *testing.T, death uint64) {
 	l.SetDelay(2*time.Millisecond, 0)
 	dc, pc := w.open(w.peer(nil, l), rendr.DialOptions{})
 	g1Exchange(t, dc, pc, 64<<10, 4501)
+	g1SchedSettled(t, dc, pc)
 
 	ds0, ps0 := dc.Status(), pc.Status()
 	act, ok := activeOf(ps0)
@@ -156,6 +157,7 @@ func TestForgedSchedWithinBoundNoChurn_L45(t *testing.T) {
 		l.SetDelay(2*time.Millisecond, 0)
 		dc, pc := w.open(w.peer(nil, l), rendr.DialOptions{})
 		g1Exchange(t, dc, pc, 64<<10, 4511)
+		g1SchedSettled(t, dc, pc)
 
 		ps0 := pc.Status()
 		act, ok := activeOf(ps0)
@@ -271,6 +273,19 @@ func g1Until(t testing.TB, within time.Duration, what string, cond func() bool) 
 // g1Exchange sends n bytes of PRNG(seed) from a to b and n bytes of
 // PRNG(seed+1) from b to a at the same time; each reader's SHA-256 must
 // equal its writer's.
+// g1SchedSettled waits until the passive applied the epoch the dialer last
+// published. The exchange before it ends when the data is delivered, and
+// the passive's reader only stores a received SCHED: its actor applies the
+// epoch in a later step, so a Status snapshot taken right after the
+// exchange may still show the epoch before it. The forged SCHED is derived
+// from the passive's epoch, so the test starts from the dialer's.
+func g1SchedSettled(t testing.TB, dc, pc *rendr.Conn) {
+	t.Helper()
+	waitFor(t, 5*time.Second, "the passive applying the dialer's SCHED epoch", func() bool {
+		return pc.Status().SchedEpoch == dc.Status().SchedEpoch
+	})
+}
+
 func g1Exchange(t testing.TB, a, b net.Conn, n int64, seed uint64) {
 	t.Helper()
 	type sum struct {

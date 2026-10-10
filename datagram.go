@@ -64,6 +64,11 @@ type DatagramCarrier struct {
 	// budget ends DialPacket with ErrMetadataTooLarge once NoPathGrace
 	// passed (on a Peer without a StreamCarrier), instead of at once.
 	MTU int
+	// Props describe the factory to the scheduler: fate group, cheap
+	// subflows, head-of-line coupling. The zero value shares the factory's
+	// carriers between the Peer's packet sessions in a fate group of its
+	// own.
+	Props Props
 }
 
 func (DatagramCarrier) isCarrier() {}

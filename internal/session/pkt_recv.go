@@ -15,10 +15,20 @@ import (
 // violation of the delivering carrier (§A3.2); the session survives.
 //
 // Accounting: a new seq counts Received (and PACK's received), a seq seen
-// within the dedup window Duplicates, one older than the window or after
-// the peer's FIN was delivered DropLate (nothing is returned after io.EOF,
-// R1-12), an eviction by the full receive queue DropRecvQueue; after this
-// side's Close an accepted datagram is discarded uncounted (M2-D37).
+// within the dedup window Duplicates — also after the peer's FIN was
+// delivered (a slow race member's copies, M3-D35) — one older than the
+// window, or a new one after the peer's FIN was delivered, DropLate
+// (nothing is returned after io.EOF, R1-12), an eviction by the full
+// receive queue DropRecvQueue; after this side's Close an accepted
+// datagram is discarded uncounted (M2-D37).
+//
+// The window keeps no record of a seq older than its width, so a race
+// member's copy of a datagram that was delivered, arriving DedupBits seqs
+// or more behind the newest accepted seq, counts as DropLate, not as
+// Duplicates (KL-15): DropLate attributes a loss only to a datagram that
+// was actually missing. A race keeps its copies in Duplicates while
+// DedupBits exceeds packets/s × the members' skew (16,384 by default:
+// 1.6 s at 10 kpps, about 330 ms at 50 kpps).
 //
 // The idle clock (M2-D41) moves on an accepted datagram without a clock
 // read per datagram: the first unreported datagram reads the clock for
@@ -38,7 +48,11 @@ func (s *Session) datagramLocked(seq uint64, d []byte, buf *carrier.Buf) error {
 	case st.peerFinSet && seq >= st.peerFin:
 		err = errDgramBeyondFin
 	case st.peerFinDelivered:
-		pk.ctr.DropLate++ // a straggler after io.EOF was decided (R1-12)
+		if pk.dedup.Accept(seq) == wire.WindowDuplicate {
+			pk.ctr.Duplicates++ // a copy of a received datagram (M3-D35)
+		} else {
+			pk.ctr.DropLate++ // a straggler after io.EOF was decided (R1-12)
+		}
 	default:
 		switch pk.dedup.Accept(seq) {
 		case wire.WindowDuplicate:

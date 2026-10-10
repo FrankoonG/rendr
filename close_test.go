@@ -1131,7 +1131,8 @@ func TestCloseDeliversSessionEnds_L53(t *testing.T) {
 		ln := wpListen(t, p, ListenConfig{})
 		link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: ln.Handle})
 		t.Cleanup(link.Close)
-		peer, err := d.NewPeer(PeerConfig{Carriers: []Carrier{e2eCarrier(link)}})
+		// One carrier per session (its kills are counted): dedicated (M3-D2).
+		peer, err := d.NewPeer(PeerConfig{Carriers: []Carrier{dedicated(e2eCarrier(link))}})
 		if err != nil {
 			t.Fatal(err)
 		}

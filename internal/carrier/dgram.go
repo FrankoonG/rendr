@@ -52,6 +52,7 @@ type dgState struct {
 	rwin          wire.FseqWindow // (R) receive anti-replay window (M2-D13)
 	peerClosed    bool            // (R) the peer's CLOSE was dispatched (M2-D30)
 	peerCloseFseq uint32          // (R) its fseq: later non-RACK frames are dropped
+	jumpPing      time.Time       // (M) when a frame ahead of rwin last asked for a PING (dgJumpClaim)
 
 	// The datagram retirement (M2-D31, R1-4): it completes when our CLOSE
 	// was RACKed, the peer's CLOSE was dispatched and a datagram carrying a

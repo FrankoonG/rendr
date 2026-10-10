@@ -63,14 +63,43 @@ const (
 	// PREFACE_ACK that opened it (design §0.13 A6) unless a test preset
 	// fixes it.
 	FirstFseq uint32 = 1
-	// SessionHandle is the handle every session frame uses in M1 and M2
-	// (one session per carrier, chosen by the dialer, echoed by the
-	// passive). ParseHeader rejects a session frame, and ParseRel a wrapped
-	// one, with any other handle (ErrHandle).
+	// SessionHandle is the first handle of every carrier: the handle of
+	// the session that opened it, and the only session handle a dedicated
+	// (non-MUX) carrier carries. Since M3 the codec accepts any non-zero
+	// handle on a session frame (ParseHeader, ParseRel; 0 is ErrHandle):
+	// a MUX trunk dispatches by handle, and the rule "handle 1 only" of a
+	// dedicated carrier is the carrier's, no longer the codec's (M3 design
+	// §A3.2, M3-D4).
 	SessionHandle uint32 = 1
 	// KnownRequired is the set of required PREFACE feature bits this build
 	// implements (none). Any other required bit is answered FEATURE.
 	KnownRequired uint32 = 0
+
+	// OptMux is optional PREFACE feature bit 0 (M3-D3): rendr mux. The
+	// dialer sets it in the PREFACE of a session carrier of a mux-eligible
+	// factory (never on a probe carrier); a passive that implements mux
+	// echoes it in PREFACE_ACK(OK) iff the PREFACE carried it. A carrier is
+	// a MUX trunk iff both carry it: it then carries several sessions, one
+	// per handle (OPEN and JOIN for new handles on the live carrier, DETACH
+	// to end one). Otherwise it is dedicated and carries handle 1 only. A
+	// PREFACE_ACK with OptMux for a PREFACE without it fails the dialer's
+	// attempt as a carrier error.
+	OptMux uint32 = 1 << 0
+	// KnownOptional is the set of optional PREFACE feature bits this build
+	// implements (OptMux). A passive echoes only these (EchoOpt); every
+	// other optional bit is ignored in both directions.
+	KnownOptional uint32 = OptMux
+)
+
+// Session modes as OPEN.mode and JOIN.mode carry them (1 selector, 2 bond,
+// 3 race). The codec accepts 1 … MaxMode (ErrValue otherwise, answered
+// BAD_REQUEST CodeBadMode); a build without race (M2) answers mode 3
+// BAD_REQUEST CodeBadMode as well (M3-D28).
+const (
+	// ModeRace: every member carrier carries every byte or datagram (M3).
+	ModeRace uint8 = 3
+	// MaxMode is the largest mode value the codec accepts.
+	MaxMode uint8 = ModeRace
 )
 
 // Magic starts every PREFACE and PREFACE_ACK.
@@ -139,34 +168,34 @@ const (
 func (t Type) Extension() bool { return t >= 0x80 }
 
 // CarrierLevel reports whether t is a carrier-level core type (PING, PONG,
-// CLOSE, GOAWAY, REL, RACK), whose handle must be 0. Every other core type
-// is a session frame whose handle must be SessionHandle: an M1–M2 carrier
-// carries exactly one session (M3's mux relaxes this to any non-zero
-// handle, dispatched by handle). ParseHeader and ParseRel enforce both
-// rules (ErrHandle). The handle of an extension type is opaque and never
-// checked.
+// CLOSE, GOAWAY, REL, RACK, DETACH), whose handle must be 0. Every other
+// core type is a session frame whose handle must not be 0: SessionHandle
+// on a dedicated carrier, the view's handle on a MUX trunk (M3-D4; the
+// carrier, not the codec, checks which handles it carries). ParseHeader
+// and ParseRel enforce both rules (ErrHandle). The handle of an extension
+// type is opaque and never checked.
 func (t Type) CarrierLevel() bool {
 	switch t {
-	case TypePing, TypePong, TypeClose, TypeGoAway, TypeRel, TypeRack:
+	case TypePing, TypePong, TypeClose, TypeGoAway, TypeRel, TypeRack, TypeDetach:
 		return true
 	}
 	return false
 }
 
-// Known reports whether t is one of the 17 core types of wire format v2:
-// the 13 of stream sessions (M1) and DGRAM, PACK, REL and RACK (M2).
-// 0x52 is never Known (TypeReservedR).
+// Known reports whether t is one of the 18 core types of wire format v2:
+// the 13 of stream sessions (M1), DGRAM, PACK, REL and RACK (M2) and
+// DETACH (M3). 0x52 is never Known (TypeReservedR).
 func (t Type) Known() bool {
 	switch t {
 	case TypeOpen, TypeOpenAck, TypeJoin, TypeJoinAck, TypeData, TypeAck, TypeFin,
 		TypeRst, TypeSched, TypePing, TypePong, TypeClose, TypeGoAway,
-		TypeDgram, TypePack, TypeRel, TypeRack:
+		TypeDgram, TypePack, TypeRel, TypeRack, TypeDetach:
 		return true
 	}
 	return false
 }
 
-// String returns the frame type name ("OPEN", "ACK", "DGRAM", ...) or
+// String returns the frame type name ("OPEN", "ACK", "DGRAM", "DETACH", ...) or
 // "0xNN".
 func (t Type) String() string {
 	switch t {
@@ -204,6 +233,8 @@ func (t Type) String() string {
 		return "REL"
 	case TypeRack:
 		return "RACK"
+	case TypeDetach:
+		return "DETACH"
 	}
 	const hex = "0123456789abcdef"
 	return string([]byte{'0', 'x', hex[t>>4], hex[t&0x0f]})
@@ -279,11 +310,20 @@ const (
 	CodeBadKind       uint32 = 2 // BAD_REQUEST: an unknown session kind, or a session kind this carrier cannot open (M2 design §A3.5)
 	CodeMetadataSize  uint32 = 3 // BAD_REQUEST: mlen exceeds the passive's MaxMetadata → ErrMetadataTooLarge
 	CodeBadValue      uint32 = 4 // BAD_REQUEST: reserved flags, pmtu or another field out of range
+	CodeDuplicateView uint32 = 5 // BAD_REQUEST: the session already holds a view on this MUX trunk without the peer's DETACH (M3-D23)
 	CodeMaxSessions   uint32 = 1 // CAPACITY: the passive Runtime is at MaxSessions
 	CodeBacklog       uint32 = 2 // CAPACITY: the Listener's AcceptBacklog is full
 	CodeAcceptTimeout uint32 = 3 // CAPACITY: the application did not Confirm within AcceptTimeout
 	CodeCarriers      uint32 = 4 // CAPACITY: the session already holds MaxCarriersPerSession carriers
 	CodeAbandoned     uint32 = 5 // CAPACITY: the passive's abandoned-call pool is full
+	// CodeMuxFull (CAPACITY): the MUX trunk holds its maximum of views (M3
+	// design §A3.5): a carrier refusal, never an application error; the
+	// attempt dials elsewhere without penalty.
+	CodeMuxFull uint32 = 6
+	// CodeListenerClosed (CAPACITY): an OPEN on a MUX trunk whose Listener
+	// was closed (R1-10): a carrier refusal for OPENs only; the trunk stays
+	// usable for JOINs and the dialer's gone-away set is not touched.
+	CodeListenerClosed uint32 = 7
 )
 
 // RST codes below 256 are reserved for rendr; rendr.AbortCode values equal

@@ -45,7 +45,7 @@ func (c *Conn) readLoop() {
 	normal := false
 	defer func() {
 		if !normal { // runtime.Goexit inside an embedder Read (L51)
-			c.Kill(CauseTransportError, "conn Read called runtime.Goexit")
+			c.killCarrier(CauseTransportError, "conn Read called runtime.Goexit")
 		}
 		// The embedder call returned or unwound: only this goroutine pools
 		// its buffers (§4.1), so both accounts return to zero (R7).
@@ -111,13 +111,13 @@ func (c *Conn) readFailed(err error) {
 		c.finishRetire("retired: read ended after CLOSE")
 		return
 	}
-	c.Kill(CauseTransportError, "read: "+err.Error())
+	c.killCarrier(CauseTransportError, "read: "+err.Error())
 }
 
 // violation kills the carrier with protocol_violation (L43, invariant 6:
 // only this carrier dies).
 func (c *Conn) violation(format string, a ...any) {
-	c.Kill(CauseProtocolViolation, fmt.Sprintf(format, a...))
+	c.killCarrier(CauseProtocolViolation, fmt.Sprintf(format, a...))
 }
 
 // readFrame reads, verifies and dispatches one frame. It reports whether the
@@ -147,21 +147,44 @@ func (c *Conn) readFrame(rd *reader) bool {
 		c.violation("%v on a stream carrier", h.Type)
 		return false
 	}
+	// v is the view a session frame is for (route: on a one-view trunk a
+	// compare with view 1's handle); nil for carrier-level and extension
+	// frames.
+	var v *Conn
 	if !h.Type.Extension() && !h.Type.CarrierLevel() {
+		if c.mux {
+			// A MUX trunk: the frame's handle and the view's state decide
+			// (§A3.3, §A5.4; mux.go).
+			act, mv, why := c.classify(h.Type, h.Handle)
+			switch act {
+			case actIllegal:
+				c.violation("%v for handle %d: %s", h.Type, h.Handle, why)
+				return false
+			case actDispatch:
+				v = mv
+			default:
+				return c.readMux(rd, h, act, mv)
+			}
+		} else {
+			v = c.route(h.Handle)
+		}
 		switch {
-		case c.ep == nil:
+		case v == nil:
+			c.violation("%v for handle %d: no such view", h.Type, h.Handle)
+			return false
+		case v.ep == nil:
 			c.violation("%v on a carrier without a session", h.Type)
 			return false
 		case h.Type == wire.TypeOpen || h.Type == wire.TypeOpenAck || h.Type == wire.TypeJoin || h.Type == wire.TypeJoinAck:
 			c.violation("%v after establishment", h.Type)
 			return false
 		case h.Type == wire.TypeData && int(h.Len)-wire.DataPrefixLen >= BigData:
-			return c.readBigData(rd, h)
-		case h.Type == wire.TypeDgram && c.pep != nil && int(h.Len)-wire.DgramPrefixLen >= BigData:
+			return c.readBigData(rd, h, v)
+		case h.Type == wire.TypeDgram && v.pep != nil && int(h.Len)-wire.DgramPrefixLen >= BigData:
 			// A packet session's DGRAM of 16 KiB or more is read by reference
 			// like big DATA (M2 §A5.3; integration 1, D1: this replaces the
 			// readStreamed guard for packet sessions only).
-			return c.readBigData(rd, h)
+			return c.readBigData(rd, h, v)
 		}
 	}
 	total := wire.HeaderLen + int(h.Len) + wire.TrailerLen
@@ -181,7 +204,7 @@ func (c *Conn) readFrame(rd *reader) bool {
 	rd.r += total
 	rd.fseq++
 	now := c.frameArrived()
-	return c.dispatch(h, body[wire.HeaderLen:], now)
+	return c.dispatch(v, h, body[wire.HeaderLen:], now)
 }
 
 // frameArrived records the arrival of a verified frame and returns now.
@@ -201,13 +224,16 @@ func (c *Conn) dataArrived(n int, now time.Time) {
 		g.AddRx(n, now)
 	}
 	if !c.rxData.Load() && c.rxData.CompareAndSwap(false, true) {
-		c.Wake()
+		c.wakeWriter()
 	}
 }
 
 // dispatch handles one verified frame whose payload p lives in the stage
-// (valid until the next read).
-func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
+// (valid until the next read). v is the view of a session frame (readFrame
+// routed it and checked its endpoint); nil for carrier-level and extension
+// frames. The DATA and DGRAM accounting (dataArrived) stays trunk-wide
+// (M3-D11).
+func (c *Conn) dispatch(v *Conn, h wire.Header, p []byte, now time.Time) bool {
 	switch h.Type {
 	case wire.TypePing:
 		ping, err := wire.ParsePing(p)
@@ -229,16 +255,22 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 			return false
 		}
 		c.peerClosed.Store(true)
-		c.ring()
+		c.ringViews()
 		if c.closeSent.Load() {
 			c.finishRetire("retired: CLOSE exchange complete")
 			return false
 		}
-		if c.ep == nil {
+		if c.view1.ep == nil {
 			// A probe or sessionless carrier has no session to drain: it
 			// answers the peer's CLOSE with its own at once (its owner may
 			// still call Retire; it is idempotent).
 			c.Retire(wire.CloseRetire)
+		} else if c.mux {
+			// A MUX trunk answers the peer's CLOSE with its own once a
+			// round places no endpoint frame (M2's rule, trunk-wide): its
+			// views' sessions see PeerClosed and place their last frames
+			// first; a trunk without views closes at once (WP10).
+			c.retireTrunk(wire.CloseRetire)
 		}
 	case wire.TypeGoAway:
 		if _, err := wire.ParseGoAway(p); err != nil {
@@ -246,7 +278,14 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 			return false
 		}
 		c.peerGoAway.Store(true)
-		c.ring()
+		c.ringViews()
+	case wire.TypeDetach:
+		// A MUX trunk's end of one handle (M3-D6; detach.go); a
+		// violation on a dedicated carrier.
+		if why, _ := c.onDetach(p); why != "" {
+			c.violation("%s", why)
+			return false
+		}
 	case wire.TypeData:
 		off, err := wire.ParseDataOffset(p)
 		if err != nil {
@@ -255,14 +294,20 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 		}
 		data := p[wire.DataPrefixLen:]
 		c.dataArrived(len(data), now)
-		if err := c.ep.Data(c, off, data, nil); err != nil {
+		if !v.enter() {
+			return true // the view's Done closed after our DETACH: dropped (M3-D13)
+		}
+		v.countRx(len(data))
+		err = v.ep.Data(v, off, data, nil)
+		v.exit()
+		if err != nil {
 			c.violation("DATA: %v", err)
 			return false
 		}
 	case wire.TypeDgram:
 		// A packet session's datagram on a stream carrier: its bytes count
 		// as DATA there (busy cadence, byte clock, M2-D26).
-		if c.pep == nil {
+		if v.pep == nil {
 			c.violation("DGRAM on a stream session")
 			return false
 		}
@@ -272,7 +317,13 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 			return false
 		}
 		c.dataArrived(len(data), now)
-		if err := c.pep.Datagram(c, seq, data, nil); err != nil {
+		if !v.enter() {
+			return true
+		}
+		v.countRx(len(data))
+		err = v.pep.Datagram(v, seq, data, nil)
+		v.exit()
+		if err != nil {
 			c.violation("DGRAM: %v", err)
 			return false
 		}
@@ -280,12 +331,103 @@ func (c *Conn) dispatch(h wire.Header, p []byte, now time.Time) bool {
 		if h.Type.Extension() {
 			return true // CRC-checked and skipped on every carrier (§5.2)
 		}
-		if err := c.ep.Control(c, h, p); err != nil {
+		if !v.enter() {
+			return true
+		}
+		err := v.ep.Control(v, h, p)
+		v.exit()
+		if err != nil {
 			c.violation("%v: %v", h.Type, err)
 			return false
 		}
 	}
 	return true
+}
+
+// readMux reads, verifies and handles a session frame of a MUX trunk that
+// is not dispatched to a view's endpoint (§A3.3): an admitted OPEN or JOIN
+// for a new handle (admit), a dialer view's response (onResponse), or a
+// legal frame that is not delivered. A frame beyond the stage (an OPEN
+// with large metadata, a big DATA of a view whose Done closed) is read
+// into a Buf of its own.
+func (c *Conn) readMux(rd *reader, h wire.Header, act muxAct, v *Conn) bool {
+	total := wire.HeaderLen + int(h.Len) + wire.TrailerLen
+	var body []byte
+	var buf *Buf
+	if total <= len(rd.stage.B) {
+		if err := c.fill(rd, total); err != nil {
+			c.readFailed(err)
+			return false
+		}
+		f := rd.stage.B[rd.r : rd.r+total]
+		body = f[:wire.HeaderLen+int(h.Len)]
+		if wire.CRC(body) != wire.Trailer(f[len(body):]) {
+			c.violation("%v: crc mismatch", h.Type)
+			return false
+		}
+		rd.r += total
+	} else {
+		buf = c.env.Bufs.Get(total, c.env.Budget)
+		rd.big = buf
+		got := copy(buf.B[:total], rd.stage.B[rd.r:rd.w])
+		rd.r += got
+		for got < total {
+			if rd.pending != nil {
+				rd.releaseBig()
+				c.readFailed(rd.pending)
+				return false
+			}
+			rd.r, rd.w = 0, 0
+			m, err := callRead(c.nc, buf.B[got:total])
+			if m < 0 || m > total-got {
+				rd.releaseBig()
+				c.readFailed(&countError{"Read", m, total - got})
+				return false
+			}
+			got += m
+			if err != nil {
+				if got < total {
+					rd.releaseBig()
+					c.readFailed(err)
+					return false
+				}
+				rd.pending = err
+			} else if m == 0 {
+				rd.releaseBig()
+				c.readFailed(errZeroRead)
+				return false
+			}
+		}
+		body = buf.B[:wire.HeaderLen+int(h.Len)]
+		if wire.CRC(body) != wire.Trailer(buf.B[len(body):total]) {
+			rd.releaseBig()
+			c.violation("%v: crc mismatch", h.Type)
+			return false
+		}
+	}
+	rd.fseq++
+	now := c.frameArrived()
+	p := body[wire.HeaderLen:]
+	ok := true
+	switch act {
+	case actAdmit:
+		c.admit(h.Handle, h, p)
+		ok = c.death.Load() == nil
+	case actResponse:
+		if err := c.onResponse(v, h, p); err != nil {
+			c.violation("%v: %v", h.Type, err)
+			ok = false
+		}
+	}
+	if h.Type == wire.TypeData || h.Type == wire.TypeDgram {
+		if n := int(h.Len) - wire.DataPrefixLen; n > 0 {
+			c.dataArrived(n, now)
+		}
+	}
+	if buf != nil {
+		rd.releaseBig()
+	}
+	return ok
 }
 
 // pong applies a PONG outside Conn.mu's callers: the estimator update under
@@ -298,7 +440,7 @@ func (c *Conn) pong(p *wire.Ping, now time.Time) {
 	}
 	c.mu.Unlock()
 	if wake {
-		c.Wake()
+		c.wakeWriter()
 	}
 	if matched {
 		if o := c.opts.Observer; o != nil {
@@ -309,13 +451,14 @@ func (c *Conn) pong(p *wire.Ping, now time.Time) {
 
 // readBigData reads a DATA frame whose payload is at least BigData bytes
 // straight into its own pooled Buf and hands it to the endpoint by
-// reference (design §4.9); a packet session's DGRAM of that size the same
+// reference (design §4.9) — v's endpoint, the view readFrame routed the
+// frame to; a packet session's DGRAM of that size the same
 // way (DATA and DGRAM share the 8-byte prefix; only the endpoint call
 // differs, M2 §A5.3). The read bound is n + LookAhead (the trailer
 // included, C15), which Get(n + LookAhead) always covers; at most 21 bytes
 // of the next frame read along are moved back to the stage. A partial frame
 // is never handed over (L42).
-func (c *Conn) readBigData(rd *reader, h wire.Header) bool {
+func (c *Conn) readBigData(rd *reader, h wire.Header, v *Conn) bool {
 	n := int(h.Len) - wire.DataPrefixLen
 	if err := c.fill(rd, wire.DataHeadLen); err != nil {
 		c.readFailed(err)
@@ -378,12 +521,18 @@ func (c *Conn) readBigData(rd *reader, h wire.Header) bool {
 	rd.fseq++
 	c.dataArrived(n, c.frameArrived())
 	rd.big = nil // buf's reference moves to the endpoint
+	if !v.enter() {
+		buf.Release() // the view's Done closed after our DETACH: dropped (M3-D13)
+		return true
+	}
+	v.countRx(n)
 	var err error
 	if dgram {
-		err = c.pep.Datagram(c, off, buf.B[:n], buf)
+		err = v.pep.Datagram(v, off, buf.B[:n], buf)
 	} else {
-		err = c.ep.Data(c, off, buf.B[:n], buf)
+		err = v.ep.Data(v, off, buf.B[:n], buf)
 	}
+	v.exit()
 	if err != nil {
 		c.violation("%v: %v", h.Type, err)
 		return false

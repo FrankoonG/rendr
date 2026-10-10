@@ -9,7 +9,7 @@ import "encoding/binary"
 type Preface struct {
 	Minor     uint8
 	Kind      CarrierKind
-	Req, Opt  uint32   // required / optional feature bits; M1 sends 0/0
+	Req, Opt  uint32   // required feature bits (none known: KnownRequired) / optional ones (OptMux, M3-D3)
 	Instance  [16]byte // the dialer Runtime's InstanceID; all-zero is invalid
 	CarrierID uint32   // assigned by the dialer, unique while in use in its Runtime; 0 is invalid
 }
@@ -21,7 +21,7 @@ type Preface struct {
 type PrefaceAck struct {
 	Minor     uint8
 	Status    PrefaceStatus
-	Req, Opt  uint32
+	Req, Opt  uint32   // Opt of an OK answer: EchoOpt of the PREFACE's (MuxNegotiated checks it)
 	Instance  [16]byte // the passive Runtime's InstanceID; all-zero is invalid
 	CarrierID uint32   // echo of the PREFACE carrierID
 }
@@ -160,4 +160,25 @@ func checkPreface(b []byte, role Role) error {
 		return ErrMalformed
 	}
 	return nil
+}
+
+// EchoOpt returns the opt field of the PREFACE_ACK(OK) that answers a
+// PREFACE whose opt field is offered: the optional bits this build
+// implements that the PREFACE announced (KnownOptional). A passive that
+// implements mux therefore echoes OptMux iff the PREFACE carried it
+// (M3-D3) and never echoes a bit it does not know. A passive that does not
+// want a feature on a carrier clears its bit from the result.
+func EchoOpt(offered uint32) uint32 { return offered & KnownOptional }
+
+// MuxNegotiated reports whether a carrier is a MUX trunk from the opt field
+// the dialer sent in its PREFACE and the opt field of the PREFACE_ACK(OK)
+// it received: true iff both carry OptMux (M3-D3). A PREFACE_ACK carrying
+// OptMux for a PREFACE without it is ErrMalformed — a carrier error of the
+// attempt, never ErrVersion (M3 design §A3.1). Every other optional bit is
+// ignored in both fields.
+func MuxNegotiated(sent, answered uint32) (bool, error) {
+	if answered&OptMux != 0 && sent&OptMux == 0 {
+		return false, ErrMalformed
+	}
+	return sent&answered&OptMux != 0, nil
 }

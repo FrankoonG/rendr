@@ -73,6 +73,16 @@ import (
 // one sending lane, and its successor's replay from the acknowledged front,
 // never get ahead of rTail.
 
+// conflictErr is the violation of a copy that differs from held bytes:
+// errRaceMismatch in a race session, whose members carry every byte
+// (M3-D31), else errConflict (L13). Either kills the delivering carrier.
+func (s *Session) conflictErr() error {
+	if s.p.Mode == ModeRace {
+		return errRaceMismatch
+	}
+	return errConflict
+}
+
 // recvLimit is the cap on the receive charge that out-of-order data may
 // fill: 2·W (V3).
 func (s *Session) recvLimit() int64 {
@@ -120,28 +130,35 @@ func (s *Session) dataLocked(off uint64, p []byte, buf *carrier.Buf) error {
 		return errDataBeyondFin
 	}
 	if off < st.rTail {
+		// Bytes the application already read are dropped uncompared (no
+		// history is kept, PA-35); held ones are compared.
 		if a, b := max(off, st.rRead), min(end, st.rTail); a < b && !st.inq.equal(a, p[a-off:b-off]) {
 			buf.Release()
-			return errConflict
+			return s.conflictErr()
 		}
 		if end <= st.rTail {
 			// A duplicate of received bytes: the sender may have missed an
-			// ACK; answer at once.
+			// ACK; answer at once — except in race, whose members deliver
+			// every byte twice (M3-D31).
 			buf.Release()
-			s.bumpNowLocked()
+			s.raceDupLocked(end-off, true)
 			return nil
 		}
 	}
 	if !st.ooq.equal(off, p) {
 		buf.Release()
-		return errConflict
+		return s.conflictErr()
 	}
 
 	// Place the bytes of [max(off, rTail), end) no segment holds yet.
 	tail := st.rTail
 	c := rcall{left: copyBudget}
-	h := st.heldIn(max(off, st.rTail), end)
+	start := max(off, st.rTail)
+	h := st.heldIn(start, end)
 	n := h.newBytes()
+	if dup := (start - off) + (end - start - n); dup > 0 {
+		s.raceDupLocked(dup, false) // the frame's bytes already held (M3-D35)
+	}
 	if buf != nil && n > 0 && (n > copyBudget || h.byRef(int64(cap(buf.B)))) {
 		s.keepRefLocked(off, p, buf, &h, n, &c)
 	} else {

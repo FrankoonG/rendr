@@ -147,6 +147,7 @@ func TestManySlotsDieTogether_L20(t *testing.T) {
 		const slots = 64
 		e := newEnv(t, rendr.Config{}, rendr.Config{}, nil)
 		a := e.path("a", time.Millisecond)
+		a.cheap = true // 64 slots, each with a carrier of its own (M3-D2)
 		peer := e.peer(a)
 		dcs, pcs := make([]*rendr.Conn, slots), make([]*rendr.Conn, slots)
 		for i := range slots {

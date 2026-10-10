@@ -35,7 +35,9 @@ func (p *Peer) Dial(ctx context.Context, o DialOptions) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newConn(p.rt, s), nil
+	c := newConn(p.rt, s)
+	c.props = &p.props // CarrierStatus.FateGroup
+	return c, nil
 }
 
 // dial is Peer.Dial (packet false) and Peer.DialPacket (packet true): the
@@ -53,7 +55,7 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 	case !packet && p.streams == 0:
 		// M2-D46: a stream session never dials a datagram factory.
 		return nil, fmt.Errorf("rendr: Dial: no stream carrier factory: %w", ErrNoPath)
-	case o.Mode > ModeBond:
+	case o.Mode > ModeRace:
 		return nil, fmt.Errorf("rendr: %s: unknown %v: %w", name, o.Mode, ErrProtocol)
 	case len(o.Metadata) > m:
 		return nil, fmt.Errorf("rendr: %s: %d bytes of metadata, limit %d: %w", name, len(o.Metadata), m, ErrMetadataTooLarge)
@@ -135,7 +137,24 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bo
 	ec := &entryCtx{Context: dctx}
 	spec := p.spec(sid, o, packet)
 	if packet {
-		spec.Factories = wrapDatagram(spec.Factories, reg.fit, offerFromBudgets(spec.Factories, spec.Params.Mode == session.ModeBond))
+		fromBudgets := offerFromBudgets(spec.Factories, everyMemberCarries(spec.Params.Mode))
+		if spec.Pool != nil {
+			// The pool dials with the Peer's own factories (poolFactories),
+			// which read this Dial's hints from each attempt's context.
+			if reg.fit != nil || fromBudgets {
+				hint := &dialHint{fit: reg.fit, fromBudgets: fromBudgets}
+				spec.AttemptContext = func(ctx context.Context) context.Context {
+					if fromBudgets {
+						// A fast path calls no factory: the view's OPEN reads
+						// the intent from the context (W4 L3-1).
+						ctx = carrier.WithBudgetOffer(ctx)
+					}
+					return context.WithValue(ctx, dialHintKey{}, hint)
+				}
+			}
+		} else {
+			spec.Factories = wrapDatagram(spec.Factories, reg.fit, fromBudgets)
+		}
 	}
 	s, err = session.Dial(ec, &env, spec)
 	// session.Dial's documented contract: it creates no session (and makes
@@ -156,12 +175,12 @@ func (p *Peer) spec(sid SessionID, o DialOptions, packet bool) session.DialSpec 
 	params := p.rt.eff.dialerParams(o.Mode, o.NoPathGrace)
 	eligible := p.streams
 	if packet {
-		params = p.rt.eff.packetParams(params, packetOffer(p.factories, params.Mode == session.ModeBond, p.rt.eff.cfg.Packet.MaxPayload))
+		params = p.rt.eff.packetParams(params, packetOffer(p.factories, everyMemberCarries(params.Mode), p.rt.eff.cfg.Packet.MaxPayload))
 		eligible = 0 // every factory
 	} else if eligible == allFactories(len(p.factories)) {
 		eligible = 0 // every factory, as for every M1 session
 	}
-	return session.DialSpec{
+	spec := session.DialSpec{
 		SID:        sid,
 		Params:     params,
 		Factories:  p.factories,
@@ -170,7 +189,54 @@ func (p *Peer) spec(sid SessionID, o DialOptions, packet bool) session.DialSpec 
 		GoneAway:   p.goneAway,
 		NoteGoAway: p.noteGoAway,
 		Eligible:   eligible,
+		Pool:       p.pool, // nil when no factory shares its carriers (M3-D16)
 	}
+	p.props.dialProps(&spec) // fate groups and HoLCoupled (M3-D36)
+	return spec
+}
+
+// dialHint is one packet Dial's per-attempt factory behaviour that
+// wrapDatagram installs on a copy of the factories when the session dials
+// itself (M2's path): the budget-offer mark and the openFit record (W4
+// L3-1). With rendr mux the Peer's pool dials with the Peer's own
+// factories, so the hint travels in the attempt's context instead
+// (session.DialSpec.AttemptContext) and poolFactories applies it.
+type dialHint struct {
+	fit         *openFit
+	fromBudgets bool
+}
+
+// dialHintKey is the context key of a dialHint.
+type dialHintKey struct{}
+
+// poolFactories returns the factory snapshot of a Peer's pool: fs with each
+// datagram factory's DialPacket wrapped so that it applies the dialHint of
+// the attempt's context, if any, exactly as wrapDatagram's wrapper does.
+// Without a hint (stream sessions, probe carriers never come here) the
+// wrapper only calls the factory.
+func poolFactories(fs []carrier.Factory) []carrier.Factory {
+	out := make([]carrier.Factory, len(fs))
+	copy(out, fs)
+	for i := range out {
+		dial, mtu := out[i].DialPacket, out[i].MTU
+		if out[i].Kind != wire.KindDatagram || dial == nil {
+			continue
+		}
+		out[i].DialPacket = func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+			h, _ := ctx.Value(dialHintKey{}).(*dialHint)
+			if h != nil && h.fromBudgets {
+				carrier.MarkBudgetOffer(ctx)
+			}
+			pc, a, err := dial(ctx)
+			if h != nil && h.fit != nil && i < len(h.fit.budget) {
+				if o, ok := pc.(*carrier.OwnedUDP); ok && o != nil && err == nil {
+					h.fit.budget[i].Store(int32(min(o.Limit(), mtu)))
+				}
+			}
+			return pc, a, err
+		}
+	}
+	return out
 }
 
 // allFactories is the DialSpec.Eligible mask of n factories.
@@ -262,6 +328,13 @@ func (f *openFit) tooSmall(meta int) bool {
 	return len(f.budget) > 0
 }
 
+// everyMemberCarries reports whether every member of a session in mode m
+// carries data — bond and race (M3-D32) — so that its packet MaxPayload
+// offer follows the bond rule of offerFromBudgets. Peer.spec (the offer)
+// and Peer.open (whether a datagram attempt lowers the OPEN's pmtu to its
+// carrier's budget) both take it from here, so the two cannot disagree.
+func everyMemberCarries(m session.Mode) bool { return m != session.ModeSelector }
+
 // packetOffer is a packet session's MaxPayload offer (M2-D49, M2 design
 // §A5.4): the smallest datagram payload budget (MTU − 25) over the Peer's
 // datagram factories when the offer comes from them (offerFromBudgets);
@@ -281,8 +354,9 @@ func packetOffer(fs []carrier.Factory, bond bool, maxPayload int) int {
 
 // offerFromBudgets reports whether a packet session's MaxPayload offer
 // comes from the datagram factories' budgets (M2-D49): a selector session
-// on a Peer with a datagram factory, or a bond session without a stream
-// factory to carry larger datagrams.
+// on a Peer with a datagram factory, or a bond or race session (bond true:
+// every member carries data) without a stream factory to carry larger
+// datagrams.
 func offerFromBudgets(fs []carrier.Factory, bond bool) bool {
 	hasDgram, hasStream := false, false
 	for i := range fs {

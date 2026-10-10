@@ -298,7 +298,9 @@ func TestEpochAndPingIDWrap_L14(t *testing.T) {
 // health layer make (Add/Summary/Classify/NextChange/Evaluate/Rank, also
 // with kind classes: M2-D47, M2-D48) and the REL timer arithmetic of a
 // datagram carrier's writer and reader (RTTVar, RTO, RTOBackoff: M2-D16)
-// allocate nothing in steady state (asserted in the non-race lane only).
+// and the fate-group orders of failover and membership (GroupFirst,
+// OnePerGroup: M3-D37, M3-D38; also in place) allocate nothing in steady
+// state (asserted in the non-race lane only).
 func TestPureCallsDoNotAllocate(t *testing.T) {
 	a := NewAggregator(DefaultAggParams())
 	at := simEpoch
@@ -312,6 +314,10 @@ func TestPureCallsDoNotAllocate(t *testing.T) {
 	cs := make([]Candidate, 3)
 	out := make([]int, 0, 16)
 	failed := []bool{false, false, false}
+	groups := [3]uint8{1, 1, 0}
+	group := func(i int) uint8 { return groups[i] }
+	fo := make([]int, 0, 16)
+	members := make([]int, 0, 16)
 	var srtt, rttvar, rto time.Duration
 	k := 0
 	n := testing.AllocsPerRun(200, func() {
@@ -329,6 +335,10 @@ func TestPureCallsDoNotAllocate(t *testing.T) {
 			cs[i] = Candidate{Index: i, Ev: Classify(sums[i], at, defFresh), Class: classes[i]}
 		}
 		out = Rank(cs, out)
+		fo = GroupFirst(out, group, 1, fo)
+		members = OnePerGroup(out, group, 16, members)
+		_ = GroupFirst(fo, group, 1, fo[:0])
+		_ = OnePerGroup(members, group, 2, members[:0])
 		// One PONG and one REL timer arming.
 		rtt := 30*ms + time.Duration(k%7)*ms
 		rttvar = RTTVar(rttvar, srtt, rtt, k == 0)
@@ -343,7 +353,7 @@ func TestPureCallsDoNotAllocate(t *testing.T) {
 	if n != 0 && !raceEnabled {
 		t.Fatalf("steady-state calls allocate %v times per run", n)
 	}
-	if k < 200 || rto < RTOMin || rto > RTOMax || out[0] != 2 {
-		t.Fatalf("runs %d, last RTO %v, ranking %v", k, rto, out)
+	if k < 200 || rto < RTOMin || rto > RTOMax || out[0] != 2 || fo[0] != 2 || len(members) != 2 {
+		t.Fatalf("runs %d, last RTO %v, ranking %v, failover %v, members %v", k, rto, out, fo, members)
 	}
 }

@@ -261,7 +261,7 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 	if dc == nil {
 		t.FailNow()
 	}
-	if r.mode == rendr.ModeBond {
+	if r.mode != rendr.ModeSelector { // bond and race: both members
 		deadline := time.Now().Add(5 * time.Second)
 		for len(liveCarriers(dc)) < 2 && time.Now().Before(deadline) {
 			time.Sleep(10 * time.Millisecond)
@@ -385,8 +385,24 @@ func runSmoke(t *testing.T, n *smokeNet, r smokeRun, cfg rendr.Config) {
 		if got := x.s.read.Load() + rp.DropRecvQueue; rp.Received != got {
 			t.Errorf("%s: Received %d ≠ read %d + DropRecvQueue %d", x.name, rp.Received, x.s.read.Load(), rp.DropRecvQueue)
 		}
-		if rp.Received > tp.Sent || rp.Duplicates != 0 {
+		if rp.Received > tp.Sent || (rp.Duplicates != 0) != (r.mode == rendr.ModeRace) {
 			t.Errorf("%s: Received %d of Sent %d, Duplicates %d", x.name, rp.Received, tp.Sent, rp.Duplicates)
+		}
+		if r.mode == rendr.ModeRace {
+			// Race (M3-D32, M3-D35): every member carries every datagram,
+			// so a member's death loses (almost) nothing; the receiver
+			// counts the other members' copies as Duplicates (G3-race's
+			// ≥ 0.9 × Received), the sender its extra placements as
+			// Race.Copies.
+			if lost*100 > x.sentSeqs {
+				t.Errorf("%s: race lost %d of %d datagrams, want ≤ 1 %%", x.name, lost, x.sentSeqs)
+			}
+			if x.tx.Race.Copies == 0 || rp.Duplicates*10 < rp.Received*9 {
+				t.Errorf("%s: race copies %d, receiver Duplicates %d of Received %d, want copies and Duplicates ≥ 0.9 × Received",
+					x.name, x.tx.Race.Copies, rp.Duplicates, rp.Received)
+			}
+			t.Logf("%s: race copies %d, receiver duplicates %d (%.3f of Received)", x.name, x.tx.Race.Copies, rp.Duplicates,
+				float64(rp.Duplicates)/float64(max(rp.Received, 1)))
 		}
 		t.Logf("%s: accepted %d, unique %d, lost %d (%.3f%%), missing ranges %d, latest loss %v after its kill, max gap %v; tx %+v; rx %+v",
 			x.name, x.sentSeqs, res.Unique, lost, 100*float64(lost)/float64(max(x.sentSeqs, 1)), len(res.Missing), late, res.MaxGap, *tp, *rp)
@@ -451,11 +467,15 @@ func waitDone(t *testing.T, done <-chan struct{}, what string) {
 }
 
 // TestPacketSmoke_CA is the in-memory half: DatagramLink and DatagramHub,
-// selector and bond, 60 virtual seconds each.
+// selector and bond, 60 virtual seconds each (30 under -race).
 func TestPacketSmoke_CA(t *testing.T) {
-	rate := 10000
+	rate, duration := 10000, 60*time.Second
 	if loopbackRace {
-		rate = 1000
+		// R1-23's first lever (R2-37), as TestPacketRaceSmoke_CR: the race
+		// lane runs 30 virtual seconds (two kills) at 1,000 datagrams per
+		// second, with the same criteria (the root package's Linux race
+		// time reached the 270-s lever line at I2).
+		rate, duration = 1000, 30*time.Second
 	}
 	for _, tr := range []struct {
 		name string
@@ -466,7 +486,7 @@ func TestPacketSmoke_CA(t *testing.T) {
 				synctest.Test(t, func(t *testing.T) {
 					n := tr.net()
 					defer n.close()
-					runSmoke(t, n, smokeRun{mode: mode, duration: 60 * time.Second, every: 10 * time.Second,
+					runSmoke(t, n, smokeRun{mode: mode, duration: duration, every: 10 * time.Second,
 						rate: rate, back: 1000, lossWin: 200 * time.Millisecond}, rendr.Config{})
 				})
 			})

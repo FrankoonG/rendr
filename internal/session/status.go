@@ -116,7 +116,11 @@ func (s *Session) initialSnapLocked() {
 // refused by the transport as too large — count in DropTooLarge and not in
 // Sent, so the send-side identity holds over public fields (R1-31). Its
 // byte counters count datagram payload bytes; AckedBytes, Window and
-// PeerWindow are 0.
+// PeerWindow are 0. The session counters count unique bytes and datagrams
+// in every mode; a race session's extra copies are in Race (sender) and
+// DupBytes or PacketCounters.Duplicates (receiver), and its carriers' rows
+// count every physical copy (M3-D35, L35). No figure is derived from a
+// race's members (no aggregate rate or latency: Unknown, PA-36).
 func (s *Session) status() Status {
 	sn := s.snap.Load()
 	out := Status{ID: s.id, Mode: s.p.Mode, Role: s.p.Role, PeerInstance: s.peer, Kind: s.Kind()}
@@ -139,6 +143,15 @@ func (s *Session) status() Status {
 	out.RxBytes = st.rxBytes
 	out.DeliveredBytes = st.delivered
 	out.RetransmittedBytes = st.retxBytes
+	out.DupBytes = st.dupBytes
+	if s.p.Mode == ModeRace {
+		// The sender's extra copies (M3-D35): never counted as
+		// retransmissions or in the unique counters above.
+		out.Race.CopyBytes = st.copyBytes
+		if s.pk != nil {
+			out.Race.Copies = s.pk.copies
+		}
+	}
 	out.Window = st.lastWin
 	out.PeerWindow = int64(st.peerLimit - st.sBase)
 	if s.pk != nil {
@@ -168,9 +181,28 @@ func (s *Session) status() Status {
 		for i := range out.Carriers {
 			refused += out.Carriers[i].Stats.Refused
 		}
+		if s.p.Mode == ModeRace {
+			out.Race.Copies, refused = raceRefused(out.Race.Copies, refused)
+		}
 		out.Packet = pktReport(ctr, refused)
 	}
 	return out
+}
+
+// raceRefused attributes a race packet session's refused DGRAMs (M3-D35):
+// its carriers' Refused counts every refused placement, copies included,
+// and no carrier reports which datagram it refused. A refusal is charged
+// to the copies first — the datagram's other placement may have gone out —
+// and only the refusals beyond every copy to Sent (pktReport moves them to
+// DropTooLarge). With P = Sent + Copies placements and r of them refused,
+// at least r − Copies datagrams had every placement refused, so
+// DropTooLarge stays a lower bound of the datagrams no transport took,
+// Copies the copies that went out (at most), and Sent + DropTooLarge
+// keeps the send-side identity (R1-31). It returns the copies to report
+// and the refusals left for Sent.
+func raceRefused(copies, refused uint64) (uint64, uint64) {
+	k := min(copies, refused)
+	return copies - k, refused - k
 }
 
 // pktReport is the reported PacketCounters (R1-31): Sent = placed −

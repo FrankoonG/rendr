@@ -37,6 +37,10 @@ type Factory struct {
 	// transport's own Headroom and not counted. A carrier's cmtu offer is
 	// min(MTU, its transport's Limit) (M2-D50).
 	MTU int
+	// Mux: the factory is mux-eligible (M3-D2: !Props.CheapSubflow). Its
+	// session carriers set wire.OptMux and go through the Peer's Pool.
+	// False: every session dials its own carriers of it (M2).
+	Mux bool
 }
 
 // Established is a dialer carrier whose handshake completed: PREFACE_ACK(OK)
@@ -46,6 +50,10 @@ type Established struct {
 	Ack     wire.PrefaceAck // Status == PrefaceOK
 	Resp    wire.Header     // the passive's first frame: OPEN_ACK, JOIN_ACK, PONG, CLOSE or GOAWAY
 	Payload []byte          // a copy of the response payload (≤ 300 bytes)
+	// Fresh: Conn is view 1 of a new MUX trunk that the Pool publishes when
+	// the session starts it (M3-D19); false for a dedicated carrier and for
+	// a view opened on a live trunk.
+	Fresh bool
 }
 
 // EstablishError describes a failed attempt. It wraps the underlying error.
@@ -195,8 +203,9 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	_, _ = rand.Read(sb[:])
 	salt := binary.LittleEndian.Uint64(sb[:])
 
+	opt := prefaceOpt(f, t)
 	hello := make([]byte, wire.PrefaceLen, wire.PrefaceLen+wire.FrameOverhead+max(len(payload), wire.PingFixedLen))
-	wire.PutPreface(hello, &wire.Preface{Minor: wire.Minor, Kind: wire.KindStream, Instance: env.Local, CarrierID: id})
+	wire.PutPreface(hello, &wire.Preface{Minor: wire.Minor, Kind: wire.KindStream, Instance: env.Local, CarrierID: id, Opt: opt})
 	first := env.Presets.fseqFrom(hello)
 	switch t {
 	case wire.TypeOpen, wire.TypeJoin:
@@ -359,6 +368,9 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 		g.join()
 		return fail(e)
 	}
+	if err := ackOptErr(opt, &ack); err != nil {
+		return failed("preface", CauseProtocolViolation, false, [16]byte{}, err, false)
+	}
 	// PREFACE_ACK(OK): the passive reads the first frame next (P18). It is
 	// written completely before check, and before anything follows it on
 	// the wire (an RST) or is read after it (the response).
@@ -405,18 +417,52 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 
 	c := newConn(env, nc, id, ack.Instance, f.Index, f.Name, true)
 	c.salt = salt
+	c.mux = muxed(opt, &ack)
 	c.wr.fseq, c.rd.fseq = first+1, rfirst+1
 	if t == wire.TypePing {
 		c.st.nextPingID = pingID + 1
 	}
 	returned = true
-	return &Established{Conn: c, Ack: ack, Resp: h, Payload: p}, nil
+	return &Established{Conn: c, Ack: ack, Resp: h, Payload: p, Fresh: c.mux}, nil
+}
+
+// prefaceOpt returns the optional feature bits of the dialer's PREFACE for
+// a first frame of type t on factory f (M3-D3, M3-D41): wire.OptMux on a
+// session carrier (OPEN or JOIN) of a mux-eligible factory, never on a
+// probe carrier (PING).
+func prefaceOpt(f Factory, t wire.Type) uint32 {
+	if f.Mux && (t == wire.TypeOpen || t == wire.TypeJoin) {
+		return wire.OptMux
+	}
+	return 0
+}
+
+// ackOptErr checks the optional bits of a PREFACE_ACK(OK) against the
+// PREFACE's opt (§A3.1): the passive echoes wire.OptMux only when the
+// PREFACE carried it, so an OptMux the dialer did not offer is a carrier
+// error (never a version error: it fails the attempt as a protocol
+// violation). Other optional bits are ignored.
+func ackOptErr(opt uint32, ack *wire.PrefaceAck) error {
+	if ack.Opt&wire.OptMux != 0 && opt&wire.OptMux == 0 {
+		return errors.New("PREFACE_ACK echoes OptMux for a PREFACE without it")
+	}
+	return nil
+}
+
+// muxed reports whether a carrier is a MUX trunk (M3-D3): both its PREFACE
+// (opt) and its PREFACE_ACK carried wire.OptMux.
+func muxed(opt uint32, ack *wire.PrefaceAck) bool {
+	return opt&ack.Opt&wire.OptMux != 0
 }
 
 // responseAllowed reports whether h may answer a first frame of type t,
 // and bounds its length: OPEN_ACK answers OPEN, JOIN_ACK answers JOIN, a
-// PONG without pad answers PING; CLOSE and GOAWAY may answer any.
+// PONG without pad answers PING; CLOSE and GOAWAY may answer any. A
+// session response carries handle 1.
 func responseAllowed(t wire.Type, h wire.Header) bool {
+	if !dedicatedOK(h.Type, h.Handle) {
+		return false // a handshake answers view 1 (§A3.2)
+	}
 	switch h.Type {
 	case wire.TypeClose, wire.TypeGoAway:
 		return true

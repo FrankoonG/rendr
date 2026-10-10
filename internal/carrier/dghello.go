@@ -178,7 +178,7 @@ func (c *Conn) dgVerdict(rp []byte, cs uint32, end time.Time) {
 func verdictRacked(d []byte, w *wire.FseqWindow, cs uint32) bool {
 	for len(d) > 0 {
 		f, n, err := wire.DecodeFrame(d)
-		if err != nil {
+		if err != nil || !dedicatedOK(f.Type, f.Handle) {
 			return false
 		}
 		d = d[n:]
@@ -290,7 +290,7 @@ func parseH1(env *Env, d []byte, maxMeta int) (h helloH1, ok bool, perr error) {
 	switch f.Type {
 	case wire.TypeRel:
 		rh, inner, err := wire.ParseRel(f.Payload)
-		if err != nil || rh.Cseq != env.Presets.firstCseq() || (rh.Type != wire.TypeOpen && rh.Type != wire.TypeJoin) {
+		if err != nil || rh.Cseq != env.Presets.firstCseq() || (rh.Type != wire.TypeOpen && rh.Type != wire.TypeJoin) || rh.Handle != wire.SessionHandle {
 			return h, false, nil
 		}
 		h.first = wire.Header{Type: rh.Type, Flags: rh.Flags, Len: uint32(len(inner)), Fseq: f.Fseq, Handle: rh.Handle}
@@ -388,7 +388,7 @@ func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 		check = newNonce()
 	}
 	var ab [wire.PrefaceLen]byte
-	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Instance: env.Local, CarrierID: h.pf.CarrierID})
+	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Opt: echoOpt(&h.pf), Instance: env.Local, CarrierID: h.pf.CarrierID})
 	afirst := env.Presets.fseqFrom(ab[:])
 	h2 := append(make([]byte, 0, wire.PrefaceLen+2*wire.FrameOverhead+wire.RackLen+wire.PingFixedLen), ab[:]...)
 	fcs := env.Presets.firstCseq()
@@ -409,6 +409,7 @@ func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 		}
 	}
 	c := newDatagramConn(env, io, h.pf.CarrierID, h.pf.Instance, -1, "", false)
+	c.mux = passiveMux(&h.pf, h.first.Type)
 	dg := c.dg
 	dg.hs.pre = bytes.Clone(d[:wire.PrefaceLen])
 	dg.hs.h2b = h2

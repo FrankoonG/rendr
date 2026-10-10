@@ -13,6 +13,7 @@ package testhooks
 
 import (
 	"errors"
+	"sync/atomic"
 	"time"
 )
 
@@ -64,6 +65,16 @@ type Overrides struct {
 	// Counter presets (L14), equal in both Runtimes of a test.
 	FirstSeq  uint64 // first packet seq of every session direction (0)
 	FirstCseq uint32 // first REL cseq of every datagram carrier direction (1)
+
+	// M3: rendr mux and the parked actor (M3 design §A10.4). Zero keeps the
+	// default.
+	MuxMaxViews         int           // views per stream MUX trunk (256)
+	MuxMaxViewsDatagram int           // views per datagram MUX trunk (64)
+	MuxQuantum          int           // DRR quantum in payload bytes (64 KiB)
+	MuxRefusalRing      int           // queued refusal answers per trunk (the kind's MuxMaxViews)
+	ActorLinger         time.Duration // an idle session actor parks after this long without work (1 s)
+	// Counter preset (L14), equal in both Runtimes of a test.
+	FirstHandle uint32 // first handle a dialer allocates on a MUX trunk (1)
 
 	// Rand replaces the U[0,1) jitter source (redial backoff, salts are not
 	// affected). Nil keeps math/rand/v2.
@@ -119,7 +130,59 @@ type Hooks struct {
 	// and twice for a confirmed one: at Opened, which frees the slot, and at
 	// Ended, when no slot is left.
 	LeavePending func(session [16]byte)
+
+	// M3 (m3-design §A10.4).
+
+	// BeforeOpenView runs in a dial attempt after it allocated handle on
+	// the MUX trunk carrier, before the view's first frame is queued
+	// (E1, E3).
+	BeforeOpenView func(carrier, handle uint32)
+	// AfterDetach runs after a DETACH for handle was placed (sent) or
+	// dispatched (!sent) on carrier.
+	AfterDetach func(carrier, handle uint32, sent bool)
+	// BeforeAdmit runs on a passive MUX trunk's reader before Env.Admit is
+	// called for handle.
+	BeforeAdmit func(carrier, handle uint32)
+	// AtPark runs on a session actor's goroutine right before it tries to
+	// park (L09).
+	AtPark func(session [16]byte)
+	// AfterViewFill runs in a MUX trunk's writer after a DRR Fill call of
+	// handle returned and before the writer's ready-set decision (R1-1).
+	AfterViewFill func(carrier, handle uint32)
+	// PingTS rewrites the TS a carrier's writer puts into each PING it
+	// encodes (ts: nanoseconds of the carrier's monotonic clock since its
+	// start), so that a test can run one side's clock slow, fast or
+	// stepped against the other's (M3 estimator: the reverse-queue floor).
+	// It runs under the carrier's lock: it must not block or call into
+	// rendr.
+	PingTS func(carrier uint32, ts uint64) uint64
+	// ClosePools runs in Runtime.Close right after its first snapshot of
+	// the Runtime's pools (step 1), with no lock held: a closed Peer's
+	// pool that registers again after it (a surviving session's redial
+	// through carrier.Env.PoolLive) is joined by Close's second check
+	// (KL-25).
+	ClosePools func()
+	// AfterReap runs on a session actor's goroutine in each step right
+	// after its death steps (reapDead) and before the step takes the
+	// session lock again for its actions, with no lock held (KL-26: a
+	// carrier death landing between the two).
+	AfterReap func(session [16]byte)
+	// BeforeAttachStart runs on a session actor's goroutine with the
+	// session lock held, in the attach of a dial attempt's carrier right
+	// before that carrier is started (after the attach checked that it is
+	// alive): a test can end the carrier there (R2-12: a view the trunk's
+	// death catches attached-pending, started after the death). It must
+	// not call into that session.
+	BeforeAttachStart func(session [16]byte, carrier uint32)
 }
+
+// Session registry gauges (M3 design Revision 1, R1-24): always compiled,
+// two atomic adds per session lifetime and per park, so that leak checks
+// see a session that holds no goroutine. LiveSessions counts sessions
+// whose actor started (Start) and has not exited; a pending session
+// discarded unstarted is never counted. ParkedSessions counts the live
+// sessions whose actor is parked.
+var LiveSessions, ParkedSessions atomic.Int64
 
 // ErrNotInstalled is returned by NewRuntime when package rendr is not linked
 // into the test binary.

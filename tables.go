@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"hash/maphash"
 	"math"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -125,7 +126,15 @@ type sessionTable[S comparable] struct {
 	maxUnits int64
 	units    atomic.Int64                // MaxSessions units in use
 	cnt      [numCategories]atomic.Int64 // live sessions per category (catNone unused)
-	tombs    tombIndex[S]
+	// moving counts category moves in progress and moves the finished
+	// ones: counts reads the categories as one snapshot (their sum is the
+	// number of live sessions), retrying a read that a move overlapped.
+	moving atomic.Int64
+	moves  atomic.Uint64
+	tombs  tombIndex[S]
+	// countsRead, when set (tests), runs inside counts between the read
+	// of Open and the other categories.
+	countsRead func()
 }
 
 // newSessionTable returns an empty table for maxSessions (≥ 1) sessions; it
@@ -270,12 +279,15 @@ func (t *sessionTable[S]) move(old, cur sessionCategory) {
 	if old == cur {
 		return
 	}
+	t.moving.Add(1)
 	if old != catNone {
 		t.cnt[old].Add(-1)
 	}
 	if cur != catNone {
 		t.cnt[cur].Add(1)
 	}
+	t.moves.Add(1)
+	t.moving.Add(-1)
 }
 
 // opened records that passive session s left StatePending (Registry.Opened).
@@ -326,17 +338,36 @@ func (t *sessionTable[S]) ended(k tableKey, s S, v session.Verdict, now time.Tim
 	return true
 }
 
+// countsTries bounds counts' retries: under a continuous stream of moves
+// Status still returns (Status never blocks), with the last read.
+const countsTries = 64
+
 // counts returns the session counts of Status.Sessions; expired tombstones
-// are pruned first, so Tombstones counts exactly the unexpired ones.
+// are pruned first, so Tombstones counts exactly the unexpired ones. The
+// four categories are one snapshot: a read that a category move overlapped
+// (a move in progress, or one that finished during the read) is retried,
+// so a session that moves between categories meanwhile is counted exactly
+// once (their sum is the number of live sessions, SessionCounts).
 func (t *sessionTable[S]) counts(now time.Time) SessionCounts {
 	t.drop(t.tombs.prune(now))
-	return SessionCounts{
-		Open:       int(t.cnt[catOpen].Load()),
-		Pending:    int(t.cnt[catPending].Load()),
-		Lingering:  int(t.cnt[catLingering].Load()),
-		Orphaned:   int(t.cnt[catOrphaned].Load()),
-		Tombstones: t.tombs.len(),
+	var c SessionCounts
+	for try := 1; ; try++ {
+		v := t.moves.Load()
+		idle := t.moving.Load() == 0
+		c.Open = int(t.cnt[catOpen].Load())
+		if t.countsRead != nil {
+			t.countsRead()
+		}
+		c.Pending = int(t.cnt[catPending].Load())
+		c.Lingering = int(t.cnt[catLingering].Load())
+		c.Orphaned = int(t.cnt[catOrphaned].Load())
+		if (idle && t.moving.Load() == 0 && t.moves.Load() == v) || try == countsTries {
+			break
+		}
+		runtime.Gosched()
 	}
+	c.Tombstones = t.tombs.len()
+	return c
 }
 
 // inUse returns the MaxSessions units in use.

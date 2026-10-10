@@ -18,8 +18,15 @@ import (
 
 // reapDead handles every lane whose carrier ended, one death per critical
 // section. Hooks.DeathObserved runs before each, outside the lock (a test
-// may hold the actor there, L21, L27). It returns now, refreshed after a
-// hook held the actor (migration timestamps are publication times, L09).
+// may hold the actor there, L21, L27). Each death step reads the clock
+// again after it saw the death and returns that time: the step's clock was
+// read when the step began, and the carrier may have died after that —
+// while the step handled its commands and facts, or while it waited for
+// the session lock — so its EventCarrierDown, the lane's end, the failed
+// mark and the migration it causes are dated at the death step, never
+// before the death record (event and migration times are publication
+// times, L09; DGDOWN: a kill's records selected by time missed a session
+// whose step began before the kill).
 //
 // A GOAWAY the peer sent on the dying carrier is reconciled first, in the
 // same critical section: GOAWAY ends the session whether or not its lane
@@ -46,8 +53,8 @@ func (a *actor) reapDead(now time.Time) time.Time {
 		}
 		if h := s.env.Hooks; h != nil && h.DeathObserved != nil {
 			h.DeathObserved(l.id)
-			now = time.Now()
 		}
+		now = time.Now() // at or after the death record: Death reported it above
 		s.mu.Lock()
 		if l.c.PeerGoAway() {
 			a.peerGoAwayLocked(now)
@@ -107,7 +114,7 @@ func (a *actor) laneDiedLocked(now time.Time, l *lane) {
 	wasData := l.data
 	l.state = LaneDead
 	l.data = false
-	requeued := s.laneGoneLocked(l) // spans to retx, FIN re-armed, ACK duty moved, survivors woken
+	requeued := s.laneGoneLocked(l) // spans to retx (race: while no data lane lives), FIN re-armed, ACK duty moved, survivors woken
 	if wasActive {
 		ctl.active = nil
 	}
@@ -123,7 +130,7 @@ func (a *actor) laneDiedLocked(now time.Time, l *lane) {
 		a.dialerLaneDiedLocked(now, l, cause, at, wasActive, wasData, requeued)
 	} else {
 		a.passiveRouteLocked(now) // local fallback (D24): routing only
-		if s.p.Mode == ModeBond && wasData {
+		if s.p.Mode.members() && wasData {
 			a.bondDeathCountLocked(now, l.id, cause, requeued)
 		}
 	}
@@ -137,8 +144,9 @@ func (a *actor) laneDiedLocked(now time.Time, l *lane) {
 // dialerLaneDiedLocked is the dialer part of a death step: the failed mark,
 // dated by the carrier's death time diedAt (zero: now) rather than by this
 // step, and the immediate redial of the factory for a death cause (not
-// gated by the mark, plan §3.2), then the bond shrink or the selector
-// fallback.
+// gated by the mark, plan §3.2), then the bond or race shrink or the
+// selector fallback, whose race tries the factories outside the dead
+// carrier's fate group first (M3-D38).
 func (a *actor) dialerLaneDiedLocked(now time.Time, l *lane, cause carrier.Cause, diedAt time.Time, wasActive, wasData bool, requeued uint64) {
 	d := a.d
 	if cause.Death() && l.factory >= 0 && l.factory < len(d.slots) {
@@ -148,7 +156,7 @@ func (a *actor) dialerLaneDiedLocked(now time.Time, l *lane, cause carrier.Cause
 		a.markFailed(l.factory, cause.String(), diedAt)
 		d.slots[l.factory].cad.Kick()
 	}
-	if a.s.p.Mode == ModeBond {
+	if a.s.p.Mode.members() {
 		if wasData {
 			a.publishSchedLocked(now, wire.SchedDeath) // the shrunk member set, if a member is left
 			a.bondDeathCountLocked(now, l.id, cause, requeued)
@@ -156,7 +164,11 @@ func (a *actor) dialerLaneDiedLocked(now time.Time, l *lane, cause carrier.Cause
 		return
 	}
 	if wasActive {
-		a.lostActiveLocked(now, l.id, cause)
+		dead := -1
+		if cause.Death() {
+			dead = l.factory
+		}
+		a.lostActiveLocked(now, l.id, cause, dead)
 	}
 }
 
@@ -165,8 +177,10 @@ func (a *actor) dialerLaneDiedLocked(now time.Time, l *lane, cause carrier.Cause
 // losing the active lane for any reason is a routing loss): the usable lane
 // with the lowest srtt becomes active at once; without one a race over the
 // ranking starts now and its winner is counted when published. A death
-// cause counts death, the others explicit (§7.6).
-func (a *actor) lostActiveLocked(now time.Time, from uint32, cause carrier.Cause) {
+// cause counts death, the others explicit (§7.6). dead is the factory whose
+// carrier died (−1: not a death): the race then ranks the factories outside
+// its fate group first (startFailoverRaceLocked, M3-D38).
+func (a *actor) lostActiveLocked(now time.Time, from uint32, cause carrier.Cause, dead int) {
 	d := a.d
 	d.switchTo = -1 // a planned switch is moot; its JOIN, if it attaches, may win the race
 	mc := wire.SchedDeath
@@ -182,7 +196,7 @@ func (a *actor) lostActiveLocked(now time.Time, from uint32, cause carrier.Cause
 		return
 	}
 	a.lossSet, a.lossCause, a.lossFrom, a.lossEv = true, mc, from, cause
-	a.startRaceLocked(now)
+	a.startFailoverRaceLocked(now, dead)
 }
 
 // countLocked counts one migration of cause c (death, quality, explicit;
@@ -206,6 +220,13 @@ func (a *actor) countLocked(now time.Time, c wire.SchedCause, from, to uint32, e
 // bondDeathCountLocked counts a bond member's death that requeued this
 // side's unacknowledged DATA (§7.6): now if another member carries data,
 // else at the next attach (deathOwed; dropped if the session ends).
+//
+// A race member's death counts the same way when its in-flight spans were
+// non-empty (M3-D34, PA-32): laneGoneLocked returns them although nothing
+// is requeued while another data lane lives (the others carry copies), so
+// the death counts whether or not another member lives. A packet member's
+// death counts when it placed a DGRAM within the last PacketPing (M2-D44),
+// in race as in bond.
 func (a *actor) bondDeathCountLocked(now time.Time, from uint32, cause carrier.Cause, requeued uint64) {
 	if requeued == 0 {
 		return
@@ -361,12 +382,12 @@ func (a *actor) peerClosedLocked(now time.Time, l *lane) {
 	}
 	if a.d == nil {
 		a.passiveRouteLocked(now)
-	} else if s.p.Mode == ModeBond {
+	} else if s.p.Mode.members() {
 		if wasData {
 			a.publishSchedLocked(now, wire.SchedExplicit)
 		}
 	} else if wasActive {
-		a.lostActiveLocked(now, l.id, carrier.CauseRetired)
+		a.lostActiveLocked(now, l.id, carrier.CauseRetired, -1)
 	}
 	if !a.hasAliveLocked() && !a.readersPendingLocked() {
 		a.episodeStartLocked(now, now)

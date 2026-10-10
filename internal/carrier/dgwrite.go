@@ -51,31 +51,28 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 	retiring, reason := st.retiring, st.reason
 	c.mu.Unlock()
 	if kill {
-		c.Kill(CausePingTimeout, "mtu probe")
+		c.killCarrier(CausePingTimeout, "mtu probe")
 		return false
 	}
 
 	if !closing {
-		epFrames := false
-		if c.ep != nil {
-			n := b.Len()
-			c.ep.Fill(c, b)
-			epFrames = b.Len() > n
-			if w.held && epFrames {
-				// The first response released the hold (R1-8); the first
-				// PING may follow it (the dialer keeps the response
-				// datagram's tail, R1-1).
-				w.held = false
-				dg.held.Store(false)
-				if !retiring {
-					c.mu.Lock()
-					kill = c.dgPingLocked(w, b, now)
-					c.mu.Unlock()
-					if kill {
-						b.ReleaseRefs()
-						c.Kill(CausePingTimeout, "mtu probe")
-						return false
-					}
+		n := b.Len()
+		c.fillRound(b) // the endpoint frames (nothing on a carrier without a session)
+		epFrames := b.Len() > n
+		if w.held && epFrames {
+			// The first response released the hold (R1-8); the first
+			// PING may follow it (the dialer keeps the response
+			// datagram's tail, R1-1).
+			w.held = false
+			dg.held.Store(false)
+			if !retiring {
+				c.mu.Lock()
+				kill = c.dgPingLocked(w, b, now)
+				c.mu.Unlock()
+				if kill {
+					b.ReleaseRefs()
+					c.killCarrier(CausePingTimeout, "mtu probe")
+					return false
 				}
 			}
 		}
@@ -90,7 +87,7 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 			// A reliable frame found no REL room: a RACK with progress wakes
 			// the writer (§A5.9); room freed since SetDatagram wakes it now.
 			if dg.rel.room() > 0 {
-				c.Wake()
+				c.wakeWriter()
 			} else {
 				dg.rel.blocked = true
 			}
@@ -288,7 +285,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	b.ReleaseRefs() // the writes returned: the chunk references go
 	if fatal != nil {
 		if fatal == errBudgetFloor {
-			c.Kill(CauseTransportError, fatal.Error())
+			c.killCarrier(CauseTransportError, fatal.Error())
 			return false
 		}
 		if c.endIfPeerClosed("write ended (" + fatal.Error() + ")") {
@@ -298,7 +295,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		if errors.Is(fatal, os.ErrDeadlineExceeded) {
 			cause = CauseWriteStall
 		}
-		c.Kill(cause, "write: "+fatal.Error())
+		c.killCarrier(cause, "write: "+fatal.Error())
 		return false
 	}
 	if w.close {

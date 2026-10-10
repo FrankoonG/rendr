@@ -126,7 +126,7 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 		return nil, fmt.Errorf("%w: PREFACE_ACK %s", errHelloRefused, prefaceStatusName(status))
 	}
 	var ab [wire.PrefaceLen]byte
-	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Instance: env.Local, CarrierID: p.CarrierID})
+	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Opt: echoOpt(&p), Instance: env.Local, CarrierID: p.CarrierID})
 	if err := writeFull(nc, ab[:]); err != nil {
 		return fail(fmt.Errorf("rendr: handshake: writing PREFACE_ACK: %w", err))
 	}
@@ -142,6 +142,9 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 	}
 	if h.Fseq != first {
 		return fail(fmt.Errorf("%w: fseq %d, want %d", errHelloFirst, h.Fseq, first))
+	}
+	if !dedicatedOK(h.Type, h.Handle) {
+		return fail(fmt.Errorf("%w: %v with handle %d (a carrier's first frame is view 1's)", errHelloFirst, h.Type, h.Handle))
 	}
 	hello := &Hello{Preface: p, First: h}
 	switch h.Type {
@@ -177,6 +180,7 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 		}
 	}
 	c := newConn(env, nc, p.CarrierID, p.Instance, -1, "", false)
+	c.mux = passiveMux(&p, h.Type)
 	c.rd.fseq = first + 1
 	c.wr.fseq = env.Presets.fseqFrom(ab[:]) // ours starts at our PREFACE_ACK's
 	if h.Type == wire.TypePing {
@@ -184,6 +188,21 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 	}
 	hello.Conn = c
 	return hello, nil
+}
+
+// echoOpt returns the optional bits of the passive's PREFACE_ACK(OK) for
+// PREFACE p (§A3.1, M3-D3): wire.OptMux iff p carried it; every other
+// optional bit is ignored and never echoed.
+func echoOpt(p *wire.Preface) uint32 {
+	return p.Opt & wire.OptMux
+}
+
+// passiveMux reports whether an accepted passive carrier is a MUX trunk:
+// its PREFACE carried wire.OptMux, which our PREFACE_ACK echoed, and its
+// first frame is a session's (OPEN or JOIN). A probe carrier (first frame
+// PING) is never one (M3-D41), whatever its PREFACE carried.
+func passiveMux(p *wire.Preface, first wire.Type) bool {
+	return echoOpt(p)&wire.OptMux != 0 && (first == wire.TypeOpen || first == wire.TypeJoin)
 }
 
 // readPayload reads an n-byte payload and its trailer (n is bounded by

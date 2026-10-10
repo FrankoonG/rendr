@@ -46,6 +46,7 @@ func (s *Session) bumpNowLocked() {
 		l.idle = false
 		l.port.Wake()
 	}
+	s.raceWakeAckLocked() // race: every live data lane carries a copy
 }
 
 // gapAckLocked runs after every Data call on lane l that started at offset
@@ -99,6 +100,7 @@ func (s *Session) ackCadenceLocked() {
 			l.idle = false
 			l.port.Wake()
 		}
+		s.raceWakeAckLocked() // race: each copy lane arms its own timer
 	}
 }
 
@@ -160,17 +162,21 @@ func (s *Session) ackDroppedLocked(l *lane) bool {
 // there before the CLOSE); else the first blocked one, preferring one that
 // is not leaving; nil if none qualifies. Writability comes first (§4.6: an
 // ACK never waits behind a blocked carrier while a writable lane
-// qualifies).
+// qualifies). A writable lane of a HoLCoupled fate group in which another
+// lane is write-blocked ranks after every other writable lane (M3-D39,
+// PA-30: it would stall with its sibling) and before the blocked ones.
 func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 	s.refreshOrderLocked(time.Now(), false)
 	var best *lane
-	bestRank := 4
+	bestRank := 6
 	for _, l := range s.st.order {
 		if l == skip || !s.ackQualifiesLocked(l) {
 			continue
 		}
 		rank := 0
 		if l.port.WriteBlocked() {
+			rank = 4
+		} else if s.holSiblingBlockedLocked(l) {
 			rank = 2
 		}
 		if s.ackLeavingLocked(l) {
@@ -191,8 +197,23 @@ func (s *Session) chooseAckLaneLocked(skip *lane) *lane {
 // write-blocked; otherwise it moves the duty to the best qualifying lane
 // (chooseAckLaneLocked, which may keep the current one if nothing better
 // exists) or clears it.
+//
+// A race session re-chooses at every call — every ACK or PACK placement
+// decision (bumps and the delivery cadence) and every lane attach and death
+// (their bumps): the duty sits on the fastest live lane
+// (raceAckLaneLocked, M3-D33, PA-33), and M1's choice applies only when no
+// lane qualifies there (every lane blocked or leaving). Every other live
+// data lane of a race session places each ACK as well (raceAckDutyLocked,
+// Fill step 4); the callers that wake the duty lane wake those too
+// (raceWakeAckLocked).
 func (s *Session) ensureAckLaneLocked() {
 	st := &s.st
+	if s.p.Mode == ModeRace {
+		if l := s.raceAckLaneLocked(); l != nil {
+			st.ackLane = l
+			return
+		}
+	}
 	cur := st.ackLane
 	if cur != nil && s.ackKeepLocked(cur) {
 		return
@@ -232,6 +253,7 @@ func (s *Session) fillAckLocked(l *lane, b *carrier.Batch) {
 			st.ackGen++
 			st.ackBumped = st.rRead
 			st.ackDelayAt = time.Time{}
+			s.raceWakeAckLocked() // race: the copy lanes place it too
 		} else {
 			b.WakeAt(st.ackDelayAt)
 		}
@@ -248,7 +270,7 @@ func (s *Session) fillAckLocked(l *lane, b *carrier.Batch) {
 		a.EpochEcho = s.ctl.epoch
 	}
 	flags := st.ackFlags
-	if !b.AddAck(wire.SessionHandle, flags, &a) {
+	if !b.AddAck(l.Handle(), flags, &a) {
 		st.rightEdge = edge
 		return
 	}

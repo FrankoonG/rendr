@@ -144,11 +144,19 @@ func TestPacketStreamLaneCapacity_L32(t *testing.T) {
 		up.halt(t, "dialer → passive")
 		settle(t, dc, pc, up, nil)
 
-		ds, ps := dc.Status().Packet, pc.Status().Packet
+		// A datagram still on the link when settle returned can be counted
+		// in Received an instant before the reader records it: compare the
+		// two from one consistent reading (bounded).
+		ds := dc.Status().Packet
+		ps, arrived := pc.Status().Packet, 0
+		waitFor(t, 5*time.Second, "the reader to record every received datagram", func() bool {
+			ps, arrived = pc.Status().Packet, up.arrivedCount()
+			return uint64(arrived) == ps.Received
+		})
 		ls_ := up.losses()
 		uncounted := ds.Sent - ps.Received
-		if ps.Duplicates+ps.DropLate+ps.DropRecvQueue != 0 || uint64(up.arrivedCount()) != ps.Received || ds.DropQueue != 0 {
-			t.Fatalf("counters: dialer %+v, passive %+v, arrived %d", *ds, *ps, up.arrivedCount())
+		if ps.Duplicates+ps.DropLate+ps.DropRecvQueue != 0 || ds.DropQueue != 0 {
+			t.Fatalf("counters: dialer %+v, passive %+v, arrived %d", *ds, *ps, arrived)
 		}
 		if uint64(len(ls_)) != drops(ds)+uncounted {
 			t.Fatalf("%d datagrams missing ≠ %d counted drops + %d lost in flight: %+v", len(ls_), drops(ds), uncounted, *ds)

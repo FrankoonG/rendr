@@ -86,6 +86,20 @@ type Batch struct {
 	relBlocked  bool                  // a reliable Add* found no REL room this round
 	lastRef     *Buf                  // the chunk of the latest DGRAM reference taken this round
 
+	// The payload quota of the current endpoint call (M3-D10; set by limit
+	// before each endpoint call of a MUX writer round, cleared by Reset).
+	quota   bool // a quota is in force
+	ctlOnly bool // the quota is 0: control frames only
+	qEnd    int  // payload() at which the quota ends
+	taken   int  // payload() when the current call began (Taken)
+
+	// The response hold of the current call (M3-D8): a passive view
+	// admitted on a started trunk places nothing after its OK response
+	// until the dialer's go frame. Set by the MUX writer around that view's
+	// call; holdOn once the OK response for holdH was added.
+	holdH  uint32
+	holdOn bool
+
 	frames [MaxBatchFrames]bframe
 	arena  []byte
 }
@@ -109,6 +123,8 @@ func (b *Batch) Reset(now time.Time) {
 	b.n, b.data, b.retx, b.ctl, b.bodies, b.used, b.dgBytes = 0, 0, 0, 0, 0, 0, 0
 	b.now, b.wake, b.capBlocked = now, time.Time{}, false
 	b.dgram, b.frameBudget, b.relRoom, b.nrel, b.relStamped, b.relBlocked = false, 0, 0, 0, 0, false
+	b.quota, b.ctlOnly, b.qEnd, b.taken = false, false, 0, 0
+	b.holdH, b.holdOn = 0, false
 }
 
 // ReleaseRefs releases the chunk references taken by AddData and AddDgram.
@@ -205,8 +221,24 @@ func (b *Batch) Len() int {
 // Room returns the DATA payload bytes still allowed in this batch
 // (Timing.BatchBudget minus DATA already added; on a stream batch DGRAM
 // bytes count as DATA, M2-D26); control frames do not count against it.
+// On a MUX trunk it is also bounded by the payload quota of the current
+// endpoint call (M3-D10): 0 under a quota of 0 (ControlOnly).
 func (b *Batch) Room() int {
-	return b.budget - b.data
+	r := b.budget - b.data
+	if b.quota {
+		r = min(r, b.qEnd-b.payload())
+	}
+	return r
+}
+
+// payload returns the DATA and DGRAM payload bytes placed in this batch:
+// DATA bytes (DGRAM bytes included) on a stream batch, DGRAM bytes on a
+// datagram batch. The quota and Taken are measured in it.
+func (b *Batch) payload() int {
+	if b.dgram {
+		return b.dgBytes
+	}
+	return b.data
 }
 
 // Full reports that no further frame of any kind fits (frame count or
@@ -239,8 +271,23 @@ func (b *Batch) AddOpenAck(handle uint32, a *wire.OpenAck) bool {
 	p, ok := b.addSessionRel(wire.TypeOpenAck, 0, handle, n)
 	if ok {
 		wire.PutOpenAck(p, a)
+		b.heldBy(handle, a.Status)
 	}
 	return ok
+}
+
+// heldBy starts the response hold of the current call when its OK
+// response for the held handle was added (M3-D8).
+func (b *Batch) heldBy(handle uint32, st wire.AckStatus) {
+	if handle == b.holdH && handle != 0 && st == wire.StatusOK {
+		b.holdOn = true
+	}
+}
+
+// heldOut reports a session frame of handle that the response hold keeps
+// out of the batch.
+func (b *Batch) heldOut(handle uint32) bool {
+	return b.holdOn && handle == b.holdH
 }
 
 // AddJoinAck appends a JOIN_ACK frame (REL on a datagram batch); false if
@@ -249,6 +296,7 @@ func (b *Batch) AddJoinAck(handle uint32, a *wire.JoinAck) bool {
 	p, ok := b.addSessionRel(wire.TypeJoinAck, 0, handle, wire.JoinAckLen)
 	if ok {
 		wire.PutJoinAck(p, a)
+		b.heldBy(handle, a.Status)
 	}
 	return ok
 }
@@ -329,7 +377,7 @@ func (b *Batch) AddData(handle uint32, off uint64, body []byte, chunk *Buf, retx
 	if b.dgram {
 		panic("rendr/carrier: DATA on a datagram batch")
 	}
-	if b.Full() || len(body) > b.Room() {
+	if b.Full() || len(body) > b.Room() || b.ctlOnly || b.heldOut(handle) {
 		return false
 	}
 	if chunk != nil {
@@ -346,6 +394,43 @@ func (b *Batch) AddData(handle uint32, off uint64, body []byte, chunk *Buf, retx
 	return true
 }
 
+// Taken returns the DATA and DGRAM payload bytes earlier endpoint calls
+// of this writer round placed in the batch (M3-D11): a view on a MUX trunk
+// subtracts it from the shared capacity, Capacity() − Inflight() − Taken().
+// Always 0 on a dedicated carrier, whose one endpoint fills the round.
+func (b *Batch) Taken() int { return b.taken }
+
+// ControlOnly reports that the current endpoint call runs under a payload
+// quota of 0 — the MUX writer's control pass (M3-D10): the call places
+// control frames only (AddData and AddDgram refuse, Room is 0), and by the
+// Fill contract it changes no idleness and marks nothing cap-blocked
+// (R1-1 rule 5; MarkCapBlocked is ignored meanwhile).
+func (b *Batch) ControlOnly() bool { return b.ctlOnly }
+
+// SetQuota sets the payload quota of the next endpoint call (limit). The
+// MUX writer sets it around each view's Fill; package session tests call
+// it to drive a Fill under a quota (TestFillQuotaZeroKeepsIdle).
+func (b *Batch) SetQuota(q int) { b.limit(q) }
+
+// limit sets the payload quota of the next endpoint call (M3-D10): Room
+// then reports at most q more payload bytes and AddDgram refuses a body
+// beyond it, and q == 0 lets the call place control frames only
+// (ControlOnly). A negative q removes the quota. Either way the call's
+// Taken is the payload placed so far. The MUX writer sets it around each
+// view's Fill; a dedicated carrier never sets one.
+//
+// On a datagram batch DgramRoom keeps reporting the carrier's budget (the
+// session reads a datagram above it as one the budget left behind, M2-D45),
+// and the quota is enforced by AddDgram refusing, as on a full batch.
+func (b *Batch) limit(q int) {
+	b.taken = b.payload()
+	if q < 0 {
+		b.quota, b.ctlOnly = false, false
+		return
+	}
+	b.quota, b.ctlOnly, b.qEnd = true, q == 0, b.taken+q
+}
+
 // MarkCapBlocked records that pullable data remained for this carrier
 // because it reached its capacity cap: the writer counts the time until
 // the next Fill that pulls data as backlog (§4.10) and requests a cap-hit
@@ -354,6 +439,9 @@ func (b *Batch) AddData(handle uint32, off uint64, body []byte, chunk *Buf, retx
 // the writer, so release is clocked by the RTT, not by the PING timer
 // (design §4.10, R13).
 func (b *Batch) MarkCapBlocked() {
+	if b.ctlOnly {
+		return // a control pass decides nothing about capacity (R1-1 rule 5)
+	}
 	b.capBlocked = true
 }
 
@@ -372,6 +460,9 @@ func (b *Batch) addSession(t wire.Type, flags uint8, handle uint32, n int) (p []
 	if handle == 0 {
 		panic("rendr/carrier: session frame with handle 0")
 	}
+	if b.heldOut(handle) {
+		return nil, false
+	}
 	return b.addControl(t, flags, handle, n)
 }
 
@@ -380,6 +471,9 @@ func (b *Batch) addSession(t wire.Type, flags uint8, handle uint32, n int) (p []
 func (b *Batch) addSessionRel(t wire.Type, flags uint8, handle uint32, n int) (p []byte, ok bool) {
 	if handle == 0 {
 		panic("rendr/carrier: session frame with handle 0")
+	}
+	if b.heldOut(handle) {
+		return nil, false
 	}
 	return b.addReliable(t, flags, handle, n)
 }
@@ -567,4 +661,117 @@ func (b *Batch) appendTo(dst []byte) []byte {
 		seg = cut
 	}
 	return append(dst, b.arena[seg:b.used]...)
+}
+
+// The MUX writer's own frames (M3 design §A5.3, §A3.4): DETACH, the first
+// frame of a view opened on a live trunk, a refusal answer of the refusal
+// ring and a view's last frame (WriteAndClose). They run on the writer
+// goroutine like the carrier control frames.
+
+// addDetach appends DETACH(h, r) (carrier level; REL on a datagram batch);
+// false if the batch is full or no REL room is left.
+func (b *Batch) addDetach(h uint32, r wire.DetachReason) bool {
+	p, ok := b.addReliable(wire.TypeDetach, 0, 0, wire.DetachLen)
+	if ok {
+		wire.PutDetach(p, &wire.Detach{Handle: h, Reason: r})
+	}
+	return ok
+}
+
+// addFirst appends the first frame (OPEN or JOIN, type t) of view h with
+// payload p. On a stream batch the payload is referenced as a body (an OPEN
+// may carry up to wire.MaxMetadata bytes of metadata, beyond the control
+// arena; p must stay unchanged until the round's write returned); on a
+// datagram batch it is a REL frame (openView bounds it by
+// wire.RelMaxPayload). False if the batch is full or no REL room is left.
+func (b *Batch) addFirst(t wire.Type, h uint32, p []byte) bool {
+	if b.dgram {
+		q, ok := b.addSessionRel(t, 0, h, len(p))
+		if ok {
+			copy(q, p)
+		}
+		return ok
+	}
+	if b.n >= MaxBatchFrames {
+		return false
+	}
+	f, _ := b.reserve(t, 0, h, 0, len(p))
+	if len(p) > 0 {
+		f.body = p
+		b.bodies += len(p)
+	}
+	return true
+}
+
+// addAnswer appends the refusal a for handle h: OPEN_ACK or JOIN_ACK with
+// a's status (REL on a datagram batch); false if the batch is full or no
+// REL room is left.
+func (b *Batch) addAnswer(h uint32, a *Answer) bool {
+	if a.Type == wire.TypeJoinAck {
+		return b.AddJoinAck(h, &wire.JoinAck{Status: a.Status, RxNext: a.RxNext})
+	}
+	return b.AddOpenAck(h, &wire.OpenAck{Status: a.Status, Window: a.Window, Code: a.Code})
+}
+
+// addLast appends a view's last session frame (WriteAndClose): type t with
+// flags and payload p for handle h, REL-wrapped on a datagram batch when t
+// is a reliable type (every session control type but ACK and a PACK
+// without flags). ok is false if the batch is full or no REL room is
+// left; skip is true for a frame that cannot travel on this batch at all
+// (ACK on a datagram batch, a carrier-level or data type), which is then
+// dropped.
+func (b *Batch) addLast(t wire.Type, flags uint8, h uint32, p []byte) (ok, skip bool) {
+	switch t {
+	case wire.TypeAck:
+		if b.dgram {
+			return false, true
+		}
+		q, ok := b.addSession(t, flags, h, len(p))
+		if ok {
+			copy(q, p)
+		}
+		return ok, false
+	case wire.TypePack:
+		var q []byte
+		if b.dgram && flags != 0 {
+			q, ok = b.addSessionRel(t, flags, h, len(p))
+		} else {
+			q, ok = b.addSession(t, flags, h, len(p))
+		}
+		if ok {
+			copy(q, p)
+		}
+		return ok, false
+	case wire.TypeOpenAck, wire.TypeJoinAck, wire.TypeFin, wire.TypeRst, wire.TypeSched:
+		if len(p) > ControlArena || (b.dgram && wire.RelHeadLen+len(p) > wire.RelMaxPayload) {
+			return false, true
+		}
+		q, ok := b.addSessionRel(t, flags, h, len(p))
+		if ok {
+			copy(q, p)
+		}
+		return ok, false
+	}
+	return false, true
+}
+
+// responseIn looks for the first OPEN_ACK or JOIN_ACK for handle h among
+// frames [from, Len()) — on a datagram batch inside REL — and returns its
+// type and status (the passive's first response of a view, M3-D7, M3-D8).
+func (b *Batch) responseIn(from int, h uint32) (t wire.Type, st wire.AckStatus, ok bool) {
+	for i := from; i < b.n; i++ {
+		f := &b.frames[i]
+		hdr := f.hdr
+		start := int(f.head) + wire.HeaderLen
+		p := b.arena[start : start+int(f.ctl)]
+		if hdr.Type == wire.TypeRel {
+			hdr = relInner(p)
+			p = p[wire.RelHeadLen:]
+		}
+		if hdr.Handle != h || (hdr.Type != wire.TypeOpenAck && hdr.Type != wire.TypeJoinAck) || len(p) == 0 {
+			continue
+		}
+		return hdr.Type, wire.AckStatus(p[0]), true
+	}
+	return 0, 0, false
 }

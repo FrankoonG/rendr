@@ -27,6 +27,7 @@ func (s *Session) placePackLocked(l *lane, b *carrier.Batch) {
 		if l.retireCalled || !b.Now().Before(st.ackDelayAt) {
 			st.ackGen++
 			st.ackDelayAt = time.Time{}
+			s.raceWakeAckLocked() // race: the copy lanes place it too
 		} else {
 			b.WakeAt(st.ackDelayAt)
 		}
@@ -50,9 +51,9 @@ func (s *Session) placePackLocked(l *lane, b *carrier.Batch) {
 		flags |= wire.FlagPackDone
 	}
 	reliable := flags != 0 || (passive && pa.EpochEcho != l.echoRel)
-	if !b.AddPack(wire.SessionHandle, flags, &pa, reliable) {
-		if reliable && b.Datagram() && b.RelRoom() == 0 {
-			s.movePackDutyLocked(l) // R1-17
+	if !b.AddPack(l.Handle(), flags, &pa, reliable) {
+		if reliable && b.Datagram() && b.RelRoom() == 0 && l == st.ackLane {
+			s.movePackDutyLocked(l) // R1-17 (a race copy lane holds no duty to move)
 		}
 		return // otherwise the batch is full: it stays due
 	}
@@ -148,6 +149,7 @@ func (s *Session) packCadenceLocked() {
 			l.idle = false
 			l.port.Wake()
 		}
+		s.raceWakeAckLocked() // race: each copy lane arms its own timer
 	}
 }
 

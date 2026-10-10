@@ -182,6 +182,11 @@ type path struct {
 	// JOIN or PING) is known when the factory is called, so a hanging call
 	// can still be classified as a session or a probe dial.
 	early bool
+	// cheap makes the factory a CheapSubflow one: every session dials
+	// carriers of its own (M2's path; rendr mux is the default, M3-D2) —
+	// for the lessons whose premise is a session's own carrier. Set it
+	// before the path is used.
+	cheap bool
 	// gate, if set, runs before the link dial of every factory call (call
 	// numbers from 1; first is the first bytes of a DialEarly call); an
 	// error fails the call. Set it before the path is used.
@@ -234,6 +239,7 @@ func (p *path) accept(c net.Conn) error {
 // carrier is the path's StreamCarrier.
 func (p *path) carrier() rendr.StreamCarrier {
 	sc := rendr.StreamCarrier{Name: p.name, Dial: func(ctx context.Context) (net.Conn, error) { return p.dial(ctx, nil) }}
+	sc.Props.CheapSubflow = p.cheap
 	if p.early {
 		sc.DialEarly = func(ctx context.Context, first []byte) (net.Conn, error) { return p.dial(ctx, first) }
 	}

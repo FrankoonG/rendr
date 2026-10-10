@@ -1,6 +1,7 @@
 package lessons4
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -99,16 +100,29 @@ func TestAttachKillChurnNoLeak_L52(t *testing.T) {
 			return id
 		}
 		id := settle("the first carrier on both ends", 0)
-		baseG := runtime.NumGoroutine()
+		// Goroutines are counted with both session actors parked (twice
+		// the default ActorLinger idle, M3-D42): a running actor is one
+		// goroutine more, so a count taken while one of them happens to run
+		// differs by one without a leak (a premise flake of the Linux race
+		// lane: 20 against a baseline of 21). Only the bubble's goroutines
+		// count, from one stack dump that is also the failure's evidence:
+		// runtime.NumGoroutine counts the whole process, and a goroutine
+		// outside the bubble that was ending at the count made it one more
+		// than the dump beside it showed (19 against 18; I3).
+		quietG := func() (int, []byte) {
+			time.Sleep(2 * time.Second)
+			synctest.Wait()
+			return bubbleGoroutines()
+		}
+		baseG, _ := quietG()
 		for i := range cycles {
 			if l.Kill() != 1 {
 				t.Fatalf("cycle %d: the link had no live carrier to cut", i)
 			}
 			id = settle(fmt.Sprintf("the carrier of cycle %d", i+1), id)
 		}
-		if g := runtime.NumGoroutine(); g != baseG {
-			buf := make([]byte, 1<<20)
-			t.Fatalf("goroutines %d after %d attach/kill cycles, want the baseline %d\n%s", g, cycles, baseG, buf[:runtime.Stack(buf, true)])
+		if g, dump := quietG(); g != baseG {
+			t.Fatalf("bubble goroutines %d after %d attach/kill cycles, want the baseline %d\n%s", g, cycles, baseG, dump)
 		}
 		for _, s := range []rendr.SessionStatus{dc.Status(), pc.Status()} {
 			if s.Migrations != (rendr.MigrationCounts{Death: uint64(cycles)}) || s.NoPathEpisodes != uint64(cycles) || s.State != rendr.StateOpen {
@@ -151,6 +165,28 @@ func TestAttachKillChurnNoLeak_L52(t *testing.T) {
 			}
 		}
 	})
+}
+
+// bubbleGoroutines returns the number of goroutines of the calling
+// synctest bubble and the stack dump it counted them in.
+func bubbleGoroutines() (int, []byte) {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	k := 0
+	for _, g := range bytes.Split(buf, []byte("\n\n")) {
+		head, _, _ := bytes.Cut(g, []byte("\n"))
+		if bytes.Contains(head, []byte("synctest bubble")) {
+			k++
+		}
+	}
+	return k, buf
 }
 
 // TestStatusSnapshotsConsistent_L53 (should): 10,000 snapshots of both ends

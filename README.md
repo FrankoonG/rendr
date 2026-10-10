@@ -10,11 +10,12 @@ lost byte because a carrier changed, and it never has to reconnect.
 rendr is a userspace session layer: session identity, byte offsets,
 acknowledgement = delivered to the receiving application, bounded
 retransmission and reordering, and the scheduling of a session over its
-carriers (one active carrier with failover and quality switching, or all
-carriers bonded for throughput). Carriers are rendr-to-rendr connections
-that the embedder supplies as `net.Conn` or `net.PacketConn` factories —
-typically L7 tunnels — or the built-in plaintext TCP and UDP carriers, or
-the QUIC carriers of the nested module `github.com/FrankoonG/rendr/v2/quic`.
+carriers (one active carrier with failover and quality switching, all
+carriers bonded for throughput, or every byte raced over every carrier).
+Carriers are rendr-to-rendr connections that the embedder supplies as
+`net.Conn` or `net.PacketConn` factories — typically L7 tunnels — or the
+built-in plaintext TCP and UDP carriers, or the QUIC carriers of the nested
+module `github.com/FrankoonG/rendr/v2/quic`.
 Besides byte-stream sessions (`net.Conn`), rendr carries packet sessions
 (`net.PacketConn`): datagrams delivered at most once, never retransmitted.
 
@@ -29,13 +30,14 @@ app ── net.Conn ── session ══ carrier × N ══ session ── net
 
 **rendr 2.0 is a ground-up rewrite in progress** on the `v2` branch
 (module `github.com/FrankoonG/rendr/v2`); it is not compatible with earlier
-releases, their API or their wire format. The current checkpoint is M2:
-the 2.0 core of M1 (stream sessions, selector and bond scheduling, the wire
-format, admission) plus packet sessions, datagram carriers (the raw UDP
-carrier `carrier/udp` and embedder `net.PacketConn` carriers) and the QUIC
-stream and datagram carriers of the nested `quic` module. The API may still
-change before v2.0.0. Race scheduling and carrier multiplexing (M3) and an
-L4 TCP module (M4) follow.
+releases, their API or their wire format. The current checkpoint is M3:
+the 2.0 core (stream sessions, selector and bond scheduling, the wire
+format, admission), packet sessions, datagram carriers (the raw UDP
+carrier `carrier/udp` and embedder `net.PacketConn` carriers), the QUIC
+stream and datagram carriers of the nested `quic` module, race
+scheduling, carrier properties (`Props`), shared carriers (rendr mux) on
+stream and datagram carriers, and parked idle sessions. An L4 TCP module
+(M4) follows. The API may still change before v2.0.0.
 
 Supported platforms are Linux and Windows; Windows has no real-network
 regression in 2.0.0 (see [Not in 2.0.0](#not-in-200)). macOS and arm64 are
@@ -69,8 +71,13 @@ transport layer meant to run inside the embedder's own protocol:
 Every frame on every carrier carries a frame sequence number and a CRC32C,
 and every carrier is bound to one peer instance. A carrier that violates the
 protocol is killed and its data is retransmitted on another carrier; the
-session survives. These checks catch accidents and misbehaving relays; they
-are not a security mechanism.
+session survives (on a shared carrier, every session on it migrates). These
+checks catch accidents and misbehaving relays; they are not a security
+mechanism. Two limits follow: a relay or peer that re-frames the traffic
+and recomputes CRC and frame sequence numbers can inject plausible bytes
+into any session on its carrier, and in race mode a copy that differs from
+the first copy is detected only while the first copy is still buffered (a
+copy of bytes the application already read is dropped uncompared).
 
 ## Embedding contract
 
@@ -92,9 +99,11 @@ are not a security mechanism.
    PingIdle + DeadMax + 5 s` (34 s with the defaults), and therefore longer
    than `NoPathGrace`. The built-in TCP carrier disables TCP keepalive on
    both ends for this reason.
-5. **Fate groups** (from M3). Carriers that share a first hop or a relay are
-   declared by the embedder as one fate group, so that bonding does not count
-   them as independent capacity and failover prefers another group.
+5. **Fate groups.** Factories whose carriers share a first hop, a relay or a
+   transport connection are declared by the embedder as one fate group
+   (`Props.FateGroup`), so that bond and race keep at most one member of the
+   group and selector failover tries another group first (see
+   [Carrier properties](#carrier-properties)).
 6. **Safety net, not a contract substitute.** The fseq, CRC32C and instance
    checks kill a carrier damaged by a misbehaving relay, but they do not
    replace items 1–5.
@@ -222,11 +231,47 @@ Semantics in brief:
 - Selector mode keeps one active carrier, fails over on carrier death and
   switches for quality only on probe evidence, with hysteresis (band, dwell,
   cooldown). Bond mode sends on all carriers in proportion to their measured
-  drain rate. No migration is ever triggered by the application's own traffic
-  pattern.
+  drain rate. Race mode sends every byte or datagram on every member carrier
+  and the receiver keeps the first copy: each byte arrives over whichever
+  member delivers it first, but throughput is the fastest member's (never
+  the sum), and the wire bytes and the sender's CPU grow with the member
+  count. A passive without race (a 2.0 build before M3) refuses it with
+  `ErrProtocol`. No migration is ever triggered by the application's own
+  traffic pattern.
 - `Runtime.Status`, `Conn.Status` and `Peer.Status` report sessions,
   carriers, death causes, migrations and buffer use; `Config.OnEvent`
-  delivers carrier, migration and session events.
+  delivers carrier, migration and session events. A session's byte and
+  datagram counters count each unit once; in race mode
+  `SessionStatus.Race` (sender) and `DupBytes` (receiver) count the copies,
+  and each `CarrierStatus` counts what its carrier moved, copies included.
+
+### Carrier properties
+
+Each factory (`StreamCarrier`, `DatagramCarrier`) carries `Props`:
+
+- `FateGroup` names factories whose carriers fail together (a shared first
+  hop, relay or transport connection). Bond and race keep at most one member
+  per group, the best-ranked factory of it; selector failover tries
+  candidates outside the dead carrier's group first. `""` puts a factory in
+  a group of its own. At most 64 bytes; compared within one Peer.
+- `HoLCoupled` marks a group whose carriers share one in-order pipe (streams
+  of one TCP or TLS connection): rendr never moves a write-blocked carrier's
+  acknowledgement or scheduling duty onto a coupled sibling while another
+  carrier exists. It requires a `FateGroup`, and the factories of one group
+  must agree on it.
+- `CheapSubflow` says that opening a carrier is cheap (a native subflow), so
+  every session dials its own carriers of that factory. Without it (the
+  default) the sessions of one Peer share the factory's live carriers (rendr
+  mux): a new session or a failover uses a live carrier instead of dialling,
+  and a carrier closes when its last session ends (no idle retention, no
+  warm standby). Sessions on one carrier share its head-of-line blocking and
+  its fate: its death migrates every one of them. On a carrier that was
+  already live, the passive's first bytes for a new session leave about one
+  round trip later than on a fresh carrier, because the passive waits for
+  the dialer's first frame for that session. Carriers are never shared
+  between Peers.
+
+`NewPeer` rejects invalid `Props` with an error naming the factory.
 
 ### Memory
 
@@ -245,14 +290,19 @@ it counts toward the 75 % threshold and can take the budget past its
 limit. Carrier reader stages add about 16 KiB per live carrier outside the
 budget; `Status.BufferedBytes` reports both.
 
-An idle session costs about 70 KiB per side with one carrier (selector) and
-about 170–185 KiB per side as a three-member bond, mostly goroutine stacks
-and the carriers' reader stages and write batches. Each side runs one
-goroutine per session plus two per carrier. While idle, a session's
-carriers wake about every `PingIdle` to send and answer liveness PINGs and
-its scheduler sleeps, except that every dialer session of a Peer with two or
-more factories wakes once per probe sample of the Peer: 90 times a minute
-with three factories at the default 2 s `Probe.Interval`.
+An idle session costs about 70 KiB per side with one carrier of its own
+(selector) and about 170–190 KiB per side as a three-member bond, mostly
+the carriers' reader stages, write batches and goroutine stacks. A session
+that shares a live carrier (rendr mux) adds about 7 KiB per side and no
+goroutine: the carrier's cost is paid once, by all of its sessions. Each
+side runs two goroutines per carrier and one per busy session: a session's
+scheduler parks after about a second without work and holds no goroutine
+until its next event or deadline (`Status.Actors` counts the running
+ones). While idle, a session's carriers wake about every `PingIdle` to
+send and answer liveness PINGs, and every dialer session of a Peer with two
+or more factories is woken once per probe sample of the Peer (90 times a
+minute with three factories at the default 2 s `Probe.Interval`); a wakeup
+that changes nothing parks again at once.
 
 ### Selector self-load guard: limitation
 
@@ -298,12 +348,14 @@ bubbles and is used by rendr's own tests.
 
 ## Not in 2.0.0
 
-- Carrier pools, warm standby carriers, carrier priorities and changing a
-  running session's carrier set. Every session snapshots its Peer's factories
-  at `Dial` and only redials those; replacing a factory affects new sessions
-  only. Selector failover therefore dials a new carrier, probe carriers are
-  never adopted by sessions, and the failover time an expensive (L7)
-  carrier dial adds is quantified only before the 2.0.0 release.
+- Warm standby carriers, idle carrier retention, carrier priorities and
+  changing a running session's carrier set. Every session snapshots its
+  Peer's factories at `Dial` and only redials those; replacing a factory
+  affects new sessions only. Selector failover dials a new carrier unless
+  the Peer has a live shared carrier of the failover factory, probe
+  carriers are never adopted by sessions, and the failover time an
+  expensive (L7) carrier dial adds is quantified only before the 2.0.0
+  release.
 - Nested scheduling groups and peak-transfer modes.
 - L4 UDP, L3 and L2 payload modules (the L4 module of M4 is TCP only).
 - Stream sessions over raw datagram carriers (use QUIC streams or a reliable

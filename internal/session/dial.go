@@ -28,6 +28,29 @@ type DialSpec struct {
 	// and marked failed for the selector's Evaluate, so that it never
 	// becomes a quality target.
 	Eligible uint16
+
+	// Pool is the Peer's carrier pool (M3-D16): with a pool every attempt
+	// goes through Pool.Attempt — a mux-eligible factory's
+	// (carrier.Factory.Mux) takes a live trunk, waits for the factory's
+	// dial in flight or dials with wire.OptMux; any other factory's is
+	// Establish. Pool.Attempt dials with the pool's own factory snapshot,
+	// which must be the Peer's (Factories differ from it only in wrappers
+	// that AttemptContext stands for). nil: every attempt runs Establish
+	// on Factories (M2).
+	Pool *carrier.Pool
+	// AttemptContext, when set, derives every attempt's base context
+	// (attempts outlive the Dial's context): package rendr attaches its
+	// per-Dial factory hints there, which the Pool's factories read, so a
+	// dial made through the pool keeps them (W4 L3-1).
+	AttemptContext func(context.Context) context.Context
+	// Groups is the fate-group index of every factory (M3-D36, M3-D37):
+	// factories with the same non-empty Props.FateGroup share an index from
+	// 1 up; index 0 is a group of its own (an empty FateGroup), so a zero
+	// Groups keeps every factory independent.
+	Groups [16]uint8
+	// Coupled has bit i set when factory i's fate group is HoLCoupled
+	// (M3-D39).
+	Coupled uint16
 }
 
 // Dial creates a dialer session and runs its opening phase (design §6.6):
@@ -120,7 +143,8 @@ func dial(ctx context.Context, env *Env, spec DialSpec, h healthSource) (*Sessio
 		d.release = h.Hold()
 		d.unsub = h.Subscribe(&s.mb)
 	}
-	go a.run()
+	s.mb.actor.Store(a) // rings kick the actor from now on (R1-7)
+	a.kick()
 	select {
 	case err := <-d.result:
 		return dialReturn(s, err)

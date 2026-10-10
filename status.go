@@ -36,6 +36,19 @@ type Status struct {
 	ConfigAdjustments []string
 
 	Datagram DatagramStatus // FromPacketConn sources and datagram carriers (M2)
+
+	Mux    MuxStatus // shared carriers (M3)
+	Actors int       // session actor goroutines running now; an idle session's actor is parked and holds none
+}
+
+// MuxStatus counts the carriers a Runtime shares between sessions (rendr
+// mux: the carriers of factories without Props.CheapSubflow).
+type MuxStatus struct {
+	Carriers  int    // live carriers that negotiated mux (both roles)
+	Views     int    // sessions attached to them (a session counts once per such carrier)
+	FastPaths uint64 // dialer: OPENs and JOINs placed on a live carrier instead of dialling
+	Coalesced uint64 // dialer: attempts that waited for another session's dial of the same factory (for a session of the same kind)
+	MuxFull   uint64 // CAPACITY answers because a carrier held its maximum of sessions (both roles)
 }
 
 // DatagramStatus summarises the raw-UDP sources (FromPacketConn) and the
@@ -100,6 +113,17 @@ type SessionStatus struct {
 	// AckedBytes, RetransmittedBytes, Window and PeerWindow are 0.
 	MaxPayload int
 	Packet     *PacketCounters // nil for stream sessions
+
+	DupBytes uint64       // stream receiver: bytes that arrived again (race copies, rescue duplicates) and were discarded
+	Race     RaceCounters // zero unless ModeRace
+}
+
+// RaceCounters count a race sender's extra copies: the session's TxBytes
+// and PacketCounters.Sent count each byte or datagram once, the carriers'
+// TxBytes count every copy.
+type RaceCounters struct {
+	CopyBytes uint64 // stream sender: payload bytes placed by a lane below another lane's cursor (extra copies)
+	Copies    uint64 // packet sender: extra placements of datagrams another lane already placed, less the carriers' refusals
 }
 
 // PacketCounters count the datagrams of one packet session on this side.
@@ -111,13 +135,13 @@ type SessionStatus struct {
 type PacketCounters struct {
 	Sent          uint64 // handed to a carrier and not refused by it
 	Received      uint64 // accepted from carriers (distinct)
-	Duplicates    uint64 // received again inside the dedup window
+	Duplicates    uint64 // received again inside the dedup window (the 16,384 datagrams behind the newest received), also after ReadFrom returned io.EOF; in a race session the members' copies of a datagram while they arrive inside the window (copies beyond it count in DropLate)
 	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
 	DropAge       uint64 // send side: not handed to a carrier within Packet.MaxAge while one existed
-	DropTooLarge  uint64 // send side: no live carrier could carry it, or a carrier refused it as too large
+	DropTooLarge  uint64 // send side: no live carrier could carry it, a carrier refused it as too large, or a budget shrink left it on a member too small for it while every member that can carry it was write-blocked or at its capacity
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no carrier
 	DropRecvQueue uint64 // receive side: evicted from a full receive queue (the application did not read)
-	DropLate      uint64 // receive side: older than the dedup window, or arrived after ReadFrom already returned io.EOF
+	DropLate      uint64 // receive side: older than the dedup window, or new and arrived after ReadFrom already returned io.EOF; in a race session also a member's copy of a datagram already received that arrives 16,384 datagrams or more behind the newest (members more than about 330 ms apart at 50,000 datagrams/s): no loss, the datagram was delivered once
 	PeerReceived  uint64 // the peer's Received, as last reported by its accounting frames
 }
 
@@ -133,7 +157,16 @@ type MigrationCounts struct {
 
 // CarrierStatus is one carrier of a session. A dead carrier's figures are
 // final once its goroutines have finished (or were abandoned) and it was
-// released.
+// released. A session that returns to a shared carrier it used before
+// lists that carrier's ID once per use; Handle tells the rows apart.
+//
+// On a carrier shared between sessions (rendr mux, Shared > 1) TxBytes,
+// RxBytes, RetxBytes and Frames count this session's traffic only; the
+// estimator (SRTT, MinRTT, Rate, Inflight, Cap) and the datagram fields
+// (MTU, Dropped, Retransmits, Rebinds) are the carrier's, the same for
+// every session on it — a datagram the carrier drops belongs to no
+// session — and a dead row keeps the values it had when the session left
+// the carrier.
 type CarrierStatus struct {
 	ID       CarrierID
 	Name     string // factory name ("" on the passive side)
@@ -159,4 +192,8 @@ type CarrierStatus struct {
 	Dropped     uint64 // datagrams and frames this carrier dropped (truncated, malformed, duplicate, out of window, foreign)
 	Retransmits uint64 // reliable control retransmissions (first datagram included)
 	Rebinds     uint64 // reply-address moves (passive raw-UDP flows)
+
+	Handle    uint32 // this session's handle on the carrier (1 on an unshared carrier)
+	Shared    int    // sessions on the carrier at the snapshot (1 = unshared; 0 once dead)
+	FateGroup string // dialer: the factory's Props.FateGroup ("" on the passive side)
 }

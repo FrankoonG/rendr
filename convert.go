@@ -17,6 +17,7 @@ import (
 var (
 	_ [0]struct{} = [int(ModeSelector) - int(session.ModeSelector)]struct{}{}
 	_ [0]struct{} = [int(ModeBond) - int(session.ModeBond)]struct{}{}
+	_ [0]struct{} = [int(ModeRace) - int(session.ModeRace)]struct{}{}
 	_ [0]struct{} = [int(RoleDialer) - int(session.RoleDialer)]struct{}{}
 	_ [0]struct{} = [int(RolePassive) - int(session.RolePassive)]struct{}{}
 	_ [0]struct{} = [int(StatePending) - int(session.StatePending)]struct{}{}
@@ -65,7 +66,9 @@ func eventFrom(ev session.Event) Event {
 }
 
 // sessionStatusFrom converts a session snapshot (M2-D61): a packet
-// session reports KindPacket, its MaxPayload and its PacketCounters.
+// session reports KindPacket, its MaxPayload and its PacketCounters; M3
+// adds the receiver's DupBytes and the race sender's copies (M3-D35).
+// CarrierStatus.FateGroup is the Peer's to fill (peerProps.status).
 func sessionStatusFrom(st session.Status) SessionStatus {
 	out := SessionStatus{
 		ID:           SessionID(st.ID),
@@ -93,6 +96,8 @@ func sessionStatusFrom(st session.Status) SessionStatus {
 		Window:             st.Window,
 		PeerWindow:         st.PeerWindow,
 		MaxPayload:         st.MaxPayload,
+		DupBytes:           st.DupBytes,
+		Race:               RaceCounters{CopyBytes: st.Race.CopyBytes, Copies: st.Race.Copies},
 	}
 	if pc := st.Packet; pc != nil {
 		out.Packet = &PacketCounters{
@@ -119,7 +124,8 @@ func sessionStatusFrom(st session.Status) SessionStatus {
 
 // carrierStatusFrom converts one lane of a session snapshot: its kind is
 // the carrier's (Stats.Kind); a datagram carrier's counters are copied
-// (M2-D61).
+// (M2-D61); the session's handle on the carrier and the carrier's view
+// count (M3-D49).
 func carrierStatusFrom(cs *session.CarrierStatus) CarrierStatus {
 	return CarrierStatus{
 		ID:          CarrierID(cs.ID),
@@ -142,6 +148,8 @@ func carrierStatusFrom(cs *session.CarrierStatus) CarrierStatus {
 		Dropped:     cs.Stats.Dropped,
 		Retransmits: cs.Stats.Retransmits,
 		Rebinds:     cs.Stats.Rebinds,
+		Handle:      cs.Stats.Handle,
+		Shared:      cs.Stats.Shared,
 	}
 }
 

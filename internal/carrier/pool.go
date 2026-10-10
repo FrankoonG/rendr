@@ -1,0 +1,889 @@
+package carrier
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/wire"
+)
+
+// Pool is one Peer's set of dialer MUX trunks (M3 design §A5.8, §A5.9;
+// M3-D16 … M3-D20). It is the fast path of the Peer's OPENs and JOINs: an
+// attempt on a mux-eligible factory (Factory.Mux) takes a usable live trunk
+// of that factory (a new view, no factory call), else waits for the
+// factory's dial already in flight (coalescing: one dial per factory and
+// session kind, not one per session), else dials itself with wire.OptMux.
+// A pool never
+// crosses Peers, keeps no idle trunk, never pre-dials, and closes a trunk
+// at its last view.
+//
+// One session kind per trunk (M3 amendment KINDSPLIT to M3-D17, M3-D24):
+// the pool keys its trunks and its dials in flight by (factory, session
+// kind). A trunk carries the kind of the session that dialled it
+// (trunk.kinds) and takes views of that kind only, and an attempt waits
+// only for a dial of its own kind, so a stream factory serves its stream
+// and its packet sessions on separate trunks: a packet session never
+// shares a stream trunk's in-flight cap with a bulk stream session, whose
+// backlog would age its datagrams out before placement (Packet.MaxAge). A
+// datagram factory carries packet sessions only (M3-D24), one kind
+// already.
+//
+// Lifecycle of a trunk in the pool: the claimant's Establish returns view 1
+// of a fresh MUX trunk (Established.Fresh); the factory's dial stays "in
+// flight" for later attempts until the session starts view 1 (Conn.Start
+// calls poolStarted, which publishes asynchronously), which puts the trunk
+// in trunks[f] and releases the waiters to open their views on it
+// (M3-D19). A fresh trunk that dies unstarted (the opening race was lost,
+// a check failed, the session ended) releases the waiters to retry at
+// once. A published trunk leaves the pool when its view count reaches
+// zero: it is sealed and retired with CLOSE (§A5.9); its other ends (a
+// dead trunk) leave the same way, as each view's Done closes. The pool
+// counts every fresh trunk until the trunk's Done (Wait joins them) without
+// a goroutine of its own beside a published trunk — a pooled trunk costs
+// its reader and writer, as any carrier (F44) — and keeps no reference to
+// a trunk past its Done: the pool's goroutine of a fresh trunk lives until
+// the trunk is settled (published) or, for a trunk that is discarded or
+// retired unpublished, until its Done; the view hook that retires a
+// published trunk at its last view waits for the trunk's Done.
+//
+// Locks: mu is per Pool and never taken under a session lock, Conn.mu or
+// trunk.mx; it may take the trunk's leaf locks trunk.mx (allocating a
+// view, sealing) and trunk.mu (the usable rule's retirement check; a death
+// in the test seam): Pool.mu → trunk.mx, Pool.mu → trunk.mu.
+type Pool struct {
+	env *Env
+	fs  []Factory // the Peer's factory snapshot; immutable
+
+	dialTimeout time.Duration // bound of a coalesced wait (M3-D18)
+	joinStall   time.Duration // least wait of a JOIN claimant's waiters for its verdict (dialWait)
+
+	mu      sync.Mutex
+	trunks  [][]*Conn           // per factory: view 1 of each published trunk (of either session kind, trunk.kinds), oldest first
+	dialing []*dialWait         // per factory and session kind (dialSlot): the dial in flight that later attempts wait for (nil: none)
+	full    map[*trunk]bool     // published trunks that answered CAPACITY CodeMuxFull, until a view leaves (§A5.8)
+	extra   map[*Conn]*dialWait // fresh trunks of dials outside dialing (dialWait: a verdict grace ran out), until settled
+	live    int                 // fresh trunks whose Done is still open (Wait)
+	watch   int                 // watchFresh goroutines running
+	idle    chan struct{}       // Wait's: closed (and reset) when Close runs, a trunk is done or a watcher ends
+	closed  bool
+	stats   PoolStats
+	folded  PoolStats // the counters the owner took (Fold): Unfolded leaves them out
+
+	// Tests only (nil in production). afterPick runs under mu between the
+	// pick and openView: the E3 window (TestPoolPickThenDeath). watchEnd
+	// runs in watchFresh once its trunk is settled (and, unpublished, done),
+	// before the watcher's end is counted (TestPoolWaitJoinsWatchers).
+	afterPick func(c *Conn)
+	watchEnd  func(c *Conn)
+}
+
+// dialWait is one factory's dial in flight: its waiters block on done; err
+// and release are set before done closes (M3-D18, R1-8). Exactly one party
+// closes done: the claimant when its result is not a fresh trunk, else
+// whoever settles the fresh trunk (its publication or its death), each
+// under Pool.mu.
+type dialWait struct {
+	done    chan struct{}
+	err     error // the claimant's failure, counted once by each waiter (a transport or PREFACE failure)
+	release bool  // the waiters retry at once without a failure (a session-level refusal, no mux, a discarded fresh trunk, a cancelled claimant)
+
+	f     int       // the factory slot
+	k     int       // its index in Pool.dialing (dialSlot of f and dk)
+	dk    wire.Type // the session kind it serves: wire.TypeData (stream) or wire.TypeDgram (packet)
+	fresh *Conn     // view 1 of the claimant's fresh trunk awaiting its Start (M3-D19); nil while dialing and once settled
+
+	// The claimant's path proof (WP10): proven closes when its PREFACE_ACK
+	// passed the check — the path works and only its session's verdict on
+	// handle 1 is outstanding. A waiter then waits for that verdict at most
+	// grace, counted from the proof or from its own wait if later, and
+	// decides again if the claimant is still inside Establish (inEst):
+	//
+	//   - An OPEN claimant's (open) verdict may wait for the passive
+	//     application's Accept and Confirm, which a slow application must
+	//     not let hold the other sessions' dials of the factory (Mux is the
+	//     default, M3-D2): grace is twice the claimant's dial and PREFACE
+	//     time, at least minVerdictGrace. A JOIN waiter then dials in the
+	//     claimant's place as the factory's dial in flight (its verdict
+	//     waits for no application); every other waiter waits for that dial
+	//     (kick wakes them). An OPEN waiter defers to the JOIN waiters
+	//     (joins > 0), so that a trunk death costs the factory one JOIN dial
+	//     beside an OPEN claimant; with no JOIN waiting it dials beside the
+	//     claimant, which stays the factory's dial in flight (its own
+	//     verdict waits for the application too, which may accept the
+	//     sessions in any order: TestPoolVerdictGrace, E19).
+	//   - A JOIN's verdict never waits for an application — its session was
+	//     confirmed when its OPEN was answered — so a slow one is a loaded
+	//     passive or a path that broke after the PREFACE: grace is at least
+	//     joinStall (the death deadline's floor, DeadMin), far above a
+	//     load-induced delay, and then one waiter, of either kind, dials in
+	//     the claimant's place (WP DIALSTORM; B0.2 item 1: one dial per
+	//     factory per trunk death).
+	proven    chan struct{}
+	provenSet bool
+	open      bool
+	start     time.Time
+	grace     time.Duration
+	inEst     bool
+	joins     int           // JOIN attempts waiting for this dial (an OPEN waiter defers to them)
+	kick      chan struct{} // closed (and replaced) when a waiter took this dial's place or its last JOIN waiter left
+	kept      bool          // the fresh trunk was published (settle)
+}
+
+// minVerdictGrace is the least a coalesced waiter waits for the claimant's
+// verdict on handle 1 once the claimant's path was proven (dialWait).
+const minVerdictGrace = 100 * time.Millisecond
+
+// newDialWait returns the dial of factory f an attempt of session kind dk
+// with first frame kind claims.
+func newDialWait(f int, dk, kind wire.Type) *dialWait {
+	return &dialWait{done: make(chan struct{}), f: f, k: dialSlot(f, dk), dk: dk, proven: make(chan struct{}), kick: make(chan struct{}),
+		open: kind == wire.TypeOpen, start: time.Now(), inEst: true}
+}
+
+// dialSlot is the index in Pool.dialing of factory f's dial in flight for
+// sessions of kind dk (KINDSPLIT: one coalesced dial per factory and
+// session kind).
+func dialSlot(f int, dk wire.Type) int {
+	if dk == wire.TypeDgram {
+		return 2*f + 1
+	}
+	return 2 * f
+}
+
+// kickLocked wakes the waiters of w to decide again (a waiter took w's
+// place, or w's last JOIN waiter left).
+func (w *dialWait) kickLocked() {
+	close(w.kick)
+	w.kick = make(chan struct{})
+}
+
+// leaveLocked ends a JOIN attempt's wait for w. When the last JOIN waiter
+// leaves an OPEN claimant still in place, the OPEN waiters that deferred to
+// the JOINs decide again.
+func (p *Pool) leaveLocked(w *dialWait) {
+	w.joins--
+	if w.joins == 0 && w.open && w.inEst && p.dialing[w.k] == w {
+		w.kickLocked()
+	}
+}
+
+// ownDialLocked reports whether an attempt of kind whose verdict grace on
+// the factory's dial in flight w ran out (graceOut == w) dials now: in w's
+// place when w's claimant is a JOIN or the attempt is one, beside it when
+// it is an OPEN with no JOIN waiting (dialWait).
+func (p *Pool) ownDialLocked(w *dialWait, kind wire.Type, graceOut *dialWait) bool {
+	return w == graceOut && w.inEst && (!w.open || kind == wire.TypeJoin || w.joins == 0)
+}
+
+// timedOut reports whether a dial failed by a timeout: its DialTimeout
+// (errDialTimeout) or a deadline on its handshake's reads or writes.
+func timedOut(err error) bool {
+	var t interface{ Timeout() bool }
+	return errors.As(err, &t) && t.Timeout()
+}
+
+// provenCheck wraps the claimant's check: a PREFACE_ACK it accepts proves
+// w's path (dialWait.proven).
+func (p *Pool) provenCheck(w *dialWait, check func(*wire.PrefaceAck) error) func(*wire.PrefaceAck) error {
+	return func(a *wire.PrefaceAck) error {
+		if check != nil {
+			if err := check(a); err != nil {
+				return err
+			}
+		}
+		p.mu.Lock()
+		if !w.provenSet {
+			w.provenSet = true
+			w.grace = max(2*time.Since(w.start), minVerdictGrace)
+			if !w.open {
+				w.grace = max(w.grace, p.joinStall)
+			}
+			close(w.proven) // grace is read by the waiters after this close
+		}
+		p.mu.Unlock()
+		return nil
+	}
+}
+
+// PoolStats are a Pool's counters (rendr.Status.Mux, dialer side).
+type PoolStats struct {
+	Carriers  int    // live trunks that are published, or fresh with view 1 started (publication pending)
+	Views     int    // views on them that are not gone
+	FastPaths uint64 // OPENs and JOINs placed on a live trunk instead of dialling
+	Coalesced uint64 // attempts that waited for another attempt's dial of the same factory
+	MuxFull   uint64 // CAPACITY CodeMuxFull answers received
+}
+
+// NewPool returns the Pool of a Peer with factory snapshot fs.
+func NewPool(env *Env, fs []Factory) *Pool {
+	return &Pool{
+		env:         env,
+		fs:          append([]Factory(nil), fs...),
+		dialTimeout: env.Timing.withDefaults().DialTimeout,
+		joinStall:   env.Timing.withDefaults().DeadMin,
+		trunks:      make([][]*Conn, len(fs)),
+		dialing:     make([]*dialWait, 2*len(fs)),
+	}
+}
+
+// Attempt opens one carrier of factory f for a session (M3-D16): for a
+// factory that is not mux-eligible it is Establish (M2); otherwise a fast
+// path view on a usable trunk (M3-D17), a coalesced wait for the factory's
+// dial in flight (bounded by ctx, M3-D18), or its own Establish with
+// wire.OptMux, whose fresh trunk (Established.Fresh) the pool publishes
+// when the session starts view 1 (M3-D19). A fast path waits for its
+// response at most Timing.DialTimeout, like Establish. cid is the
+// CarrierID reserved for a dial (released when a fast path or a wait
+// serves the attempt);
+// kind and payload are the first frame (OPEN or JOIN); check verifies the
+// PREFACE_ACK as for Establish; inst is the session's bound instance for a
+// JOIN (zero for an OPEN); sess identifies the session (one unreaped view
+// per trunk, R1-6); dk is the session's kind as its data frame type,
+// wire.TypeDgram for a packet session and wire.TypeData (any other value)
+// for a stream session — a JOIN does not carry it: the attempt uses only
+// trunks of that kind and waits only for a dial of that kind (KINDSPLIT).
+// Errors are Establish's; a fast path that fails before its first frame
+// was placed continues with a dial and counts no failure.
+//
+// Further contracts of this implementation: a fast path refused with
+// CAPACITY CodeMuxFull (the trunk is then full until a view leaves) or,
+// for an OPEN, CodeListenerClosed (the trunk takes no further OPEN, R1-10)
+// is a carrier refusal without penalty: the attempt continues with a dial
+// (or a wait, or another trunk) instead of returning the refusal. A
+// coalesced wait that outlasts Timing.DialTimeout fails like an attempt
+// that hit its DialTimeout (a path failure, L20). Once the claimant's path
+// was proven a waiter waits for its verdict at most the verdict grace —
+// for a JOIN claimant at least joinStall — and then one waiter dials in
+// the claimant's place as the factory's dial in flight, which the others
+// wait for: a JOIN, or after a JOIN claimant's stall any waiter; an OPEN
+// waiter of an OPEN claimant defers to the JOIN waiters, and with none
+// dials beside the claimant (dialWait; B0.2 item 1). A claimant's dial that
+// timed out counts for a waiter only when it began no earlier than the
+// waiter's attempt: the timeout of an older dial says how the path was
+// when that dial was sent (into an outage that may have ended since), not
+// how it is now, so it sends the waiter round again at once with a fresh
+// wait, as a dial of its own started with the attempt might have
+// attached (L22). Every other claimant failure — observed when it
+// happened — counts for every waiter. Close changes nothing
+// here: the sessions that survive Peer.Close keep their fast paths and
+// coalescing.
+func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, payload []byte, check func(*wire.PrefaceAck) error, inst [16]byte, sess uintptr, dk wire.Type) (*Established, error) {
+	fac := p.fs[f]
+	if !fac.Mux || (kind != wire.TypeOpen && kind != wire.TypeJoin) {
+		return Establish(ctx, p.env, fac, cid, kind, payload, check)
+	}
+	if dk != wire.TypeDgram {
+		dk = wire.TypeData
+	}
+	k := dialSlot(f, dk)
+	begin := time.Now() // a claimant's dial timeout counts for this attempt only if the dial began no earlier
+	var (
+		skip     []*trunk    // trunks this attempt does not try again (openView failed, refused, died)
+		graceOut *dialWait   // the dial in flight whose verdict grace ran out for this attempt
+		graceW   *dialWait   // the dial in flight graceEnd belongs to
+		graceEnd time.Time   // when graceW's verdict grace runs out for this attempt (zero: not proven yet)
+		joined   *dialWait   // the dial this JOIN attempt is counted a waiter of (dialWait.joins)
+		timer    *time.Timer // the coalesced wait's DialTimeout (from the first wait)
+		counted  bool        // Coalesced counted for this attempt
+	)
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		if joined != nil {
+			p.mu.Lock()
+			p.leaveLocked(joined)
+			p.mu.Unlock()
+		}
+	}()
+	for {
+		p.mu.Lock()
+		if c := p.pickLocked(f, dk, inst, sess, skip); c != nil {
+			if p.afterPick != nil {
+				p.afterPick(c)
+			}
+			v, err := c.openViewMux(kind, payload, sess, budgetOffered(ctx))
+			if err != nil {
+				// E3: the trunk died (or sealed, or filled) between the usable
+				// check and the allocation; this attempt continues without it.
+				p.mu.Unlock()
+				skip = append(skip, c.trunk)
+				continue
+			}
+			p.stats.FastPaths++
+			p.mu.Unlock()
+			est, retry, err := p.fastPath(ctx, v, check)
+			if retry {
+				skip = append(skip, c.trunk) // a refusal or a death: never the same trunk again in this attempt
+				continue
+			}
+			p.releaseCID(cid)
+			return est, err
+		}
+		w := p.dialing[k]
+		if w != nil && !p.ownDialLocked(w, kind, graceOut) {
+			if !counted {
+				p.stats.Coalesced++
+				counted = true
+			}
+			if kind == wire.TypeJoin && joined != w {
+				if joined != nil {
+					p.leaveLocked(joined)
+				}
+				joined = w
+				w.joins++
+			}
+			var proven <-chan struct{}
+			if w != graceOut {
+				proven = w.proven // its verdict grace has not run out for this attempt
+			}
+			if graceW != w {
+				graceW, graceEnd = w, time.Time{}
+			}
+			kick := w.kick
+			p.mu.Unlock()
+			if timer == nil {
+				timer = time.NewTimer(p.dialTimeout)
+			}
+			switch awaitDial(ctx, w, proven, &graceEnd, kick, timer) {
+			case waitEnded:
+				if w.release || w.err == nil {
+					continue // published (it is usable now) or released: retry at once
+				}
+				if w.start.Before(begin) && timedOut(w.err) {
+					// A dial older than this attempt timed out: not this
+					// attempt's failure. Retry at once (a trunk, a newer
+					// dial, or a dial of its own) with a fresh wait.
+					timer.Stop()
+					timer = nil
+					continue
+				}
+				p.releaseCID(cid)
+				return nil, w.err
+			case waitGrace:
+				graceOut = w
+				continue // decide again (ownDialLocked)
+			case waitKick:
+				continue // a waiter took w's place, or the JOIN waiters left: decide again
+			case waitCtx:
+				p.releaseCID(cid)
+				return nil, &EstablishError{Stage: "dial", Cause: CauseLocalClose, Err: context.Cause(ctx)}
+			default: // waitTimer
+				p.releaseCID(cid)
+				return nil, &EstablishError{Stage: "dial", Cause: CauseTransportError, Err: fmt.Errorf("%w (waiting for the factory's dial in flight)", errDialTimeout)}
+			}
+		}
+		nw := newDialWait(f, dk, kind)
+		if w == nil || !w.open || kind == wire.TypeJoin {
+			// The factory's dial in flight: the first, or in the place of a
+			// claimant whose verdict grace ran out (w keeps its claimant;
+			// claimed puts its fresh trunk in extra), whose waiters wait for
+			// this dial now. An OPEN beside a slow OPEN claimant leaves it in
+			// place.
+			p.dialing[k] = nw
+			if w != nil {
+				w.kickLocked()
+			}
+		}
+		if joined != nil {
+			p.leaveLocked(joined)
+			joined = nil
+		}
+		p.mu.Unlock()
+		est, err := Establish(ctx, p.env, fac, cid, kind, payload, p.provenCheck(nw, check))
+		p.claimed(ctx, nw, est, err, sess)
+		return est, err
+	}
+}
+
+// waitOutcome is how a coalesced wait for a dial in flight ended.
+type waitOutcome int
+
+const (
+	waitEnded waitOutcome = iota // the dial ended: published, released or failed (dialWait.done)
+	waitGrace                    // its verdict grace ran out (dialWait)
+	waitKick                     // a waiter took its place, or its JOIN waiters left
+	waitCtx                      // the attempt's context ended
+	waitTimer                    // the coalesced wait's DialTimeout ran out
+)
+
+// awaitDial waits for dial in flight w. proven is w's path proof (nil when
+// w's verdict grace already ran out for the attempt): once it closes the
+// wait is bounded by w's grace too, which runs out at *graceEnd, set on the
+// attempt's first wait after the proof (a wait again after a kick keeps
+// it). kick is w's kick channel and timer the attempt's DialTimeout of the
+// coalesced wait.
+func awaitDial(ctx context.Context, w *dialWait, proven <-chan struct{}, graceEnd *time.Time, kick <-chan struct{}, timer *time.Timer) waitOutcome {
+	var grace <-chan time.Time
+	for {
+		select {
+		case <-w.done:
+			return waitEnded
+		case <-kick:
+			return waitKick
+		case <-proven:
+			proven = nil
+			if graceEnd.IsZero() {
+				*graceEnd = time.Now().Add(w.grace) // written before proven closed
+			}
+			g := time.NewTimer(time.Until(*graceEnd))
+			defer g.Stop()
+			grace = g.C
+		case <-grace:
+			return waitGrace
+		case <-ctx.Done():
+			return waitCtx
+		case <-timer.C:
+			return waitTimer
+		}
+	}
+}
+
+// pickLocked returns view 1 of the trunk of factory f a new view of session
+// sess of kind dk goes on (M3-D17): among the usable published trunks,
+// which are those of kind dk only (KINDSPLIT), the one with the most views
+// below the cap, then the oldest; nil when none is usable.
+func (p *Pool) pickLocked(f int, dk wire.Type, inst [16]byte, sess uintptr, skip []*trunk) *Conn {
+	var best *Conn
+	bestN := -1
+next:
+	for _, c := range p.trunks[f] {
+		for _, s := range skip {
+			if s == c.trunk {
+				continue next
+			}
+		}
+		if p.full[c.trunk] {
+			if c.fullMarked() {
+				continue
+			}
+			// The trunk's own mark cleared: a view left — its Done, or a
+			// retiring dialer view leaving the view table (WP16 MUX-1).
+			delete(p.full, c.trunk)
+		}
+		if !c.usableFor(dk, inst, sess) {
+			continue
+		}
+		if n := c.viewCount(); n > bestN {
+			best, bestN = c, n
+		}
+	}
+	return best
+}
+
+// fastPath waits for the response of view v, bounded like Establish by
+// Timing.DialTimeout (and a shorter deadline of ctx): its expiry while ctx
+// is alive is a path failure (stage response, CauseTransportError,
+// errDialTimeout), as Establish reports an attempt that hit its
+// DialTimeout. retry reports a result the attempt does not return
+// (fastPathRetry).
+func (p *Pool) fastPath(ctx context.Context, v *Conn, check func(*wire.PrefaceAck) error) (est *Established, retry bool, err error) {
+	actx, cancel := context.WithTimeout(ctx, p.dialTimeout)
+	est, err = v.awaitResponse(actx, check)
+	expired := err != nil && ctx.Err() == nil && actx.Err() != nil
+	cancel()
+	if expired {
+		return nil, false, &EstablishError{Stage: "response", Cause: CauseTransportError, PrefaceOK: true, Instance: v.trunk.peer,
+			Err: fmt.Errorf("%w (waiting for the view's response)", errDialTimeout)}
+	}
+	return est, p.fastPathRetry(ctx, v, est, err), err
+}
+
+// fastPathRetry classifies a fast path's result: true when the attempt
+// continues (a carrier refusal without penalty — CodeMuxFull for an OPEN
+// or a JOIN, or CodeListenerClosed for an OPEN, R1-10 — or a trunk that
+// ended before the view's first frame was placed); false when the result
+// is the attempt's.
+func (p *Pool) fastPathRetry(ctx context.Context, v *Conn, est *Established, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if err == nil {
+		st, code, ok := responseStatus(est.Resp, est.Payload)
+		if !ok || st != wire.StatusCapacity {
+			return false
+		}
+		if est.Resp.Type == wire.TypeJoinAck {
+			code = v.respCode() // a view's JOIN_ACK carries its code (wire.ParseJoinAckMux; WP16 W3)
+		}
+		switch {
+		case code == wire.CodeMuxFull:
+			p.mu.Lock()
+			p.stats.MuxFull++
+			if p.full == nil {
+				p.full = make(map[*trunk]bool)
+			}
+			p.full[v.trunk] = true // until a view leaves (viewGone)
+			p.mu.Unlock()
+			return true
+		case code == wire.CodeListenerClosed && est.Resp.Type == wire.TypeOpenAck:
+			return true
+		}
+		return false
+	}
+	var ee *EstablishError
+	if !errors.As(err, &ee) || ee.Cause != CauseTransportError {
+		return false // a check failure (the view ended, never the trunk) is the attempt's result
+	}
+	t := v.trunk
+	t.mx.Lock()
+	unplaced := t.firstUnplacedLocked(v)
+	t.mx.Unlock()
+	return unplaced
+}
+
+// firstUnplacedLocked reports whether dialer view v's first frame was never
+// placed, whichever end came first: the view is still in the opens FIFO
+// (the writer removes an entry only when it places it or drops an ended
+// one, and a dead trunk's writer removes nothing more), or the view ended
+// in state opening (gone without a response or a DETACH) and the writer
+// dropped it. Neither the view's own Kill nor the trunk's finishAll
+// (opening → dead) changes the answer.
+func (t *trunk) firstUnplacedLocked(v *Conn) bool {
+	for i := 0; i < t.ms.opN; i++ {
+		if t.opens[(t.ms.opHead+i)%len(t.opens)] == v {
+			return true
+		}
+	}
+	return v.state == viewGone && !v.vx.refused && !v.vx.respGot && !v.vx.detQ && !v.vx.detSent.Load()
+}
+
+// responseStatus returns the status and code of a response frame (OPEN_ACK
+// or JOIN_ACK; the canonical JOIN_ACK has no code: 0, a view's code is
+// Conn.respCode); ok is false for any other frame or a malformed payload.
+func responseStatus(h wire.Header, p []byte) (st wire.AckStatus, code uint32, ok bool) {
+	switch h.Type {
+	case wire.TypeOpenAck:
+		a, err := wire.ParseOpenAck(p)
+		return a.Status, a.Code, err == nil
+	case wire.TypeJoinAck:
+		a, err := wire.ParseJoinAck(p)
+		return a.Status, 0, err == nil
+	}
+	return 0, 0, false
+}
+
+// claimed settles the claimant's dial w with its Establish result (M3-D18,
+// M3-D19, R1-8): an OK response on a MUX trunk keeps w in flight until the
+// session starts or discards the fresh trunk; anything else ends w at once
+// — the waiters fail with a transport or PREFACE failure, and retry at
+// once after any other outcome (a session-level refusal of handle 1, a
+// trunk without mux, a check of the claimant's own session, the claimant
+// cancelled by its own session; a DialTimeout expiry stays a failure).
+func (p *Pool) claimed(ctx context.Context, w *dialWait, est *Established, err error, sess uintptr) {
+	if est != nil {
+		est.Fresh = false
+	}
+	p.mu.Lock()
+	w.inEst = false
+	if err == nil && est.Conn.Mux() {
+		if st, _, ok := responseStatus(est.Resp, est.Payload); ok && st == wire.StatusOK {
+			c := est.Conn
+			est.Fresh = true
+			c.owner = p
+			c.kinds = w.dk // set before its publication, read under mu (KINDSPLIT)
+			c.bindSession(sess)
+			f := w.f
+			c.onViewDone(func(v *Conn) { p.viewGone(f, c, v) })
+			w.fresh = c
+			if p.dialing[w.k] != w {
+				// An OPEN waiter's own dial beside the claimant, or a
+				// claimant another waiter took the place of (a verdict grace
+				// ran out): not the factory's dial in flight, but published
+				// alike.
+				if p.extra == nil {
+					p.extra = make(map[*Conn]*dialWait)
+				}
+				p.extra[c] = w
+			}
+			// A closed pool that dials again (a session that survived
+			// Peer.Close fails over or redials) tells its owner, which may
+			// have dropped it meanwhile, so that Status.Mux and
+			// Runtime.Close's join see the trunk (WP16 API-1).
+			relive := p.closed && p.env.PoolLive != nil
+			p.live++
+			p.watch++
+			p.mu.Unlock()
+			if relive {
+				p.env.PoolLive(p)
+			}
+			go p.watchFresh(w, c)
+			return
+		}
+	}
+	if p.dialing[w.k] == w {
+		p.dialing[w.k] = nil
+	}
+	if err != nil && !claimantReleases(ctx, err) {
+		w.err = err
+	} else {
+		w.release = true
+	}
+	p.mu.Unlock()
+	close(w.done)
+}
+
+// claimantReleases reports whether a failed claimant releases its waiters
+// instead of failing them (R1-8): its own context ended other than by a
+// deadline (withdrawal, its session ending), or its own session's check
+// rejected the PREFACE_ACK (a bound instance or the gone-away set: other
+// sessions decide for themselves).
+func claimantReleases(ctx context.Context, err error) bool {
+	if errors.Is(err, ErrWithdrawn) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if ctx.Err() != nil && !errors.Is(context.Cause(ctx), context.DeadlineExceeded) {
+		return true
+	}
+	var ee *EstablishError
+	return errors.As(err, &ee) && ee.Cause == CauseInstanceMismatch
+}
+
+// watchFresh is the pool's goroutine of fresh trunk c while it is in
+// flight (L52: owned by the pool, joined by Wait). It settles a trunk that
+// dies before its session starts it (M3-D19: discarded, its waiters retry
+// at once). It ends once the trunk is published, so a published trunk runs
+// no pool goroutine (F44: two goroutines per carrier) — its last view's
+// hook (viewGone) counts its Done — and otherwise (a trunk discarded, or
+// retired at its publication with no view left) once the trunk is done.
+func (p *Pool) watchFresh(w *dialWait, c *Conn) {
+	select {
+	case <-w.done:
+	case <-c.dying:
+		p.settle(w, c)
+	}
+	p.mu.Lock()
+	kept := w.kept
+	p.mu.Unlock()
+	if !kept {
+		<-c.tdone
+	}
+	if p.watchEnd != nil {
+		p.watchEnd(c)
+	}
+	p.mu.Lock()
+	if !kept {
+		p.live--
+	}
+	p.watch--
+	p.idleLocked()
+	p.mu.Unlock()
+}
+
+// poolStarted is called by Conn.Start on view 1 of a dialer trunk once the
+// trunk runs: the trunk's pool publishes it (M3-D19). Start may run under
+// the session's lock, which Pool.mu is never taken under (§A4.2), so the
+// publication runs on a goroutine of its own (short-lived, owned by the
+// pool). A no-op on a trunk no pool owns, and idempotent.
+func (c *Conn) poolStarted() {
+	if c.trunk != nil && c.owner != nil {
+		go c.owner.settle(nil, c)
+	}
+}
+
+// settle ends the in-flight state of fresh trunk c (view 1): published when
+// it runs, else discarded; either way its waiters retry at once (they find
+// the published trunk usable). w is c's dialWait when the caller knows it.
+// Idempotent.
+func (p *Pool) settle(w *dialWait, c *Conn) {
+	p.mu.Lock()
+	if w == nil {
+		for _, d := range p.dialing {
+			if d != nil && d.fresh == c {
+				w = d
+				break
+			}
+		}
+	}
+	if w == nil {
+		w = p.extra[c]
+	}
+	if w == nil || w.fresh != c {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.extra, c)
+	if p.dialing[w.k] == w {
+		p.dialing[w.k] = nil
+	}
+	w.fresh, w.release = nil, true
+	retire := false
+	if c.death.Load() == nil && c.ms.started.Load() {
+		if c.viewCount() > 0 {
+			p.trunks[w.f] = append(p.trunks[w.f], c)
+			w.kept = true // its last view's hook counts its Done (viewGone)
+		} else {
+			// Every view ended before the publication (view 1 killed or
+			// retired right after its Start): close at zero (M3-D20).
+			c.seal()
+			retire = true
+		}
+	}
+	p.mu.Unlock()
+	close(w.done)
+	if retire {
+		c.retireTrunk(wire.CloseRetire)
+	}
+}
+
+// viewGone is the trunk's view hook (onViewDone): view v of trunk c (view
+// 1) of factory f ended. A view that leaves (not a handle refused at its
+// opening) ends the trunk's CodeMuxFull mark. At zero views a published
+// trunk leaves the pool, is sealed and retired with CLOSE (M3-D20,
+// §A5.9). The count and the view allocation both change under Pool.mu, so
+// an openView racing the close either counted first (no close) or finds
+// the trunk gone and dials.
+func (p *Pool) viewGone(f int, c, v *Conn) {
+	p.mu.Lock()
+	v.mx.Lock()
+	refused := v.vx.refused
+	v.mx.Unlock()
+	if !refused {
+		delete(p.full, c.trunk)
+	}
+	ts := p.trunks[f]
+	i := 0
+	for i < len(ts) && ts[i] != c {
+		i++
+	}
+	if i == len(ts) || c.viewCount() > 0 {
+		p.mu.Unlock()
+		return // not published (still in flight, or discarded), or views remain
+	}
+	copy(ts[i:], ts[i+1:])
+	ts[len(ts)-1] = nil
+	p.trunks[f] = ts[:len(ts)-1]
+	delete(p.full, c.trunk)
+	c.seal() // under mu: no openView after this point
+	p.mu.Unlock()
+	c.retireTrunk(wire.CloseRetire)
+	// The pool counts the trunk until its Done (Wait, L52): this hook's
+	// goroutine waits for it — the retirement's CLOSE exchange, bounded
+	// like any carrier's close, or a dead trunk's teardown — and so the
+	// pool keeps no reference to a trunk past its Done.
+	<-c.tdone
+	p.mu.Lock()
+	p.live--
+	p.idleLocked()
+	p.mu.Unlock()
+}
+
+// releaseCID returns the CarrierID reserved for a dial the attempt did not
+// make.
+func (p *Pool) releaseCID(cid uint32) {
+	if p.env.IDs != nil && cid != 0 {
+		p.env.IDs.Release(cid)
+	}
+}
+
+// Close records that the pool's Peer closed (§A2.3, §A4.5). Attempts are
+// not affected: the sessions that survive Peer.Close keep fast paths,
+// coalescing and publication, and every trunk still closes at its last
+// view; Close lets Wait return once no trunk is left. Idempotent.
+func (p *Pool) Close() {
+	p.mu.Lock()
+	p.closed = true
+	p.idleLocked()
+	p.mu.Unlock()
+}
+
+// Wait joins the pool (Runtime.Close, L52): it returns nil once Close ran,
+// every trunk the pool dialled is done (its goroutines finished) and the
+// pool's watchers ended, or context.Cause(ctx) when ctx ends first. A
+// trunk dialled after Close is waited for as well.
+func (p *Pool) Wait(ctx context.Context) error {
+	for {
+		p.mu.Lock()
+		if p.closed && p.live == 0 && p.watch == 0 {
+			p.mu.Unlock()
+			return nil
+		}
+		if p.idle == nil {
+			p.idle = make(chan struct{})
+		}
+		ch := p.idle
+		p.mu.Unlock()
+		select {
+		case <-ch: // Close ran, a trunk is done or a watcher ended
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
+}
+
+// idleLocked wakes Wait to look again (Close ran, a trunk is done or a
+// watcher ended).
+func (p *Pool) idleLocked() {
+	if p.idle != nil {
+		close(p.idle)
+		p.idle = nil
+	}
+}
+
+// Stats returns a snapshot of the pool's counters.
+func (p *Pool) Stats() PoolStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.statsLocked(p.stats)
+}
+
+// Unfolded is Stats with the counters (FastPaths, Coalesced, MuxFull) less
+// what Fold took: an owner that keeps the folded counters of a pool it
+// dropped adds these, so a pool that comes back (Env.PoolLive) is never
+// counted twice.
+func (p *Pool) Unfolded() PoolStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s := p.stats
+	s.FastPaths -= p.folded.FastPaths
+	s.Coalesced -= p.folded.Coalesced
+	s.MuxFull -= p.folded.MuxFull
+	return p.statsLocked(s)
+}
+
+// Fold returns the counters (FastPaths, Coalesced, MuxFull) that grew since
+// the previous Fold and marks them taken: the owner keeps them when it
+// drops the pool, so its totals stay cumulative (rendr.Status.Mux).
+func (p *Pool) Fold() PoolStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	d := PoolStats{
+		FastPaths: p.stats.FastPaths - p.folded.FastPaths,
+		Coalesced: p.stats.Coalesced - p.folded.Coalesced,
+		MuxFull:   p.stats.MuxFull - p.folded.MuxFull,
+	}
+	p.folded.FastPaths, p.folded.Coalesced, p.folded.MuxFull = p.stats.FastPaths, p.stats.Coalesced, p.stats.MuxFull
+	return d
+}
+
+// statsLocked returns s with the live trunks and their views counted.
+func (p *Pool) statsLocked(s PoolStats) PoolStats {
+	count := func(c *Conn) {
+		if c.death.Load() == nil {
+			s.Carriers++
+			s.Views += c.viewCount()
+		}
+	}
+	for _, ts := range p.trunks {
+		for _, c := range ts {
+			count(c)
+		}
+	}
+	// A fresh trunk whose session started view 1 counts before its
+	// asynchronous publication (poolStarted), so a session that just opened
+	// on it is never missing from Status.Mux.
+	for _, w := range p.dialing {
+		if w != nil && w.fresh != nil && w.fresh.ms.started.Load() {
+			count(w.fresh)
+		}
+	}
+	for c, w := range p.extra {
+		if w.fresh == c && c.ms.started.Load() {
+			count(c)
+		}
+	}
+	return s
+}

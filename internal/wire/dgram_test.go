@@ -235,6 +235,8 @@ func parseTyped(t Type, p []byte) error {
 		sinkPack, err = ParsePack(p)
 	case TypeRack:
 		sinkRack, err = ParseRack(p)
+	case TypeDetach:
+		sinkDetach, err = ParseDetach(p)
 	case TypeRel:
 		var inner []byte
 		if sinkRelHead, inner, err = ParseRel(p); err == nil {
@@ -283,6 +285,8 @@ func validInner(t Type) []byte {
 		return encodeTyped(t, GoAwayShutdown)
 	case TypePack:
 		return encodeTyped(t, Pack{HighestSeq: 3, Received: 2, EpochEcho: 1})
+	case TypeDetach:
+		return encodeTyped(t, Detach{Handle: 5, Reason: DetachEnded})
 	}
 	return nil
 }
@@ -414,7 +418,7 @@ func TestDgramPackCodec_L44(t *testing.T) {
 		{"DGRAM 7", hdrBytes(0x20, 0, 7, 1, 1), ErrLength},
 		{"DGRAM flag", hdrBytes(0x20, 1, 8, 1, 1), ErrFlags},
 		{"DGRAM handle 0", hdrBytes(0x20, 0, 8, 1, 0), ErrHandle},
-		{"DGRAM handle 2", hdrBytes(0x20, 0, 8, 1, 2), ErrHandle},
+		{"DGRAM handle 2", hdrBytes(0x20, 0, 8, 1, 2), nil}, // any non-zero session handle since M3 (M3-D4)
 		{"PACK", hdrBytes(0x21, 3, 20, 1, 1), nil},
 		{"PACK 19", hdrBytes(0x21, 0, 19, 1, 1), ErrLength},
 		{"PACK 21", hdrBytes(0x21, 0, 21, 1, 1), ErrLength},
@@ -462,8 +466,8 @@ func TestRelRackCodec_L44(t *testing.T) {
 			}
 		}
 	}
-	if wrapped != (10+2)*4 { // ten types, two of them (SCHED, PACK) with flags
-		t.Fatalf("%d REL round trips, want %d", wrapped, (10+2)*4)
+	if wrapped != (11+2)*4 { // eleven types (DETACH since M3), two of them (SCHED, PACK) with flags
+		t.Fatalf("%d REL round trips, want %d", wrapped, (11+2)*4)
 	}
 
 	// Check order: each seed is valid up to its step and damaged at the
@@ -480,7 +484,10 @@ func TestRelRackCodec_L44(t *testing.T) {
 		{"type", bcat(bu32(1), []byte{byte(TypeData), 0xff}, bu32(9)), ErrType},
 		{"flags", bcat(bu32(1), []byte{byte(TypeFin), 1}, bu32(9), fin[:3]), ErrFlags},
 		{"handle", bcat(bu32(1), []byte{byte(TypeFin), 0}, bu32(0), fin[:3]), ErrHandle},
-		{"handle 2", bcat(bu32(1), []byte{byte(TypeFin), 0}, bu32(2), fin), ErrHandle},
+		{"handle 2", bcat(bu32(1), []byte{byte(TypeFin), 0}, bu32(2), fin), nil}, // any non-zero session handle since M3 (M3-D4)
+		{"handle 2, short", bcat(bu32(1), []byte{byte(TypeFin), 0}, bu32(2), fin[:7]), ErrLength},
+		{"DETACH handle 1", bcat(bu32(1), []byte{byte(TypeDetach), 0}, bu32(1), validInner(TypeDetach)), ErrHandle},
+		{"DETACH", bcat(bu32(1), []byte{byte(TypeDetach), 0}, bu32(0), validInner(TypeDetach)), nil},
 		{"length", bcat(bu32(1), []byte{byte(TypeFin), 0}, bu32(1), fin[:7]), ErrLength},
 		{"length trailing", bcat(bu32(1), []byte{byte(TypeFin), 0}, bu32(1), fin, []byte{0}), ErrLength},
 		{"CLOSE handle 1", bcat(bu32(1), []byte{byte(TypeClose), 0}, bu32(1), []byte{1}), ErrHandle},
@@ -591,6 +598,7 @@ func TestRelNestingImpossible_L44(t *testing.T) {
 	want := map[Type]bool{
 		TypeOpen: true, TypeOpenAck: true, TypeJoin: true, TypeJoinAck: true, TypeFin: true,
 		TypeRst: true, TypeSched: true, TypeClose: true, TypeGoAway: true, TypePack: true,
+		TypeDetach: true, // M3-D6
 	}
 	lengths := []int{0, 1, 8, 20, RelMaxPayload, 1 << 16}
 	bufs := make([][]byte, len(lengths))
@@ -604,7 +612,7 @@ func TestRelNestingImpossible_L44(t *testing.T) {
 			t.Errorf("Wrappable(%v) = %v", ty, Wrappable(ty))
 		}
 		if want[ty] {
-			if !ty.Known() || ty.Extension() || (ty.CarrierLevel() && ty != TypeClose && ty != TypeGoAway) {
+			if !ty.Known() || ty.Extension() || (ty.CarrierLevel() && ty != TypeClose && ty != TypeGoAway && ty != TypeDetach) {
 				t.Errorf("wrappable %v: known %v, carrier level %v", ty, ty.Known(), ty.CarrierLevel())
 			}
 			if _, _, err := ParseRel(relPayload(RelHead{Cseq: 1, Type: ty, Handle: relHandle(ty)}, validInner(ty))); err != nil {
@@ -625,7 +633,7 @@ func TestRelNestingImpossible_L44(t *testing.T) {
 			}
 		}
 	}
-	if checked != (256-10)*3*3*6 {
+	if checked != (256-11)*3*3*6 {
 		t.Fatalf("%d non-wrappable REL payloads checked", checked)
 	}
 	// A valid REL payload wrapped again, and a whole valid REL frame as the
@@ -753,8 +761,8 @@ func TestPrefaceTypeReserved_L44(t *testing.T) {
 			}
 		}
 	}
-	if known != 17 {
-		t.Fatalf("%d known core types, want 13 (M1) + 4 (M2)", known)
+	if known != 18 {
+		t.Fatalf("%d known core types, want 13 (M1) + 4 (M2) + 1 (M3)", known)
 	}
 	pre, ack := validPrefaces()
 	for _, c := range []struct {
@@ -997,6 +1005,12 @@ func TestControlFrameSizes_L37(t *testing.T) {
 		{"REL{RST}, a 255-byte message", rel(TypeRst, 0, Rst{Code: 1, Msg: msg(MaxMsg)}), 32 + 255},
 		{"REL{CLOSE}", rel(TypeClose, 0, CloseRetire), 28},
 		{"REL{GOAWAY}", rel(TypeGoAway, 0, GoAwayShutdown), 28},
+		// M3 (design §A3.6).
+		{"DETACH (stream)", size(TypeDetach, Detach{Handle: 2, Reason: DetachEnded}), 22},
+		{"REL{DETACH} (datagram)", rel(TypeDetach, 0, Detach{Handle: 2, Reason: DetachRetired}), 32},
+		{"OPEN on a live stream trunk, no metadata", size(TypeOpen, Open{SID: gSID, Kind: KindStream, Mode: ModeRace}), 49},
+		{"OPEN on a live stream trunk, 100 bytes of metadata", size(TypeOpen, Open{SID: gSID, Kind: KindStream, Mode: 1, Metadata: make([]byte, 100)}), 49 + 100},
+		{"REL{OPEN} on a live datagram trunk, no metadata", rel(TypeOpen, 0, withMeta(0)), 59},
 		{"H1: PREFACE ‖ REL{OPEN}", h1, 99},
 		{"H1: PREFACE ‖ REL{JOIN}", len(goldenByName(t, "h1_join").b), 92},
 		{"H1p: PREFACE ‖ PING", len(goldenByName(t, "h1_probe").b), 77},

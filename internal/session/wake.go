@@ -17,9 +17,15 @@ import (
 // until the summed spare capacity (Capacity − Inflight, busy lanes
 // included) covers the pending bytes, so demand-limited traffic rides the
 // fastest healthy member and backlogged traffic wakes every member. The
-// walk usually visits one lane, whatever the lane count (L54).
+// walk usually visits one lane, whatever the lane count (L54). Race: every
+// member carries every byte, so every idle data lane with something to
+// place is woken (raceWakeDataLocked, M3-D30).
 func (s *Session) wakeDataLocked(now time.Time) {
 	st := &s.st
+	if s.p.Mode == ModeRace {
+		s.raceWakeDataLocked()
+		return
+	}
 	if s.p.Mode != ModeBond {
 		l := s.ctl.active
 		if l == nil || !l.data || l.state == LaneDead {
