@@ -72,6 +72,23 @@
 // waits for the dialer's first frame for that session). CheapSubflow
 // factories give every session its own carriers.
 //
+// Early return (DialOptions.EarlyReturn) gives Dial the semantics of TCP
+// Fast Open: Dial returns before any network I/O, the session opens with
+// its first Write, Read or CloseWrite, and up to Handshake.EarlyDataMax
+// (64 KiB) of the first bytes written travel with the OPEN when the
+// session dials a carrier of its own, so a protocol whose client speaks
+// first saves one round trip. The opening's outcome — a refusal, no path —
+// is then the error of the next Read and Write instead of Dial's. The
+// passive application reads early bytes only after it confirmed the
+// session; a refused session discards them. On a carrier shared with other
+// sessions no early data is sent, which costs the same round trip.
+//
+// Package l4 carries TCP connections over stream sessions: l4.Dial names
+// the target in the OPEN's metadata, an l4.Server dials it while the
+// session is pending and confirms only once the target connected (else it
+// rejects with a typed code), and l4.Forward moves the bytes with half-close
+// and resets mapped in both directions.
+//
 // Idle sessions hold no goroutine: a session's scheduler parks after about
 // a second without work and restarts at its next event or deadline
 // (Status.Actors counts the running ones).

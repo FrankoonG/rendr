@@ -6,10 +6,11 @@ import "time"
 // range. The zero value of every field selects its default; out-of-range
 // values are clamped to the range and every change (clamp or
 // cross-parameter constraint) is recorded in Status.ConfigAdjustments as
-// "Field: old → new (reason)". For the four fields whose range includes
-// zero (RetireGrace, Selector.Floor, Probe.DialWait, Handshake.MaxMetadata)
-// a negative value selects zero. Configuration is frozen when the Runtime
-// is built; each session also snapshots it at Dial or OPEN.
+// "Field: old → new (reason)". For the five fields whose range includes
+// zero (RetireGrace, Selector.Floor, Probe.DialWait, Handshake.MaxMetadata,
+// Handshake.EarlyDataMax) a negative value selects zero. Configuration is
+// frozen when the Runtime is built; each session also snapshots it at Dial
+// or OPEN.
 //
 // PacketPing and Packet configure packet sessions and datagram carriers
 // (milestone M2).
@@ -179,8 +180,9 @@ type HandshakeLimits struct {
 	// EarlyDataMax (64 KiB; 0–64 KiB; a negative value selects 0) bounds the
 	// bytes an EarlyReturn session sends before the peer's answer. A passive
 	// always accepts up to 64 KiB of early data per pending session (a
-	// protocol constant), so the two sides never disagree. (Not normalized
-	// yet: EarlyReturn is not implemented.)
+	// protocol constant), so the two sides never disagree. 0 keeps
+	// EarlyReturn's early return without early bytes: the first bytes then
+	// wait for the answer.
 	EarlyDataMax int
 }
 

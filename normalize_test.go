@@ -80,6 +80,7 @@ func normFields() []normField {
 		i("MaxSessions", func(c *Config) *int { return &c.MaxSessions }, 10000, 1, 1000000, false),
 		i("Handshake.MaxConcurrent", func(c *Config) *int { return &c.Handshake.MaxConcurrent }, 256, 1, 65536, false),
 		i("Handshake.MaxMetadata", func(c *Config) *int { return &c.Handshake.MaxMetadata }, 4096, 0, 65535, true),
+		i("Handshake.EarlyDataMax", func(c *Config) *int { return &c.Handshake.EarlyDataMax }, 65536, 0, 65536, true),
 		i("Sessionless.PerInstance", func(c *Config) *int { return &c.Sessionless.PerInstance }, 16, 1, 1024, false),
 		i("Sessionless.Total", func(c *Config) *int { return &c.Sessionless.Total }, 1024, 1, 65536, false),
 		d("Packet.MaxAge", func(c *Config) *time.Duration { return &c.Packet.MaxAge }, 100*time.Millisecond, 10*time.Millisecond, 2*time.Second, false, nil),
@@ -443,6 +444,7 @@ func checkNormalized(t *testing.T, c Config) {
 	in("Handshake.Timeout", c.Handshake.Timeout, time.Second, 60*time.Second)
 	ini("Handshake.MaxConcurrent", int64(c.Handshake.MaxConcurrent), 1, 65536)
 	ini("Handshake.MaxMetadata", int64(c.Handshake.MaxMetadata), 0, 65535)
+	ini("Handshake.EarlyDataMax", int64(c.Handshake.EarlyDataMax), 0, 65536)
 	ini("Sessionless.PerInstance", int64(c.Sessionless.PerInstance), 1, 1024)
 	ini("Sessionless.Total", int64(c.Sessionless.Total), 1, 65536)
 	in("PacketPing", c.PacketPing, 200*time.Millisecond, min(10*time.Second, c.DeadMin/2))
@@ -539,6 +541,7 @@ func randomConfig(r *rand.Rand) Config {
 			Timeout:       dur(time.Second, 60*time.Second),
 			MaxConcurrent: int(num(1, 65536)),
 			MaxMetadata:   int(num(1, 65535)),
+			EarlyDataMax:  int(num(1, 65536)),
 		},
 		Sessionless: SessionlessLimits{
 			PerInstance: int(num(1, 1024)),
@@ -555,7 +558,7 @@ func randomConfig(r *rand.Rand) Config {
 }
 
 // asInput turns a normalized Config back into the input that selects it:
-// a zero in one of the four zero-able fields must be written as a negative
+// a zero in one of the five zero-able fields must be written as a negative
 // value, because zero would select the default.
 func asInput(c Config) Config {
 	for _, p := range []*time.Duration{&c.RetireGrace, &c.Selector.Floor, &c.Probe.DialWait} {
@@ -563,8 +566,10 @@ func asInput(c Config) Config {
 			*p = -1
 		}
 	}
-	if c.Handshake.MaxMetadata == 0 {
-		c.Handshake.MaxMetadata = -1
+	for _, p := range []*int{&c.Handshake.MaxMetadata, &c.Handshake.EarlyDataMax} {
+		if *p == 0 {
+			*p = -1
+		}
 	}
 	return c
 }
@@ -617,7 +622,7 @@ func TestConfigNormalizeDefaults(t *testing.T) {
 		Probe:       ProbePolicy{Interval: 2 * time.Second, Fresh: 10 * time.Second, BackoffMax: 4 * time.Second, DialWait: 800 * time.Millisecond},
 		DialTimeout: 10 * time.Second, Linger: 30 * time.Second,
 		Window: 8 << 20, MaxCarriersPerSession: 6, MaxSessions: 10000, MaxBufferedBytes: 1 << 30,
-		Handshake:   HandshakeLimits{Timeout: 10 * time.Second, MaxConcurrent: 256, MaxMetadata: 4096},
+		Handshake:   HandshakeLimits{Timeout: 10 * time.Second, MaxConcurrent: 256, MaxMetadata: 4096, EarlyDataMax: 65536},
 		Sessionless: SessionlessLimits{PerInstance: 16, Total: 1024, Idle: 30 * time.Second},
 		PacketPing:  time.Second,
 		Packet:      PacketPolicy{Queue: 1 << 20, MaxAge: 100 * time.Millisecond, MaxPayload: 65507},

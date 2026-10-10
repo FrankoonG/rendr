@@ -14,10 +14,10 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// Configuration defaults and clamp ranges (plan §4). The four fields whose
+// Configuration defaults and clamp ranges (plan §4). The five fields whose
 // range includes zero (RetireGrace, Selector.Floor, Probe.DialWait,
-// Handshake.MaxMetadata) select zero with a negative value; IdleTimeout is
-// off (0) by default.
+// Handshake.MaxMetadata, Handshake.EarlyDataMax) select zero with a
+// negative value; IdleTimeout is off (0) by default.
 const (
 	defNoPathGrace, minNoPathGrace, maxNoPathGrace                = 15 * time.Second, 3 * time.Second, 300 * time.Second
 	defRejoinBackoffMax, minRejoinBackoffMax, maxRejoinBackoffMax = 4 * time.Second, 1 * time.Second, 8 * time.Second
@@ -51,6 +51,7 @@ const (
 	defHandshakeTimeout, minHandshakeTimeout, maxHandshakeTimeout = 10 * time.Second, 1 * time.Second, 60 * time.Second
 	defMaxConcurrent, minMaxConcurrent, maxMaxConcurrent          = 256, 1, 65536
 	defMaxMetadata, maxMaxMetadata                                = 4096, 65535
+	defEarlyDataMax, maxEarlyDataMax                              = wire.EarlyWindow, wire.EarlyWindow // 64 KiB: a dialer cap within the passive's window (M4-D16)
 
 	defSlPerInstance, minSlPerInstance, maxSlPerInstance = 16, 1, 1024
 	defSlTotal, minSlTotal, maxSlTotal                   = 1024, 1, 65536
@@ -110,7 +111,8 @@ const (
 type effective struct {
 	// cfg is the normalized Config. Its zero-able fields keep the selected
 	// zero (RetireGrace, Selector.Floor, Probe.DialWait,
-	// Handshake.MaxMetadata), IdleTimeout 0 means off; every other field is
+	// Handshake.MaxMetadata, Handshake.EarlyDataMax), IdleTimeout 0 means
+	// off; every other field is
 	// non-zero and inside its range unless an override set it. OnEvent is
 	// passed through. It is an output, never an input: normalizing it again
 	// would turn those selected zeros back into defaults.
@@ -187,6 +189,7 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 	clampField(&a, "Handshake.Timeout", &c.Handshake.Timeout, defHandshakeTimeout, minHandshakeTimeout, maxHandshakeTimeout, false, fmtDur)
 	clampField(&a, "Handshake.MaxConcurrent", &c.Handshake.MaxConcurrent, defMaxConcurrent, minMaxConcurrent, maxMaxConcurrent, false, fmtInt)
 	clampField(&a, "Handshake.MaxMetadata", &c.Handshake.MaxMetadata, defMaxMetadata, 0, maxMaxMetadata, true, fmtInt)
+	clampField(&a, "Handshake.EarlyDataMax", &c.Handshake.EarlyDataMax, defEarlyDataMax, 0, maxEarlyDataMax, true, fmtInt)
 
 	clampField(&a, "Sessionless.PerInstance", &c.Sessionless.PerInstance, defSlPerInstance, minSlPerInstance, maxSlPerInstance, false, fmtInt)
 	clampField(&a, "Sessionless.Total", &c.Sessionless.Total, defSlTotal, minSlTotal, maxSlTotal, false, fmtInt)
@@ -333,6 +336,7 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 		FirstOffset:       k.firstOffset,
 		OffsetLimit:       k.offsetLimit,
 		FirstEpoch:        k.firstEpoch,
+		EarlyDataMax:      c.Handshake.EarlyDataMax, // EarlyReturn dialers only (M4-D16)
 	}
 	if ov != nil {
 		// The parked actor's linger (M3-D42, M3-D50): internal, overridden

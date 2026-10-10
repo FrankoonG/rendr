@@ -85,10 +85,8 @@ type DialOptions struct {
 	// data on a carrier of its own. Do not use it when the peer's answer must
 	// precede your first byte (a SOCKS5 reply, for example). Write before you
 	// Read: a Read that comes first opens the session without early bytes.
-	// DialPacket refuses it with ErrProtocol.
-	//
-	// Not implemented yet: Dial and DialPacket return ErrProtocol
-	// ("EarlyReturn: not implemented") when it is set.
+	// DialPacket refuses it with ErrProtocol. SessionStatus.EarlyBytes
+	// reports how many bytes travelled as early data.
 	EarlyReturn bool
 }
 
