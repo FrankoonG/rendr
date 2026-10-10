@@ -183,8 +183,14 @@ const (
 // each, path B (factory b) before path A (factory a) in the Peer; the
 // dialer's DialTimeout is 5 s; four sessions opened in order (S1, S2
 // selector — active on b, the first factory —, S3, S4 bond), each with a
-// continuous B → A transfer paced at 512 KiB/s (128 KiB/s under -race,
-// R1-11; the gold paces 20 Mbit/s).
+// continuous B → A transfer paced at 512 KiB/s in every lane (the gold
+// paces 20 Mbit/s). Not a quarter under -race (R1-11): bond places
+// demand-limited bytes on its fastest member and wakes another only when
+// the pending bytes exceed the woken members' spare capacity (session
+// wakeDataLocked, L54), so at 128 KiB/s the rejoined member of a, its path
+// as fast as b's, could go a whole 1-s sample without a byte (the pool's
+// Linux race lane, I3, and the host at -race -cpu 1,2: 2 of 16); at
+// 512 KiB/s the row takes no longer under -race (5 s on the host).
 //
 // Sequence (M1c's G5-sel flow for the selector sessions, G5-bond's
 // criteria for the bond sessions): 5 s into the transfers path A is
@@ -207,9 +213,6 @@ const (
 // after Runtime.Close.
 func TestMuxG5Miniature_L22(t *testing.T) {
 	rate := float64(512 << 10)
-	if raceEnabled {
-		rate = 128 << 10 // R1-11
-	}
 	synctest.Test(t, func(t *testing.T) { g5(t, rate) })
 }
 
