@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -354,12 +355,19 @@ func TestForwardBadCountsFromLocal_L42(t *testing.T) {
 
 // TestForwardGoroutines_L52 (§A9): 1,000 forwarded connections cost at most
 // three goroutines each (two pumps and the caller), +20; once they ended,
-// the goroutine count is back at its value before the world.
+// the goroutine count is back at its value before the world. The counts
+// are the bubble's own (bubbleGoroutines): goroutines of other tests of
+// the binary that start or end meanwhile — the real-socket rows' — are not
+// the forwards'; the row proves it by ending one such goroutine halfway
+// (the process-wide count failed the pool's l4 sweep 2 times in 600).
 func TestForwardGoroutines_L52(t *testing.T) {
+	outside := make(chan struct{})
+	outsideDone := make(chan struct{})
+	go func() { <-outside; close(outsideDone) }() // not in the bubble
 	synctest.Test(t, func(t *testing.T) {
 		const n = 1000
 		synctest.Wait()
-		base0 := runtime.NumGoroutine()
+		base0 := bubbleGoroutines()
 		w := newWorld(t, worldOpts{n: n})
 		type conn struct {
 			d, p *rendr.Conn
@@ -371,7 +379,7 @@ func TestForwardGoroutines_L52(t *testing.T) {
 		}
 		time.Sleep(5 * time.Second) // the actors park
 		synctest.Wait()
-		base := runtime.NumGoroutine()
+		base := bubbleGoroutines()
 		ctx, cancel := context.WithCancel(context.Background())
 		res := make([]<-chan ForwardResult, n)
 		for i := range cs {
@@ -381,7 +389,9 @@ func TestForwardGoroutines_L52(t *testing.T) {
 		}
 		time.Sleep(5 * time.Second)
 		synctest.Wait()
-		live := runtime.NumGoroutine()
+		live := bubbleGoroutines()
+		close(outside) // a goroutine outside the bubble ends meanwhile
+		<-outsideDone
 		if live > base+3*n+20 || live < base+3*n {
 			t.Fatalf("%d goroutines with %d forwards, %d before: want %d per forward (+20)", live, n, base, 3)
 		}
@@ -408,7 +418,7 @@ func TestForwardGoroutines_L52(t *testing.T) {
 		}
 		w.shutdown()
 		synctest.Wait()
-		if after := runtime.NumGoroutine(); after != base0 {
+		if after := bubbleGoroutines(); after != base0 {
 			t.Fatalf("%d goroutines after the forwards and the world ended, %d before", after, base0)
 		}
 	})
@@ -546,4 +556,38 @@ func TestForwardSetsNoDeadlines(t *testing.T) {
 		waitDone(t, p, time.Minute)
 		w.shutdown()
 	})
+}
+
+// bubbleGoroutines counts the goroutines of the calling goroutine's
+// synctest bubble: the goroutine dump marks each with its bubble, and the
+// caller's own record comes first.
+func bubbleGoroutines() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	tag := ""
+	count := 0
+	for _, line := range strings.Split(string(buf), "\n") {
+		if !strings.HasPrefix(line, "goroutine ") || !strings.HasSuffix(line, "]:") {
+			continue
+		}
+		i := strings.Index(line, ", synctest bubble ")
+		if i < 0 {
+			continue
+		}
+		b := line[i : len(line)-2]
+		if tag == "" {
+			tag = b // the caller's own record is the first
+		}
+		if b == tag {
+			count++
+		}
+	}
+	return count
 }
