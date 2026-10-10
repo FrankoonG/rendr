@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -139,4 +140,112 @@ func TestPoolKindSplitCoalescing(t *testing.T) {
 			t.Fatalf("%d factory calls, stats %+v; want 2 carriers with %d views", d, st, 2*n)
 		}
 	})
+}
+
+// TestPoolKindSplitExtra: a fresh trunk dialled outside the pool's dial in
+// flight of its (factory, kind) slot — the extra path of claimed — records
+// its session kind too. Two rows on one stream factory, both with a packet
+// OPEN claimant whose verdict comes 1 s late (its passive application has
+// not accepted it):
+//
+//   - open beside: a packet OPEN waiter dials beside the claimant once its
+//     verdict grace runs out (no JOIN waiting), so its trunk is extra while
+//     the claimant stays the dial in flight;
+//   - join takes over: a packet JOIN waiter dials in the claimant's place,
+//     so it is the claimant's own trunk that ends up extra.
+//
+// Either way the extra trunk carries DGRAM, a later stream OPEN is no fast
+// path on it but dials a DATA trunk of its own, and a later packet JOIN is
+// a fast path on a packet trunk. A trunk published with no kind would take
+// views of both kinds: the in-flight-cap head-of-line KINDSPLIT removes.
+func TestPoolKindSplitExtra(t *testing.T) {
+	for _, row := range []struct {
+		name   string
+		waiter wire.Type // the packet waiter's first frame
+	}{
+		{"open_beside", wire.TypeOpen},
+		{"join_takes_over", wire.TypeJoin},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const late = time.Second
+				pt := newPoolT(t, nil, nil)
+				pt.srv.lateVerdicts(func(n int) time.Duration {
+					if n == 1 {
+						return late
+					}
+					return 0
+				})
+				claimed, waiters := newDueResults(t, 1), newDueResults(t, 1)
+				pt.goAttemptKind(context.Background(), wire.TypeOpen, 1, wire.TypeDgram, claimed.ch)
+				synctest.Wait()
+				pt.goAttemptKind(context.Background(), row.waiter, 2, wire.TypeDgram, waiters.ch)
+				own := waiters.get(t, 1)[0]
+				if own.err != nil || !own.est.Fresh || !isOK(own.est) {
+					t.Fatalf("packet waiter after the grace: %v (fresh %v), want its own fresh carrier", own.err, own.est != nil && own.est.Fresh)
+				}
+				if d := pt.srv.dials.Load(); d != 2 {
+					t.Fatalf("%d factory calls once the waiter dialled, want 2", d)
+				}
+				var extra *Established // the trunk claimed outside the dial in flight
+				if row.waiter == wire.TypeOpen {
+					extra = own.est
+					pt.p.mu.Lock()
+					inExtra := pt.p.extra[own.est.Conn] != nil
+					pt.p.mu.Unlock()
+					if !inExtra {
+						t.Fatal("the OPEN waiter's trunk is not on the extra path")
+					}
+					pt.attach(own.est)
+				} else {
+					pt.attach(own.est)
+					claim := claimed.get(t, 1)[0]
+					if claim.err != nil || !claim.est.Fresh || !isOK(claim.est) {
+						t.Fatalf("claimant: %v", claim.err)
+					}
+					extra = claim.est
+					pt.p.mu.Lock()
+					inExtra := pt.p.extra[claim.est.Conn] != nil
+					pt.p.mu.Unlock()
+					if !inExtra {
+						t.Fatal("the replaced claimant's trunk is not on the extra path")
+					}
+					pt.attach(claim.est)
+				}
+				if k := extra.Conn.kinds; k != wire.TypeDgram {
+					t.Fatalf("extra trunk kind %v, want DGRAM", k)
+				}
+				published := false
+				for _, c := range pt.p.listed(0) {
+					published = published || c.trunk == extra.Conn.trunk
+				}
+				if !published {
+					t.Fatal("the extra trunk was not published")
+				}
+				s, err := pt.attemptKind(context.Background(), pt.p, 0, wire.TypeOpen, 3, [16]byte{}, nil, wire.TypeData)
+				if err != nil || !isOK(s) {
+					t.Fatalf("stream OPEN: %v", err)
+				}
+				if !s.Fresh || s.Conn.trunk == extra.Conn.trunk || s.Conn.kinds != wire.TypeData {
+					t.Fatalf("stream OPEN: fresh %v, on the extra packet trunk %v, kind %v; want a DATA trunk of its own", s.Fresh, s.Conn.trunk == extra.Conn.trunk, s.Conn.kinds)
+				}
+				pt.attach(s)
+				j, err := pt.attemptKind(context.Background(), pt.p, 0, wire.TypeJoin, 4, [16]byte{}, nil, wire.TypeDgram)
+				if err != nil || !isOK(j) || j.Fresh || j.Conn.kinds != wire.TypeDgram {
+					t.Fatalf("packet JOIN: %v (fresh %v), want a fast path on a packet trunk", err, j != nil && j.Fresh)
+				}
+				pt.attach(j)
+				if row.waiter == wire.TypeOpen {
+					claim := claimed.get(t, 1)[0]
+					if claim.err != nil || !claim.est.Fresh || !isOK(claim.est) || claim.est.Conn.kinds != wire.TypeDgram {
+						t.Fatalf("claimant: %v", claim.err)
+					}
+					pt.attach(claim.est)
+				}
+				if d, st := pt.srv.dials.Load(), pt.p.Stats(); d != 3 || st.Carriers != 3 || st.Views != 4 || st.FastPaths != 1 {
+					t.Fatalf("%d factory calls, stats %+v; want 3 calls (two packet trunks, one stream trunk) with 4 views and 1 fast path", d, st)
+				}
+			})
+		})
+	}
 }

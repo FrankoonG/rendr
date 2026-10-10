@@ -14,8 +14,9 @@ import (
 // M3-D16 … M3-D20). It is the fast path of the Peer's OPENs and JOINs: an
 // attempt on a mux-eligible factory (Factory.Mux) takes a usable live trunk
 // of that factory (a new view, no factory call), else waits for the
-// factory's dial already in flight (coalescing: one dial per factory, not
-// one per session), else dials itself with wire.OptMux. A pool never
+// factory's dial already in flight (coalescing: one dial per factory and
+// session kind, not one per session), else dials itself with wire.OptMux.
+// A pool never
 // crosses Peers, keeps no idle trunk, never pre-dials, and closes a trunk
 // at its last view.
 //

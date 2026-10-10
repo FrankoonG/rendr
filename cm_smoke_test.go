@@ -492,7 +492,17 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	if got := downs.Load(); got < int64(len(kills)) {
 		t.Errorf("stimulus: %d CarrierDown events for %d kills", got, len(kills))
 	}
-	// ≤ 1 dial per factory and session kind per kill.
+	// ≤ 1 dial per factory and session kind per kill. The bound counts per
+	// Link, not per kind: a Link's log cannot tell a JOIN's kind (its
+	// payload does not carry it). It is still tight per kind here: the
+	// identities before the run require both kinds' trunks on every Link,
+	// the stream sessions pace until cmDuration and the packet sessions run
+	// until stop, and every kill comes before cmDuration, so each kill ends
+	// one trunk of each kind and each kind is owed at most one redial. The
+	// bound has slack for a double dial of one kind only after a kill at
+	// which the other kind did not redial on that Link; the root-level
+	// per-kind rows (internal/carrier TestPoolKindSplitCoalescing,
+	// internal/scenario/mux TestMuxMixedKinds) pin one dial per kind.
 	for i, l := range links {
 		all, _ := cmSessionCarriers(l)
 		if all > 2*(1+killsOf[i]) {
