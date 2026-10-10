@@ -31,6 +31,15 @@ type Env struct {
 	// Dgram are the Runtime-wide datagram counters behind
 	// rendr.Status.Datagram; nil in component tests.
 	Dgram *DgramStats
+	// MuxFull counts the CAPACITY CodeMuxFull answers this Runtime's
+	// passive MUX trunks queued (rendr.Status.Mux.MuxFull, passive role;
+	// the dialer's are PoolStats.MuxFull); nil in component tests.
+	MuxFull *atomic.Uint64
+	// PoolLive (dialer) is called, without a pool lock held, when a pool
+	// whose Close ran publishes a fresh trunk (a session that survived
+	// Peer.Close dialled): the owner tracks the pool again if it dropped
+	// it (rendr.Status.Mux, Runtime.Close's join). nil: no call.
+	PoolLive func(*Pool)
 
 	// Admit (passive) receives an OPEN or JOIN for a new handle on a started
 	// MUX trunk (M3-D21, §A5.6): v is the new view (pending or joining,

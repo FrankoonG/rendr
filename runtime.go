@@ -68,6 +68,9 @@ type Runtime struct {
 	trunks map[*carrier.Conn]*trunkRec
 	trk    *group
 	pools  map[*carrier.Pool]struct{}
+
+	muxFull atomic.Uint64 // CAPACITY CodeMuxFull answers of the passive trunks (carrier.Env.MuxFull; Status.Mux.MuxFull)
+	muxGone MuxStatus     // the counters (FastPaths, Coalesced, MuxFull) of the pools pruned (carrier.Pool.Fold; mu)
 }
 
 // Join bounds of Runtime.Close (design §3.1, §6.8).
@@ -139,6 +142,10 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		DBufs:   carrier.NewDatagramBufPool(),
 		Dgram:   &carrier.DgramStats{},
 		Admit:   rt.admitView, // OPENs and JOINs on live passive MUX trunks (M3-D21)
+		MuxFull: &rt.muxFull,  // the passive's CodeMuxFull answers (Status.Mux.MuxFull, both roles)
+		// A closed Peer's pool that dials again for a surviving session is
+		// tracked again (Status.Mux, Runtime.Close's join; WP16 API-1).
+		PoolLive: rt.addPool,
 	}
 	rt.eff.params.Actors = &rt.actors // every session's Params counts its running actor (M3-D44)
 	rt.gateFn = rt.gate
@@ -228,23 +235,28 @@ func (rt *Runtime) Status() Status {
 }
 
 // muxStatus returns Status.Mux: the Peers' pools (dialer) and the trunk set
-// of passive MUX trunks. Zero while the Runtime has no MUX trunk. Carriers
-// counts the live MUX trunks of both roles, Views the views on them that
-// are not gone (Σ over those trunks, TestStatusMuxIdentities).
+// of passive MUX trunks. Carriers counts the live MUX trunks of both roles
+// and Views the views on them that are not gone (Σ over those trunks,
+// TestStatusMuxIdentities): both are zero while the Runtime has no MUX
+// trunk. FastPaths, Coalesced and MuxFull are cumulative over the
+// Runtime's life: the pools' counters, those of pools already pruned
+// included (muxGone), and for MuxFull also the CodeMuxFull answers the
+// passive trunks placed.
 func (rt *Runtime) muxStatus() MuxStatus {
 	rt.mu.Lock()
 	pools := mapKeys(rt.pools)
 	trunks := mapKeys(rt.trunks)
+	m := rt.muxGone
 	rt.mu.Unlock()
-	var m MuxStatus
 	for _, p := range pools {
-		st := p.Stats()
+		st := p.Unfolded()
 		m.Carriers += st.Carriers
 		m.Views += st.Views
 		m.FastPaths += st.FastPaths
 		m.Coalesced += st.Coalesced
 		m.MuxFull += st.MuxFull
 	}
+	m.MuxFull += rt.muxFull.Load()
 	for _, c := range trunks {
 		if c.TrunkDying() {
 			continue
@@ -388,8 +400,12 @@ func (rec *trunkRec) zeroBound(gen uint64, idle bool) {
 	rec.mu.Unlock()
 }
 
-// addPool records a Peer's pool for Runtime.Close's join (L52); pools of
-// closed Peers whose trunks all drained are dropped on the way.
+// addPool records a Peer's pool for Runtime.Close's join (L52) and
+// Status.Mux; pools of closed Peers whose trunks all drained are dropped on
+// the way. A closed Peer's pool that dials a trunk again (a session that
+// survived Peer.Close fails over or redials) calls it again through
+// carrier.Env.PoolLive, so a pool dropped during that dial is tracked again
+// before the trunk runs (WP16 API-1). Idempotent.
 func (rt *Runtime) addPool(p *carrier.Pool) {
 	rt.mu.Lock()
 	rt.prunePoolsLocked()
@@ -397,12 +413,17 @@ func (rt *Runtime) addPool(p *carrier.Pool) {
 	rt.mu.Unlock()
 }
 
-// prunePoolsLocked drops the pools that are closed and track no trunk.
+// prunePoolsLocked drops the pools that are closed and track no trunk; their
+// counters stay in Status.Mux (muxGone).
 func (rt *Runtime) prunePoolsLocked() {
 	done, cancel := context.WithCancel(context.Background())
 	cancel()
 	for p := range rt.pools {
 		if p.Wait(done) == nil {
+			g := p.Fold()
+			rt.muxGone.FastPaths += g.FastPaths
+			rt.muxGone.Coalesced += g.Coalesced
+			rt.muxGone.MuxFull += g.MuxFull
 			delete(rt.pools, p)
 		}
 	}
@@ -584,6 +605,17 @@ func (rt *Runtime) Close() error {
 	// at their trunks' Done; every pool (also of a closed Peer) is joined
 	// once its trunks are done.
 	rt.trk.wait(bound, nil)
+	// A closed Peer's pool that dialled again after the snapshot of step 1
+	// was tracked again then (carrier.Env.PoolLive): the sessions are
+	// joined, so the pools now are every pool that can hold a trunk.
+	rt.mu.Lock()
+	for p := range rt.pools {
+		if !slices.Contains(pools, p) {
+			p.Close()
+			pools = append(pools, p)
+		}
+	}
+	rt.mu.Unlock()
 	pctx, pcancel := context.WithDeadline(context.Background(), bound)
 	for _, p := range pools {
 		_ = p.Wait(pctx)

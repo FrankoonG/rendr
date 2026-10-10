@@ -107,6 +107,12 @@ func (t *trunk) refuse(h uint32, a Answer) bool {
 	}
 	t.refusals[(t.refHead+t.refN)%len(t.refusals)] = refusal{handle: h, a: a}
 	t.refN++
+	if a.Status == wire.StatusCapacity && a.Code == wire.CodeMuxFull && t.env.MuxFull != nil {
+		// Status.Mux.MuxFull counts both roles (§A2.1): every passive
+		// CodeMuxFull answer is queued here, admitView's included (WP16
+		// API-2).
+		t.env.MuxFull.Add(1)
+	}
 	t.tolerateLocked(h, false)
 	t.markWorkLocked()
 	t.mx.Unlock()
@@ -150,13 +156,16 @@ func (t *trunk) responsePlacedLocked(v *Conn, typ wire.Type, st wire.AckStatus, 
 }
 
 // onResponse applies the response of a dialer view (reader): OPEN_ACK for
-// an OPEN, JOIN_ACK for a JOIN, decoded canonically. OK makes the view
-// attached-pending (the attempt returns it; it stays dark until its
-// session's Start); a refusal ends the handle (M3-D7) — CodeListenerClosed
-// marks the trunk unusable for OPENs (R1-10), CodeMuxFull full until a
-// view leaves. A response that crossed our DETACH (we abandoned the view)
-// ends it when it is a refusal and is ignored otherwise (the passive's
-// DETACH follows). It returns the rule a malformed response broke.
+// an OPEN, JOIN_ACK for a JOIN, decoded canonically — a view's JOIN_ACK
+// with its refusal code (wire.ParseJoinAckMux; the attempt's payload is the
+// canonical JOIN_ACK without it, the code is the view's, respCode). OK
+// makes the view attached-pending (the attempt returns it; it stays dark
+// until its session's Start); a refusal ends the handle (M3-D7) —
+// CodeListenerClosed marks the trunk unusable for OPENs (R1-10),
+// CodeMuxFull (OPEN or JOIN) full until a view leaves. A response that
+// crossed our DETACH (we abandoned the view) ends it when it is a refusal
+// and is ignored otherwise (the passive's DETACH follows). It returns the
+// rule a malformed response broke.
 func (t *trunk) onResponse(v *Conn, hdr wire.Header, p []byte) error {
 	var st wire.AckStatus
 	var code uint32
@@ -168,17 +177,24 @@ func (t *trunk) onResponse(v *Conn, hdr wire.Header, p []byte) error {
 		}
 		st, code = a.Status, a.Code
 	case wire.TypeJoinAck:
-		a, err := wire.ParseJoinAck(p)
+		a, c, err := wire.ParseJoinAckMux(p)
 		if err != nil {
 			return err
 		}
-		st = a.Status
+		st, code = a.Status, c
+		if c != 0 {
+			// The session reads the canonical JOIN_ACK (M2's codec).
+			var b [wire.JoinAckLen]byte
+			wire.PutJoinAck(b[:], &a)
+			p = b[:]
+		}
 	default:
 		return errors.New("not a response")
 	}
 	pl := &t.ms.rpost
 	t.mx.Lock()
 	v.vx.respGot = true
+	v.vx.rcode = code
 	switch v.state {
 	case viewAwaiting:
 		v.vx.rhdr, v.vx.rp = hdr, append([]byte(nil), p...)
@@ -205,6 +221,15 @@ func (t *trunk) onResponse(v *Conn, hdr wire.Header, p []byte) error {
 	t.mx.Unlock()
 	t.runPost(pl)
 	return nil
+}
+
+// respCode returns the refusal code of dialer view c's response (0 for OK
+// or none): for a JOIN_ACK the code its MUX encoding carried, which the
+// attempt's canonical payload does not (onResponse).
+func (c *Conn) respCode() uint32 {
+	c.mx.Lock()
+	defer c.mx.Unlock()
+	return c.vx.rcode
 }
 
 // errShim: a frame reached a view that no session attached.

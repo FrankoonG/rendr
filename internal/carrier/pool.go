@@ -58,6 +58,7 @@ type Pool struct {
 	idle    chan struct{}       // Wait's: closed (and reset) when Close runs, a trunk is done or a watcher ends
 	closed  bool
 	stats   PoolStats
+	folded  PoolStats // the counters the owner took (Fold): Unfolded leaves them out
 
 	// Tests only (nil in production). afterPick runs under mu between the
 	// pick and openView: the E3 window (TestPoolPickThenDeath). watchEnd
@@ -438,7 +439,15 @@ next:
 				continue next
 			}
 		}
-		if p.full[c.trunk] || !c.usableFor(dk, inst, sess) {
+		if p.full[c.trunk] {
+			if c.fullMarked() {
+				continue
+			}
+			// The trunk's own mark cleared: a view left — its Done, or a
+			// retiring dialer view leaving the view table (WP16 MUX-1).
+			delete(p.full, c.trunk)
+		}
+		if !c.usableFor(dk, inst, sess) {
 			continue
 		}
 		if n := c.viewCount(); n > bestN {
@@ -467,9 +476,10 @@ func (p *Pool) fastPath(ctx context.Context, v *Conn, check func(*wire.PrefaceAc
 }
 
 // fastPathRetry classifies a fast path's result: true when the attempt
-// continues (a carrier refusal without penalty — CodeMuxFull, or
-// CodeListenerClosed for an OPEN, R1-10 — or a trunk that ended before the
-// view's first frame was placed); false when the result is the attempt's.
+// continues (a carrier refusal without penalty — CodeMuxFull for an OPEN
+// or a JOIN, or CodeListenerClosed for an OPEN, R1-10 — or a trunk that
+// ended before the view's first frame was placed); false when the result
+// is the attempt's.
 func (p *Pool) fastPathRetry(ctx context.Context, v *Conn, est *Established, err error) bool {
 	if ctx.Err() != nil {
 		return false
@@ -478,6 +488,9 @@ func (p *Pool) fastPathRetry(ctx context.Context, v *Conn, est *Established, err
 		st, code, ok := responseStatus(est.Resp, est.Payload)
 		if !ok || st != wire.StatusCapacity {
 			return false
+		}
+		if est.Resp.Type == wire.TypeJoinAck {
+			code = v.respCode() // a view's JOIN_ACK carries its code (wire.ParseJoinAckMux; WP16 W3)
 		}
 		switch {
 		case code == wire.CodeMuxFull:
@@ -522,7 +535,8 @@ func (t *trunk) firstUnplacedLocked(v *Conn) bool {
 }
 
 // responseStatus returns the status and code of a response frame (OPEN_ACK
-// or JOIN_ACK); ok is false for any other frame or a malformed payload.
+// or JOIN_ACK; the canonical JOIN_ACK has no code: 0, a view's code is
+// Conn.respCode); ok is false for any other frame or a malformed payload.
 func responseStatus(h wire.Header, p []byte) (st wire.AckStatus, code uint32, ok bool) {
 	switch h.Type {
 	case wire.TypeOpenAck:
@@ -567,9 +581,17 @@ func (p *Pool) claimed(ctx context.Context, w *dialWait, est *Established, err e
 				}
 				p.extra[c] = w
 			}
+			// A closed pool that dials again (a session that survived
+			// Peer.Close fails over or redials) tells its owner, which may
+			// have dropped it meanwhile, so that Status.Mux and
+			// Runtime.Close's join see the trunk (WP16 API-1).
+			relive := p.closed && p.env.PoolLive != nil
 			p.live++
 			p.watch++
 			p.mu.Unlock()
+			if relive {
+				p.env.PoolLive(p)
+			}
 			go p.watchFresh(w, c)
 			return
 		}
@@ -787,7 +809,40 @@ func (p *Pool) idleLocked() {
 func (p *Pool) Stats() PoolStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.statsLocked(p.stats)
+}
+
+// Unfolded is Stats with the counters (FastPaths, Coalesced, MuxFull) less
+// what Fold took: an owner that keeps the folded counters of a pool it
+// dropped adds these, so a pool that comes back (Env.PoolLive) is never
+// counted twice.
+func (p *Pool) Unfolded() PoolStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	s := p.stats
+	s.FastPaths -= p.folded.FastPaths
+	s.Coalesced -= p.folded.Coalesced
+	s.MuxFull -= p.folded.MuxFull
+	return p.statsLocked(s)
+}
+
+// Fold returns the counters (FastPaths, Coalesced, MuxFull) that grew since
+// the previous Fold and marks them taken: the owner keeps them when it
+// drops the pool, so its totals stay cumulative (rendr.Status.Mux).
+func (p *Pool) Fold() PoolStats {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	d := PoolStats{
+		FastPaths: p.stats.FastPaths - p.folded.FastPaths,
+		Coalesced: p.stats.Coalesced - p.folded.Coalesced,
+		MuxFull:   p.stats.MuxFull - p.folded.MuxFull,
+	}
+	p.folded.FastPaths, p.folded.Coalesced, p.folded.MuxFull = p.stats.FastPaths, p.stats.Coalesced, p.stats.MuxFull
+	return d
+}
+
+// statsLocked returns s with the live trunks and their views counted.
+func (p *Pool) statsLocked(s PoolStats) PoolStats {
 	count := func(c *Conn) {
 		if c.death.Load() == nil {
 			s.Carriers++

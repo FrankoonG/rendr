@@ -103,11 +103,13 @@ func (t *trunk) abandonLocked(v *Conn, r wire.DetachReason, p *postList) {
 	}
 }
 
-// refusalPayload encodes the payload of a refusal response of type typ.
+// refusalPayload encodes the payload of a refusal response of type typ for
+// a view of a MUX trunk: a JOIN_ACK carries code in its MUX encoding
+// (wire.PutJoinAckMux; WP16 W3).
 func refusalPayload(typ wire.Type, st wire.AckStatus, code uint32) []byte {
 	if typ == wire.TypeJoinAck {
 		b := make([]byte, wire.JoinAckLen)
-		wire.PutJoinAck(b, &wire.JoinAck{Status: st})
+		wire.PutJoinAckMux(b, &wire.JoinAck{Status: st}, code)
 		return b
 	}
 	b := make([]byte, wire.OpenAckFixedLen)
@@ -316,7 +318,7 @@ func (t *trunk) placeControlLocked(b *Batch, rd *roundData, nowNs int64, p *post
 	// Refusal answers (passive).
 	for t.refN > 0 {
 		r := &t.refusals[t.refHead]
-		if !b.addAnswer(r.handle, &r.a) {
+		if !t.addRefusal(b, r) {
 			break
 		}
 		*r = refusal{}
@@ -355,6 +357,20 @@ func (t *trunk) placeControlLocked(b *Batch, rd *roundData, nowNs int64, p *post
 	}
 	ms.work.Store(len(ms.lasts) > 0 || len(ms.detq) > 0 || t.refN > 0 || ms.opN > 0 ||
 		len(ms.retiring) > 0 || t.view1.vx.retireQ.Load())
+}
+
+// addRefusal places the queued refusal r: an OPEN_ACK with its code, or a
+// JOIN_ACK with its code in the MUX encoding (wire.PutJoinAckMux), so that
+// the dialer tells a CodeMuxFull JOIN refusal from the session's own
+// (WP16 W3). False when the batch has no room for it.
+func (t *trunk) addRefusal(b *Batch, r *refusal) bool {
+	if r.a.Type != wire.TypeJoinAck {
+		return b.addAnswer(r.handle, &r.a)
+	}
+	var p [wire.JoinAckLen]byte
+	wire.PutJoinAckMux(p[:], &wire.JoinAck{Status: r.a.Status}, r.a.Code)
+	ok, skip := b.addLast(wire.TypeJoinAck, 0, r.handle, p[:])
+	return ok || skip
 }
 
 func (t *trunk) popLastLocked() {
@@ -603,6 +619,13 @@ func (t *trunk) onDetachLocked(d wire.Detach, una uint32, p *postList) string {
 	v := t.lookupLocked(d.Handle)
 	if v == nil {
 		if t.toleratedLocked(d.Handle, wire.TypeDetach, true) {
+			if t.dialer {
+				// The passive's DETACH for a handle we retired at its
+				// DETACH bound: its view ended, its place is free, so a
+				// CodeMuxFull answer that came after ours left the table
+				// marks the trunk full no longer (WP16 MUX-1).
+				t.ms.full = false
+			}
 			return ""
 		}
 		return "DETACH for an unknown handle"
