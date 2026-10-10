@@ -17,6 +17,10 @@ import (
 // violation — must equal the reference model of §A3.3 and §A5.4 below;
 // the trunk dies iff the model says so; the largest handle seen never
 // decreases; no endpoint call reaches a handle the model does not hold.
+// The passive harness defers the attach of every OPEN for a handle that is
+// a multiple of 3 (deferStart: a second OPEN of a pending session, whose
+// actor attaches it later, WP16 W1): until then only one RST — a dialer's
+// withdrawal (R1-5) — and the DETACH are legal for it.
 
 // fuzzTypes is the frame alphabet.
 var fuzzTypes = []wire.Type{wire.TypeOpen, wire.TypeJoin, wire.TypeOpenAck, wire.TypeJoinAck, wire.TypeFin, wire.TypeRst, wire.TypeDetach, wire.TypeData}
@@ -41,7 +45,8 @@ type muxModel struct {
 	// per handle: "live", "pending", "awaiting", "attached", "retiring-ours",
 	// "retiring-awaiting" (abandoned before its response, our DETACH
 	// placed), "retiring-answered" (its response crossed our DETACH),
-	// "retiring-peer", "gone"
+	// "retiring-peer", "gone", "unattached" (passive: an OPEN no session
+	// attached yet), "unattached-rst" (its withdrawal RST arrived)
 	st       map[uint32]string
 	tolerate map[uint32]bool // refused handles: a crossing RST, response or DETACH is dropped
 	tolAll   map[uint32]bool // retired at the DETACH bound: every session frame and the DETACH are dropped
@@ -109,6 +114,9 @@ func (m *muxModel) step(t wire.Type, h uint32) fuzzOut {
 			m.maxHandle = h
 			if t == wire.TypeOpen {
 				m.st[h] = "pending"
+				if deferStart(h) {
+					m.st[h] = "unattached"
+				}
 				return fzAdmit
 			}
 			m.tolerate[h] = true // the harness refuses JOINs at admission
@@ -140,6 +148,12 @@ func (m *muxModel) step(t wire.Type, h uint32) fuzzOut {
 			return m.illegal()
 		}
 		return fzDispatch
+	case "unattached":
+		if t == wire.TypeRst {
+			m.st[h] = "unattached-rst" // the withdrawal: legal, recorded
+			return fzIgnore
+		}
+		return m.illegal()
 	case "live", "retiring-ours":
 		if isFirstType(t) {
 			return m.illegal()
@@ -148,6 +162,10 @@ func (m *muxModel) step(t wire.Type, h uint32) fuzzOut {
 	}
 	return m.illegal()
 }
+
+// deferStart reports an OPEN handle whose attach the passive harness defers
+// (the model's "unattached" state).
+func deferStart(h uint32) bool { return h%3 == 0 }
 
 // fuzzConn serves a byte stream to the reader and discards writes.
 type fuzzConn struct {
@@ -216,6 +234,9 @@ func fuzzTrunk(dialer, mux, dg bool, ep *recEP, admits *[]uint32) (*Conn, *fuzzC
 			if h.Type == wire.TypeJoin {
 				v.Refuse(v.Handle(), Answer{Type: wire.TypeJoinAck, Status: wire.StatusUnknownSession})
 				return
+			}
+			if deferStart(v.Handle()) {
+				return // its session's actor attaches it later (never, here)
 			}
 			v.Start(ep, nil, StartOptions{})
 		}
@@ -289,6 +310,9 @@ func FuzzMuxDispatch_L43_L14(f *testing.F) {
 	f.Add([]byte{0x3, 2, 5, 6, 5, 4, 5})                               // dialer: OPEN_ACK 6 crossing our DETACH, DETACH 6, FIN 6 (a violation)
 	f.Add([]byte{0x3, 7, 6, 4, 6, 5, 6, 3, 6, 6, 6, 7, 6})             // dialer: retired at the bound: DATA, FIN, RST, JOIN_ACK 7, DETACH 7, DATA 7 (a violation)
 	f.Add([]byte{0x7, 2, 5, 4, 5, 6, 5, 7, 6, 5, 6, 6, 6, 6, 6, 4, 6}) // dialer datagram: the same rows, drops counted
+	f.Add([]byte{0x2, 0, 2, 5, 2, 6, 2, 7, 2})                         // passive: OPEN 3 unattached, RST 3 (withdrawal), DETACH 3, DATA 3 (a violation)
+	f.Add([]byte{0x2, 0, 2, 7, 2})                                     // passive: OPEN 3 unattached, DATA 3 (a violation)
+	f.Add([]byte{0x6, 0, 2, 5, 2, 5, 2, 6, 2, 4, 2})                   // passive datagram: OPEN 3, RST 3, a second RST (dropped), DETACH 3, FIN 3 (dropped)
 	f.Fuzz(func(t *testing.T, in []byte) {
 		if len(in) < 1 {
 			return

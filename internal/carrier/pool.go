@@ -438,7 +438,15 @@ next:
 				continue next
 			}
 		}
-		if p.full[c.trunk] || !c.usableFor(dk, inst, sess) {
+		if p.full[c.trunk] {
+			if c.fullMarked() {
+				continue
+			}
+			// The trunk's own mark cleared: a view left — its Done, or a
+			// retiring dialer view leaving the view table (WP16 MUX-1).
+			delete(p.full, c.trunk)
+		}
+		if !c.usableFor(dk, inst, sess) {
 			continue
 		}
 		if n := c.viewCount(); n > bestN {
@@ -467,9 +475,10 @@ func (p *Pool) fastPath(ctx context.Context, v *Conn, check func(*wire.PrefaceAc
 }
 
 // fastPathRetry classifies a fast path's result: true when the attempt
-// continues (a carrier refusal without penalty — CodeMuxFull, or
-// CodeListenerClosed for an OPEN, R1-10 — or a trunk that ended before the
-// view's first frame was placed); false when the result is the attempt's.
+// continues (a carrier refusal without penalty — CodeMuxFull for an OPEN
+// or a JOIN, or CodeListenerClosed for an OPEN, R1-10 — or a trunk that
+// ended before the view's first frame was placed); false when the result
+// is the attempt's.
 func (p *Pool) fastPathRetry(ctx context.Context, v *Conn, est *Established, err error) bool {
 	if ctx.Err() != nil {
 		return false
@@ -478,6 +487,9 @@ func (p *Pool) fastPathRetry(ctx context.Context, v *Conn, est *Established, err
 		st, code, ok := responseStatus(est.Resp, est.Payload)
 		if !ok || st != wire.StatusCapacity {
 			return false
+		}
+		if est.Resp.Type == wire.TypeJoinAck {
+			code = v.respCode() // a view's JOIN_ACK carries its code (wire.ParseJoinAckMux; WP16 W3)
 		}
 		switch {
 		case code == wire.CodeMuxFull:
@@ -522,7 +534,8 @@ func (t *trunk) firstUnplacedLocked(v *Conn) bool {
 }
 
 // responseStatus returns the status and code of a response frame (OPEN_ACK
-// or JOIN_ACK); ok is false for any other frame or a malformed payload.
+// or JOIN_ACK; the canonical JOIN_ACK has no code: 0, a view's code is
+// Conn.respCode); ok is false for any other frame or a malformed payload.
 func responseStatus(h wire.Header, p []byte) (st wire.AckStatus, code uint32, ok bool) {
 	switch h.Type {
 	case wire.TypeOpenAck:
@@ -567,9 +580,17 @@ func (p *Pool) claimed(ctx context.Context, w *dialWait, est *Established, err e
 				}
 				p.extra[c] = w
 			}
+			// A closed pool that dials again (a session that survived
+			// Peer.Close fails over or redials) tells its owner, which may
+			// have dropped it meanwhile, so that Status.Mux and
+			// Runtime.Close's join see the trunk (WP16 API-1).
+			relive := p.closed && p.env.PoolLive != nil
 			p.live++
 			p.watch++
 			p.mu.Unlock()
+			if relive {
+				p.env.PoolLive(p)
+			}
 			go p.watchFresh(w, c)
 			return
 		}

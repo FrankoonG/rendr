@@ -55,7 +55,8 @@ type muxState struct {
 	work     atomic.Bool  // mux control is queued: last frames, DETACHes, answers, first frames, retirements, a pending retirement of view 1
 	started  atomic.Bool  // view 1's Start ran (join.started, readable without jmu)
 	awaitAck atomic.Int32 // datagram trunks: retiring views whose DETACH waits for its RACK (relAcked)
-	full     bool         // dialer: a CAPACITY CodeMuxFull answer arrived; cleared when a view's Done closes (the pool's usable rule)
+	full     bool         // dialer: a CAPACITY CodeMuxFull answer arrived; cleared when a view leaves (the pool's usable rule)
+	linger   int          // dialer: views whose Done closed while they are still in the view table (each still holds its place under the cap, WP16 MUX-1)
 
 	detq     []*Conn    // views whose DETACH is due (abandoned, killed, after their last frame, the peer's DETACH answered)
 	lasts    []*Conn    // views with a WriteAndClose frame to place
@@ -96,6 +97,8 @@ type viewExt struct {
 	fillOK   atomic.Bool // the writer may call the view's Fill (attached; not held, ended, retired or answering last)
 	fin      atomic.Bool // ended: Done closes once the calls drain (M3-D13)
 	peerDet  atomic.Bool // the peer's DETACH(h) was dispatched
+	peerRst  bool        // passive: the dialer's withdrawal RST arrived before a session attached the view (R1-5; WP16 W1)
+	lingers  bool        // dialer: counted in muxState.linger (its Done closed, it is still in the table)
 	detSent  atomic.Bool // our DETACH(h) was placed
 	needResp atomic.Bool // passive: pending or joining, the first response not yet placed (the writer looks for it)
 	retireQ  atomic.Bool // a planned retirement: DETACH once a Fill places nothing (writer reads it)
@@ -111,6 +114,7 @@ type viewExt struct {
 	respGot  bool              // dialer: a response arrived
 	rhdr     wire.Header       // dialer: the response header
 	rp       []byte            // dialer: a copy of the response payload
+	rcode    uint32            // dialer: the response's refusal code (OPEN_ACK's code; a MUX JOIN_ACK's, wire.ParseJoinAckMux)
 	reason   wire.DetachReason // our DETACH's reason
 	detQ     bool              // in detq or lasts (no further Fill)
 	last     *lastFrame        // a WriteAndClose frame to place
@@ -149,6 +153,17 @@ type detachEvent struct {
 	h    uint32
 	sent bool
 }
+
+// slotsLocked returns the places the trunk's views hold under MuxMaxViews:
+// the views not gone, plus — on the dialer — the views whose Done closed
+// but that are still in the view table (WP16 MUX-1). The passive counts its
+// own view until it placed its DETACH, which reaches the dialer before the
+// dialer's view leaves its table (stream: the exchange completes at the
+// peer's DETACH; datagram: at both DETACHes and our RACK), so a dialer that
+// opens only within these places never exceeds the passive's cap (R1-4
+// rule 3). nviews keeps the session-facing count: Views, the pool's close
+// at the last view.
+func (t *trunk) slotsLocked() int { return t.nviews + t.ms.linger }
 
 // maxViews returns the view cap of the trunk's kind (M3-D12): views and
 // queued refusal answers count against it.
@@ -239,6 +254,13 @@ func (t *trunk) removeLocked(v *Conn) {
 	v.vx.inTable = false
 	if t.ms.multi.Load() {
 		delete(t.views, v.handle)
+	}
+	if v.vx.lingers {
+		// Its place is free now: the full mark of a CodeMuxFull answer
+		// goes with it, as at a view's Done (viewDoneClosed).
+		v.vx.lingers = false
+		t.ms.linger--
+		t.ms.full = false
 	}
 	t.leaveLiveLocked(v)
 	t.unreadyLocked(v)
@@ -373,7 +395,14 @@ func (t *trunk) viewDoneClosed(v *Conn) {
 	close(v.done)
 	v.vx.doneShut = true
 	t.nviews--
-	if !v.vx.refused {
+	switch {
+	case v.vx.dialer && v.vx.inTable:
+		// A dialer view still in the table (retiring: the peer's DETACH,
+		// or the RACK of ours, is outstanding) keeps its place under the
+		// cap until it leaves (removeLocked), and so does the full mark.
+		v.vx.lingers = true
+		t.ms.linger++
+	case !v.vx.refused:
 		// A view leaving frees a place; the refused view's own Done (it
 		// closes right after the CodeMuxFull answer) does not (M3-D12).
 		t.ms.full = false
@@ -422,7 +451,7 @@ const (
 	actDispatch muxAct = iota // the view's endpoint (with its call counted)
 	actAdmit                  // a new handle's OPEN or JOIN on a passive MUX trunk (admit)
 	actResponse               // the response of a dialer view awaiting it (onResponse)
-	actIgnore                 // legal, not delivered (after our DETACH and the view's Done; a refused handle's late frame)
+	actIgnore                 // legal, not delivered (after our DETACH and the view's Done; a refused handle's late frame; a withdrawal RST before the attach)
 	actIllegal                // a §A3.3 violation (stream) or counted drop (datagram)
 )
 
@@ -491,6 +520,16 @@ func (t *trunk) classifyLocked(typ wire.Type, h uint32) (muxAct, *Conn, string) 
 			return actIllegal, nil, "a response from the dialer"
 		}
 		if !v.vx.attached {
+			if typ == wire.TypeRst && v.state == viewPending && !v.vx.peerRst {
+				// R1-5: a dialer withdraws an OPEN with RST(AbortWithdrawn),
+				// then DETACH; a second OPEN of a pending session is attached
+				// by the session's actor later (its adopt), so the RST may
+				// come first. It is legal and recorded: an attach after it
+				// ends the view (startView), the DETACH that follows ends it
+				// otherwise (WP16 W1).
+				v.vx.peerRst = true
+				return actIgnore, nil, ""
+			}
 			return actIllegal, nil, "a frame for a view no session attached"
 		}
 		return actDispatch, v, ""
@@ -1118,6 +1157,15 @@ func (c *Conn) startView(ep Endpoint, bell Doorbell, o StartOptions) {
 		}
 		return
 	}
+	if c.vx.peerRst {
+		// The dialer withdrew this OPEN before its session attached the
+		// view (R1-5): the view ends instead (a refusal answers the handle
+		// unless the dialer's DETACH came, abandonLocked), and its session
+		// sees it end like any lane whose carrier ended (WP16 W1).
+		t.mx.Unlock()
+		c.killView(CauseRetired, "withdrawn by the dialer before its session attached the view (R1-5)")
+		return
+	}
 	c.ep = ep
 	c.pep, _ = ep.(PacketEndpoint)
 	c.vx.attached = true
@@ -1152,7 +1200,7 @@ func (t *trunk) openViewMux(kind wire.Type, payload []byte, sess uintptr, fromBu
 	}
 	t.mx.Lock()
 	defer t.mx.Unlock()
-	if t.sealed || t.nviews+t.refN >= t.maxViews() {
+	if t.sealed || t.slotsLocked()+t.refN >= t.maxViews() {
 		return nil, ErrDead
 	}
 	h := t.nextLocked()
@@ -1262,7 +1310,7 @@ func (t *trunk) usableForMux(kind wire.Type, inst [16]byte, sess uintptr) bool {
 	}
 	t.mx.Lock()
 	defer t.mx.Unlock()
-	if t.sealed || t.ms.full || t.nviews >= t.maxViews() || (inst == ([16]byte{}) && t.openFull) {
+	if t.sealed || t.ms.full || t.slotsLocked() >= t.maxViews() || (inst == ([16]byte{}) && t.openFull) {
 		return false
 	}
 	if sess != 0 {
@@ -1278,6 +1326,15 @@ func (t *trunk) usableForMux(kind wire.Type, inst [16]byte, sess uintptr) bool {
 		}
 	}
 	return true
+}
+
+// fullMarked reports the trunk's CodeMuxFull mark (muxState.full), which
+// the trunk clears when a view leaves; the pool's own mark follows it
+// (pickLocked).
+func (t *trunk) fullMarked() bool {
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	return t.ms.full
 }
 
 // bindSession records the session a dialer view belongs to (the pool sets
