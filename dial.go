@@ -30,6 +30,17 @@ import (
 //
 // ctx bounds only the Dial: cancelling it after Dial returned does not
 // affect the session.
+//
+// With o.EarlyReturn Dial returns after the same local checks (a closed
+// Peer or Runtime, no stream factory, an unknown Mode, the metadata size,
+// the abandoned-call pool, MaxSessions), before any network I/O of the
+// session and without the cold-start wait for probe samples. The session
+// opens with its first Write, Read or CloseWrite and reports StatePending
+// until the peer answers; the opening's outcomes (*RejectError,
+// ErrCapacity, ErrVersion, ErrProtocol, ErrMetadataTooLarge,
+// ErrSessionLost, ErrNoPath) end the session instead: its Reads and Writes
+// return them and EventSessionEnd carries them (see
+// DialOptions.EarlyReturn).
 func (p *Peer) Dial(ctx context.Context, o DialOptions) (*Conn, error) {
 	s, err := p.dial(ctx, o, false)
 	if err != nil {
@@ -57,10 +68,9 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 		return nil, fmt.Errorf("rendr: Dial: no stream carrier factory: %w", ErrNoPath)
 	case o.Mode > ModeRace:
 		return nil, fmt.Errorf("rendr: %s: unknown %v: %w", name, o.Mode, ErrProtocol)
-	case o.EarlyReturn:
-		// M4 skeleton: EarlyReturn arrives with WP10 (stream sessions; a
-		// DialPacket then refuses it: "EarlyReturn is for stream sessions").
-		return nil, fmt.Errorf("rendr: %s: EarlyReturn: not implemented: %w", name, ErrProtocol)
+	case packet && o.EarlyReturn:
+		// M4-D14: before any network I/O, the probe start included.
+		return nil, fmt.Errorf("rendr: DialPacket: EarlyReturn is for stream sessions: %w", ErrProtocol)
 	case len(o.Metadata) > m:
 		return nil, fmt.Errorf("rendr: %s: %d bytes of metadata, limit %d: %w", name, len(o.Metadata), m, ErrMetadataTooLarge)
 	case packet && !openCapable(p.factories, len(o.Metadata)):
@@ -119,8 +129,10 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 }
 
 // open runs the opening phase of session sid (design §6.6): the cold-start
-// wait for probe evidence (Health.Use, WaitFirst) and session.Dial, under a
-// context that also ends when the Runtime closes. session.Dial holds the
+// wait for probe evidence (Health.Use, WaitFirst; an EarlyReturn session
+// skips WaitFirst, M4-D13) and session.Dial, under a context that also ends
+// when the Runtime closes. An EarlyReturn session.Dial returns before its
+// opening and uses no part of ctx after the return. session.Dial holds the
 // Peer's health layer itself for the session's lifetime. created reports
 // whether session.Dial created a session — then that session calls reg's
 // Ended exactly once, also when Dial failed (it withdraws in the
@@ -134,7 +146,9 @@ func (p *Peer) open(ctx context.Context, sid SessionID, o DialOptions, packet bo
 	defer stop()
 	if p.health != nil {
 		p.health.Use()
-		p.health.WaitFirst(dctx)
+		if !o.EarlyReturn {
+			p.health.WaitFirst(dctx)
+		}
 	}
 	env := p.env
 	env.Registry = reg
@@ -194,6 +208,9 @@ func (p *Peer) spec(sid SessionID, o DialOptions, packet bool) session.DialSpec 
 		NoteGoAway: p.noteGoAway,
 		Eligible:   eligible,
 		Pool:       p.pool, // nil when no factory shares its carriers (M3-D16)
+		// M4-D9: the session opens at its first Write, Read or CloseWrite
+		// (DialPacket refused it in the entry checks, M4-D14).
+		EarlyReturn: o.EarlyReturn,
 	}
 	p.props.dialProps(&spec) // fate groups and HoLCoupled (M3-D36)
 	return spec
