@@ -39,18 +39,21 @@ func (r ForwardResult) Err() error {
 // When the session ends uncleanly while local still has a direction open (a
 // peer that ignores FIN or never reads), local is reset at once; after a
 // clean end the last bytes and the FIN are written first, within a bound.
-// A Conn still opening (EarlyReturn) is read only after local's first
-// bytes were written to it, or after 20 ms. ctx ending aborts the session
-// (AbortShutdown) and resets local. Forward owns c and local from the call
-// on, sets no deadlines on them during the transfer, and starts two
-// goroutines that end before it returns.
+// (Pending, R1-15: a Conn still opening (EarlyReturn) is read at once
+// until the first-read hold lands; with it, such a Conn is read only after
+// local's first bytes were written to it, or after 20 ms.) ctx ending
+// aborts the session (AbortShutdown) and resets local. Forward owns c and
+// local from the call on, sets no deadlines on them during the transfer,
+// and starts two goroutines that end before it returns.
 //
 // After local's FIN, Forward reads nothing more from local, so a later
 // close of local is not observable (TCP sends nothing for it): such a
 // session ends when the far side ends it, at its idle limit, or when ctx
 // ends; an embedder that learns of the close by other means closes the
 // Conn. A deadline set on local by its owner that expires is a failure of
-// local (a reset both ways): hand Forward conns without deadlines. A local
+// local (a reset both ways): hand Forward conns without deadlines. So
+// are a local Read count outside [0, len(p)] and 100 Reads in a row that
+// return neither bytes nor an error (io.ErrNoProgress). A local
 // conn without CloseWrite is closed fully at the end; one without
 // SetLinger is closed plainly where a reset is due. Forward calls only the
 // net.Conn methods, CloseWrite and SetLinger of local.
@@ -84,6 +87,11 @@ var (
 	// bytes and the FIN within cleanJoinMax (R1-1).
 	errNoDrain = errors.New("l4: local did not drain after the session ended")
 )
+
+// maxEmptyReads is the number of consecutive local Reads returning (0, nil)
+// after which local has failed with io.ErrNoProgress (L42: a conn that
+// neither delivers nor fails must not make a pump spin; bufio's limit).
+const maxEmptyReads = 100
 
 // The messages of Forward's RSTs (fixed class texts).
 const (
@@ -176,12 +184,21 @@ func (f *forwarder) pumpA() {
 	bp := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bp)
 	buf := *bp
+	empty := 0
 	for {
 		n, err := f.local.Read(buf)
 		if n < 0 || n > len(buf) {
 			f.failLocal(errBadCount, msgLocalRead)
 			return
 		}
+		if n == 0 && err == nil {
+			if empty++; empty >= maxEmptyReads {
+				f.failLocal(io.ErrNoProgress, msgLocalRead)
+				return
+			}
+			continue
+		}
+		empty = 0
 		if n > 0 {
 			w, werr := f.c.Write(buf[:n])
 			f.toSession += int64(w)

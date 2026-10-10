@@ -23,9 +23,11 @@ import (
 // TestForwardBackpressure_L15 (§A9): a target that reads 1 MiB/s holds
 // back a client that writes 8 MiB as fast as it can: the bytes the client
 // handed over and the target has not read stay below 2 × Window + 128 KiB
-// (the two session windows, two pump buffers and the pipes; this count
-// stands in for the design's heap bound, which a heap reading cannot
-// attribute in a shared process), the client's
+// (bytes in transit: the two session windows, two pump buffers and the
+// pipes); the memory the two Runtimes account for (Status.BufferedBytes)
+// stays below that bound plus the core's own per-carrier buffers (one
+// write scratch of at most the 512 KiB class and one 16 KiB reader stage
+// per carrier and Runtime), which a transit count cannot see; the client's
 // Writes advance at the target's pace, and every byte arrives in order.
 func TestForwardBackpressure_L15(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -69,6 +71,10 @@ func TestForwardBackpressure_L15(t *testing.T) {
 			}
 		}()
 		bound := int64(2*window + 128<<10)
+		// One link: one carrier per Runtime, each with at most one write
+		// scratch (512 KiB class) and one reader stage (16 KiB class).
+		const classSlack = 64
+		memBound := bound + 2*(512<<10+classSlack) + 2*(16<<10+classSlack)
 		var peak, bufPeak int64
 		for range 6 {
 			time.Sleep(500 * time.Millisecond)
@@ -78,10 +84,13 @@ func TestForwardBackpressure_L15(t *testing.T) {
 			if held > bound {
 				t.Fatalf("%d bytes held between the client and the target, want at most %d", held, bound)
 			}
-			// Recorded, not asserted: the Runtimes' own accounting also
-			// counts the carriers' write stages (a core figure, not
-			// Forward's).
+			// The Runtimes' accounting adds the carriers' write scratches
+			// and reader stages (core memory outside Forward) to the
+			// bytes in transit.
 			bufPeak = max(bufPeak, w.d.Status().BufferedBytes+w.p.Status().BufferedBytes)
+			if bufPeak > memBound {
+				t.Fatalf("the Runtimes account %d buffered bytes, want at most %d", bufPeak, memBound)
+			}
 		}
 		if el := 3 * time.Second; written.Load() > int64(el.Seconds()*(1<<20))+bound || read.Load() < 2<<20 {
 			t.Fatalf("load: after %v the client wrote %d and the target read %d bytes; want the target's pace", el, written.Load(), read.Load())
@@ -90,7 +99,7 @@ func TestForwardBackpressure_L15(t *testing.T) {
 		if g.err != io.EOF || g.n != total || g.sum != prngSum(1, total) {
 			t.Fatalf("target read %d bytes (SHA ok: %v), then %v", g.n, g.sum == prngSum(1, total), g.err)
 		}
-		t.Logf("peak held %d bytes (bound %d); the Runtimes' BufferedBytes peaked at %d", peak, bound, bufPeak)
+		t.Logf("peak held %d bytes (bound %d); the Runtimes' BufferedBytes peaked at %d (bound %d)", peak, bound, bufPeak, memBound)
 		tsrv.CloseWrite()
 		checkClean(t, "ingress", <-in, total, 0)
 		checkClean(t, "egress", <-out, 0, total)
@@ -105,8 +114,9 @@ func TestForwardBackpressure_L15(t *testing.T) {
 // TestForwardConcurrentClose_L03 (§A7.3): while bytes move both ways, the
 // application closes the session, the client resets its socket and the
 // target's Forward is cancelled, at different instants per iteration: both
-// Forwards return, the client's Forward does not end clean, the target is
-// released, and the client never reads EOF.
+// Forwards return, neither ends clean, the target is released, and the
+// client's Read ends with a reset (or net.ErrClosed after its own close),
+// never EOF.
 func TestForwardConcurrentClose_L03(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newWorld(t, worldOpts{n: 4})
@@ -132,11 +142,13 @@ func TestForwardConcurrentClose_L03(t *testing.T) {
 			}
 			wg.Wait()
 			in, out := ch.results()
-			if in.Clean {
+			if in.Clean || out.Clean {
 				t.Fatalf("iteration %d: a clean end after the resets: ingress %+v, egress %+v", i, in, out)
 			}
-			if err := <-readEnd; err == io.EOF {
-				t.Fatalf("iteration %d: the client read EOF", i)
+			// The client's Read ends with the reset Forward sent, or with
+			// net.ErrClosed where the client's own close came first.
+			if err := <-readEnd; !isReset(err) && !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("iteration %d: the client's Read ended with %v, want a reset (or its own close)", i, err)
 			}
 			<-pumped
 			synctest.Wait()
@@ -198,6 +210,32 @@ func (s *scriptedConn) Read(b []byte) (int, error) {
 }
 
 var errScripted = errors.New("scripted write error")
+
+// emptyReadConn's Reads return (0, nil), up to emptyReadGuard of them;
+// after that (a pump that spins on) they fail with errSpinGuard.
+type emptyReadConn struct {
+	net.Conn
+	reads atomic.Int64
+}
+
+const emptyReadGuard = 100 * maxEmptyReads
+
+var errSpinGuard = errors.New("empty-read guard: the pump kept reading")
+
+func (e *emptyReadConn) Read([]byte) (int, error) {
+	if e.reads.Add(1) > emptyReadGuard {
+		return 0, errSpinGuard
+	}
+	return 0, nil
+}
+
+func (e *emptyReadConn) CloseWrite() error {
+	return e.Conn.(interface{ CloseWrite() error }).CloseWrite()
+}
+
+func (e *emptyReadConn) SetLinger(sec int) error {
+	return e.Conn.(interface{ SetLinger(int) error }).SetLinger(sec)
+}
 
 // TestForwardShortWrites_L42 (§A7.1, L42): a short Write without an error
 // that made progress is continued; no progress, an invalid count or a short
@@ -261,28 +299,46 @@ func TestForwardShortWrites_L42(t *testing.T) {
 }
 
 // TestForwardBadCountsFromLocal_L42 (§A7.1, L42): a local Read that
-// returns a count outside [0, len(p)] is a failure of local: nothing of it
-// reaches the session, the session is reset toward the peer, local is
-// reset.
+// returns a count outside [0, len(p)], and a local whose Reads keep
+// returning (0, nil), are failures of local: nothing of them reaches the
+// session, the session is reset toward the peer, local is reset; the pump
+// does not spin (exactly maxEmptyReads Reads).
 func TestForwardBadCountsFromLocal_L42(t *testing.T) {
 	for _, tc := range []struct {
-		name string
-		n    func(l int) int
-	}{{"len+1", func(l int) int { return l + 1 }}, {"-1", func(int) int { return -1 }}} {
+		name  string
+		local func(c net.Conn) net.Conn
+		want  error
+	}{
+		{"len+1", func(c net.Conn) net.Conn {
+			return &scriptedConn{Conn: c, n: func(l int) int { return l + 1 }}
+		}, errBadCount},
+		{"-1", func(c net.Conn) net.Conn {
+			return &scriptedConn{Conn: c, n: func(int) int { return -1 }}
+		}, errBadCount},
+		// (0, nil) forever: io.ErrNoProgress after maxEmptyReads Reads;
+		// the conn's own guard ends a pump that spins on regardless.
+		{"0 nil forever", func(c net.Conn) net.Conn { return &emptyReadConn{Conn: c} }, io.ErrNoProgress},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				w := newWorld(t, worldOpts{})
 				d, p := w.open(rendr.DialOptions{})
 				tcli, tsrv := rendrtest.TargetPipe(0)
-				spy := &spyConn{Conn: &scriptedConn{Conn: tcli, n: tc.n}}
+				local := tc.local(tcli)
+				spy := &spyConn{Conn: local}
 				out := forwardAsync(context.Background(), p, spy)
 				n, _, err := readAll(d)
 				if code, remote, ok := abortCode(err); n != 0 || !ok || code != AbortReset || !remote {
 					t.Fatalf("dialer read %d bytes, then %v; want none, then *AbortError{AbortReset, Remote}", n, err)
 				}
 				r := <-out
-				if r.Clean || !errors.Is(r.LocalErr, errBadCount) || r.ToSession != 0 {
-					t.Fatalf("Forward: %+v, want LocalErr %v and nothing sent", r, errBadCount)
+				if r.Clean || !errors.Is(r.LocalErr, tc.want) || r.ToSession != 0 {
+					t.Fatalf("Forward: %+v, want LocalErr %v and nothing sent", r, tc.want)
+				}
+				if e, ok := local.(*emptyReadConn); ok {
+					if k := e.reads.Load(); k != maxEmptyReads {
+						t.Fatalf("local was read %d times, want %d", k, maxEmptyReads)
+					}
 				}
 				if _, _, closes, _ := spy.snapshot(); closes != 1 {
 					t.Fatalf("local closed %d times, want once", closes)

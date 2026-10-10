@@ -25,9 +25,13 @@ func checkClean(t *testing.T, side string, r ForwardResult, toSession, toLocal i
 }
 
 // checkTargetConn requires the target's one connection to have read in
-// bytes (SHA-256 sumIn), with the given FIN and RST records.
+// bytes (SHA-256 sumIn), with the given FIN and RST records. It first
+// waits for the bubble to settle: the pipe records FINIn when the writer
+// calls CloseWrite, but the target counts BytesIn only when its behaviour
+// goroutine has read them.
 func checkTargetConn(t *testing.T, tg *rendrtest.Target, in int64, sumIn [32]byte, finIn, rstIn, rstOut bool) rendrtest.TargetConnCounts {
 	t.Helper()
+	synctest.Wait()
 	cs := tg.Counts()
 	if cs.Accepted != 1 {
 		t.Fatalf("target accepted %d connections, want 1", cs.Accepted)
@@ -290,6 +294,7 @@ func TestForwardNoCloseWriteLocal(t *testing.T) {
 		waitDone(t, d, time.Minute)
 		waitDone(t, p, time.Minute)
 		tg.Close()
+		synctest.Wait()
 		if c := tg.Counts().Conns[0]; c.BytesIn != req || c.BytesOut != resp || c.RSTIn || c.RSTOut || c.Open {
 			t.Fatalf("target connection %+v", c)
 		}
