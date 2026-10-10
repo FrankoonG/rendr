@@ -41,8 +41,10 @@ import (
 // (B1.5's dialer bound; the gold cases select a kill's records by these
 // times; a long session's within 1 ms: its death step runs at the kill's
 // virtual instant, woken by the trunk's death fan-out) — a long session
-// exactly one per view it held there, with transport_error (or retired
-// for a view whose retirement completed at the kill's instant); a churn
+// exactly one per view it held there, with transport_error (retired only
+// for a view listed retiring, whose retirement completed at the kill's
+// instant; a view listed active or member records transport_error, the
+// gold packet kill's dialer cause, B1.5); a churn
 // session too unless it was already ending at the kill (its SessionEnd at
 // the kill's instant: an ending session records no CarrierDown, §A10) —;
 // for every session the CarrierDowns of the trunk's ID equal its dead
@@ -377,8 +379,22 @@ func (k *dgKill) judge(t *testing.T, target rendr.CarrierID, killAt time.Time, l
 				bad = append(bad, fmt.Sprintf("%s (long %v): listed %v on carrier %d at the kill, %d CarrierDown of it at or after the kill (%v), want %d",
 					s.key, s.long, st, target, len(after), causes(after), len(st)))
 			}
+			// retired only for a view listed retiring at the kill (its
+			// retirement completed at the kill's instant); a view listed
+			// active or member records the kill's transport_error (B1.5's
+			// dialer cause).
+			retiring, retired := 0, 0
+			for _, cs := range st {
+				if cs == rendr.CarrierRetiring {
+					retiring++
+				}
+			}
 			for _, ev := range after {
-				if ev.Cause != rendr.CauseTransportError && ev.Cause != rendr.CauseRetired {
+				switch ev.Cause {
+				case rendr.CauseTransportError:
+				case rendr.CauseRetired:
+					retired++
+				default:
 					bad = append(bad, fmt.Sprintf("%s: CarrierDown of the killed carrier with %v, want transport_error", s.key, ev.Cause))
 				}
 				if bound := dgDownBound; ev.Time.After(killAt.Add(bound)) || s.long && ev.Time.After(killAt.Add(dgLongBound)) {
@@ -387,6 +403,10 @@ func (k *dgKill) judge(t *testing.T, target rendr.CarrierID, killAt time.Time, l
 					}
 					bad = append(bad, fmt.Sprintf("%s: CarrierDown of the killed carrier %v after the kill, want ≤ %v", s.key, ev.Time.Sub(killAt), bound))
 				}
+			}
+			if retired > retiring {
+				bad = append(bad, fmt.Sprintf("%s: listed %v on carrier %d at the kill, %d CarrierDown with retired at or after the kill (%v): retired only for a view listed retiring",
+					s.key, st, target, retired, causes(after)))
 			}
 		}
 		if s.long || !ended {
