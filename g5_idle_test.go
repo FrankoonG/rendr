@@ -69,6 +69,7 @@ type g5IdleCase struct {
 	factories int             // factories of the Peer
 	n         int             // idle sessions measured by the test (the benchmark opens g5BenchSessions)
 	delays    []time.Duration // one-way delay of each factory's rendrtest Link; nil: net.Pipe carriers
+	shared    bool            // the factories keep the default Props: the sessions share the warm-up session's MUX trunk (else dedicated, M3-D2)
 
 	goroutines    float64 // structural: a reader and a writer per carrier, on each side (an idle session's actor is parked, M3-D42)
 	writerWakeups float64 // bound per idle minute
@@ -258,8 +259,11 @@ func g5MeasureIdle(t testing.TB, e *e2ePair, parks *atomic.Int64, c g5IdleCase, 
 		} else {
 			cs[i] = g5PipeCarrier(string(rune('a'+i)), e.ln)
 		}
-		// The cost of one session with its own carriers: dedicated (M3-D2).
-		cs[i] = dedicated(cs[i].(StreamCarrier))
+		// The cost of one session with its own carriers: dedicated (M3-D2);
+		// a shared case measures a session added to a MUX trunk.
+		if !c.shared {
+			cs[i] = dedicated(cs[i].(StreamCarrier))
+		}
 	}
 	peer, err := e.d.NewPeer(PeerConfig{Carriers: cs})
 	if err != nil {
