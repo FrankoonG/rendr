@@ -18,7 +18,10 @@ import (
 // view's: once every byte arrived, on each role, the views' TxBytes add
 // up to the trunk's TxBytes and their RxBytes to its RxBytes, a view's
 // TxBytes on one end equals its RxBytes on the other, and every view
-// reports the same MTU (a trunk field). Rows: a stream trunk (DATA) and a
+// reports the same MTU, SRTT, MinRTT, Dropped and Retransmits (the
+// carrier's fields); each view's Frames is positive and the views' Frames
+// add up to at most the trunk's (which also counts the trunk's own
+// control frames), and no view reports RetxBytes on a lossless pipe. Rows: a stream trunk (DATA) and a
 // datagram trunk (DGRAM), three views each (view 1, which first sends
 // alone on the trunk, and two opened ones), each direction of each view
 // with a different amount, so a view reporting the trunk's figure,
@@ -157,10 +160,12 @@ func mvCountersRows(t *testing.T, d, p *muxSide, dAmt, pAmt map[uint32]int, dgra
 		tr := sd.s.c.trunk
 		tr.mu.Lock()
 		trTx := tr.st.txBytes
-		tr.mu.Unlock()
 		trRx := tr.rxBytes.Load()
-		var sumTx, sumRx uint64
+		trFrames := tr.st.frames
+		tr.mu.Unlock()
+		var sumTx, sumRx, sumFrames uint64
 		mtu := -1
+		var first Stats
 		for _, h := range handles {
 			st := sd.s.view(h).c.Stats()
 			if st.Handle != h || st.Shared != 3 {
@@ -177,11 +182,24 @@ func mvCountersRows(t *testing.T, d, p *muxSide, dAmt, pAmt map[uint32]int, dgra
 				t.Errorf("%s view %d MTU %d, view 1's %d: the trunk's field differs between views", sd.name, h, st.MTU, mtu)
 			}
 			mtu = st.MTU
+			if h == 1 {
+				first = st
+			} else if st.SRTT != first.SRTT || st.MinRTT != first.MinRTT || st.Dropped != first.Dropped || st.Retransmits != first.Retransmits {
+				t.Errorf("%s view %d SRTT %v MinRTT %v Dropped %d Retransmits %d, view 1's %v %v %d %d: the carrier's fields differ between views",
+					sd.name, h, st.SRTT, st.MinRTT, st.Dropped, st.Retransmits, first.SRTT, first.MinRTT, first.Dropped, first.Retransmits)
+			}
+			if st.Frames == 0 || st.RetxBytes != 0 {
+				t.Errorf("%s view %d: Frames %d RetxBytes %d, want the frames of its own traffic (> 0) and no retransmission on a lossless pipe", sd.name, h, st.Frames, st.RetxBytes)
+			}
 			sumTx += st.TxBytes
 			sumRx += st.RxBytes
+			sumFrames += st.Frames
 		}
 		if sumTx != trTx || sumRx != trRx {
 			t.Errorf("%s: Σ views TxBytes %d RxBytes %d, trunk TxBytes %d RxBytes %d: want equal", sd.name, sumTx, sumRx, trTx, trRx)
+		}
+		if sumFrames > trFrames {
+			t.Errorf("%s: Σ views Frames %d, more than the trunk's %d", sd.name, sumFrames, trFrames)
 		}
 		if dgram && mtu <= 0 || !dgram && mtu != 0 {
 			t.Errorf("%s: MTU %d on a %s trunk", sd.name, mtu, map[bool]string{false: "stream", true: "datagram"}[dgram])

@@ -113,13 +113,13 @@ type RaceCounters struct {
 type PacketCounters struct {
 	Sent          uint64 // placed on a carrier (seq assigned) and not refused by it
 	Received      uint64 // accepted from carriers (new seqs)
-	Duplicates    uint64 // received again inside the dedup window
+	Duplicates    uint64 // received again inside the dedup window, also after the peer's FIN was delivered (M3-D35); in a race session the members' copies while they arrive inside the window (KL-15)
 	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
 	DropAge       uint64 // send side: older than Packet.MaxAge before placement while a data lane existed
 	DropTooLarge  uint64 // send side: no live data lane could carry it, a carrier refused it as too large, or a budget shrink left it on a member too small for it while every member that can carry it was write-blocked or at its capacity (M2-D45, L37)
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no data lane
 	DropRecvQueue uint64 // receive side: evicted by a full receive queue (the application did not read)
-	DropLate      uint64 // receive side: older than the dedup window, or arrived after the peer's FIN was delivered (R1-12)
+	DropLate      uint64 // receive side: older than the dedup window, or new and arrived after the peer's FIN was delivered (R1-12); in a race session also a member's copy of a received datagram that arrives beyond the window (KL-15): no loss, delivered once
 	PeerReceived  uint64 // the peer's Received, from its PACKs (merged by max)
 }
 

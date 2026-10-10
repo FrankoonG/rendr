@@ -23,17 +23,24 @@ import (
 // writer per dedicated carrier on each side; 0 for a session added to a
 // trunk: the trunk's goroutines are the warm-up session's and every actor
 // is parked); a session added to a trunk adds no reader stage; and the
-// per-side cost stays within the bounds below (the README figures with
-// headroom), so a README figure that no longer holds fails here first.
+// per-side cost stays within the bounds below. The bounds sit about a
+// third above the largest figures observed (selector 73, bond3 184 and
+// selector-on-trunk 8 KiB per side, also under -race; the live heap per
+// pair is stable to a few percent, the growth of the stack spans moves
+// the selector figure between about 60 and 73 KiB), so a README figure
+// that grows by more than about a third fails here, and a smaller drift
+// does not.
+// Every row checks the reader stages: one per dedicated carrier
+// (g5StageBytes each), none for a session added to a trunk.
 // Load: the sessions opened (actor resumptions counted while opening).
 func TestIdleSessionMemory(t *testing.T) {
 	rows := []struct {
 		c       g5IdleCase
 		perSide float64 // bound in bytes per side
 	}{
-		{g5IdleCase{name: "selector", mode: ModeSelector, factories: 1, goroutines: 4}, 160 << 10},
-		{g5IdleCase{name: "bond3", mode: ModeBond, factories: 3, goroutines: 12}, 400 << 10},
-		{g5IdleCase{name: "selector-on-trunk", mode: ModeSelector, factories: 1, shared: true}, 24 << 10},
+		{g5IdleCase{name: "selector", mode: ModeSelector, factories: 1, goroutines: 4}, 100 << 10},
+		{g5IdleCase{name: "bond3", mode: ModeBond, factories: 3, goroutines: 12}, 240 << 10},
+		{g5IdleCase{name: "selector-on-trunk", mode: ModeSelector, factories: 1, shared: true}, 12 << 10},
 	}
 	const n = 200 // < MuxMaxViews (256): every added session shares the warm-up session's trunk
 	for _, r := range rows {
@@ -52,11 +59,12 @@ func TestIdleSessionMemory(t *testing.T) {
 				if cost.goroutines != r.c.goroutines {
 					t.Errorf("%.2f goroutines per pair, want %v", cost.goroutines, r.c.goroutines)
 				}
-				if want := float64(r.c.carriers() * g5StageBytes); r.c.shared {
+				want := float64(r.c.carriers() * g5StageBytes)
+				if r.c.shared {
 					want = 0
-					if cost.stages != want {
-						t.Errorf("%.0f bytes of reader stages per side and session, want %.0f", cost.stages, want)
-					}
+				}
+				if cost.stages != want {
+					t.Errorf("%.0f bytes of reader stages per side and session, want %.0f", cost.stages, want)
 				}
 				if side > r.perSide {
 					t.Errorf("%.1f KiB per side and session, want at most %.0f KiB", side/1024, r.perSide/1024)

@@ -14,10 +14,16 @@ import (
 // §A5.7 item 6, §A10.3; DGDOWN): a MUX trunk's death that catches a
 // session's view attached-pending — the OPEN answered OK, the attach
 // checked the view alive, the session has not started it — reaches that
-// session when it starts the view after the death: the view's late Start
-// rings the session, whose death step records the carrier's end like any
-// other (one EventCarrierDown with the trunk's ID and cause, its row dead
-// in Status), and the session recovers on a new trunk.
+// session when it starts the view after the death. Every Start of a
+// carrier runs inside an actor step (attachLocked under handleLocked), and
+// the reapDead of that same step reads the view's Death, which reports the
+// trunk's death record whether or not the view is attached yet; the death
+// step records the carrier's end like any other (one EventCarrierDown with
+// the trunk's ID and cause, its row dead in Status), and the session
+// recovers on a new trunk. The late Start's doorbell ring
+// (Conn.startView) is defensive at this level: without it the same step
+// still reaps the view (mutant r12b passes here), and
+// TestDgTrunkDeathReachesEveryViewState pins the ring at carrier level.
 //
 // Session A is open on the stream trunk of link a. Session B's Dial takes
 // the live trunk (a new view, its OPEN answered OK); in B's attach, right

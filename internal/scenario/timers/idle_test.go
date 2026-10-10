@@ -138,8 +138,9 @@ func live(c *rendr.Conn) int {
 // session) + the carriers' goroutines (dedicated: a reader and a writer
 // per carrier per side; mux: those of the 4 trunks, likewise) + 10 — a
 // goroutine per parked session would exceed that by hundreds, and three
-// more per trunk in the MUX half would exceed it. The parked sessions still carry a second byte each way;
-// closing them and the Runtimes leaves nothing.
+// more per trunk in the MUX half would exceed it (two more per trunk, 8
+// in all, stay inside the slack). The parked sessions still carry a
+// second byte each way; closing them and the Runtimes leaves nothing.
 func TestIdleSessionsHoldNoGoroutine(t *testing.T) {
 	eachHalf(t, func(t *testing.T, h half) {
 		n := h.population()
