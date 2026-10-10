@@ -84,8 +84,13 @@ func (s *Session) conflictErr() error {
 }
 
 // recvLimit is the cap on the receive charge that out-of-order data may
-// fill: 2·W (V3).
+// fill: 2·W (V3); while a passive session is pending, earlyRecvLimit, so
+// that sparse early DATA cannot make a session that nobody accepted yet
+// hold more than its early span allows (L48; early_recv.go).
 func (s *Session) recvLimit() int64 {
+	if s.pendingLocked() {
+		return earlyRecvLimit
+	}
 	return 2 * s.window()
 }
 
@@ -107,16 +112,26 @@ type rcall struct {
 }
 
 // dataLocked implements lane.Data of lane l under s.mu (l: the lane whose
-// carrier delivered the frame, for M4's pre-verdict rule, lane.early).
+// carrier delivered the frame, for M4's pre-verdict rule, lane.early). An
+// ended session discards the frame (also early DATA that arrives after a
+// refusal, M4-D8); a pending passive session takes it only as early data
+// (earlyDataLocked, M4-D5).
 func (s *Session) dataLocked(l *lane, off uint64, p []byte, buf *carrier.Buf) error {
-	st := &s.st
-	if st.ended {
+	if s.st.ended {
 		buf.Release()
 		return nil
 	}
 	if s.pendingLocked() {
-		return s.earlyDataLocked(l, off, p, buf) // M4-D5 (errDataBeforeOpen until WP9b)
+		return s.earlyDataLocked(l, off, p, buf) // M4-D5
 	}
+	return s.recvDataLocked(off, p, buf)
+}
+
+// recvDataLocked is the receive path of one DATA frame inside the right
+// edge (the file comment): the checks, the comparison with held bytes, the
+// placement and the wakes.
+func (s *Session) recvDataLocked(off uint64, p []byte, buf *carrier.Buf) error {
+	st := &s.st
 	end := off + uint64(len(p))
 	switch {
 	case len(p) == 0 || end < off:
