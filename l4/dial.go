@@ -2,7 +2,6 @@ package l4
 
 import (
 	"context"
-	"errors"
 
 	"github.com/FrankoonG/rendr/v2"
 )
@@ -13,8 +12,18 @@ import (
 // any network I/O) and the Peer.Dial errors; an l4 Server's refusal is a
 // *rendr.RejectError whose code CodeOf reports. With o.EarlyReturn the
 // refusal is the first Read's or Write's error instead.
-//
-// Not implemented yet: it returns errors.ErrUnsupported.
 func Dial(ctx context.Context, p *rendr.Peer, addr string, o rendr.DialOptions) (*rendr.Conn, error) {
-	return nil, errors.ErrUnsupported // M4 WP4
+	md, err := AppendMetadata(make([]byte, 0, maxHeader+len(o.Metadata)), Request{Cmd: CmdConnect, Addr: addr, App: o.Metadata})
+	if err != nil {
+		return nil, err
+	}
+	o.Metadata = md
+	c, err := p.Dial(ctx, o)
+	if err != nil {
+		return nil, err
+	}
+	// net.ErrClosed only: the session already ended, and its first Read or
+	// Write reports why.
+	c.SetIdleTimeout(DefaultIdleTimeout)
+	return c, nil
 }
