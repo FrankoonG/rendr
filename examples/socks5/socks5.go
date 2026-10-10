@@ -209,7 +209,7 @@ func (q request) hostport() string {
 // drain; or err, when the connection is closed without a reply (a read or
 // write failure, a version other than 5, a greeting without methods).
 func handshake(r *bufio.Reader, w io.Writer) (req request, fail []byte, err error) {
-	var buf [255]byte
+	var buf [255 + 2]byte // the longest field: a 255-byte domain and the port
 	if _, err = io.ReadFull(r, buf[:2]); err != nil {
 		return req, nil, err
 	}

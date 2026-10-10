@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -37,7 +37,7 @@ func readToEnd(c net.Conn) ([]byte, error) {
 
 // isReset reports a connection reset (a TargetPipe's or a real socket's).
 func isReset(err error) bool {
-	return errors.Is(err, rendrtest.ErrReset) || errors.Is(err, syscall.ECONNRESET)
+	return errors.Is(err, rendrtest.ErrReset) || errors.Is(err, errConnReset)
 }
 
 // methodOK is the no-auth method reply.
@@ -82,6 +82,8 @@ func TestSocks5Parser_L44(t *testing.T) {
 		{name: "numeric 127.1", in: req(connectReq("127.1", 80)), out: outReply, method: true, rep: repBadAddress},
 		{name: "numeric 0x7f.1", in: req(connectReq("0x7f.1", 80)), out: outReply, method: true, rep: repBadAddress},
 		{name: "port 0", in: req(connectReq("ok.test", 0)), out: outReply, method: true, rep: repBadAddress},
+		{name: "domain 254 with the trailing dot", in: req(connectReq(longName(253)+".", 80)), out: outReply, method: true, rep: repSuccess},
+		{name: "domain 255", in: req(connectReq(longName(255), 80)), out: outReply, method: true, rep: repBadAddress},
 		{name: "ipv4", in: req(request{cmd: cmdConnect, atyp: atypIPv4, addr: []byte{192, 0, 2, 1}, port: 80}), out: outReply, method: true, rep: repSuccess},
 		{name: "ipv6", in: req(request{cmd: cmdConnect, atyp: atypIPv6, addr: net.ParseIP("2001:db8::1"), port: 443}), out: outReply, method: true, rep: repSuccess},
 	}
@@ -149,6 +151,19 @@ func TestSocks5Parser_L44(t *testing.T) {
 		})
 	}
 	t.Run("ip literal in domain form", ipLiteralRows)
+}
+
+// longName is a valid-looking name of n bytes: labels of at most 63 bytes
+// joined by dots (n > 253 is too long for l4's grammar).
+func longName(n int) string {
+	var b strings.Builder
+	for b.Len() < n {
+		if b.Len() > 0 {
+			b.WriteByte('.')
+		}
+		b.WriteString(strings.Repeat("a", min(63, n-b.Len())))
+	}
+	return b.String()
 }
 
 // ipLiteralRows are TestSocks5Parser_L44's R1-10 rows: an IP literal in
@@ -562,7 +577,7 @@ func TestSocks5AcceptErrorBackoff(t *testing.T) {
 		s := newStack(t, stackOpts{})
 		synctest.Wait() // the front end waits in Accept
 		for range 3 {
-			s.pl.errs <- &net.OpError{Op: "accept", Net: "tcp", Err: syscall.EMFILE}
+			s.pl.errs <- &net.OpError{Op: "accept", Net: "tcp", Err: errTooManyFiles}
 		}
 		start := time.Now()
 		synctest.Wait() // the first error taken: the front end backs off

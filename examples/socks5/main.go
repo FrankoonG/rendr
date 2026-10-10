@@ -9,7 +9,7 @@
 // which is only for carriers inside a tunnel that authenticates and
 // encrypts (see examples/mtls). Both subcommands stop on SIGINT or
 // SIGTERM: they reset the connections they forward, close the rendr
-// Runtime and exit with status 0.
+// Runtime, log "<subcommand>: stopped" and exit with status 0.
 //
 //	socks5 server [-rendr addr] [-carrier-insecure]
 //	socks5 client [-listen addr] [-rendr addr]... [-carrier-insecure]
@@ -95,6 +95,7 @@ func run(ctx context.Context, args []string, stderr io.Writer) int {
 		logger.Print(err)
 		return 1
 	}
+	logger.Printf("%s: stopped", args[0]) // the Runtime is closed
 	return 0
 }
 

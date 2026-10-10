@@ -10,6 +10,10 @@ import (
 // os.Interrupt equivalent where available").
 var stopSignals = []stopSignal{{"CTRL_BREAK", os.Interrupt}}
 
+// stopResetsVisible: Windows resets the sockets of an exiting process, so
+// a reset proves nothing here (the "stopped" line does).
+const stopResetsVisible = false
+
 // childAttr starts each child in its own process group, the target of
 // CTRL_BREAK_EVENT.
 func childAttr() *syscall.SysProcAttr {

@@ -74,7 +74,7 @@ func waitAddr(t *testing.T, out interface{ String() string }) string {
 // loopback address exits with status 2 and names the rule; loopback
 // addresses serve until ctx ends (status 0).
 func TestSocks5LoopbackOnly(t *testing.T) {
-	for _, l := range []string{"0.0.0.0:0", "[::]:0", ":0", "192.0.2.1:1080", "10.1.2.3:0", "[2001:db8::1]:1080"} {
+	for _, l := range []string{"0.0.0.0:0", "[::]:0", ":0", "192.0.2.1:1080", "198.51.100.7:0", "[2001:db8::1]:1080"} {
 		var out lockedBuffer
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		code := run(ctx, []string{"client", "-listen", l}, &out)
@@ -131,7 +131,10 @@ func startChild(t *testing.T, args ...string) *child {
 }
 
 // TestSocks5SignalExit (R1-21): both subcommands stop on SIGTERM and
-// SIGINT (Windows: CTRL_BREAK): a forwarded connection is reset, a
+// SIGINT (Windows: CTRL_BREAK) through the shutdown path: each logs that it
+// stopped after its Runtime closed, a forwarded connection is reset (on
+// unix, where an exit without the reset would send a FIN; Windows resets
+// the sockets of any exiting process, so there it is only closed), a
 // connection still in its handshake is closed at once, both exit with
 // status 0 well before the 10-s handshake deadline, and neither leaves a
 // listener behind.
@@ -173,7 +176,15 @@ func TestSocks5SignalExit(t *testing.T) {
 				t.Fatalf("dial: %v", err)
 			}
 			defer hs.Close()
-			time.Sleep(50 * time.Millisecond) // accepted into its handshake
+			// The method reply proves hs is in its handshake (it holds a
+			// slot and waits for the request).
+			var m [2]byte
+			if _, err := hs.Write(greeting); err != nil {
+				t.Fatalf("greeting: %v", err)
+			}
+			if _, err := io.ReadFull(hs, m[:]); err != nil || !bytes.Equal(m[:], methodOK) {
+				t.Fatalf("method reply % x, %v; want % x", m, err, methodOK)
+			}
 
 			start := time.Now()
 			for _, c := range []*child{cli, srv} {
@@ -193,10 +204,19 @@ func TestSocks5SignalExit(t *testing.T) {
 				}
 			}
 			t.Logf("both exited %v after %s", time.Since(start), sig.name)
+			for _, c := range []*child{cli, srv} {
+				if line := c.cmd.Args[1] + ": stopped"; !strings.Contains(c.out.String(), line) {
+					t.Fatalf("%q exited without %q (not through the shutdown path); output %q", c.cmd.Args[1:], line, c.out)
+				}
+			}
 			for _, c := range []net.Conn{fwd, hs} {
 				c.SetReadDeadline(time.Now().Add(5 * time.Second))
-				if _, err := bufio.NewReader(c).ReadByte(); err == nil || isTimeout(err) {
+				_, err := bufio.NewReader(c).ReadByte()
+				switch {
+				case err == nil || isTimeout(err):
 					t.Fatalf("a client connection after the exit: %v, want it closed", err)
+				case c == fwd && stopResetsVisible && !isReset(err):
+					t.Fatalf("the forwarded connection ended with %v, want a reset (Forward's AbortShutdown)", err)
 				}
 			}
 			for _, a := range []string{cli.addr, srv.addr} {
