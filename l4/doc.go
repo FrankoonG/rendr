@@ -53,7 +53,10 @@
 // plain Close. A dial that fails reaches the dialer as a *rendr.RejectError
 // whose CodeOf is the class of the failure (refused, unreachable, timeout,
 // name not found, …); its message is the code's fixed text, never the raw
-// error, which stays on the passive (ServerStatus.LastErr).
+// error, which stays on the passive (ServerStatus.LastErr). The message is
+// empty when the refusal is repeated for an OPEN retried on a shared
+// carrier (after a carrier death took the first answer down): such a
+// repeat carries the code only. The code is what to act on.
 //
 // # Bounds and memory
 //
