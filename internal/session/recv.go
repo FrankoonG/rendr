@@ -106,16 +106,16 @@ type rcall struct {
 	copied int // payload bytes copied (the call's own and the merged ones)
 }
 
-// dataLocked implements lane.Data under s.mu.
-func (s *Session) dataLocked(off uint64, p []byte, buf *carrier.Buf) error {
+// dataLocked implements lane.Data of lane l under s.mu (l: the lane whose
+// carrier delivered the frame, for M4's pre-verdict rule, lane.early).
+func (s *Session) dataLocked(l *lane, off uint64, p []byte, buf *carrier.Buf) error {
 	st := &s.st
 	if st.ended {
 		buf.Release()
 		return nil
 	}
 	if s.pendingLocked() {
-		buf.Release()
-		return errDataBeforeOpen
+		return s.earlyDataLocked(l, off, p, buf) // M4-D5 (errDataBeforeOpen until WP9b)
 	}
 	end := off + uint64(len(p))
 	switch {

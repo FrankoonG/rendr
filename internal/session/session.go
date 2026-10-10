@@ -96,6 +96,11 @@ type Status struct {
 	// mode); Race the sender's extra copies (race sessions only).
 	DupBytes uint64
 	Race     RaceCounters
+
+	// M4. EarlyBytes (M4-D18): dialer — the early bytes of the attempt
+	// that won the opening (0 for a fast-path winner); passive — the bytes
+	// accepted before the verdict.
+	EarlyBytes uint64
 }
 
 // RaceCounters are a race sender's extra copies (field-for-field

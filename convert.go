@@ -98,6 +98,7 @@ func sessionStatusFrom(st session.Status) SessionStatus {
 		MaxPayload:         st.MaxPayload,
 		DupBytes:           st.DupBytes,
 		Race:               RaceCounters{CopyBytes: st.Race.CopyBytes, Copies: st.Race.Copies},
+		EarlyBytes:         st.EarlyBytes,
 	}
 	if pc := st.Packet; pc != nil {
 		out.Packet = &PacketCounters{

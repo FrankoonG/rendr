@@ -166,6 +166,7 @@ func (a *actor) onConfirmLocked(now time.Time, c *confirm) {
 	}
 	a.decided, a.opened = true, true
 	a.openedAt = now
+	a.leavePendingLocked() // M4: every exit from StatePending
 	ctl.state = StateOpen
 	win := s.openWindowLocked()
 	var sender *lane
@@ -250,6 +251,12 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	}
 	a.gen++
 	l := a.newLaneLocked(now, ad.conn, -1, a.gen, LaneJoining)
+	if ad.early {
+		// M4-D5: recorded before the carrier starts; earlyDataLocked
+		// reads it (WP9b).
+		l.early = true
+		s.st.earlyOpen = true
+	}
 	a.unconfirmed = append(a.unconfirmed, l)
 	switch {
 	case ad.kind == adoptJoin:
@@ -257,7 +264,7 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	case ctl.state != StatePending:
 		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: s.laneWindowLocked(l)}}
 	}
-	ad.conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Hold: true})
+	ad.conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Hold: true, Early: ad.early})
 	if ctl.state != StatePending {
 		a.episodeEndLocked(now)
 	}

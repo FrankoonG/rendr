@@ -63,6 +63,33 @@ type DialOptions struct {
 	// NoPathGrace overrides Config.NoPathGrace for this session (clamped to
 	// 3 s–300 s; 0 keeps the Runtime value).
 	NoPathGrace time.Duration
+
+	// EarlyReturn makes Dial return as soon as its local checks passed,
+	// before any network I/O (TCP Fast Open semantics; stream sessions only).
+	// The session opens with the first Write, Read or CloseWrite: the first
+	// Write's bytes, up to Handshake.EarlyDataMax, travel with the OPEN in the
+	// same carrier write when the session dials a carrier of its own, so a
+	// protocol whose client speaks first saves one round trip. Until the
+	// peer answers, Write accepts at most EarlyDataMax bytes in all and then
+	// waits for the answer (deadlines apply). Every outcome Dial would have
+	// returned arrives later instead: the next Read and Write return it
+	// (*RejectError, ErrCapacity, ErrVersion, ErrProtocol, ErrMetadataTooLarge,
+	// ErrSessionLost, ErrNoPath); the bytes written early are then discarded
+	// on both sides and Done is closed. Close keeps its meaning: what was
+	// written is delivered once the peer accepts, within Linger; Abort
+	// withdraws. A Close before the first Write, Read or CloseWrite sends
+	// nothing. The cold-start wait for probe samples is skipped. PeerInstance
+	// and RemoteAddr report the zero InstanceID until the peer accepted. A
+	// session that opens on a carrier it shares with other sessions (rendr
+	// mux) sends its bytes after the answer, which costs the same as early
+	// data on a carrier of its own. Do not use it when the peer's answer must
+	// precede your first byte (a SOCKS5 reply, for example). Write before you
+	// Read: a Read that comes first opens the session without early bytes.
+	// DialPacket refuses it with ErrProtocol.
+	//
+	// Not implemented yet: Dial and DialPacket return ErrProtocol
+	// ("EarlyReturn: not implemented") when it is set.
+	EarlyReturn bool
 }
 
 // Peer is one destination rendr instance reachable through a set of

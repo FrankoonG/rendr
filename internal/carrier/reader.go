@@ -59,6 +59,11 @@ func (c *Conn) readLoop() {
 	if rd.stage == nil {
 		rd.stage = c.env.Bufs.Get(BigData, c.env.stageBudget())
 	}
+	if c.opts.Early {
+		if h := c.env.Hooks; h != nil && h.BeforeEarlyRead != nil {
+			h.BeforeEarlyRead() // M4 R1-17: a test holds the reader before the early DATA
+		}
+	}
 	for c.readFrame(rd) {
 	}
 	normal = true

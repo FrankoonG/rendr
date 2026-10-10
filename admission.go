@@ -74,8 +74,9 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 			return true
 		}
 	}
+	early := o.Flags&wire.OpenFlagEarly != 0 // M4-D5: a duplicate OPEN's lane records it
 	if r := rt.table.lookup(key, time.Now()); r.found {
-		return rt.routeOpen(r, c, fl, o.Kind, deadline)
+		return rt.routeOpen(r, c, fl, o.Kind, early, deadline)
 	}
 	if st, code := ln.viewRefusal(view); st != wire.StatusOK {
 		answerOpen(c, wire.OpenAck{Status: st, Code: code}, deadline)
@@ -103,6 +104,7 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 		DialerInstance: h.Preface.Instance,
 		PeerWindow:     o.Window,
 		Metadata:       o.Metadata,
+		Early:          o.Flags&wire.OpenFlagEarly != 0, // M4-D5 (never set while ParseOpen refuses the flag)
 	}
 	if packet {
 		spec.Params = rt.eff.packetParams(spec.Params, maxPayload)
@@ -119,7 +121,7 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 		rt.untrackFlows(s)
 		ln.unreserve(k)
 		rt.table.unreserve()
-		return rt.routeOpen(r, c, fl, o.Kind, deadline)
+		return rt.routeOpen(r, c, fl, o.Kind, early, deadline)
 	}
 	ln.bind(s, k)
 	s.Start()
@@ -197,7 +199,7 @@ func packetAccept(o *wire.Open, limit, ownMax int) (cmtu, maxPayload int) {
 // already attached, an ended session's verdict). A datagram carrier's
 // budget was set by admitOpen before (R1-5). It reports whether it answered
 // the carrier itself.
-func (rt *Runtime) routeOpen(r lookupResult[*session.Session], c *carrier.Conn, fl *udpflow.Flow, kind wire.CarrierKind, deadline time.Time) (refused bool) {
+func (rt *Runtime) routeOpen(r lookupResult[*session.Session], c *carrier.Conn, fl *udpflow.Flow, kind wire.CarrierKind, early bool, deadline time.Time) (refused bool) {
 	switch {
 	case r.tomb:
 		answerOpen(c, r.verdict.OpenAck(), deadline)
@@ -206,7 +208,7 @@ func (rt *Runtime) routeOpen(r lookupResult[*session.Session], c *carrier.Conn, 
 	case rt.sessionKind(r.sess) != kind:
 		answerOpen(c, wire.OpenAck{Status: wire.StatusBadRequest, Code: wire.CodeBadKind}, deadline)
 	default:
-		taken, v := r.sess.AttachOpen(c)
+		taken, v := r.sess.AttachOpenEarly(c, early)
 		if taken {
 			rt.holdFlow(r.sess, fl)
 			return false

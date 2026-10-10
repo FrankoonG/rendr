@@ -21,6 +21,10 @@ type PassiveSpec struct {
 	// PendingPacket.MaxPayload reads the accepted value before Confirm (M2
 	// design Revision 1, R1-32).
 	MaxPayload int
+	// Early: the OPEN carried wire.OpenFlagEarly (a stream OPEN, the
+	// carrier's first frame; M4-D5): the first lane accepts early DATA
+	// within wire.EarlyWindow before the verdict. M4's WP9b records it.
+	Early bool
 }
 
 // NewPending creates an unstarted passive session in StatePending with
@@ -61,8 +65,13 @@ func NewPending(env *Env, spec PassiveSpec, first *carrier.Conn) *Session {
 	s.ctl.state = StatePending
 	s.ctl.epoch = p.FirstEpoch - 1 // the first SCHED (FirstEpoch) is newer (V15)
 	s.ctl.rescuedBase = ^uint64(0)
+	// Closed by leavePendingLocked when the session leaves StatePending
+	// (M4-D22).
+	s.ctl.pendingDone = make(chan struct{})
 	l := &lane{s: s, c: first, port: first, id: first.ID(), factory: -1, gen: 1, since: now}
 	l.state = LaneJoining
+	l.early = spec.Early // M4-D5: recorded here; earlyDataLocked reads it (WP9b)
+	s.st.earlyOpen = spec.Early
 	l.schedSent = s.ctl.epoch
 	l.echoRel = s.ctl.epoch - 1 // the first epoch echo placed on l is reliable (M2-D39)
 	s.lanes = append(s.lanes, l)
@@ -90,7 +99,7 @@ func (s *Session) Start() {
 	a.gen = first.gen
 	a.unconfirmed = append(a.unconfirmed, first)
 	a.acceptBy = first.since.Add(orDefault(s.p.AcceptTimeout, defAcceptTimeout))
-	first.c.Start(s.endpoint(first), &s.mb, carrier.StartOptions{Hold: true})
+	first.c.Start(s.endpoint(first), &s.mb, carrier.StartOptions{Hold: true, Early: first.early})
 	s.mb.actor.Store(a) // rings kick the actor from now on (R1-7)
 	a.kick()
 }
@@ -189,6 +198,15 @@ func (s *Session) finalVerdict() Verdict {
 // R1-11). For a packet session the admission has validated c's packet OPEN
 // fields and set its budget (R1-5); its OPEN_ACK window is c's own.
 func (s *Session) AttachOpen(c *carrier.Conn) (taken bool, v Verdict) {
+	return s.AttachOpenEarly(c, false)
+}
+
+// AttachOpenEarly is AttachOpen with the duplicate OPEN's EARLY flag (M4-D5,
+// §A5.1): early reports that c's OPEN carried wire.OpenFlagEarly, and the
+// lane the actor adopts records it (lane.early, st.earlyOpen), so that the
+// early DATA following that OPEN on c is accepted before the verdict
+// (earlyDataLocked). A duplicate OPEN need not repeat the flag.
+func (s *Session) AttachOpenEarly(c *carrier.Conn, early bool) (taken bool, v Verdict) {
 	s.mu.Lock()
 	switch {
 	case s.ctl.state == StateEnded:
@@ -206,7 +224,7 @@ func (s *Session) AttachOpen(c *carrier.Conn) (taken bool, v Verdict) {
 	}
 	s.ctl.adopting++
 	s.mu.Unlock()
-	if !s.mb.post(&adopt{conn: c, kind: adoptOpen}) {
+	if !s.mb.post(&adopt{conn: c, kind: adoptOpen, early: early}) {
 		return false, s.finalVerdict() // the actor exited meanwhile
 	}
 	return true, Verdict{}

@@ -39,9 +39,18 @@ import (
 // DONE were lost, or its Runtime closing) only says that the peer gave up
 // waiting for our DONE. Invariant 1 holds: the peer's FIN was delivered at
 // the contiguous point, where Read returns io.EOF anyway.
+//
+// A dialer still in its opening phase takes the pending branch (M4): no
+// rule below applies before the verdict; earlyCloseLocked runs the
+// deadline of a Close called before it (M4-D12; a no-op until M4's WP9a).
 func (a *actor) terminationLocked(now time.Time) {
 	s := a.s
 	st := &s.st
+	if a.d != nil && !a.d.opened {
+		a.earlyCloseLocked(now)
+		return
+	}
+	idle := a.idleTimeout()
 	linger := orDefault(s.p.Linger, defLinger)
 	idleBase := st.lastData
 	if a.openedAt.After(idleBase) {
@@ -52,6 +61,11 @@ func (a *actor) terminationLocked(now time.Time) {
 		// RST received: no RST is sent back (§4.7).
 		r := st.rstIn
 		a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortCode(r.Code), Msg: string(r.Msg), Remote: true}), nil, false)
+	case st.abortReq != nil:
+		// Conn.Abort (M4-D20): the application's RST; this side's calls
+		// return net.ErrClosed. A peer RST that arrived first wins (the
+		// case above): one end decision.
+		a.terminateLocked(now, net.ErrClosed, st.abortReq, false)
 	case st.exhausted:
 		// L14: exactly one RST(Exhausted); the Write already returned the error.
 		a.terminateLocked(now, errExhausted(), &wire.Rst{Code: wire.RstExhausted}, false)
@@ -68,7 +82,7 @@ func (a *actor) terminationLocked(now time.Time) {
 		a.terminateLocked(now, net.ErrClosed, &wire.Rst{Code: wire.RstClosed}, false)
 	case st.closed && !st.doneSent && !now.Before(st.closedAt.Add(linger)):
 		a.terminateLocked(now, net.ErrClosed, &wire.Rst{Code: wire.RstLinger}, false)
-	case s.p.IdleTimeout > 0 && !st.doneSent && !now.Before(idleBase.Add(s.p.IdleTimeout)):
+	case idle > 0 && !st.doneSent && !now.Before(idleBase.Add(idle)):
 		// After our DONE the exchange is complete and Linger bounds the
 		// wait for the peer's DONE (design §0.14 B4): not idleness.
 		a.terminateLocked(now, ErrIdleTimeout, &wire.Rst{Code: wire.RstIdle}, false)
@@ -78,8 +92,8 @@ func (a *actor) terminationLocked(now time.Time) {
 		} else if st.closed {
 			a.want(st.closedAt.Add(linger))
 		}
-		if s.p.IdleTimeout > 0 && !st.doneSent {
-			a.want(idleBase.Add(s.p.IdleTimeout))
+		if idle > 0 && !st.doneSent {
+			a.want(idleBase.Add(idle))
 		}
 	}
 }
@@ -100,6 +114,9 @@ func (a *actor) terminateLocked(now time.Time, err error, rst *wire.Rst, goAway 
 	a.endErr = err
 	if a.opened {
 		a.verdict = Verdict{Opened: true}
+	}
+	if ctl.state == StatePending {
+		a.leavePendingLocked() // M4: every exit from StatePending
 	}
 	ctl.state = StateEnded
 	if rst != nil {

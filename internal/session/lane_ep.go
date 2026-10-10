@@ -156,7 +156,7 @@ func (l *lane) Data(c *carrier.Conn, off uint64, p []byte, buf *carrier.Buf) err
 	s := l.s
 	s.mu.Lock()
 	tail := s.st.rTail
-	err := s.dataLocked(off, p, buf)
+	err := s.dataLocked(l, off, p, buf)
 	if err == nil {
 		s.gapAckLocked(l, off, tail)
 	}

@@ -40,7 +40,7 @@ type State uint8
 
 // States.
 const (
-	StatePending State = 1 // passive: OPEN admitted, waiting for Confirm/Reject/AcceptTimeout
+	StatePending State = 1 // passive: OPEN admitted, waiting for Confirm/Reject/AcceptTimeout; dialer: opening (a session returned by Dial with DialSpec.EarlyReturn before its verdict, M4-D19)
 	StateOpen    State = 2 // data flows (possibly inside a no-path episode)
 	StateClosing State = 3 // the application called Close; linger delivers the rest
 	StateEnded   State = 4 // terminal; Status().Err is the end error (io.EOF after a clean finish)
@@ -155,6 +155,15 @@ type Params struct {
 	// Actors is the Runtime's gauge of running actor goroutines
 	// (rendr.Status.Actors, M3-D44); nil: not counted.
 	Actors *atomic.Int64
+
+	// EarlyDataMax (M4-D16; dialer, EarlyReturn sessions only) caps the
+	// early span: the bytes Write admits before the verdict and the first
+	// flight carries (0 … wire.EarlyWindow; 0: no early bytes).
+	EarlyDataMax int
+	// MinIdleTimeout is the floor of SetIdleTimeout's clamp (M4-D21): 0
+	// keeps 10 s (testhooks.MinIdleTimeout lowers it for real-socket
+	// tests).
+	MinIdleTimeout time.Duration
 }
 
 // PacketParams is the frozen configuration of a packet session (M2-D1),

@@ -57,6 +57,10 @@ func (p *Peer) dial(ctx context.Context, o DialOptions, packet bool) (*session.S
 		return nil, fmt.Errorf("rendr: Dial: no stream carrier factory: %w", ErrNoPath)
 	case o.Mode > ModeRace:
 		return nil, fmt.Errorf("rendr: %s: unknown %v: %w", name, o.Mode, ErrProtocol)
+	case o.EarlyReturn:
+		// M4 skeleton: EarlyReturn arrives with WP10 (stream sessions; a
+		// DialPacket then refuses it: "EarlyReturn is for stream sessions").
+		return nil, fmt.Errorf("rendr: %s: EarlyReturn: not implemented: %w", name, ErrProtocol)
 	case len(o.Metadata) > m:
 		return nil, fmt.Errorf("rendr: %s: %d bytes of metadata, limit %d: %w", name, len(o.Metadata), m, ErrMetadataTooLarge)
 	case packet && !openCapable(p.factories, len(o.Metadata)):

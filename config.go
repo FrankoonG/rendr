@@ -175,6 +175,13 @@ type HandshakeLimits struct {
 	Timeout       time.Duration // 10 s; 1 s–60 s: PREFACE + first frame + verdict write
 	MaxConcurrent int           // 256; 1–65536: handshake slots per Runtime (the oldest is evicted when full)
 	MaxMetadata   int           // 4096; 0–65535: OPEN metadata bytes
+
+	// EarlyDataMax (64 KiB; 0–64 KiB; a negative value selects 0) bounds the
+	// bytes an EarlyReturn session sends before the peer's answer. A passive
+	// always accepts up to 64 KiB of early data per pending session (a
+	// protocol constant), so the two sides never disagree. (Not normalized
+	// yet: EarlyReturn is not implemented.)
+	EarlyDataMax int
 }
 
 // SessionlessLimits bound the sessionless probe carriers that dialers'

@@ -126,8 +126,8 @@ func (s *Session) ringActor() { s.mb.ring() }
 
 // command is one ownership-carrying message to the actor (design §3.4).
 // The concrete types are pointers: *dialResult, *adopt, *confirm, *reject,
-// *refuse, *shutdown and *withdraw. The actor handles them in arrival
-// order.
+// *refuse, *shutdown, *withdraw and *startOpen. The actor handles them in
+// arrival order.
 type command interface{ isCommand() }
 
 // dialResult is the outcome of one dial attempt (dialer). The attempt id
@@ -151,9 +151,10 @@ const (
 // adopt hands an unstarted passive carrier to the actor; it counts in
 // ctl.adopting until handled (§6.3).
 type adopt struct {
-	conn *carrier.Conn
-	kind adoptKind
-	join wire.Join // adoptJoin: the JOIN as received
+	conn  *carrier.Conn
+	kind  adoptKind
+	join  wire.Join // adoptJoin: the JOIN as received
+	early bool      // adoptOpen: the duplicate OPEN carried wire.OpenFlagEarly (M4-D5; AttachOpenEarly)
 }
 
 // confirm is PendingConn.Confirm. reply has capacity 1; the actor sends
@@ -182,6 +183,11 @@ type shutdown struct{}
 // withdraw: Dial's ctx ended before the opening phase succeeded.
 type withdraw struct{}
 
+// startOpen: the first Write, Read or CloseWrite of a session that Dial
+// returned with EarlyReturn (M4-D9; triggerOpen posts it once): the actor
+// starts the opening phase (onStartOpenLocked).
+type startOpen struct{}
+
 func (*dialResult) isCommand() {}
 func (*adopt) isCommand()      {}
 func (*confirm) isCommand()    {}
@@ -189,3 +195,4 @@ func (*reject) isCommand()     {}
 func (*refuse) isCommand()     {}
 func (*shutdown) isCommand()   {}
 func (*withdraw) isCommand()   {}
+func (*startOpen) isCommand()  {}

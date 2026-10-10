@@ -271,9 +271,19 @@ func NewPool(env *Env, fs []Factory) *Pool {
 // here: the sessions that survive Peer.Close keep their fast paths and
 // coalescing.
 func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, payload []byte, check func(*wire.PrefaceAck) error, inst [16]byte, sess uintptr, dk wire.Type) (*Established, error) {
+	return p.AttemptEarly(ctx, f, cid, kind, payload, check, inst, sess, dk, nil)
+}
+
+// AttemptEarly is Attempt with the session's early span (M4 design §A4.3,
+// M4-D3, M4-D17; skeleton): early goes to a dial of the attempt's own
+// (EstablishEarly) only — a dedicated carrier, or handle 1 of a fresh
+// trunk —, never to a fast-path view or a coalesced wait, whose
+// Established.Early is 0. early must be nil for a JOIN. Until M4's WP8 it
+// is threaded to EstablishEarly, which ignores it.
+func (p *Pool) AttemptEarly(ctx context.Context, f int, cid uint32, kind wire.Type, payload []byte, check func(*wire.PrefaceAck) error, inst [16]byte, sess uintptr, dk wire.Type, early []byte) (*Established, error) {
 	fac := p.fs[f]
 	if !fac.Mux || (kind != wire.TypeOpen && kind != wire.TypeJoin) {
-		return Establish(ctx, p.env, fac, cid, kind, payload, check)
+		return EstablishEarly(ctx, p.env, fac, cid, kind, payload, early, check)
 	}
 	if dk != wire.TypeDgram {
 		dk = wire.TypeData
@@ -393,7 +403,7 @@ func (p *Pool) Attempt(ctx context.Context, f int, cid uint32, kind wire.Type, p
 			joined = nil
 		}
 		p.mu.Unlock()
-		est, err := Establish(ctx, p.env, fac, cid, kind, payload, p.provenCheck(nw, check))
+		est, err := EstablishEarly(ctx, p.env, fac, cid, kind, payload, early, p.provenCheck(nw, check))
 		p.claimed(ctx, nw, est, err, sess)
 		return est, err
 	}

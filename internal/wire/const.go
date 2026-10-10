@@ -341,6 +341,16 @@ const (
 // must be 0 (ErrReserved).
 const OpenFlagEarly uint16 = 1 << 0
 
+// EarlyWindow is the protocol's bound on early data (M4 design M4-D2): a
+// passive accepts DATA before its verdict only on a carrier whose own first
+// frame was a stream OPEN with OpenFlagEarly, and only within the first
+// EarlyWindow bytes of the stream; DATA beyond it is a violation of that
+// carrier (it dies; the pending session survives). It is a constant, not
+// negotiated: no dialer may send more (Handshake.EarlyDataMax ≤ it), so the
+// two sides never disagree. ParseOpen keeps refusing OpenFlagEarly until
+// M4's wire work package accepts it.
+const EarlyWindow = 1 << 16
+
 // CloseReason is the CLOSE payload.
 type CloseReason uint8
 

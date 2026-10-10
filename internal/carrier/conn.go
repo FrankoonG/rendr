@@ -100,6 +100,10 @@ type StartOptions struct {
 	// Sessionless (passive probe carriers): never PING; answer PONGs; close
 	// after Timing.SessionlessIdle without a PING.
 	Sessionless bool
+	// Early (passive session carriers, M4): the carrier's first frame was
+	// an OPEN with wire.OpenFlagEarly, so early DATA follows it; the
+	// reader runs Hooks.BeforeEarlyRead before its first read (R1-17).
+	Early bool
 }
 
 // Conn is one view of a carrier (M3 design §A5.1, M3-D1): one session's

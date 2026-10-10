@@ -54,6 +54,13 @@ type Established struct {
 	// the session starts it (M3-D19); false for a dedicated carrier and for
 	// a view opened on a live trunk.
 	Fresh bool
+	// Early is the number of early DATA bytes (the session's early span
+	// [0, Early)) that followed the OPEN(EARLY) in this carrier's first
+	// flight (M4 design §A3.2): set only once the whole first flight was
+	// written; 0 for an attempt without early data, a JOIN, a PING, a
+	// partial first flight, a fast-path or coalesced view of the Pool.
+	// EstablishEarly fills it (M4 WP8); until then it is always 0.
+	Early int
 }
 
 // EstablishError describes a failed attempt. It wraps the underlying error.
@@ -195,6 +202,26 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // PREFACE_ACK of this major also reports the passive's Instance (the
 // instance a GOING_AWAY names, design §6.6), with PrefaceOK false.
 func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type, payload []byte, check func(*wire.PrefaceAck) error) (*Established, error) {
+	return EstablishEarly(ctx, env, f, id, t, payload, nil, check)
+}
+
+// EstablishEarly is Establish with the session's early span (M4 design
+// §A3.2, M4-D4; skeleton): for an OPEN on a stream factory with a non-empty
+// early (at most wire.EarlyWindow bytes), the OPEN carries
+// wire.OpenFlagEarly — payload is the plain OPEN (flags 0) and
+// EstablishEarly sets the flag in its own copy, so the caller's payload
+// serves fast-path views unchanged — and one DATA frame (handle 1, offset
+// 0, fseq first + 1) with early follows it in the same first flight — one
+// conn Write without
+// DialEarly; with DialEarly the hello writer writes the DATA frame after
+// the factory's PREFACE ‖ OPEN — and Established.Early reports the bytes
+// once the whole first flight was written; a withdrawal RST then follows at
+// fseq first + 2 (R1-4). early must be nil for a JOIN, a PING and a
+// datagram factory. The caller keeps early unmodified until the call
+// returns. M4's WP8 implements it; until then early is ignored and
+// EstablishEarly is exactly Establish.
+func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type, payload, early []byte, check func(*wire.PrefaceAck) error) (*Established, error) {
+	_ = early // M4 WP8: the first flight's DATA frame
 	if f.Kind == wire.KindDatagram {
 		return establishDatagram(ctx, env, f, id, t, payload, check)
 	}

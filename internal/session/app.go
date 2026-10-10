@@ -19,6 +19,7 @@ import (
 // returned) or "Close won" ((0, net.ErrClosed), data discarded). Concurrent
 // Reads are serialized (rsem, acquireLocked).
 func (s *Session) Read(p []byte) (int, error) {
+	s.triggerOpen() // EarlyReturn: the first Read opens the session (M4-D9)
 	s.mu.Lock()
 	sem, ok := s.acquireLocked(&s.rsem)
 	if !ok {
@@ -185,6 +186,10 @@ func (s *Session) write(p []byte, poll **time.Timer) (int, error) {
 			s.mu.Unlock()
 			return n, err // this round is not delivered
 		}
+		// EarlyReturn: the first admitted round opens the session, after
+		// its bytes are committed, so the first attempt's early span
+		// includes them (M4-D9, R1-15).
+		s.triggerOpen()
 		n += int(k)
 		p = p[k:]
 	}
@@ -200,6 +205,7 @@ func (s *Session) write(p []byte, poll **time.Timer) (int, error) {
 // It returns nil, also when repeated or after Close, so concurrent closers
 // all see the same result (L03).
 func (s *Session) CloseWrite() error {
+	s.triggerOpen() // EarlyReturn: CloseWrite opens the session (M4-D9)
 	s.mu.Lock()
 	s.closeWriteLocked(time.Now())
 	s.mu.Unlock()

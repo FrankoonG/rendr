@@ -32,6 +32,7 @@ func (s *Session) initStreamLocked() {
 	st.echoIn = s.p.FirstEpoch - 1
 	now := time.Now()
 	st.lastData, st.lastAdvance = now, now
+	st.idleOverride = -1 // no SetIdleTimeout yet (M4-D21)
 	st.order = make([]*lane, 0, 4)
 	// Deadline timers are created by the first Set*Deadline with a future
 	// time (§3.6); a zero deadline needs none.

@@ -116,6 +116,8 @@ type SessionStatus struct {
 
 	DupBytes uint64       // stream receiver: bytes that arrived again (race copies, rescue duplicates) and were discarded
 	Race     RaceCounters // zero unless ModeRace
+
+	EarlyBytes uint64 // dialer: bytes that travelled as early data on the carrier that won the opening (DialOptions.EarlyReturn); passive: bytes received before the verdict
 }
 
 // RaceCounters count a race sender's extra copies: the session's TxBytes

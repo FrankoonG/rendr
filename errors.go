@@ -31,12 +31,15 @@ var (
 	// confirmation) ends the session with io.EOF instead.
 	ErrAborted = session.ErrAborted
 	// ErrRejected: Dial was rejected by the peer application; errors.As
-	// yields *RejectError.
+	// yields *RejectError. With DialOptions.EarlyReturn, returned by the
+	// first Read or Write.
 	ErrRejected = session.ErrRejected
 	// ErrCapacity: Dial refused for capacity: CAPACITY from the peer (its
 	// MaxSessions, a full backlog or a closed Listener, its AcceptTimeout),
 	// GOING_AWAY from the peer (its Runtime is closing), local MaxSessions,
-	// or the local abandoned-call pool is full.
+	// or the local abandoned-call pool is full. With
+	// DialOptions.EarlyReturn, a refusal by the peer is returned by the
+	// first Read or Write.
 	ErrCapacity = session.ErrCapacity
 	// ErrVersion: the peer answered PREFACE_ACK VERSION or FEATURE.
 	ErrVersion = session.ErrVersion
@@ -104,7 +107,8 @@ const (
 type AbortError = session.AbortError
 
 // RejectError is the Dial error when the peer application called
-// PendingConn.Reject. errors.Is(err, ErrRejected) is true; like every Dial
+// PendingConn.Reject (with DialOptions.EarlyReturn, returned by the first
+// Read or Write). errors.Is(err, ErrRejected) is true; like every Dial
 // error it is a net.Error with Timeout() == false. It is a struct with these
 // fields:
 //

@@ -298,6 +298,8 @@ func (a *actor) handleLocked(now time.Time, c command) {
 		a.onShutdownLocked(now)
 	case *withdraw:
 		a.onWithdrawLocked(now)
+	case *startOpen:
+		a.onStartOpenLocked(now)
 	}
 }
 
@@ -344,8 +346,8 @@ func (a *actor) actLocked(now time.Time) {
 	if !a.ending {
 		if a.s.p.Role == RolePassive && a.s.ctl.state == StatePending {
 			a.pendingLocked(now)
-		} else if a.d == nil || a.d.opened {
-			a.terminationLocked(now)
+		} else {
+			a.terminationLocked(now) // an opening dialer takes its pending branch (M4)
 		}
 	}
 	if !a.ending && a.d != nil {

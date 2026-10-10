@@ -51,6 +51,16 @@ type DialSpec struct {
 	// Coupled has bit i set when factory i's fate group is HoLCoupled
 	// (M3-D39).
 	Coupled uint16
+
+	// EarlyReturn (M4-D9 … M4-D12; stream sessions only): Dial returns the
+	// session at once, before any attempt, in StatePending; the opening
+	// starts at the first Write, Read or CloseWrite (triggerOpen), the
+	// first attempt fixes the early span [0, min(end, EarlyDataMax)) that
+	// every fresh-carrier attempt carries (R1-2), and the opening's
+	// terminal outcome ends the session with Dial's error. M4's WP9a
+	// implements it; until then package rendr refuses EarlyReturn and Dial
+	// ignores the field.
+	EarlyReturn bool
 }
 
 // Dial creates a dialer session and runs its opening phase (design §6.6):

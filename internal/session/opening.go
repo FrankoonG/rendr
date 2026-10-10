@@ -114,6 +114,18 @@ type dialer struct {
 
 	unsub   func()
 	release func()
+
+	// EarlyReturn (M4 design §A4; WP9a). deferred is set by Dial for an
+	// EarlyReturn session that has not started its opening; the first
+	// triggerOpen to clear it posts startOpen. closeAt is when Close was
+	// called before the verdict (zero: not closed): Linger counts from it
+	// (earlyCloseLocked, M4-D12). early is the session's one early span
+	// [0, k0) (R1-2): fixed by the actor at the first attempt after the
+	// trigger, read-only afterwards, shared by every fresh-carrier OPEN
+	// attempt (nil: none).
+	deferred atomic.Bool
+	closeAt  time.Time
+	early    []byte
 }
 
 // slot is one factory of the session's snapshot.
@@ -478,7 +490,11 @@ func (a *actor) startAttemptLocked(now time.Time, i int, kind wire.Type) {
 	sl.att = at
 	d.running++
 	a.dirty = true // Status shows the attempt as a joining carrier (L22)
-	go a.runAttempt(ctx, at, sl.f, payload)
+	var early []byte
+	if kind == wire.TypeOpen {
+		early = d.early // the session's one early span (M4 R1-2; nil until WP9a fixes it)
+	}
+	go a.runAttempt(ctx, at, sl.f, payload, early)
 }
 
 // runAttempt is a dial-attempt goroutine: Establish, Hooks.DialResult,
@@ -491,7 +507,11 @@ func (a *actor) startAttemptLocked(now time.Time, i int, kind wire.Type) {
 // conn itself, and this goroutine's deferred cleanup reports the attempt
 // as failed, so the slot's cadence, the attempt count and the abandoned
 // pool stay exact and the slot redials.
-func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, payload []byte) {
+//
+// early is the session's early span for an OPEN attempt (M4, R1-2; nil for
+// a JOIN): passed to a dial of the attempt's own only (EstablishEarly,
+// Pool.AttemptEarly).
+func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, payload, early []byte) {
 	s := a.s
 	posted := false
 	defer func() {
@@ -523,9 +543,9 @@ func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, 
 		if s.pk != nil {
 			dk = wire.TypeDgram
 		}
-		est, err = p.Attempt(ctx, f.Index, at.cid, at.kind, payload, check, inst, s.poolKey(), dk)
+		est, err = p.AttemptEarly(ctx, f.Index, at.cid, at.kind, payload, check, inst, s.poolKey(), dk, early)
 	} else {
-		est, err = carrier.Establish(ctx, s.env.Carrier, f, at.cid, at.kind, payload, check)
+		est, err = carrier.EstablishEarly(ctx, s.env.Carrier, f, at.cid, at.kind, payload, early, check)
 	}
 	posted = true
 	a.postResult(at, est, err)
@@ -884,6 +904,7 @@ func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 		s.peer = inst
 		s.bound.Store(true)
 		s.peerWindowLocked(window)
+		a.leavePendingLocked() // M4: every exit from StatePending
 		s.ctl.state = StateOpen
 		ch := d.result
 		a.answer(func() { ch <- nil })
