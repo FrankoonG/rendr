@@ -471,6 +471,9 @@ func (rt *Runtime) Close() error {
 	srcs := mapKeys(rt.sources)
 	pools := mapKeys(rt.pools)
 	rt.mu.Unlock()
+	if h := rt.eff.hooks; h != nil && h.ClosePools != nil {
+		h.ClosePools() // KL-25: a pool may register after this snapshot
+	}
 	rt.cancel(net.ErrClosed) // in-flight Dials withdraw (session.Dial returns within 100 ms)
 
 	// Steps 2–5 only post work: nothing before the joins waits for a session

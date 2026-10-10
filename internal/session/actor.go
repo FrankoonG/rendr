@@ -258,6 +258,9 @@ func (a *actor) step(now time.Time) {
 	a.factsLocked(now)
 	a.unlockStep(now)
 	now = a.reapDead(now)
+	if h := s.env.Hooks; h != nil && h.AfterReap != nil {
+		h.AfterReap(s.id) // KL-26: a death after the reap, before the actions
+	}
 	s.mu.Lock()
 	a.peerSignalsLocked(now)
 	a.actLocked(now)

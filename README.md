@@ -30,14 +30,14 @@ app ── net.Conn ── session ══ carrier × N ══ session ── net
 
 **rendr 2.0 is a ground-up rewrite in progress** on the `v2` branch
 (module `github.com/FrankoonG/rendr/v2`); it is not compatible with earlier
-releases, their API or their wire format. The current checkpoint is M2:
-the 2.0 core of M1 (stream sessions, selector and bond scheduling, the wire
-format, admission) plus packet sessions, datagram carriers (the raw UDP
-carrier `carrier/udp` and embedder `net.PacketConn` carriers) and the QUIC
-stream and datagram carriers of the nested `quic` module. Milestone M3 is
-in progress: race scheduling, carrier properties (`Props`), shared
-carriers (rendr mux) and parked idle sessions. The API may still change
-before v2.0.0. An L4 TCP module (M4) follows.
+releases, their API or their wire format. The current checkpoint is M3:
+the 2.0 core (stream sessions, selector and bond scheduling, the wire
+format, admission), packet sessions, datagram carriers (the raw UDP
+carrier `carrier/udp` and embedder `net.PacketConn` carriers), the QUIC
+stream and datagram carriers of the nested `quic` module, race
+scheduling, carrier properties (`Props`), shared carriers (rendr mux) on
+stream and datagram carriers, and parked idle sessions. An L4 TCP module
+(M4) follows. The API may still change before v2.0.0.
 
 Supported platforms are Linux and Windows; Windows has no real-network
 regression in 2.0.0 (see [Not in 2.0.0](#not-in-200)). macOS and arm64 are
@@ -290,18 +290,19 @@ it counts toward the 75 % threshold and can take the budget past its
 limit. Carrier reader stages add about 16 KiB per live carrier outside the
 budget; `Status.BufferedBytes` reports both.
 
-An idle session costs about 70 KiB per side with one carrier (selector) and
-about 170–185 KiB per side as a three-member bond, mostly goroutine stacks
-and the carriers' reader stages and write batches (figures measured before
-M3; sessions sharing a carrier share its cost). Each side runs two
-goroutines per carrier and one per busy session: a session's scheduler
-parks after about a second without work and holds no goroutine until its
-next event or deadline (`Status.Actors` counts the running ones). While
-idle, a session's carriers wake about every `PingIdle` to send and answer
-liveness PINGs, and every dialer session of a Peer with two or more
-factories is woken once per probe sample of the Peer (90 times a minute
-with three factories at the default 2 s `Probe.Interval`); a wakeup that
-changes nothing parks again at once.
+An idle session costs about 70 KiB per side with one carrier of its own
+(selector) and about 170–190 KiB per side as a three-member bond, mostly
+the carriers' reader stages, write batches and goroutine stacks. A session
+that shares a live carrier (rendr mux) adds about 7 KiB per side and no
+goroutine: the carrier's cost is paid once, by all of its sessions. Each
+side runs two goroutines per carrier and one per busy session: a session's
+scheduler parks after about a second without work and holds no goroutine
+until its next event or deadline (`Status.Actors` counts the running
+ones). While idle, a session's carriers wake about every `PingIdle` to
+send and answer liveness PINGs, and every dialer session of a Peer with two
+or more factories is woken once per probe sample of the Peer (90 times a
+minute with three factories at the default 2 s `Probe.Interval`); a wakeup
+that changes nothing parks again at once.
 
 ### Selector self-load guard: limitation
 

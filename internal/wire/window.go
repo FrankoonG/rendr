@@ -119,8 +119,9 @@ func (w *SeqWindow) Init(storage []uint64) {
 }
 
 // Accept marks seq and returns WindowNew, or reports a duplicate, or a seq
-// older than the window (WindowLate: counted as DropLate). The first
-// accepted seq sets the newest; a seq after the newest moves the window
+// older than the window (WindowLate: counted as DropLate, whether it was
+// seen or not — a race member's late copy of a delivered datagram too).
+// The first accepted seq sets the newest; a seq after the newest moves the window
 // forward by any distance, clearing the bits it passes (seqs do not wrap:
 // the session ends before 2^62, L14; only DGRAMs that passed a carrier's
 // FseqWindow reach it); a seq at least the width behind the newest is

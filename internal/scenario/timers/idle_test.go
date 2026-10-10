@@ -38,12 +38,13 @@ const (
 )
 
 // Goroutines a carrier runs while its sessions are parked: a dedicated
-// carrier its reader and writer on each side; a MUX trunk its reader and
-// writer on each side plus its owner's watcher on each side (the dialer
-// pool's, the passive Runtime's).
+// carrier and a MUX trunk alike run their reader and writer on each side.
+// The owners keep no goroutine per trunk (R2-13: the passive trunk set's
+// OnTrunkDone; R2-20: the dialer pool's watcher ends once the trunk is
+// published), so a trunk costs 4, not the 6 of WP12a's bound.
 const (
 	dedicatedGoroutines = 4
-	trunkGoroutines     = 6
+	trunkGoroutines     = 4
 )
 
 // half is one half of the idle scenarios: n sessions on dedicated carriers
@@ -135,10 +136,11 @@ func live(c *rendr.Conn) int {
 // sessions, no actor goroutine runs, and the rendr goroutines are at most
 // the baseline (both Runtimes, the Listener and the Peer before any
 // session) + the carriers' goroutines (dedicated: a reader and a writer
-// per carrier per side; mux: those of the 4 trunks and their owners'
-// watchers) + 10 — a goroutine per parked session would exceed that by
-// hundreds. The parked sessions still carry a second byte each way;
-// closing them and the Runtimes leaves nothing.
+// per carrier per side; mux: those of the 4 trunks, likewise) + 10 — a
+// goroutine per parked session would exceed that by hundreds, and three
+// more per trunk in the MUX half would exceed it (two more per trunk, 8
+// in all, stay inside the slack). The parked sessions still carry a
+// second byte each way; closing them and the Runtimes leaves nothing.
 func TestIdleSessionsHoldNoGoroutine(t *testing.T) {
 	eachHalf(t, func(t *testing.T, h half) {
 		n := h.population()

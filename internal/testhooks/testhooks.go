@@ -156,6 +156,24 @@ type Hooks struct {
 	// It runs under the carrier's lock: it must not block or call into
 	// rendr.
 	PingTS func(carrier uint32, ts uint64) uint64
+	// ClosePools runs in Runtime.Close right after its first snapshot of
+	// the Runtime's pools (step 1), with no lock held: a closed Peer's
+	// pool that registers again after it (a surviving session's redial
+	// through carrier.Env.PoolLive) is joined by Close's second check
+	// (KL-25).
+	ClosePools func()
+	// AfterReap runs on a session actor's goroutine in each step right
+	// after its death steps (reapDead) and before the step takes the
+	// session lock again for its actions, with no lock held (KL-26: a
+	// carrier death landing between the two).
+	AfterReap func(session [16]byte)
+	// BeforeAttachStart runs on a session actor's goroutine with the
+	// session lock held, in the attach of a dial attempt's carrier right
+	// before that carrier is started (after the attach checked that it is
+	// alive): a test can end the carrier there (R2-12: a view the trunk's
+	// death catches attached-pending, started after the death). It must
+	// not call into that session.
+	BeforeAttachStart func(session [16]byte, carrier uint32)
 }
 
 // Session registry gauges (M3 design Revision 1, R1-24): always compiled,

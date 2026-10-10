@@ -1062,6 +1062,9 @@ func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	s.raceAttachLocked(l)
 	s.routingChangedLocked()
 	a.episodeEndLocked(now)
+	if h := s.env.Hooks; h != nil && h.BeforeAttachStart != nil {
+		h.BeforeAttachStart(s.id, l.id) // R2-12: a death between the check and Start
+	}
 	est.Conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Gauge: a.laneGauge(est.Conn.Kind(), i)})
 	a.succeeded(i)
 	a.event(now, EventCarrierUp, l.id, 0, 0, carrier.CauseNone, nil)
