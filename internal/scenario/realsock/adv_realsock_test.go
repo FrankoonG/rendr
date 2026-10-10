@@ -419,11 +419,11 @@ func advRows(t *testing.T, size int64, mux bool) {
 		fs := advStartAll(ds, ps, size, 1, g)
 		advUntil(t, "a quarter of the transfer", func() bool { return fs[0].got.Load() >= size/4 })
 		id, tm := n.shared(ds)
-		advHeld(t, fs, size)
 		// Armed before the gate lets the other three quarters go: the next
 		// DATA frame up the carrier is one of a live session (any of the
 		// trunk's) with most of its stream still to come.
 		tm.FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameData), 13*8+20)
+		advHeld(t, g, fs, size)
 		g.open()
 		advUntilDiag(t, "the flip (stimulus)", func() bool { return tm.Stats().Flipped == 1 }, advStimulusDiag(tm, fs))
 		for i, pc := range ps {
@@ -451,9 +451,9 @@ func advRows(t *testing.T, size int64, mux bool) {
 		advUntil(t, "a quarter of both", func() bool { return fx[0].got.Load() >= size/4 && fy[0].got.Load() >= size/4 })
 		_, tx := n.shared(xd)
 		id, ty := n.shared(yd)
-		advHeld(t, slices.Concat(fx, fy), size)
 		// Armed before the gate: X's remaining quarters are frames to splice.
 		ty.Splice(rendrtest.Up, tx, 0)
+		advHeld(t, g, slices.Concat(fx, fy), size)
 		g.open()
 		advUntilDiag(t, "X's frames in Y's carrier (stimulus)", func() bool { return ty.Stats().SplicedBytes > 0 }, advStimulusDiag(ty, slices.Concat(fx, fy)))
 		for i, pc := range yp {
@@ -482,7 +482,6 @@ func advRows(t *testing.T, size int64, mux bool) {
 		fs := advStartAll(ds, ps, size, 4, g)
 		advUntil(t, "a quarter of the transfer", func() bool { return fs[0].got.Load() >= size/4 })
 		id, tm := n.shared(ds)
-		advHeld(t, fs, size)
 		var fresh *advReadRec
 		tm.SwitchUpstream(func() (net.Conn, error) {
 			c, err := net.Dial("tcp", n.pl.Addr().String())
@@ -497,6 +496,10 @@ func advRows(t *testing.T, size int64, mux bool) {
 		}
 		// Opened after the switch: the remaining quarters go into the fresh
 		// connection, whose first bytes the passive's handshake rejects.
+		// The switch lands between quarters, so the fresh connection's
+		// first bytes usually start a frame; the cut in the middle of a
+		// write is TestTamperSwitchUpstreamCut's.
+		advHeld(t, g, fs, size)
 		g.open()
 		// The passive closed the fresh connection without a byte back (no
 		// PREFACE_ACK: its first bytes are not "RND2", L48): the relay's
@@ -546,11 +549,17 @@ func (n *advNet) shared(ds []*rendr.Conn) (rendr.CarrierID, *rendrtest.Tamper) {
 	return id, tm
 }
 
-// advHeld asserts the premise of a stimulus armed before the gate opens:
-// no sender went past its first quarter, so the rest of every stream is
-// still to come through the relay.
-func advHeld(t testing.TB, fs []*advFlow, size int64) {
+// advHeld, called right after a row armed its stimulus, asserts that the
+// stimulus was armed while the senders were held: the gate is still
+// closed and no sender went past its first quarter, so the rest of every
+// stream is still to come through the relay, after the stimulus.
+func advHeld(t testing.TB, g *advGate, fs []*advFlow, size int64) {
 	t.Helper()
+	select {
+	case <-g.ch:
+		t.Fatalf("premise: the gate opened before the stimulus was armed")
+	default:
+	}
 	for i, f := range fs {
 		if k := f.sent.Load(); k > size/4 {
 			t.Fatalf("premise: session %d's sender wrote %d bytes before the stimulus, past its quarter (%d)", i, k, size/4)
