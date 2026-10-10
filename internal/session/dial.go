@@ -52,14 +52,13 @@ type DialSpec struct {
 	// (M3-D39).
 	Coupled uint16
 
-	// EarlyReturn (M4-D9 … M4-D12; stream sessions only): Dial returns the
-	// session at once, before any attempt, in StatePending; the opening
-	// starts at the first Write, Read or CloseWrite (triggerOpen), the
-	// first attempt fixes the early span [0, min(end, EarlyDataMax)) that
-	// every fresh-carrier attempt carries (R1-2), and the opening's
-	// terminal outcome ends the session with Dial's error. M4's WP9a
-	// implements it; until then package rendr refuses EarlyReturn and Dial
-	// ignores the field.
+	// EarlyReturn (M4-D9 … M4-D12; stream sessions only, M4-D14): Dial
+	// returns the session at once, before any attempt, in StatePending;
+	// the opening starts at the first Write, Read or CloseWrite
+	// (triggerOpen), the first attempt fixes the early span [0, min(end,
+	// Params.EarlyDataMax)) that every fresh-carrier attempt carries
+	// (R1-2), and the opening's terminal outcome ends the session with
+	// Dial's error (early_dial.go).
 	EarlyReturn bool
 }
 
@@ -84,6 +83,17 @@ type DialSpec struct {
 // selector race loser on the bound instance is retired with CLOSE instead.
 // A success that raced the cancellation wins (one CAS decides).
 // spec.Health may be nil (inert).
+//
+// With spec.EarlyReturn (M4 design §A4) Dial returns the session at once,
+// before any I/O and before any attempt, in StatePending: the opening
+// above starts at the session's first Write, Read or CloseWrite, with
+// openBy = that instant + Grace, and every terminal outcome after the
+// return — or a Close followed by Linger before the verdict — ends the
+// session with that error instead (Read and Write return it, Done closes,
+// EventSessionEnd carries it). Before the verdict Write admits at most
+// Params.EarlyDataMax bytes in all; a Close keeps its linger meaning and
+// an Abort withdraws (early_dial.go). ctx is not used after the return. A
+// packet session with EarlyReturn fails at once with ErrProtocol.
 //
 // A packet session (Params.Kind == wire.KindDatagram, M2 design §A5.4,
 // §A5.12) sends OPEN with its MaxPayload offer (Params.Packet.MaxPayload)
@@ -125,6 +135,9 @@ func dial(ctx context.Context, env *Env, spec DialSpec, h healthSource) (*Sessio
 	if len(spec.Factories) == 0 || !spec.anyEligible() {
 		return nil, fmt.Errorf("%w: no carrier factory", ErrNoPath)
 	}
+	if spec.EarlyReturn && spec.Params.Kind == wire.KindDatagram {
+		return nil, fmt.Errorf("%w: EarlyReturn is for stream sessions", ErrProtocol)
+	}
 	p := spec.Params
 	p.Role = RoleDialer
 	if p.Mode == 0 {
@@ -147,12 +160,20 @@ func dial(ctx context.Context, env *Env, spec DialSpec, h healthSource) (*Sessio
 	s.initialSnapLocked()
 	s.mu.Unlock()
 	d.open = openPayload(s, win)
-	d.openBy = time.Now().Add(orDefault(p.Grace, defGrace))
 	if h != nil {
 		d.gauges = h.Gauges()
 		d.release = h.Hold()
 		d.unsub = h.Subscribe(&s.mb)
 	}
+	if spec.EarlyReturn {
+		// M4-D9: no attempt before the trigger; the actor runs at the
+		// first ring (a trigger's startOpen, Close, a health snapshot).
+		d.deferred.Store(true)
+		s.mb.actor.Store(a)
+		return s, nil
+	}
+	d.started = true
+	d.openBy = time.Now().Add(orDefault(p.Grace, defGrace))
 	s.mb.actor.Store(a) // rings kick the actor from now on (R1-7)
 	a.kick()
 	select {
