@@ -167,6 +167,13 @@ type Hooks struct {
 	// session lock again for its actions, with no lock held (KL-26: a
 	// carrier death landing between the two).
 	AfterReap func(session [16]byte)
+	// BeforeAttachStart runs on a session actor's goroutine with the
+	// session lock held, in the attach of a dial attempt's carrier right
+	// before that carrier is started (after the attach checked that it is
+	// alive): a test can end the carrier there (R2-12: a view the trunk's
+	// death catches attached-pending, started after the death). It must
+	// not call into that session.
+	BeforeAttachStart func(session [16]byte, carrier uint32)
 }
 
 // Session registry gauges (M3 design Revision 1, R1-24): always compiled,
