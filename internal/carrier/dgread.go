@@ -62,21 +62,21 @@ type dgReader struct {
 	// transport: the four-state word of R1-5 says who owns it). hdr, stale
 	// and gen belong to the reader goroutine; the atomics are shared with
 	// the idle-release timer.
-	dio     depthIO
-	hdr     *ioHdr // the lent extras; nil at depth 1
-	stale   *ioHdr // extras an idle release took: pooled once that release completed
-	gen     uint64 // lend generations (each lent header gets the next)
-	size    int    // the slots' length: ReadSize()
-	pool    *BufPool
-	budget  *Budget        // the slots' account (Env.Budget: refusable, R1-4)
-	stages  *Budget        // the headers' account (Env.Stages: forced)
-	refused *atomic.Uint64 // DgramStats.ChargeRefused (nil in component tests)
-	idleT   *time.Timer    // the idle release (batchIdleRelease), armed while extras are held
-	armed   atomic.Bool    // idleT is armed
-	lastSeq atomic.Uint64  // the reader's parks at idleT's previous firing
-	lentGen atomic.Uint64  // the generation of the latest lend
-	relGen  atomic.Uint64  // the generation the latest idle release returned (after it completed)
-	woke    atomic.Bool    // the idle release set the read deadline to wake the reader
+	dio       depthIO
+	hdr       *ioHdr // the lent extras; nil at depth 1
+	stale     *ioHdr // extras an idle release took: pooled once that release completed
+	gen       uint64 // lend generations (each lent header gets the next)
+	size      int    // the slots' length: ReadSize()
+	pool      *BufPool
+	budget    *Budget        // the slots' account (Env.Budget: refusable, R1-4)
+	stages    *Budget        // the headers' account (Env.Stages: forced)
+	refused   *atomic.Uint64 // DgramStats.ChargeRefused (nil in component tests)
+	idleT     *time.Timer    // the idle release (batchIdleRelease), armed while extras are held
+	armed     atomic.Bool    // idleT is armed
+	lastSeq   atomic.Uint64  // the reader's parks at idleT's previous firing
+	relGen    atomic.Uint64  // the generation the latest idle release returned (after it completed)
+	relHdrGen atomic.Uint64  // the generation of the header releaseHdr returned (the timer's goroutine; published as relGen)
+	woke      atomic.Bool    // the idle release set the read deadline to wake the reader
 }
 
 // depthIO is a dialer socket's side of the adaptive receive depth (M5
@@ -307,6 +307,13 @@ func (rd *dgReader) startDepth(c *Conn, d depthIO) {
 // reports whether the reader continues.
 func (c *Conn) dgReadDepth(rd *dgReader) bool {
 	d := rd.dio
+	if rd.hdr != nil && d.depthMax() < 2 {
+		// The socket stopped batching since the last call (M5-D15) — or that
+		// call moved no datagram, so no depth rule ran after it: the extras go
+		// back before a read that cannot use them, which may block with them
+		// held until a datagram arrives (R1-5 rule 5).
+		rd.shrink(1)
+	}
 	p0 := d.parks()
 	n, ev, err := d.readDepth(rd.buf, rd.hdr)
 	if rd.hdr != nil && !d.held() {
@@ -413,7 +420,6 @@ func (rd *dgReader) grow(nk int) {
 		nh.put()
 		return
 	}
-	rd.lentGen.Store(nh.gen)
 	if h != nil {
 		clear(h.slots[1:k]) // moved to nh
 		h.put()
@@ -503,12 +509,15 @@ func (rd *dgReader) idleFire() {
 			rd.idleT.Reset(batchIdleRelease)
 			return
 		}
-		gen := rd.lentGen.Load()
+		rd.relHdrGen.Store(0)
 		if !d.tryRelease(seq) {
 			rd.idleT.Reset(batchIdleRelease) // held and reading: busy
 			return
 		}
-		rd.relGen.Store(gen)
+		// The generation of the header actually released (releaseHdr), not
+		// the latest lend: a lend that raced the release would leave the
+		// released header unmatched by collect.
+		rd.relGen.Store(rd.relHdrGen.Load())
 		rd.woke.Store(true)
 		_ = d.SetReadDeadline(time.Now())
 	}
@@ -525,6 +534,7 @@ func (rd *dgReader) idleFire() {
 func (rd *dgReader) releaseHdr(h *ioHdr) {
 	releaseSlots(h, 1, h.k)
 	h.uncharge()
+	rd.relHdrGen.Store(h.gen)
 }
 
 // dgBackoff sleeps the reader's back-off (5 ms doubling to 100 ms); it

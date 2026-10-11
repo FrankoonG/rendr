@@ -229,9 +229,8 @@ type Conn struct {
 	// netpoller).
 	rawRead, rawWrite func(func(uintptr) bool) error
 
-	// permittedAt is, per call (callSend, callRecv), the time (Unix
-	// nanoseconds) of the last fd −1 probe that found it permitted (R1-3
-	// rule 3).
+	// permittedAt is, per call (callSend, callRecv), the time (monoNow)
+	// of the last fd −1 probe that found it permitted (R1-3 rule 3).
 	permittedAt [2]atomic.Int64
 
 	sys connSys // the platform's per-socket state (the socket's family)
@@ -303,7 +302,7 @@ func (c *Conn) ReadBatch(b *Batch, ms []Msg) (n int, err error) {
 	}
 	b.prepRecv(ms[:min(len(ms), b.max)])
 	err = c.rawRead(b.recv)
-	return c.endRead(b, &ms[0], err)
+	return c.endRead(b, &ms[0], err, nil)
 }
 
 // writePlain writes ms with one WriteToUDPAddrPort each, stopping at the
@@ -381,8 +380,10 @@ func (c *Conn) writeBatch(b *Batch, ms []Msg) (int, error) {
 
 // endRead ends a batched read with b (ModeBatch): err is the RawConn's,
 // b.err the call's. A call refused by the kernel or a sandbox moves the
-// socket to ModePlain and reads into m0 plainly (M5-D15, R1-3).
-func (c *Conn) endRead(b *Batch, m0 *Msg, err error) (int, error) {
+// socket to ModePlain and reads into m0 plainly (M5-D15, R1-3) — through r
+// (nil: the Conn's own read), whose held extras count as parked while that
+// read blocks.
+func (c *Conn) endRead(b *Batch, m0 *Msg, err error, r *Reader) (int, error) {
 	got, cerr := b.got, b.err
 	b.reset()
 	if err != nil {
@@ -391,6 +392,9 @@ func (c *Conn) endRead(b *Batch, m0 *Msg, err error) (int, error) {
 	if cerr != nil {
 		if c.denied(cerr, callRecv) {
 			c.fallback()
+			if r != nil {
+				return r.readPlain(m0)
+			}
 			return c.readPlain(m0)
 		}
 		return 0, c.opError("read", "recvmmsg", cerr)
@@ -417,7 +421,7 @@ func (c *Conn) denied(err error, call int) bool {
 // 2) — or trusts one that found it permitted less than probeCache ago
 // (rule 3). A denial is never cached: it moves the socket to ModePlain.
 func (c *Conn) permitted(call int) bool {
-	now := time.Now().UnixNano()
+	now := monoNow()
 	at := &c.permittedAt[call]
 	if t := at.Load(); t != 0 && now >= t && now-t < int64(probeCache) {
 		return true
@@ -456,12 +460,15 @@ func (c *Conn) opError(op, call string, err error) error {
 }
 
 // The idle release of a dialer reader's extras (R1-5): the four states of
-// Reader.state.
+// a Reader, in the low bits of Reader.word.
 const (
-	rIdle      uint32 = iota // no extras: the reader reads one datagram through its fixed header
+	rIdle      uint64 = iota // no extras: the reader reads one datagram through its fixed header
 	rHeld                    // the reader goroutine holds the extras (and uses them)
-	rParked                  // the reader is parked in the netpoller holding the extras
+	rParked                  // the reader is parked (in the netpoller, or in a plain read) holding the extras
 	rReleasing               // the idle release owns the extras and is returning them
+
+	rStateBits = 2
+	rStateMask = 1<<rStateBits - 1
 )
 
 // Reader is the batched reader of a dialer carrier's socket (R1-5,
@@ -475,12 +482,16 @@ const (
 // that loses the CAS reads one datagram into slot 0 through the fixed
 // header; it never touches the released Batch or slots.
 //
+// The word also counts the reader's parks while it holds the extras (the
+// bits above the state), so the idle release's check that the reader has
+// not parked again and its parked → releasing transition are one CAS.
+// Only the reader goroutine changes the count.
+//
 // One goroutine (the carrier's reader) calls ReadBatch, Hold, Held and
 // Drop; the idle-release timer calls Parks, Holding and TryRelease.
 type Reader struct {
 	c       *Conn
-	state   atomic.Uint32
-	parks   atomic.Uint64 // parks while holding the extras
+	word    atomic.Uint64 // parks<<rStateBits | state
 	one     *Batch        // the fixed one-message header
 	b       *Batch        // the extras' header; owned per state
 	cur     *Batch        // the header of the callback's last call
@@ -499,6 +510,41 @@ func NewReader(c *Conn, release func(*Batch)) *Reader {
 	return r
 }
 
+// state returns the reader's state.
+func (r *Reader) state() uint64 { return r.word.Load() & rStateMask }
+
+// setState stores state s with the park count unchanged. Only the reader
+// goroutine calls it, in a state the idle release never changes (idle or
+// held).
+func (r *Reader) setState(s uint64) {
+	r.word.Store(r.word.Load()&^rStateMask | s)
+}
+
+// park counts a park and leaves the held extras parked (the reader
+// goroutine, holding them).
+func (r *Reader) park() {
+	w := r.word.Load()
+	r.word.Store((w>>rStateBits+1)<<rStateBits | rParked)
+}
+
+// unpark takes the extras back from parked by CAS (the idle release may
+// have taken them); it reports whether the reader holds them.
+func (r *Reader) unpark() bool {
+	for {
+		w := r.word.Load()
+		switch w & rStateMask {
+		case rHeld:
+			return true
+		case rParked:
+			if r.word.CompareAndSwap(w, w&^rStateMask|rHeld) {
+				return true
+			}
+		default:
+			return false
+		}
+	}
+}
+
 // Hold gives the reader b (Cap ≥ 2) as the header of its extras. It
 // returns the Batch b replaces, if the reader held one, and false — nothing
 // changed — for a nil b or one with Cap < 2, or while an idle release is
@@ -513,10 +559,10 @@ func (r *Reader) Hold(b *Batch) (old *Batch, ok bool) {
 	if b == nil || b.max < 2 {
 		return nil, false
 	}
-	switch r.state.Load() {
+	switch r.state() {
 	case rIdle:
 		r.b = b
-		r.state.Store(rHeld)
+		r.setState(rHeld)
 		return nil, true
 	case rHeld:
 		old, r.b = r.b, b
@@ -528,68 +574,77 @@ func (r *Reader) Hold(b *Batch) (old *Batch, ok bool) {
 // Held reports whether the reader goroutine holds the extras. False after
 // a ReadBatch means an idle release took them (or is returning them): the
 // caller treats its slots 1 … K−1 as gone and reads at depth 1.
-func (r *Reader) Held() bool { return r.state.Load() == rHeld }
+func (r *Reader) Held() bool { return r.state() == rHeld }
 
 // Drop takes the extras back from the reader (when the carrier ends, or
 // when the socket left ModeBatch) and returns their Batch; nil if it holds
 // none.
 func (r *Reader) Drop() *Batch {
-	if r.state.Load() != rHeld {
+	if r.state() != rHeld {
 		return nil
 	}
 	b := r.b
 	r.b = nil
-	r.state.Store(rIdle)
+	r.setState(rIdle)
 	return b
 }
 
 // Parks returns the number of times the reader parked while holding the
 // extras.
-func (r *Reader) Parks() uint64 { return r.parks.Load() }
+func (r *Reader) Parks() uint64 { return r.word.Load() >> rStateBits }
 
 // Holding reports whether the reader holds extras (held or parked): the
 // idle-release timer stays armed while it does.
 func (r *Reader) Holding() bool {
-	s := r.state.Load()
+	s := r.state()
 	return s == rHeld || s == rParked
 }
 
 // TryRelease releases the extras of a reader that is parked and has not
 // parked again since Parks returned seq (the timer's previous firing):
-// parked → releasing by CAS, then release, then idle. It reports whether
-// it released.
+// parked → releasing by one CAS on the word that holds both, then release,
+// then idle. It reports whether it released.
 func (r *Reader) TryRelease(seq uint64) bool {
-	if r.parks.Load() != seq || !r.state.CompareAndSwap(rParked, rReleasing) {
+	w := seq<<rStateBits | rParked
+	if r.word.Load() != w {
 		return false
+	}
+	if releaseSeam != nil {
+		releaseSeam()
+	}
+	if !r.word.CompareAndSwap(w, seq<<rStateBits|rReleasing) {
+		return false // the reader woke, and maybe parked again, since the check
 	}
 	b := r.b
 	r.b = nil
 	b.reset()
 	r.release(b)
-	r.state.Store(rIdle)
+	r.word.Store(seq<<rStateBits | rIdle) // a reader without extras counts no park
 	return true
 }
 
 // ReadBatch waits like Conn.ReadBatch and fills ms[:n], n ≥ 1, in arrival
 // order: up to len(ms) datagrams while the reader holds the extras (ms
 // holds the caller's K slots), else one into ms[0]. A read callback that
-// finds the extras released reads into ms[0] only.
+// finds the extras released reads into ms[0] only. A plain read (the
+// socket left ModeBatch) reads into ms[0]; extras the reader still holds
+// count as parked while it blocks (readPlain).
 func (r *Reader) ReadBatch(ms []Msg) (int, error) {
 	c := r.c
 	if len(ms) == 0 {
 		return 0, errNoSlot
 	}
 	if c.Mode() != ModeBatch {
-		return c.readPlain(&ms[0])
+		return r.readPlain(&ms[0])
 	}
-	r.extras = r.state.Load() == rHeld
+	r.extras = r.state() == rHeld
 	r.one.prepRecv(ms[:1])
 	if r.extras {
 		r.b.prepRecv(ms[:min(len(ms), r.b.max)])
 	}
 	r.cur = nil
 	err := c.rawRead(r.cb)
-	held := r.extras && (r.state.CompareAndSwap(rParked, rHeld) || r.state.Load() == rHeld)
+	held := r.extras && r.unpark()
 	b := r.cur
 	if held && b != r.b {
 		r.b.reset()
@@ -607,7 +662,23 @@ func (r *Reader) ReadBatch(ms []Msg) (int, error) {
 		}
 		return 0, err
 	}
-	return c.endRead(b, &ms[0], err)
+	return c.endRead(b, &ms[0], err, r)
+}
+
+// readPlain reads one datagram into m (the caller's slot 0) plainly. Held
+// extras cannot be used by it, so while it blocks they count as parked —
+// one park — and the idle release returns them as it returns a parked
+// batch read's (R1-5 rules 3 and 5): the read touches only m, never the
+// Batch or the slots 1 … K−1. On return the reader takes them back unless
+// the release won (Held then reports false).
+func (r *Reader) readPlain(m *Msg) (int, error) {
+	if r.state() != rHeld {
+		return r.c.readPlain(m)
+	}
+	r.park()
+	n, err := r.c.readPlain(m)
+	r.unpark()
+	return n, err
 }
 
 // doRead is the RawConn.Read callback of a Reader: it takes the extras
@@ -616,18 +687,15 @@ func (r *Reader) ReadBatch(ms []Msg) (int, error) {
 // parked.
 func (r *Reader) doRead(fd uintptr) bool {
 	b := r.one
-	if r.extras {
-		if s := r.state.Load(); s == rHeld || s == rParked && r.state.CompareAndSwap(rParked, rHeld) {
-			b = r.b
-		}
+	if r.extras && r.unpark() {
+		b = r.b
 	}
 	r.cur = b
 	if b.doRecv(fd) {
 		return true
 	}
 	if b != r.one {
-		r.parks.Add(1)
-		r.state.Store(rParked)
+		r.park()
 	}
 	return false
 }
@@ -661,14 +729,15 @@ func probeAllows(sendErr, recvErr error) bool {
 
 // zoneTable maps IPv6 zones (interface names) to interface indexes and
 // back, for the sockaddrs of the batch calls. It is the net package's zone
-// cache without its lock: an immutable snapshot behind an atomic pointer,
-// so a zoned (link-local) destination or source costs a map lookup — no
-// system call, no allocation — per datagram (L41, L55's equivalence with
-// the plain path, which uses the net package's cache).
+// cache without its lock once the first snapshot exists: an immutable
+// snapshot behind an atomic pointer, so a zoned (link-local) destination
+// or source costs a map lookup — no system call, no allocation — per
+// datagram (L41, L55's equivalence with the plain path, which uses the net
+// package's cache). Its clock is the monotonic one (monoNow).
 type zoneTable struct {
 	toIndex map[string]uint32
 	toName  map[uint32]string
-	at      int64 // when it was fetched (Unix nanoseconds)
+	at      int64 // when it was fetched (monoNow)
 }
 
 // A snapshot is refetched when it is zoneRefresh old, as the net package
@@ -682,32 +751,97 @@ const (
 
 var (
 	zones     atomic.Pointer[zoneTable]
-	zoneFetch atomic.Int64 // the earliest time (Unix nanoseconds) of the next fetch; the CAS winner fetches
+	zoneFetch atomic.Int64 // while a snapshot exists: the earliest time (monoNow) of the next fetch; the CAS winner fetches
+
+	// While no snapshot exists the lookups are serialized as the net
+	// package's zone cache serializes them: one fetches, the others wait
+	// for its snapshot (zoneFirst).
+	zoneFirstMu   sync.Mutex
+	zoneFirstWait chan struct{} // closed when the table-less fetch in progress ends; nil while none runs
 )
 
-// zoneLookup returns the current snapshot (nil before the first fetch),
-// fetching a new one if it is stale, or if miss and the miss period
-// passed.
+// monoEpoch is the base of monoNow.
+var monoEpoch = time.Now()
+
+// monoNow returns the time in nanoseconds since monoEpoch: the zone
+// table's and the probe cache's clock. It reads the monotonic clock, which
+// a step of the wall clock never moves (inside a synctest bubble, whose
+// times carry no monotonic reading, it is the bubble's clock).
+func monoNow() int64 { return int64(time.Since(monoEpoch)) }
+
+// zoneLookup returns the current snapshot — nil only while none could be
+// fetched yet — fetching a new one if it is stale, or if miss and the miss
+// period passed.
 func zoneLookup(miss bool) *zoneTable {
 	t := zones.Load()
-	now := time.Now().UnixNano()
-	if t != nil && !miss && now-t.at < int64(zoneRefresh) {
+	if t == nil {
+		return zoneFirst()
+	}
+	now := monoNow()
+	if age := now - t.at; !miss && age >= 0 && age < int64(zoneRefresh) {
 		return t
 	}
+	// A clock that went back (a snapshot from the future, a gate more than
+	// a period ahead) expires both, as permitted treats its cache: the
+	// monotonic clock never goes back, the bubble clock of a synctest test
+	// (a wall clock) may.
 	next := zoneFetch.Load()
-	if now < next || !zoneFetch.CompareAndSwap(next, now+int64(zoneMissRefresh)) {
+	if now < next && next-now <= int64(zoneMissRefresh) || !zoneFetch.CompareAndSwap(next, now+int64(zoneMissRefresh)) {
 		return t // another caller fetches, or a miss fetched less than a period ago
 	}
+	if nt := fetchZones(now); nt != nil {
+		zones.Store(nt)
+		return nt
+	}
+	return t
+}
+
+// zoneFirst returns the first snapshot. While none exists one lookup
+// fetches and the concurrent ones wait for its result — never the decimal
+// fallback while a fetch that would resolve them runs (R3-11, L55); a
+// failed fetch keeps no miss period, so the next lookup fetches again, as
+// the net package forces a refresh at every miss. It returns nil when its
+// fetch, or the one it waited for, failed. Once a snapshot exists the
+// lookups never come here: the steady state takes no lock.
+func zoneFirst() *zoneTable {
+	zoneFirstMu.Lock()
+	if t := zones.Load(); t != nil {
+		zoneFirstMu.Unlock()
+		return t
+	}
+	if w := zoneFirstWait; w != nil {
+		zoneFirstMu.Unlock()
+		<-w
+		return zones.Load()
+	}
+	w := make(chan struct{})
+	zoneFirstWait = w
+	zoneFirstMu.Unlock()
+	now := monoNow()
+	t := fetchZones(now)
+	if t != nil {
+		zoneFetch.Store(now + int64(zoneMissRefresh)) // a miss right after the first fetch waits the period
+		zones.Store(t)
+	}
+	zoneFirstMu.Lock()
+	zoneFirstWait = nil
+	zoneFirstMu.Unlock()
+	close(w)
+	return t
+}
+
+// fetchZones dumps the interfaces into a new snapshot taken at now; nil if
+// the dump failed.
+func fetchZones(now int64) *zoneTable {
 	ift, err := interfacesFn()
 	if err != nil {
-		return t
+		return nil
 	}
 	nt := &zoneTable{toIndex: make(map[string]uint32, len(ift)), toName: make(map[uint32]string, len(ift)), at: now}
 	for _, ifi := range ift {
 		nt.toIndex[ifi.Name] = uint32(ifi.Index)
 		nt.toName[uint32(ifi.Index)] = ifi.Name
 	}
-	zones.Store(nt)
 	return nt
 }
 
@@ -721,10 +855,10 @@ func zoneIndex(zone string) uint32 {
 		if i, ok := t.toIndex[zone]; ok {
 			return i
 		}
-	}
-	if t := zoneLookup(true); t != nil {
-		if i, ok := t.toIndex[zone]; ok {
-			return i
+		if t := zoneLookup(true); t != nil {
+			if i, ok := t.toIndex[zone]; ok {
+				return i
+			}
 		}
 	}
 	n, _ := strconv.ParseUint(zone, 10, 32)
@@ -738,10 +872,10 @@ func zoneName(index uint32) string {
 		if name, ok := t.toName[index]; ok {
 			return name
 		}
-	}
-	if t := zoneLookup(true); t != nil {
-		if name, ok := t.toName[index]; ok {
-			return name
+		if t := zoneLookup(true); t != nil {
+			if name, ok := t.toName[index]; ok {
+				return name
+			}
 		}
 	}
 	return strconv.FormatUint(uint64(index), 10)
@@ -754,6 +888,10 @@ var (
 	probeFn      = probe
 	batchTarget  = accelerated // tests set it on other targets to drive ModeBatch through fake calls
 	interfacesFn = net.Interfaces
+
+	// releaseSeam, if set, runs inside TryRelease between its check and its
+	// transition (TestReaderReleaseSeqAtomic: a timer descheduled there).
+	releaseSeam func()
 )
 
 func clampBatch(n int) int {

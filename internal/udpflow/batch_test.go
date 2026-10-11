@@ -14,7 +14,6 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -462,7 +461,8 @@ func TestFlowReadDatagramsOrder(t *testing.T) {
 // datagrams to the socket in calls of at most MaxBatch with the writer's
 // pooled Batch (a single datagram without one); a Batch is charged to
 // Stages only while a call holds it; the error of datagram n is returned
-// with n, classified as WriteDatagram's (§A6.4).
+// with n (L42's invalid count here; the errno classes in
+// TestFlowWriteDatagramsNoise, batch_errno_test.go).
 func TestFlowWriteDatagramsSeam(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
@@ -508,12 +508,6 @@ func TestFlowWriteDatagramsSeam(t *testing.T) {
 		}
 
 		c.mu.Lock()
-		c.wErrs = []fakeWErr{{n: 2, err: opErr("write", syscall.ECONNREFUSED)}}
-		c.mu.Unlock()
-		if n, err := f.WriteDatagrams(ds[:4]); n != 2 || err != carrier.ErrNoise {
-			t.Fatalf("noise at datagram 2: %d, %v", n, err)
-		}
-		c.mu.Lock()
 		c.wErrs = []fakeWErr{{n: 1, err: udpsocket.ErrInvalidCount}}
 		c.mu.Unlock()
 		if n, err := f.WriteDatagrams(ds[:4]); n != 1 || err != udpsocket.ErrInvalidCount {
@@ -522,64 +516,6 @@ func TestFlowWriteDatagramsSeam(t *testing.T) {
 		f.Close()
 		if _, err := f.WriteDatagrams(ds[:2]); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("a closed flow: %v", err)
-		}
-	})
-}
-
-// TestSourceOwnedErrnos_L58 (§A6.4): the errors of rendr's own socket —
-// a udpsocket.Conn returns the socket's errnos — keep M2's classes on the
-// batched paths: on a read, noise and an abort back off, a too-large error
-// is a truncated datagram; on a write, too large is a refusal without a
-// size, noise, a local filter's EPERM and an abort lose the datagram, and
-// anything else ends the carrier.
-func TestSourceOwnedErrnos_L58(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		env := testEnv(1 << 30)
-		c := newFakeSock(32)
-		h := newFHarness(t, env, Limits{}, c, seamDgram)
-		defer h.shutdown()
-		peer := apOf(2, 1000)
-		c.queue(peer, h1(1, wire.TypeOpen, 1))
-		synctest.Wait()
-		f := h.flows()[0]
-		readOne(t, f, time.Second)
-
-		c.failRead(opErr("read", syscall.ECONNREFUSED))
-		c.failRead(opErr("read", syscall.ECONNABORTED))
-		c.failRead(opErr("read", 10040)) // WSAEMSGSIZE
-		c.queue(peer, dg(1, pingFrame(2)))
-		if _, _, ev := readOne(t, f, time.Second); ev != carrier.ReadOK {
-			t.Fatalf("event %d", ev)
-		}
-		if st := h.s.Stats(); st.ReadErrors != 2 || st.Truncated != 1 || st.Flows != 1 {
-			t.Fatalf("Stats %+v, want 2 read errors, 1 truncated, the flow alive", st)
-		}
-
-		b := make([]byte, wire.FlowHeaderLen+30)
-		for _, tc := range []struct {
-			err  error
-			want error
-		}{
-			{opErr("write", syscall.EMSGSIZE), wire.ErrDatagramTooLarge},
-			{opErr("write", syscall.ENOBUFS), carrier.ErrNoise},
-			{opErr("write", syscall.EPERM), carrier.ErrNoise},
-			{opErr("write", syscall.ECONNABORTED), carrier.ErrNoise},
-			{opErr("write", syscall.EINVAL), syscall.EINVAL},
-		} {
-			c.mu.Lock()
-			c.wErrs = []fakeWErr{{err: tc.err}}
-			c.mu.Unlock()
-			if err := f.WriteDatagram(b); !errors.Is(err, tc.want) {
-				t.Errorf("%v: %v, want %v", tc.err, err, tc.want)
-			}
-		}
-		c.failRead(opErr("read", syscall.EINVAL)) // permanent: this source stops
-		synctest.Wait()
-		if !h.s.killed.Load() {
-			t.Fatal("a permanent read error did not stop the source")
-		}
-		if _, _, _, err := f.ReadDatagram(nil); err == nil {
-			t.Fatal("a flow of a stopped source still reads")
 		}
 	})
 }
