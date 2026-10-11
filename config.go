@@ -6,11 +6,11 @@ import "time"
 // range. The zero value of every field selects its default; out-of-range
 // values are clamped to the range and every change (clamp or
 // cross-parameter constraint) is recorded in Status.ConfigAdjustments as
-// "Field: old → new (reason)". For the five fields whose range includes
+// "Field: old → new (reason)". For the six fields whose range includes
 // zero (RetireGrace, Selector.Floor, Probe.DialWait, Handshake.MaxMetadata,
-// Handshake.EarlyDataMax) a negative value selects zero. Configuration is
-// frozen when the Runtime is built; each session also snapshots it at Dial
-// or OPEN.
+// Handshake.EarlyDataMax, IdleTimeout) a negative value selects zero.
+// Configuration is frozen when the Runtime is built; each session also
+// snapshots it at Dial or OPEN.
 //
 // PacketPing and Packet configure packet sessions and datagram carriers
 // (milestone M2).
@@ -34,14 +34,15 @@ type Config struct {
 	DialTimeout time.Duration // 10 s; 1 s–60 s; bounds one factory call and one whole dial attempt
 	Linger      time.Duration // 30 s; 1 s–300 s; Close's background delivery bound
 
-	// IdleTimeout (0 = off; else 10 s–24 h) ends a session with
-	// ErrIdleTimeout, and the peer's with AbortIdle, once for this long no
-	// application Read or Write moved bytes and none of this side's data was
-	// acknowledged as delivered. Data that still reaches the peer
-	// application keeps the session alive; a peer application that stops
-	// reading lets it time out. It does not end a finished exchange (both
-	// FINs delivered and this side's FIN acknowledged): Linger bounds the
-	// wait for the peer's final confirmation, and that end is io.EOF.
+	// IdleTimeout (0 or a negative value = off; else clamped to 10 s–24 h)
+	// ends a session with ErrIdleTimeout, and the peer's with AbortIdle,
+	// once for this long no application Read or Write moved bytes and none
+	// of this side's data was acknowledged as delivered. Data that still
+	// reaches the peer application keeps the session alive; a peer
+	// application that stops reading lets it time out. It does not end a
+	// finished exchange (both FINs delivered and this side's FIN
+	// acknowledged): Linger bounds the wait for the peer's final
+	// confirmation, and that end is io.EOF.
 	// For a packet session the clock moves on every successful WriteTo, on
 	// every datagram accepted from a carrier and on every datagram ReadFrom
 	// returns (M2-D41); the move on accepted datagrams may lag by up to

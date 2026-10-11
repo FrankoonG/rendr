@@ -312,3 +312,32 @@ func TestConnSetIdleTimeout(t *testing.T) {
 		}
 	})
 }
+
+// TestConnSetIdleTimeoutNegativeIsOff (M4-D21, C-2): a negative
+// SetIdleTimeout turns idle expiry off, as 0 does (it is not raised to the
+// 10 s floor), and it overrides the Runtime's Config.IdleTimeout: a quiet
+// session is still open 25 h later (past the 24 h ceiling), and data still
+// moves both ways.
+func TestConnSetIdleTimeoutNegativeIsOff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := Config{IdleTimeout: 10 * time.Second, PingIdle: time.Minute}
+		e := e2eNew(t, cfg, Config{PingIdle: time.Minute}, nil, ListenConfig{}, "a")
+		defer e.close()
+		dc, pc := e2eOpen(t, e.peer(), e.ln, DialOptions{})
+		if err := dc.SetIdleTimeout(-1); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-dc.s.Done():
+			t.Fatalf("the session ended after SetIdleTimeout(-1): %v", dc.Status().Err)
+		case <-pc.s.Done():
+			t.Fatalf("the peer ended after SetIdleTimeout(-1): %v", pc.Status().Err)
+		case <-time.After(25 * time.Hour):
+		}
+		e2eExchange(t, dc, pc, 64<<10, 7)
+		if err := dc.Status().Err; err != nil {
+			t.Fatalf("end error %v after 25 h idle, want none", err)
+		}
+		e2eFinish(t, dc, pc)
+	})
+}

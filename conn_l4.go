@@ -23,9 +23,10 @@ func (c *Conn) Abort(code AbortCode, msg string) error {
 }
 
 // SetIdleTimeout overrides Config.IdleTimeout for this session from now on,
-// with the same meaning and clamp: 0 turns idle expiry off, other values are
-// clamped to 10 s–24 h. The idle clock is not restarted. Both roles. It
-// returns net.ErrClosed once the session has ended.
+// with the same meaning and clamp: 0 or a negative value turns idle expiry
+// off; other values are clamped to 10 s–24 h. The idle clock is not
+// restarted. Both roles. It returns net.ErrClosed once the session has
+// ended.
 func (c *Conn) SetIdleTimeout(d time.Duration) error {
 	return c.s.SetIdleTimeout(d)
 }
