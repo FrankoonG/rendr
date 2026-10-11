@@ -177,8 +177,12 @@ type DgramStats struct {
 	// &IO.
 	IO udpsocket.Counters
 	// ChargeRefused counts the receive slots beyond the first that the
-	// memory budget refused to a batched reader (a dialer carrier's or an
-	// owned Source's); the reader then kept its depth (R1-4).
+	// memory budget refused to a batched reader (R1-4; one unit on every
+	// reader, M5 design R3-23): a dialer carrier's refused growth counts
+	// the slots it would have added and keeps its depth; an owned Source
+	// counts each extra slot whose refill was refused; a flow whose
+	// held-entry slice was refused counts its slots beyond the first and
+	// reads one datagram (R3-28).
 	ChargeRefused atomic.Uint64
 }
 

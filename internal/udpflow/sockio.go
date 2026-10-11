@@ -3,6 +3,7 @@ package udpflow
 import (
 	"net"
 	"net/netip"
+	"unsafe"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
@@ -48,6 +49,11 @@ type sockIO interface {
 type batchToken interface {
 	NewBatchConn(ctr *udpsocket.Counters) (*udpsocket.Conn, error)
 }
+
+// rendr's own listening socket is a batchToken: a change of either side's
+// signature fails the build instead of leaving every rendr-owned Source on
+// tokenIO (R3-25).
+var _ batchToken = (*carrier.OwnedUDPSocket)(nil)
 
 // ownedIO returns the sockIO of rendr's own listening socket: the token's
 // udpsocket.Conn, counted in env.Dgram.IO, or — for a token without the
@@ -105,6 +111,13 @@ func (tokenIO) MaxBatch() int        { return 1 }
 
 // setIO makes io the Source's socket path (NewSource for rendr's own
 // socket; tests). It runs before Run.
+//
+// The writers' pool (wpool) is the one recorded exception to "every held
+// buffer is visible in BufferedBytes" (R1-5 rule 1, M5 design R3-28): an
+// idle wbatch resting in it is not charged. The garbage collector may
+// reclaim it at any time, a Batch in use is charged to Env.Stages for its
+// call (writeBatch), and the idle ones number at most the flows that
+// wrote at once.
 func (s *Source) setIO(io sockIO) {
 	s.bio = io
 	mb := io.MaxBatch()
@@ -232,9 +245,20 @@ func (f *Flow) WriteDatagrams(ds [][]byte) (int, error) {
 // ReadDatagrams implements carrier.BatchIO: it waits as ReadDatagram does
 // and then drains up to min(len(rs), MaxBatch()) inbox datagrams in
 // arrival order under one lock (no system call), each what ReadDatagram
-// would have returned for it. The buffers stay valid until the next
-// ReadDatagrams or ReadDatagram call or Release; a flow keeps the slice of
-// them (one entry per datagram of its largest batch) for its life.
+// would have returned for it. The call ends at its first ReadCandidate
+// (BatchIO; M5 design R3-14): the carrier's reader handles it — its
+// challenge answer may commit the rebind (SetPeer) — before a later
+// datagram is classified against the peer, so a datagram from another
+// source behind it in the inbox cannot replace the candidate first. The
+// buffers stay valid until the next ReadDatagrams or ReadDatagram call or
+// Release.
+//
+// A call of two or more holds its datagrams in a slice the flow keeps for
+// its life (no allocation per call), charged to Env.Budget — the account
+// of receive slots (R1-4) — when it is allocated and returned at Close, so
+// BufferedBytes sees it (R3-28). A refused charge never fails the read:
+// the call moves one datagram, held as ReadDatagram holds it, and its
+// slots beyond the first count in ChargeRefused; the next call asks again.
 func (f *Flow) ReadDatagrams(rs []carrier.ReadResult) (int, error) {
 	k := min(len(rs), f.MaxBatch())
 	if k < 1 {
@@ -245,19 +269,58 @@ func (f *Flow) ReadDatagrams(rs []carrier.ReadResult) (int, error) {
 		f.mu.Unlock()
 		return 0, err
 	}
-	if cap(f.held) < k {
-		f.held = make([]entry, 0, k)
+	if k > 1 && !f.heldRoomLocked(k) {
+		k = 1
+	}
+	if k == 1 {
+		e, key, ev := f.popLocked()
+		if ev != carrier.ReadTruncated {
+			f.cur = e
+		}
+		rs[0] = carrier.ReadResult{Data: e.data, Src: key, Ev: ev}
+		f.mu.Unlock()
+		return 1, nil
 	}
 	n := 0
-	for ; n < k && f.n > 0; n++ {
+	for n < k && f.n > 0 {
 		e, key, ev := f.popLocked()
 		if ev != carrier.ReadTruncated {
 			f.held = append(f.held, e)
 		}
 		rs[n] = carrier.ReadResult{Data: e.data, Src: key, Ev: ev}
+		n++
+		if ev == carrier.ReadCandidate {
+			break // the call ends at its first candidate (R3-14)
+		}
 	}
 	f.mu.Unlock()
 	return n, nil
+}
+
+// heldEntryBytes is what one entry of a flow's held slice costs the
+// Budget (R3-28).
+const heldEntryBytes = int64(unsafe.Sizeof(entry{}))
+
+// heldRoomLocked makes the held slice (empty: the caller waited, which
+// returned its datagrams) able to hold k entries, charging a new slice to
+// Env.Budget by TryAcquire and returning the old one's charge; false, with
+// nothing changed, when the Budget refuses — ChargeRefused then counts the
+// k − 1 slots beyond the first (R1-4's unit, R3-23).
+func (f *Flow) heldRoomLocked(k int) bool {
+	if cap(f.held) >= k {
+		return true
+	}
+	env := f.src.env
+	nb := int64(k) * heldEntryBytes
+	if !env.Budget.TryAcquire(nb) {
+		if dg := env.Dgram; dg != nil {
+			dg.ChargeRefused.Add(uint64(k - 1))
+		}
+		return false
+	}
+	env.Budget.Release(f.heldBytes)
+	f.held, f.heldBytes = make([]entry, 0, k), nb
+	return true
 }
 
 var _ carrier.BatchIO = (*Flow)(nil)

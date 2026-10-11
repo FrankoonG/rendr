@@ -337,12 +337,14 @@ func TestDgramReadHalvesDepth_L16(t *testing.T) {
 	})
 }
 
-// TestDgramReadPartialGrowthRefused_L16 (R1-4, invariant 4): at depth 2,
-// with Env.Budget room for one more slot only, a full call's growth to 4
-// gets one slot and is refused the next: the depth stays 2, ChargeRefused
-// counts the attempt once, and the slot it got goes back — Env.Budget and
-// Env.Stages at their values before the attempt. Mutant: the refusal
-// keeps the slots granted before it.
+// TestDgramReadPartialGrowthRefused_L16 (R1-4, R3-23, invariant 4): at
+// depth 2, with Env.Budget room for one more slot only, a full call's
+// growth to 4 gets one slot and is refused the next: the depth stays 2,
+// ChargeRefused counts the 2 slots the growth would have added (refused
+// slots, not attempts: +2 per refused growth), and the slot it got goes
+// back — Env.Budget and Env.Stages at their values before the attempt.
+// Mutants: the refusal keeps the slots granted before it; a refusal
+// counted once per attempt.
 func TestDgramReadPartialGrowthRefused_L16(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, p, fb, base, _ := depthRig(t)
@@ -360,8 +362,8 @@ func TestDgramReadPartialGrowthRefused_L16(t *testing.T) {
 		mark := len(fb.readCalls())
 		injectBurst(s.io, p.io.addr, p.burst(1, 2, 100))
 		synctest.Wait()
-		if r := s.env.Dgram.ChargeRefused.Load() - refused; r != 1 {
-			t.Fatalf("ChargeRefused +%d, want +1", r)
+		if r := s.env.Dgram.ChargeRefused.Load() - refused; r != 2 {
+			t.Fatalf("ChargeRefused +%d, want +2 (the slots 2 and 3 of depth 4)", r)
 		}
 		if bud.Used() != before || stg.Used() != sBefore {
 			t.Fatalf("after the refused growth: Budget %+d, Stages %+d; want both unchanged", bud.Used()-before, stg.Used()-sBefore)
@@ -370,6 +372,9 @@ func TestDgramReadPartialGrowthRefused_L16(t *testing.T) {
 		synctest.Wait()
 		if calls := fb.readCalls()[mark:]; !slices.Equal(calls, []int{2, 2, 1}) {
 			t.Fatalf("calls %v, want [2 2 1]: the depth stays 2", calls)
+		}
+		if r := s.env.Dgram.ChargeRefused.Load() - refused; r != 4 {
+			t.Fatalf("ChargeRefused +%d after the second refused growth, want +4", r)
 		}
 		if bud.Used() != before || stg.Used() != sBefore {
 			t.Fatalf("after the second refusal: Budget %+d, Stages %+d", bud.Used()-before, stg.Used()-sBefore)

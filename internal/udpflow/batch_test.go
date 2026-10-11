@@ -365,9 +365,10 @@ func TestSourceDrainsQueuedSeam_L54(t *testing.T) {
 
 // TestFlowReadDatagramsOrder (§A4.5): ReadDatagrams drains up to
 // min(len(rs), MaxBatch) inbox datagrams per call in arrival order, each
-// as ReadDatagram would return it (a candidate from another source, a
-// datagram over the receive limit truncated); the buffers stay charged
-// until the next read or Release.
+// as ReadDatagram would return it (a candidate from another source — the
+// call's last result, R3-14 — a datagram over the receive limit
+// truncated); the buffers stay charged until the next read or Release,
+// and the held-entry slice of the largest call until Close (R3-28).
 func TestFlowReadDatagramsOrder(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
@@ -397,17 +398,14 @@ func TestFlowReadDatagramsOrder(t *testing.T) {
 
 		rs := make([]carrier.ReadResult, 3)
 		n, err := f.ReadDatagrams(rs)
-		if err != nil || n != 3 {
-			t.Fatalf("ReadDatagrams: %d, %v", n, err)
+		if err != nil || n != 2 {
+			t.Fatalf("ReadDatagrams: %d, %v; want 2 (the call ends at its candidate)", n, err)
 		}
 		if rs[0].Ev != carrier.ReadOK || pingSeq(rs[0].Data) != 2 || rs[0].Src.AP != peer {
 			t.Fatalf("result 0: %+v", rs[0])
 		}
 		if rs[1].Ev != carrier.ReadCandidate || pingSeq(rs[1].Data) != 3 || rs[1].Src.AP != other {
 			t.Fatalf("result 1: event %d, source %v", rs[1].Ev, rs[1].Src)
-		}
-		if rs[2].Ev != carrier.ReadTruncated || rs[2].Data != nil {
-			t.Fatalf("result 2: event %d, %d bytes; want truncated", rs[2].Ev, len(rs[2].Data))
 		}
 		if err := f.WriteDatagramTo(make([]byte, wire.FlowHeaderLen+8), carrier.PeerKey{AP: other}); err != nil {
 			t.Fatalf("a challenge to the batch's candidate: %v", err)
@@ -421,18 +419,21 @@ func TestFlowReadDatagramsOrder(t *testing.T) {
 		if env.Budget.Used() >= held {
 			t.Fatal("the previous batch's buffers were not returned by the next read")
 		}
-		for i := range n {
-			if want := uint32(5 + i); big[i].Ev != carrier.ReadOK || pingSeq(big[i].Data) != want {
+		if big[0].Ev != carrier.ReadTruncated || big[0].Data != nil {
+			t.Fatalf("result 0: event %d, %d bytes; want truncated", big[0].Ev, len(big[0].Data))
+		}
+		for i := 1; i < n; i++ {
+			if want := uint32(4 + i); big[i].Ev != carrier.ReadOK || pingSeq(big[i].Data) != want {
 				t.Fatalf("result %d: event %d, seq %d, want %d", i, big[i].Ev, pingSeq(big[i].Data), want)
 			}
 		}
 		n, err = f.ReadDatagrams(big)
-		if err != nil || n != 9 || pingSeq(big[8].Data) != 45 {
+		if err != nil || n != 10 || pingSeq(big[9].Data) != 45 {
 			t.Fatalf("the rest: %d, %v", n, err)
 		}
 		f.Release()
-		if u := env.Budget.Used(); u != base {
-			t.Fatalf("Budget %d after Release, want %d", u, base)
+		if u, want := env.Budget.Used(), base+32*entrySize; u != want {
+			t.Fatalf("Budget %d after Release, want %d (the held slice of 32 entries)", u, want)
 		}
 		if _, err := f.ReadDatagrams(nil); err == nil {
 			t.Fatal("ReadDatagrams without a result slot succeeded")
@@ -444,8 +445,14 @@ func TestFlowReadDatagramsOrder(t *testing.T) {
 			t.Fatalf("an empty inbox: %v, want the deadline", err)
 		}
 		f.Close()
+		if u := env.Budget.Used(); u != base {
+			t.Fatalf("Budget %d after Close, want %d: Close returns the slice's charge", u, base)
+		}
 		if _, err := f.ReadDatagrams(big); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("a closed flow: %v", err)
+		}
+		if f.held != nil || env.Budget.Used() != base {
+			t.Fatalf("a closed flow's read kept its slice (cap %d) or charged one (Budget %d, want %d)", cap(f.held), env.Budget.Used(), base)
 		}
 	})
 }
@@ -759,7 +766,10 @@ func TestSourceChargedSlotMoves_L16(t *testing.T) {
 }
 
 // TestSourceAnswerCounted (R1-2, A2.1): the stateless answers of rendr's
-// own socket go through its counted calls like every other write.
+// own socket go through its counted calls like every other write. The
+// count lands when the Source's write returns, which may be after the
+// client already read the answer: the row waits for it (bounded), then
+// requires exactly one call of one datagram.
 func TestSourceAnswerCounted(t *testing.T) {
 	env := testEnv(1 << 30)
 	rs := newRealSourceIO(t, 1232, env, Limits{}, defaultMaxBatch)
@@ -772,8 +782,14 @@ func TestSourceAnswerCounted(t *testing.T) {
 	if id, ack := parseAnswer(t, ans); id != 0x77 || ack.Status != wire.PrefaceCapacity {
 		t.Fatalf("answer: flow %x, %+v", id, ack)
 	}
-	if calls, sent, _, _, _ := env.Dgram.IO.Load(); calls != 1 || sent != 1 {
-		t.Fatalf("SendCalls %d, SentDatagrams %d; want the answer counted once", calls, sent)
+	for deadline := time.Now().Add(realWait); ; time.Sleep(time.Millisecond) {
+		calls, sent, _, _, _ := env.Dgram.IO.Load()
+		if calls != 0 || time.Now().After(deadline) {
+			if calls != 1 || sent != 1 {
+				t.Fatalf("SendCalls %d, SentDatagrams %d; want the answer counted once", calls, sent)
+			}
+			break
+		}
 	}
 }
 

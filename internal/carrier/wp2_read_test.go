@@ -59,14 +59,18 @@ func setIdleRelease(t testing.TB, d time.Duration) {
 // over the harness's link (ReadSize 1201: the 2 KiB class).
 func slotSize() int64 { return int64(dgramLayout.size(dgramLayout.class(1201))) }
 
-// TestDgramReadAdaptiveDepth_L16 (R1-4): with Env.Budget filled by a test
-// charge, a burst of 20 queued datagrams is read at depth 1 — each full
-// call's growth is refused, ChargeRefused counts exactly those 20 — and
-// nothing is charged; once the charge is released a burst of 40 is read
-// at depths 1, 2, 4, 8, 16, 32 (the slots charged to Env.Budget, the
-// header to Env.Stages); an idle release returns everything
-// (BufferedBytes at its baseline) and the next burst starts at depth 1
-// again. Mutant: extra read slots taken without TryGet (no refusal).
+// TestDgramReadAdaptiveDepth_L16 (R1-4, R3-23): with Env.Budget filled by
+// a test charge, a burst of 20 queued datagrams is read at depth 1 — each
+// full call's growth to 2 is refused, ChargeRefused counts exactly those
+// 20 refused slots — and nothing is charged; once the charge is released
+// a burst of 40 is read at depths 1, 2, 4, 8, 16, 32 (the slots charged
+// to Env.Budget, the header to Env.Stages); an idle release returns
+// everything (BufferedBytes at its baseline) and the next burst starts at
+// depth 1 again, growing to 4; with the Budget full once more, a full
+// call at depth 4 is refused its growth to 8: ChargeRefused +4 (the slots
+// 4 … 7; a count per attempt would say +1), the depth stays 4. Mutants:
+// extra read slots taken without TryGet (no refusal); a refusal counted
+// once per attempt.
 func TestDgramReadAdaptiveDepth_L16(t *testing.T) {
 	setIdleRelease(t, 100*time.Millisecond)
 	synctest.Test(t, func(t *testing.T) {
@@ -122,6 +126,23 @@ func TestDgramReadAdaptiveDepth_L16(t *testing.T) {
 			t.Fatalf("calls %v after the release, want [1 2]: depth 1 again", calls)
 		}
 		if got := seqsOf(s.ep); !slices.Equal(got, upTo(63)) {
+			t.Fatalf("delivered %v", got)
+		}
+
+		// Depth 4 now (the call of 2 grew it); the Budget full again.
+		full := bud.Max()
+		bud.Acquire(full)
+		mark = len(fb.readCalls())
+		injectBurst(s.io, p.io.addr, p.burst(63, 8, 100))
+		synctest.Wait()
+		if calls := fb.readCalls()[mark:]; !slices.Equal(calls, []int{4, 4}) {
+			t.Fatalf("calls %v with the Budget full at depth 4, want [4 4]: each growth to 8 refused", calls)
+		}
+		if r := s.env.Dgram.ChargeRefused.Load(); r != 28 {
+			t.Fatalf("ChargeRefused %d, want 28 (20 + 2 refused growths of 4 slots)", r)
+		}
+		bud.Release(full)
+		if got := seqsOf(s.ep); !slices.Equal(got, upTo(71)) {
 			t.Fatalf("delivered %v", got)
 		}
 		if dead, cause, detail, _ := s.c.Death(); dead {
