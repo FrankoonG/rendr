@@ -81,6 +81,7 @@ type churn struct {
 	kills                    []churnKillRec
 	earlyPending             int // EarlyReturn ingresses whose l4.Dial returned StatePending
 	earlyFresh, earlyBytes   int // echoe sessions that used a fresh trunk (handle 1); of them, with EarlyBytes > 0
+	earlyExact               int // of them, those that never migrated: all 16 KiB rode the first flight
 }
 
 // churnKillRec is one Link kill of the churn.
@@ -105,7 +106,9 @@ type churnKillRec struct {
 // (the opening deferred to the first use); on these default Props most
 // early sessions open on the mux fast path, where the OPEN carries no
 // EARLY (M4-D17): EarlyBytes > 0 only on a session that used a fresh
-// trunk of its own (handle 1).
+// trunk of its own (handle 1), and an echo session that opened on a fresh
+// trunk and never migrated carried its whole 16-KiB request as early data
+// (Forward's first-read hold, R1-15); at least one such session per run.
 //
 // PASS: every designed outcome exact — refusals with their code (and the
 // dropped SYN at the 5-s budget, + 1 s), resets mid-response as a reset at
@@ -239,13 +242,16 @@ func runChurn(t *testing.T) {
 	}
 
 	s.mu.Lock()
-	rstLost, earlyPending := s.rstLost, s.earlyPending
+	rstLost, earlyPending, earlyExact := s.rstLost, s.earlyPending, s.earlyExact
 	s.mu.Unlock()
 	if rstLost > churnRSTLostMax {
 		t.Fatalf("%d reset connections lost their RST with a killed carrier, want at most %d", rstLost, churnRSTLostMax)
 	}
 	if earlyPending != 550+100 {
 		t.Fatalf("stimulus: %d EarlyReturn ingresses returned StatePending from l4.Dial, want all 650", earlyPending)
+	}
+	if earlyExact == 0 {
+		t.Fatalf("stimulus: no EarlyReturn echo session opened on a fresh trunk of its own without migrating, so no first flight was checked")
 	}
 
 	// W after the last connection with the Peer still open: no session, and
@@ -280,10 +286,10 @@ func runChurn(t *testing.T) {
 	}
 	s.mu.Lock()
 	t.Logf("2,000 connections, %d kills in %v virtual; stall released %v–%v, noread %v–%v after the last progress; "+
-		"%d resets lost with a killed carrier; EarlyReturn: %d pending at Dial, %d echoe sessions on a fresh trunk, %d with EarlyBytes; "+
+		"%d resets lost with a killed carrier; EarlyReturn: %d pending at Dial, %d echoe sessions on a fresh trunk, %d with EarlyBytes, %d checked whole; "+
 		"with the Peer open: %d carriers, buffered %d and %d; Server %+v",
 		kills, time.Since(s.start), minOf(s.stallRel), maxOf(s.stallRel), minOf(s.noreadRel), maxOf(s.noreadRel),
-		s.rstLost, s.earlyPending, s.earlyFresh, s.earlyBytes, open, ds.BufferedBytes, ps.BufferedBytes, plain(st))
+		s.rstLost, s.earlyPending, s.earlyFresh, s.earlyBytes, s.earlyExact, open, ds.BufferedBytes, ps.BufferedBytes, plain(st))
 	s.mu.Unlock()
 	w.noViolation()
 	w.close()
@@ -373,7 +379,12 @@ func (s *churn) run(class, addr string, seed uint64) {
 // returned StatePending (the opening deferred to the first use; without
 // EarlyReturn it returns StateOpen), and early bytes only on a session that
 // opened on a fresh trunk of its own (handle 1): on the mux fast path the
-// OPEN carries no EARLY (M4-D17), so EarlyBytes stays 0 there.
+// OPEN carries no EARLY (M4-D17), so EarlyBytes stays 0 there. A session
+// on a fresh trunk that never migrated carried the whole request early:
+// Forward held its first read until the request's Write (R1-15), so the
+// 16 KiB rode the first flight (EarlyBytes == 16 KiB). A session that
+// migrated by JOIN onto a freshly dialled trunk also shows handle 1, so the
+// exact check leaves migrated sessions out.
 func (s *churn) runEcho(addr string, seed uint64, early bool) error {
 	in, err := s.w.ingress(s.peer, addr, rendr.DialOptions{EarlyReturn: early}, 0)
 	if err != nil {
@@ -416,11 +427,18 @@ func (s *churn) runEcho(addr string, seed uint64, early bool) error {
 	case st.EarlyBytes > 0 && !fresh:
 		return fmt.Errorf("EarlyBytes %d on a session that only used shared trunks (M4-D17: no EARLY on the fast path): %+v", st.EarlyBytes, st.Carriers)
 	}
+	whole := early && fresh && st.Migrations == (rendr.MigrationCounts{})
+	if whole && st.EarlyBytes != churnEcho {
+		return fmt.Errorf("EarlyReturn session on a fresh trunk of its own, never migrated: EarlyBytes %d, want the whole %d-byte request (R1-15's first-read hold): %+v", st.EarlyBytes, churnEcho, st.Carriers)
+	}
 	if early && fresh {
 		s.mu.Lock()
 		s.earlyFresh++
 		if st.EarlyBytes > 0 {
 			s.earlyBytes++
+		}
+		if whole {
+			s.earlyExact++
 		}
 		s.mu.Unlock()
 	}
