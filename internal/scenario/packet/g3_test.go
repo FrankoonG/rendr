@@ -13,9 +13,9 @@ import (
 // reduced scale (§A8.3): the zero Config on both ends, two DatagramLinks of
 // 20 ms RTT (u1, u2; frame budget 1223 as carrier/udp's default, Peer order
 // u1, u2, so probe carriers exist), one packet session with 1000-byte
-// datagrams at 2,000 per second B → A and 200 per second A → B (F3), for 60
-// virtual seconds with events at t_k = 15 + 30k s (k = 0, 1: the gold's
-// 30-s slots, two of its ten):
+// datagrams at 2,000 per second B → A and 200 per second A → B (F3; half
+// both under -race: goldRateBA), for 60 virtual seconds with events at
+// t_k = 15 + 30k s (k = 0, 1: the gold's 30-s slots, two of its ten):
 //
 //   - selector, k even — quality: +60 ms on the active path's B → A delay,
 //     proven by the one-way delay of the datagrams written after it (the
@@ -53,8 +53,8 @@ func TestG3Miniature(t *testing.T) {
 // Gold timing shared by the miniatures (B1.0, F8, F9, F15).
 const (
 	goldOneWay   = 10 * time.Millisecond // RTT 20 ms
-	goldRateBA   = 2000                  // B → A datagrams per second (the miniature's 2 kpps)
-	goldRateAB   = goldRateBA / 10       // A → B (F3)
+	fullRateBA   = 2000                  // B → A datagrams per second (the miniature's 2 kpps)
+	goldRateAB   = goldRateBA / 10       // A → B (F3); goldRateBA: race_off_test.go, race_on_test.go
 	lossWindow   = 200*time.Millisecond + sendSlot
 	gapWindow    = 2 * time.Second
 	gapLimit     = 200 * time.Millisecond

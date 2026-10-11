@@ -59,15 +59,17 @@ func fseqJumpRecovery(t *testing.T, mode rendr.Mode, both bool) {
 		win   = 1024 // wire.FseqWindowBits
 	)
 	bound := 2*rtt + sendSlot
-	rateUp := goldRateAB
+	// The full rate in both lanes (not goldRateBA, which the race lane
+	// halves): 1 s of blackhole must hand the carrier a window of datagrams.
+	rateDown, rateUp := fullRateBA, fullRateBA/10
 	if both {
-		rateUp = goldRateBA
+		rateUp = fullRateBA
 	}
 	w := newWorld(t, worldOpts{oneWay: goldOneWay}, "u1")
 	l := w.link("u1")
 	dc, pc := w.open(w.peer("u1"), rendr.DialOptions{Mode: mode})
 	up := startFlow(dc, pc, flowCfg{name: "A → B", seed: 1, rate: rateUp})
-	down := startFlow(pc, dc, flowCfg{name: "B → A", seed: 2, rate: goldRateBA})
+	down := startFlow(pc, dc, flowCfg{name: "B → A", seed: 2, rate: rateDown})
 	time.Sleep(warm)
 
 	act, ok := activeOf(dc.Status())
@@ -145,7 +147,7 @@ func fseqJumpRecovery(t *testing.T, mode rendr.Mode, both bool) {
 	if both {
 		flows = []*flow{down, up}
 	}
-	rates := map[*flow]int{down: goldRateBA, up: rateUp}
+	rates := map[*flow]int{down: rateDown, up: rateUp}
 	for _, f := range flows {
 		first := f.firstArrivalWrittenFrom(heal)
 		if first.IsZero() || first.Sub(heal) > bound+goldOneWay {
