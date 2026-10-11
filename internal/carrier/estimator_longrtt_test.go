@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -18,15 +19,18 @@ import (
 // lrLinkPair is ltLinkPair with a link buffer of buf bytes per direction.
 func lrLinkPair(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint) (dialer, passive *Conn) {
 	t.Helper()
-	return lrLinkPairWrap(t, envD, envP, rate, delay, buf, sink, nil)
+	return lrLinkPairWrap(t, envD, envP, rate, delay, buf, sink, nil, nil)
 }
 
-// lrLinkPairWrap is lrLinkPair whose dialer conn is wrapped by wrap (nil:
-// none).
-func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint, wrap func(net.Conn) net.Conn) (dialer, passive *Conn) {
+// lrLinkPairWrap is lrLinkPair whose dialer conn is wrapped by wrap and
+// whose passive conn by wrapP, before its handshake (nil: none).
+func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint, wrap, wrapP func(net.Conn) net.Conn) (dialer, passive *Conn) {
 	t.Helper()
 	pass := make(chan *Conn, 1)
 	link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "wan", Buffer: buf, Accept: func(nc net.Conn) error {
+		if wrapP != nil {
+			nc = wrapP(nc)
+		}
 		h, err := ReadHello(envP, nc, time.Now().Add(10*time.Second), 4096, nil)
 		if err != nil {
 			pass <- nil
@@ -71,15 +75,22 @@ func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Dura
 
 // lrDuplex is the passive endpoint of a duplex flow: its first Fill places
 // OPEN_ACK(OK) (ltSink), later ones bulk DATA from src; DATA it receives is
-// checked like ltSink's.
+// checked like ltSink's. With gate set, no DATA goes out until the time it
+// holds (Unix ns; 0: not yet).
 type lrDuplex struct {
 	*ltSink
-	src *hSource
+	src  *hSource
+	gate *atomic.Int64
 }
 
 func (d *lrDuplex) Fill(c *Conn, b *Batch) {
 	if !d.placed {
 		if d.ltSink.Fill(c, b); !d.placed {
+			return
+		}
+	}
+	if g := d.gate; g != nil {
+		if at := g.Load(); at == 0 || time.Now().UnixNano() < at {
 			return
 		}
 	}

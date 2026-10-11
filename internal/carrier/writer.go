@@ -409,7 +409,7 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 		}
 	}
 	c.mu.Lock()
-	c.commitLocked(w, b, end)
+	c.commitLocked(w, b, start, end)
 	c.mu.Unlock()
 	if w.ping {
 		if w.pingJudged {

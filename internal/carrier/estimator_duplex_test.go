@@ -3,6 +3,8 @@ package carrier
 import (
 	"fmt"
 	"math"
+	"net"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -26,6 +28,64 @@ type duplexCase struct {
 	// since is the virtual time since the run began, before the handshake
 	// (a peer clock that drifts or steps against the dialer's).
 	pingTS func(ts uint64, since time.Duration) uint64
+	// late: the passive's bulk starts this long after the dialer's Start
+	// (it sends nothing but its OPEN_ACK before), which sets the phase of
+	// the two writers' blocking Writes. dlate: the dialer's bulk starts
+	// this long after its Start (its source places nothing before).
+	late, dlate time.Duration
+	// stalls: Writes that wait before they go, once each (duplexStall).
+	stalls []duplexStall
+}
+
+// duplexStall makes the first Write of one side's conn at or after at
+// (from the dialer's Start) wait d before it goes, once: a mid-run shift
+// of that writer's phase. Before Start (the handshake) nothing stalls.
+type duplexStall struct {
+	passive bool
+	at, d   time.Duration
+}
+
+// stallWrap returns the conn wrap for one side's stalls (nil: none); t0
+// holds the dialer's Start (Unix ns; 0: not yet).
+func stallWrap(t0 *atomic.Int64, stalls []duplexStall, passive bool) func(net.Conn) net.Conn {
+	type pending struct {
+		at, d time.Duration
+		done  atomic.Bool
+	}
+	var mine []*pending
+	for _, s := range stalls {
+		if s.passive == passive {
+			mine = append(mine, &pending{at: s.at, d: s.d})
+		}
+	}
+	if len(mine) == 0 {
+		return nil
+	}
+	return func(nc net.Conn) net.Conn {
+		return &hookConn{Conn: nc, onWrite: func(c net.Conn, p []byte) (int, error) {
+			if base := t0.Load(); base != 0 {
+				for _, s := range mine {
+					if time.Now().UnixNano() >= base+int64(s.at) && s.done.CompareAndSwap(false, true) {
+						time.Sleep(s.d)
+					}
+				}
+			}
+			return c.Write(p)
+		}}
+	}
+}
+
+// dlateSource is the dialer's source, placing nothing before from.
+type dlateSource struct {
+	Endpoint
+	from time.Time
+}
+
+func (g *dlateSource) Fill(c *Conn, b *Batch) {
+	if time.Now().Before(g.from) {
+		return
+	}
+	g.Endpoint.Fill(c, b)
 }
 
 // duplexResult is what duplexRun measured over the judged window.
@@ -76,12 +136,25 @@ func duplexRun(t *testing.T, c duplexCase) duplexResult {
 	back := newSource(envP, ChunkSize, true)
 	defer back.chunk.Release()
 	back.offer(total)
-	dc, pc := lrLinkPair(t, envD, envP, c.rate, c.rtt/2, c.buf, &lrDuplex{ltSink: sink, src: back})
+	ep := &lrDuplex{ltSink: sink, src: back}
+	if c.late > 0 {
+		ep.gate = new(atomic.Int64)
+	}
+	t0 := new(atomic.Int64) // the dialer's Start for the stalls (Unix ns; 0: not yet)
+	dc, pc := lrLinkPairWrap(t, envD, envP, c.rate, c.rtt/2, c.buf, ep, stallWrap(t0, c.stalls, false), stallWrap(t0, c.stalls, true))
 	src := newSource(envD, ChunkSize, true)
 	defer src.chunk.Release()
 	src.offer(total)
 	start := time.Now()
-	dc.Start(src, &hBell{}, StartOptions{})
+	if ep.gate != nil {
+		ep.gate.Store(start.Add(c.late).UnixNano())
+	}
+	var dep Endpoint = src
+	if c.dlate > 0 {
+		dep = &dlateSource{Endpoint: src, from: start.Add(c.dlate)}
+	}
+	t0.Store(start.UnixNano())
+	dc.Start(dep, &hBell{}, StartOptions{})
 
 	var r duplexResult
 	// clockErr is how much later than the truth the PINGs x receives read
@@ -194,9 +267,45 @@ func requireShares(t *testing.T, r duplexResult) {
 // 1.5 × (3·minRTT + 4·PingBusy + 200 ms), held over 6 s and fails on all
 // four 60-s rows: srtt up to 2.25 × the exact-estimate figure).
 //
+// The late, dlate and stalls rows are the 2 MiB/s, 128-KiB row with the
+// phase of the two writers shifted (M5-D63, KL-20). Both writers' Writes
+// block on the queue, shorter than a 256-KiB batch, and which side loses
+// the phase of the two blocking writers decides the run: the race build
+// picks the phase at random (KL-20: 0.807–0.849 in about 0.3 % of host
+// -race runs of the unshifted row, about one pool race-unit pass in
+// three), and these rows pin three phases. The loser's leading PINGs
+// prove only the bytes before each batch, so those bytes stay in flight
+// for the batch's blocking Write as well as the round trip; one way the
+// base term's headroom absorbs that, with bulk both ways it goes to the
+// reverse queue and to the PONG's wait behind the peer's Write, and the
+// cap held the loser below the link. The capacity now adds the write lag
+// while the peer is BUSY (duplexLocked, sched.CapacityDuplex).
+//
+//   - late100ms: the passive's bulk starts 100 ms after the dialer's.
+//     Before the write-lag part: 0.979/0.828 in every run (a start 73–122
+//     ms late gave that phase; the passive's start swept over 0–400 ms in
+//     1-ms steps failed in 50 of 401 cells). Kills the mutant without the
+//     write lag.
+//   - dlate292ms: the dialer's bulk starts 292 ms after its Start (a band
+//     of 264–321 ms; the dialer's start swept over 0–400 ms failed in 121
+//     of 401 cells, down to 0.750). Before: 0.750/1.000 in every run. Kills
+//     the mutant without the write lag.
+//   - stalls: the dialer's first Write at or after 465 ms waits 106 ms,
+//     the passive's first at or after 1077 ms waits 50 ms (both before the
+//     window). It passed before (0.927/0.953) and passes with the
+//     allowance (0.938/0.932); priced at the delivered rate instead of the
+//     rate estimate the write-lag part gives 0.797/0.792 in every run: the
+//     delivered rate moves in batch steps and dips on the side that is
+//     behind, so that price takes the allowance away where it is needed. A
+//     guard row for the price, as the unshifted row is one for KL-20.
+//
+// Over the judge's perturbations at this point (both starts swept, single
+// and random multiple Write stalls, with and without -race) no cell
+// carries less than 0.870 with the allowance (m5-estimator §3.3).
+//
 // Under -race (R1-23 lever 1, I3: the rows took 43 s of the Linux race
-// lane's carrier package) the three 6-s rows and the cheapest 60-s row
-// (1 MiB/s) run, with the same criteria; the non-race lanes run all seven.
+// lane's carrier package) the 6-s rows and the cheapest 60-s row (1 MiB/s)
+// run, with the same criteria; the non-race lanes run all ten.
 //
 // PASS: over the window after the warm-up, while both flows run, each
 // direction carries ≥ 0.85 of the link; the price of the allowance is
@@ -210,27 +319,41 @@ func requireShares(t *testing.T, r duplexResult) {
 // the two deep Links and read the reverse queue that much short). Both
 // flows then complete intact and in order, and neither carrier dies.
 func TestDuplexKeepsBothDirections_L15(t *testing.T) {
+	const ms = time.Millisecond
 	for _, tc := range []struct {
-		rtt  time.Duration
-		rate float64
-		buf  int // the link's buffer per direction
-		span time.Duration
-		race bool // runs under -race too
+		rtt    time.Duration
+		rate   float64
+		buf    int // the link's buffer per direction
+		span   time.Duration
+		race   bool // runs under -race too
+		suffix string
+		// late, dlate, stalls: duplexCase's.
+		late, dlate time.Duration
+		stalls      []duplexStall
 	}{
-		{20 * time.Millisecond, 4 << 20, 2 << 20, 6 * time.Second, true},
-		{20 * time.Millisecond, 2 << 20, (2 << 20) / 16, 6 * time.Second, true},
-		{100 * time.Millisecond, 16 << 20, 64 << 20, 6 * time.Second, true},
-		{20 * time.Millisecond, 4 << 20, 2 << 20, time.Minute, false},
-		{20 * time.Millisecond, 2 << 20, 2 << 20, time.Minute, false},
-		{20 * time.Millisecond, 1 << 20, 1 << 20, time.Minute, true},
-		{20 * time.Millisecond, 8 << 20, 8 << 20, time.Minute, false},
+		{rtt: 20 * ms, rate: 4 << 20, buf: 2 << 20, span: 6 * time.Second, race: true},
+		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true},
+		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "late100ms", late: 100 * ms},
+		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "dlate292ms", dlate: 292 * ms},
+		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "stalls",
+			stalls: []duplexStall{{at: 465 * ms, d: 106 * ms}, {passive: true, at: 1077 * ms, d: 50 * ms}}},
+		{rtt: 100 * ms, rate: 16 << 20, buf: 64 << 20, span: 6 * time.Second, race: true},
+		{rtt: 20 * ms, rate: 4 << 20, buf: 2 << 20, span: time.Minute},
+		{rtt: 20 * ms, rate: 2 << 20, buf: 2 << 20, span: time.Minute},
+		{rtt: 20 * ms, rate: 1 << 20, buf: 1 << 20, span: time.Minute, race: true},
+		{rtt: 20 * ms, rate: 8 << 20, buf: 8 << 20, span: time.Minute},
 	} {
 		if carrierRace && !tc.race {
 			continue
 		}
-		t.Run(fmt.Sprintf("rtt%v/%gMiBps/buf%dKiB/%v", tc.rtt, tc.rate/(1<<20), tc.buf>>10, tc.span), func(t *testing.T) {
+		name := fmt.Sprintf("rtt%v/%gMiBps/buf%dKiB/%v", tc.rtt, tc.rate/(1<<20), tc.buf>>10, tc.span)
+		if tc.suffix != "" {
+			name += "/" + tc.suffix
+		}
+		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				r := duplexRun(t, duplexCase{rtt: tc.rtt, rate: tc.rate, buf: tc.buf, warm: 2 * time.Second, span: tc.span})
+				r := duplexRun(t, duplexCase{rtt: tc.rtt, rate: tc.rate, buf: tc.buf, warm: 2 * time.Second, span: tc.span,
+					late: tc.late, dlate: tc.dlate, stalls: tc.stalls})
 				requireShares(t, r)
 				for i, who := range []string{"dialer", "passive"} {
 					if bound := latencyBound(r, i, tc.rate); r.srttMax[i] > bound {
@@ -345,7 +468,7 @@ func TestReverseQueueAllowance(t *testing.T) {
 	st.srtt, st.minRTT, st.rttvar = 600*time.Millisecond, 20*time.Millisecond, 0
 	plain := sched.Capacity(rate, st.minRTT, tr.tm.PingBusy, tr.tm.CapFloor, tr.tm.Window)
 	allow := func(d time.Duration, r float64) int64 { // the formula's own rows are sched's
-		return sched.CapacityDuplex(rate, st.minRTT, tr.tm.PingBusy, r, d, tr.tm.CapFloor, tr.tm.Window)
+		return sched.CapacityDuplex(rate, st.minRTT, tr.tm.PingBusy, r, d, 0, int64(tr.tm.BatchBudget), tr.tm.CapFloor, tr.tm.Window)
 	}
 	// ping delivers a PING sent at the peer's clock 5 s + at (an offset of
 	// 5 s against ours) that took oneWay to arrive.
@@ -598,5 +721,137 @@ func TestDeliveredRateWindow(t *testing.T) {
 	st.noteDelivered(t0.Add(600 * time.Millisecond))
 	if want := float64(1<<20) / 0.4; st.dlvRate != want {
 		t.Fatalf("second window: delivered rate %v, want %v", st.dlvRate, want)
+	}
+}
+
+// TestWriteLagAllowance (M5-D63, KL-20; duplexLocked, sched.CapacityDuplex):
+// the write-lag part of the capacity's duplex allowance, driven through
+// commitLocked with chosen write times.
+//
+//   - A write that carried DATA behind its leading PING gives a sample:
+//     the time the write took. wlag follows a rising sample at once and a
+//     falling one with gain 1/8.
+//   - A PING that ends its batch (endPing), a batch without DATA and a
+//     batch without a PING give none.
+//   - Neither part of the allowance applies while the peer is not BUSY or
+//     before the first RTT, whatever wlag reads: one way the base term's
+//     headroom absorbs the write lag, and the one-way estimator stays M4's.
+//   - With the peer BUSY and an RTT the capacity is sched.CapacityDuplex
+//     with rev = min(revQ, srtt − minRTT) and lag = wlag: the lag adds
+//     rate·wlag, priced at the rate estimate whatever the delivered rate
+//     reads (as long as it is positive), and never more than one batch.
+func TestWriteLagAllowance(t *testing.T) {
+	const rate = 2 << 20
+	t0 := time.Unix(1000, 0)
+	env := hEnv()
+	chunk := env.Bufs.Get(ChunkSize, nil)
+	defer chunk.Release()
+	tr := &trunk{tm: hTiming(), base: t0}
+	st := &tr.st
+	st.rate, st.dlvRate = rate, rate
+	st.srtt, st.minRTT, st.rttSeen = 80*time.Millisecond, 10*time.Millisecond, true
+	plain := sched.Capacity(rate, st.minRTT, tr.tm.PingBusy, tr.tm.CapFloor, tr.tm.Window)
+	// want is the capacity the duplex allowance gives for the state as it is.
+	want := func() int64 {
+		return sched.CapacityDuplex(st.rate, st.minRTT, tr.tm.PingBusy, st.dlvRate, max(0, min(st.revQ, st.srtt-st.minRTT)), st.wlag,
+			int64(tr.tm.BatchBudget), tr.tm.CapFloor, tr.tm.Window)
+	}
+	// withLag is the plain capacity plus d of lag at the rate, computed as
+	// sched.CapacityDuplex sums it (in float64 bytes, no allowance clamp).
+	withLag := func(d time.Duration) int64 {
+		c := 2 * float64(rate) * (float64(st.minRTT) + float64(tr.tm.PingBusy) + float64(50*time.Millisecond)) / float64(time.Second)
+		return int64(c + float64(rate)*float64(d)/float64(time.Second))
+	}
+	capNow := func() int64 {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return tr.capacityLocked()
+	}
+	if got := capNow(); got != plain {
+		t.Fatalf("no sample yet: capacity %d, want the plain %d", got, plain)
+	}
+	// write commits a batch written over [at, at+took): with a PING (led
+	// or, atEnd, ending its DATA) and data bytes of DATA.
+	var id uint32
+	write := func(at, took time.Duration, ping, atEnd bool, data int) {
+		b := NewBatch(tr.tm.BatchBudget)
+		b.Reset(t0.Add(at))
+		w := &writer{}
+		if ping {
+			id++
+			st.push(pingRecord{id: id})
+			w.ping, w.pingID, w.pingAtEnd = true, id, atEnd
+		}
+		for off := 0; off < data; off += ChunkSize {
+			if !b.AddData(wire.SessionHandle, uint64(off), chunk.B[:min(ChunkSize, data-off)], chunk, false) {
+				t.Fatal("AddData refused")
+			}
+		}
+		tr.mu.Lock()
+		tr.commitLocked(w, b, t0.Add(at), t0.Add(at+took))
+		tr.mu.Unlock()
+		b.ReleaseRefs()
+	}
+
+	write(0, 90*time.Millisecond, true, false, 192<<10)
+	if st.wlag != 90*time.Millisecond {
+		t.Fatalf("a led write of 90 ms: wlag %v, want 90ms", st.wlag)
+	}
+	// The gate: without the peer's BUSY, or before the first RTT, the
+	// capacity is the plain one whatever wlag reads.
+	if st.peerBusy {
+		t.Fatal("premise: the peer is not BUSY yet")
+	}
+	if got := capNow(); got != plain {
+		t.Fatalf("wlag 90 ms without the peer's BUSY: capacity %d, want the plain %d", got, plain)
+	}
+	st.peerBusy, st.rttSeen = true, false
+	if got := capNow(); got != plain {
+		t.Fatalf("wlag 90 ms before the first RTT: capacity %d, want the plain %d", got, plain)
+	}
+	st.rttSeen = true
+	if got, w := capNow(), withLag(90*time.Millisecond); got != w || got != want() {
+		t.Fatalf("peer BUSY, wlag 90 ms: capacity %d, want %d (plain + rate·90 ms; CapacityDuplex %d)", got, w, want())
+	}
+	// Priced at the rate estimate: a delivered rate of half the estimate
+	// leaves the lag's part alone.
+	st.dlvRate = rate / 2
+	if got, w := capNow(), withLag(90*time.Millisecond); got != w || got != want() {
+		t.Fatalf("delivered rate/2, wlag 90 ms: capacity %d, want %d (plain + rate·90 ms; CapacityDuplex %d)", got, w, want())
+	}
+	st.dlvRate = rate
+
+	// None of these is a sample.
+	write(100*time.Millisecond, 500*time.Millisecond, true, true, 192<<10)   // the PING ends its DATA
+	write(700*time.Millisecond, 500*time.Millisecond, true, false, 0)        // no DATA
+	write(1300*time.Millisecond, 500*time.Millisecond, false, false, 64<<10) // no PING
+	if st.wlag != 90*time.Millisecond {
+		t.Fatalf("after writes that give no sample: wlag %v, want 90ms", st.wlag)
+	}
+	// A falling sample moves it by 1/8; a rising one at once.
+	write(2*time.Second, 10*time.Millisecond, true, false, 64<<10)
+	if w := 90*time.Millisecond - 80*time.Millisecond/owdGain; st.wlag != w {
+		t.Fatalf("a falling sample: wlag %v, want %v", st.wlag, w)
+	}
+	write(3*time.Second, 100*time.Millisecond, true, false, 256<<10)
+	if st.wlag != 100*time.Millisecond {
+		t.Fatalf("a rising sample: wlag %v, want 100ms", st.wlag)
+	}
+	// Added to the reverse queue's part (min(revQ, srtt − minRTT) at the
+	// delivered rate).
+	st.revQ, st.dlvRate = 30*time.Millisecond, rate/2
+	if got, w := capNow(), want(); got != w || got <= withLag(100*time.Millisecond) {
+		t.Fatalf("with a 30-ms reverse queue: capacity %d, want %d, above %d", got, w, withLag(100*time.Millisecond))
+	}
+	st.revQ, st.dlvRate = 0, rate
+	// At most one batch of bytes: a stalled write of 2 s adds BatchBudget.
+	write(4*time.Second, 2*time.Second, true, false, 64<<10)
+	if got, w := capNow(), plain+int64(tr.tm.BatchBudget); got != w || got != want() {
+		t.Fatalf("a 2-s write: capacity %d, want %d (one batch more than without the lag)", got, w)
+	}
+	// Nothing without a delivered rate.
+	st.dlvRate = 0
+	if got := capNow(); got != plain {
+		t.Fatalf("no delivered rate: capacity %d, want the plain %d", got, plain)
 	}
 }
