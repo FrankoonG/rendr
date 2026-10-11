@@ -361,7 +361,11 @@ func (p *acPassive) admitJoin(h *carrier.Hello) {
 	p.joins[st]++
 	p.mu.Unlock()
 	if !taken {
-		p.answerJoin(h.Conn, st)
+		var code uint32
+		if st == wire.StatusUnknownSession && h.Conn.EndCodes() {
+			code = s.EndCode() // as the root's admitJoin (WP13 B-1, L47)
+		}
+		p.answerJoinCode(h.Conn, st, code)
 	}
 }
 
@@ -373,9 +377,13 @@ func (p *acPassive) answerOpen(c *carrier.Conn, oa wire.OpenAck) {
 }
 
 // answerJoin writes JOIN_ACK(st) on the unstarted carrier c and closes it.
-func (p *acPassive) answerJoin(c *carrier.Conn, st wire.AckStatus) {
+func (p *acPassive) answerJoin(c *carrier.Conn, st wire.AckStatus) { p.answerJoinCode(c, st, 0) }
+
+// answerJoinCode is answerJoin with an UNKNOWN_SESSION's end code (0: the
+// canonical JOIN_ACK), for a carrier that negotiated wire.OptEndCode.
+func (p *acPassive) answerJoinCode(c *carrier.Conn, st wire.AckStatus, code uint32) {
 	var b [wire.JoinAckLen]byte
-	c.WriteAndClose(wire.TypeJoinAck, 0, wire.SessionHandle, b[:wire.PutJoinAck(b[:], &wire.JoinAck{Status: st})], time.Time{})
+	c.WriteAndClose(wire.TypeJoinAck, 0, wire.SessionHandle, b[:wire.PutJoinAckMux(b[:], &wire.JoinAck{Status: st}, code)], time.Time{})
 	p.closed(c)
 }
 

@@ -39,8 +39,9 @@ const (
 	// carrier writer queue.
 	churnRSTInFlight = 250 * time.Millisecond
 	// churnRSTLostMax caps the reset connections whose RST a kill took
-	// down (see runRST): about one per run is observed.
-	churnRSTLostMax = 5
+	// down (see runRST): none since the tombstone carries the code to the
+	// rejoin (OptEndCode, M4 WP13 B-1; one per run before).
+	churnRSTLostMax = 0
 	// churnStage is a live stream carrier's reader stage in BufferedBytes
 	// (the Status doc: carrier.BigData plus the size class's slack).
 	churnStage = carrier.BigData + carrier.ClassSlack
@@ -114,8 +115,8 @@ type churnKillRec struct {
 // PASS: every designed outcome exact — refusals with their code (and the
 // dropped SYN at the 5-s budget, + 1 s), resets mid-response as a reset at
 // the client after a PRNG prefix and *AbortError{l4.AbortReset} from the
-// peer (or, at most churnRSTLostMax times, ErrSessionLost from a JOIN's
-// UNKNOWN_SESSION when a kill took the passive's RST down: see runRST),
+// peer (also when a kill took the passive's RST down: the tombstone's
+// JOIN_ACK carries its code; churnRSTLostMax is 0, see runRST),
 // the stall and never-reading classes released at the idle limit (in
 // [30 s − the poll step, 30 s + DeadMax + 1 s] after the session's last
 // progress, ErrIdleTimeout at the ingress, *AbortError{AbortIdle} from the
@@ -488,10 +489,10 @@ func (s *churn) runRST(addr string) error {
 	}
 	// The passive's RST travels once, on the carrier the session had then.
 	// When a kill takes it down with that carrier, the dialer's JOIN finds
-	// the passive's tombstone and the session is lost (plan §5:
-	// UNKNOWN_SESSION → ErrSessionLost); the client still sees a reset.
-	// This outcome is accepted only with that exact mechanism (and capped
-	// in the run; open item: whether an RST must survive a carrier death).
+	// the passive's tombstone, which answers UNKNOWN_SESSION with the RST's
+	// code (OptEndCode, M4 WP13 B-1): *AbortError{l4.AbortReset} as above.
+	// A loss (ErrSessionLost) is diagnosed with its mechanism and counted
+	// against churnRSTLostMax (0).
 	if !res.Clean && errors.Is(res.SessionErr, rendr.ErrSessionLost) {
 		if err := s.rstLostByKill(in, res.SessionErr); err != nil {
 			return fmt.Errorf("ingress Forward %+v, want the peer's *AbortError{l4.AbortReset}; ErrSessionLost without its RST lost to a kill: %v", res, err)

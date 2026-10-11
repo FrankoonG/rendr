@@ -221,7 +221,10 @@ func (rt *Runtime) routeOpen(r lookupResult[*session.Session], c *carrier.Conn, 
 // admitJoin routes a JOIN carrier (design §6.3; L48: no OPEN capacity,
 // backlog or MaxSessions check applies). The Runtime answers only what the
 // table decides: no entry or a tombstone is UNKNOWN_SESSION (a JOIN from
-// another dialer instance cannot find the key, plan §3.4). A live session
+// another dialer instance cannot find the key, plan §3.4) — on a carrier
+// that negotiated wire.OptEndCode (any of its views), an opened session's
+// tombstone adds the RST code that session decided (WP13 B-1, L47; 0 for
+// none). A live session
 // decides everything else under its own lock (pending: BAD_REQUEST; ended:
 // UNKNOWN_SESSION; mode; the carrier's kind and a packet session's cmtu
 // offer, M2 design §A3.5; carrier limit; rxNext), and the root writes the
@@ -243,13 +246,17 @@ func (rt *Runtime) admitJoin(ln *Listener, h *carrier.Hello, deadline time.Time,
 	}
 	j, err := wire.ParseJoin(h.Payload)
 	if err != nil {
-		answerJoin(c, wire.StatusBadRequest, deadline)
+		answerJoin(c, wire.StatusBadRequest, 0, deadline)
 		return true
 	}
 	j.RxNext = joinOffer(j.RxNext, c.Kind(), limit)
 	r := rt.table.lookup(passiveKey(InstanceID(h.Preface.Instance), SessionID(j.SID)), time.Now())
 	if !r.found || r.tomb || r.sess == nil {
-		answerJoin(c, wire.StatusUnknownSession, deadline)
+		var code uint32
+		if r.tomb && r.verdict.Opened && c.EndCodes() {
+			code = r.verdict.Code // the ended session's own RST (WP13 B-1, L47)
+		}
+		answerJoin(c, wire.StatusUnknownSession, code, deadline)
 		return true
 	}
 	taken, st := r.sess.Join(c, &j)
@@ -259,7 +266,13 @@ func (rt *Runtime) admitJoin(ln *Listener, h *carrier.Hello, deadline time.Time,
 		}
 		return false
 	}
-	answerJoin(c, st, deadline)
+	var code uint32
+	if st == wire.StatusUnknownSession && c.EndCodes() {
+		// Ended before Registry.Ended made it a tombstone: the same code
+		// (WP13 B-1, L47).
+		code = r.sess.EndCode()
+	}
+	answerJoin(c, st, code, deadline)
 	return true
 }
 

@@ -1,7 +1,10 @@
 package lessons2
 
 import (
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -126,88 +129,143 @@ func TestIdleSurvivesRepeatedDeaths_L19(t *testing.T) {
 	})
 }
 
-// TestUnknownSessionIsSessionLost_L19 (L19): the bound instance forgets the
+// TestUnknownSessionIsSessionLost_L19 (L19, L47): the bound instance forgets the
 // session while the dialer is cut off — the passive's IdleTimeout ends it,
 // its tombstone remains — and the dialer, still inside its 60 s grace,
 // redials (jitter fixed at its mean, so the redial times are reproducible).
-// The JOIN is answered UNKNOWN_SESSION and the session ends with
-// ErrSessionLost within one RTT of that redial's start, without waiting for
-// the grace.
+// The JOIN is answered UNKNOWN_SESSION and the session ends within one RTT
+// of that redial's start, without waiting for the grace: with
+// ErrSessionLost when the JOIN carrier did not negotiate OptEndCode (the
+// passive reads PREFACEs with that bit cleared: a dialer of M3), and with
+// the passive's own RST code — *AbortError{AbortIdle, Remote}, which the
+// tombstone carries in the JOIN_ACK — when it did (M4 WP13 B-1).
 func TestUnknownSessionIsSessionLost_L19(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		var mu sync.Mutex
-		var starts []time.Time
-		dov := &testhooks.Overrides{Rand: func() float64 { return 0.5 }, Hooks: &testhooks.Hooks{DialStart: func(int) {
-			mu.Lock()
-			starts = append(starts, time.Now())
-			mu.Unlock()
-		}}}
-		e := newEnvSplit(t, rendr.Config{}, rendr.Config{IdleTimeout: 10 * time.Second}, dov, nil)
-		const oneWay = 5 * time.Millisecond
-		a := e.path("a", oneWay)
-		dc, pc := e.open(e.peer(a), rendr.DialOptions{NoPathGrace: time.Minute})
-		// The passive's idle clock starts at its last read or at the last
-		// acknowledged delivery of its data, whichever is later.
-		exchange(t, dc, pc, 256<<10, 193)
-
-		a.link.SetRefuse(true)
-		cut := time.Now()
-		if n := a.link.Kill(); n != 1 {
-			t.Fatalf("Kill killed %d carriers", n)
-		}
-		waitEnded(t, pc, 15*time.Second)
-		if st := pc.Status(); !errors.Is(st.Err, rendr.ErrIdleTimeout) {
-			t.Fatalf("passive ended with %v, want ErrIdleTimeout", st.Err)
-		}
-		// The Runtime records the tombstone when the ended session leaves
-		// its tables, just after the session's Done (a premise flake of the
-		// Linux race lane read it at once).
-		waitFor(t, time.Second, time.Millisecond, "the passive's tombstone", func() bool {
-			return e.p.Status().Sessions.Tombstones == 1
+	for _, tc := range []struct {
+		name    string
+		strip   bool // the passive reads every PREFACE without OptEndCode
+		dialEnd func(err error) bool
+	}{
+		{"JOIN without OptEndCode", true, func(err error) bool { return isTerminal(err, rendr.ErrSessionLost) }},
+		{"JOIN with OptEndCode", false, func(err error) bool {
+			var ae *rendr.AbortError
+			return errors.As(err, &ae) && ae.Code == rendr.AbortIdle && ae.Remote
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { unknownSessionRow(t, tc.strip, tc.dialEnd) })
 		})
-		if st := dc.Status(); st.State != rendr.StateOpen || !st.InNoPath {
-			t.Fatalf("dialer while cut off: %+v", st)
-		}
-		if a.link.Stats().DialFailures < 2 {
-			t.Fatalf("stimulus: %d refused redials while cut off", a.link.Stats().DialFailures)
-		}
+	}
+}
 
-		rres := goOp(func() (int, error) { return dc.Read(make([]byte, 1)) })
-		fixed := time.Now()
-		a.link.SetRefuse(false)
-		r := await(t, rres, 10*time.Second, "Read after the redial")
-		if !isTerminal(r.err, rendr.ErrSessionLost) {
-			t.Fatalf("Read = %v, want ErrSessionLost", r.err)
-		}
+// unknownSessionRow is one row of TestUnknownSessionIsSessionLost_L19.
+func unknownSessionRow(t *testing.T, strip bool, dialEnd func(error) bool) {
+	var mu sync.Mutex
+	var starts []time.Time
+	// A fixed first fseq on both ends (L14: identical presets), so that a
+	// PREFACE edited on its way (strip) does not move the fseq it seeds.
+	dov := &testhooks.Overrides{FirstFseq: 1, Rand: func() float64 { return 0.5 }, Hooks: &testhooks.Hooks{DialStart: func(int) {
 		mu.Lock()
-		var att time.Time
-		for _, s := range starts {
-			if !s.Before(fixed) {
-				att = s
-				break
-			}
-		}
+		starts = append(starts, time.Now())
 		mu.Unlock()
-		if att.IsZero() || r.at.Sub(att) > 2*oneWay+time.Millisecond {
-			t.Fatalf("ErrSessionLost %v after the redial started, want within one RTT", r.at.Sub(att))
-		}
-		if r.at.Sub(cut) >= time.Minute {
-			t.Fatal("the session ended only at its grace")
-		}
-		var answered bool
-		for _, c := range a.sessionConns(false) {
-			for _, f := range c.out.list(wire.TypeJoinAck) {
-				answered = answered || f.b0 == byte(wire.StatusUnknownSession)
-			}
-		}
-		if !answered {
-			t.Fatal("stimulus: no JOIN_ACK(UNKNOWN_SESSION) crossed the wire")
-		}
-		if st := dc.Status(); st.State != rendr.StateEnded || !isTerminal(st.Err, rendr.ErrSessionLost) {
-			t.Fatalf("dialer status %+v", st)
-		}
-		e.close()
+	}}}
+	e := newEnvSplit(t, rendr.Config{}, rendr.Config{IdleTimeout: 10 * time.Second}, dov, &testhooks.Overrides{FirstFseq: 1})
+	const oneWay = 5 * time.Millisecond
+	a := e.path("a", oneWay)
+	if strip {
+		a.setFar(func(c net.Conn) error { return e.ln.Handle(&endCodeStrip{Conn: c}) })
+	}
+	dc, pc := e.open(e.peer(a), rendr.DialOptions{NoPathGrace: time.Minute})
+	// The passive's idle clock starts at its last read or at the last
+	// acknowledged delivery of its data, whichever is later.
+	exchange(t, dc, pc, 256<<10, 193)
+
+	a.link.SetRefuse(true)
+	cut := time.Now()
+	if n := a.link.Kill(); n != 1 {
+		t.Fatalf("Kill killed %d carriers", n)
+	}
+	waitEnded(t, pc, 15*time.Second)
+	if st := pc.Status(); !errors.Is(st.Err, rendr.ErrIdleTimeout) {
+		t.Fatalf("passive ended with %v, want ErrIdleTimeout", st.Err)
+	}
+	// The Runtime records the tombstone when the ended session leaves
+	// its tables, just after the session's Done (a premise flake of the
+	// Linux race lane read it at once).
+	waitFor(t, time.Second, time.Millisecond, "the passive's tombstone", func() bool {
+		return e.p.Status().Sessions.Tombstones == 1
 	})
+	if st := dc.Status(); st.State != rendr.StateOpen || !st.InNoPath {
+		t.Fatalf("dialer while cut off: %+v", st)
+	}
+	if a.link.Stats().DialFailures < 2 {
+		t.Fatalf("stimulus: %d refused redials while cut off", a.link.Stats().DialFailures)
+	}
+
+	rres := goOp(func() (int, error) { return dc.Read(make([]byte, 1)) })
+	fixed := time.Now()
+	a.link.SetRefuse(false)
+	r := await(t, rres, 10*time.Second, "Read after the redial")
+	if !dialEnd(r.err) {
+		t.Fatalf("Read = %v after the UNKNOWN_SESSION", r.err)
+	}
+	mu.Lock()
+	var att time.Time
+	for _, s := range starts {
+		if !s.Before(fixed) {
+			att = s
+			break
+		}
+	}
+	mu.Unlock()
+	if att.IsZero() || r.at.Sub(att) > 2*oneWay+time.Millisecond {
+		t.Fatalf("the end %v after the redial started, want within one RTT", r.at.Sub(att))
+	}
+	if r.at.Sub(cut) >= time.Minute {
+		t.Fatal("the session ended only at its grace")
+	}
+	var answered bool
+	for _, c := range a.sessionConns(false) {
+		for _, f := range c.out.list(wire.TypeJoinAck) {
+			answered = answered || f.b0 == byte(wire.StatusUnknownSession)
+		}
+	}
+	if !answered {
+		t.Fatal("stimulus: no JOIN_ACK(UNKNOWN_SESSION) crossed the wire")
+	}
+	if st := dc.Status(); st.State != rendr.StateEnded || !dialEnd(st.Err) {
+		t.Fatalf("dialer status %+v", st)
+	}
+	e.close()
+}
+
+// endCodeStrip is a passive end that reads the dialer's PREFACE with
+// wire.OptEndCode cleared (and a fresh CRC): the passive sees a dialer
+// that does not offer it (M3) and answers the canonical JOIN_ACK. Both
+// ends need a fixed first fseq (testhooks FirstFseq): by default the
+// PREFACE's bytes seed it.
+type endCodeStrip struct {
+	net.Conn
+	pre  []byte // the edited PREFACE, until it was read
+	done bool
+}
+
+func (c *endCodeStrip) Read(b []byte) (int, error) {
+	if !c.done {
+		c.done = true
+		c.pre = make([]byte, wire.PrefaceLen)
+		if _, err := io.ReadFull(c.Conn, c.pre); err != nil {
+			return 0, err
+		}
+		opt := binary.BigEndian.Uint32(c.pre[12:16]) &^ wire.OptEndCode
+		binary.BigEndian.PutUint32(c.pre[12:16], opt)
+		binary.BigEndian.PutUint32(c.pre[36:40], crc32.Checksum(c.pre[:36], crc32.MakeTable(crc32.Castagnoli)))
+	}
+	if len(c.pre) > 0 {
+		n := copy(b, c.pre)
+		c.pre = c.pre[n:]
+		return n, nil
+	}
+	return c.Conn.Read(b)
 }
 
 // TestPeerRestartFastFail_L19 (L19, plan §3.4). The passive instance

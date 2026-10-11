@@ -137,7 +137,7 @@ func TestRefusalCodesM3(t *testing.T) {
 // version answer); unknown optional bits are still ignored and OptMux as a
 // required bit is still an unknown required feature (M3 design §A3.1).
 func TestPrefaceOptMux_L44(t *testing.T) {
-	if OptMux != 1 || KnownOptional != OptMux || KnownRequired != 0 {
+	if OptMux != 1 || KnownOptional != OptMux|OptEndCode || KnownRequired != 0 { // M4 adds OptEndCode (WP13 B-1)
 		t.Fatalf("OptMux %#x, KnownOptional %#x, KnownRequired %#x", OptMux, KnownOptional, KnownRequired)
 	}
 	// Set and decoded, on both carrier kinds, with and without unknown
@@ -158,8 +158,9 @@ func TestPrefaceOptMux_L44(t *testing.T) {
 			if got, err := ParsePrefaceAck(b); err != nil || got != a {
 				t.Errorf("PREFACE_ACK opt %#x: %+v, %v", a.Opt, got, err)
 			}
-			// The echo: OptMux iff offered, never an unknown bit.
-			if want := opt & OptMux; a.Opt != want {
+			// The echo: OptMux (and M4's OptEndCode) iff offered, never an
+			// unknown bit.
+			if want := opt & (OptMux | OptEndCode); a.Opt != want {
 				t.Errorf("EchoOpt(%#x) = %#x, want %#x", opt, a.Opt, want)
 			}
 			// The dialer's view of its own offer and that echo.
@@ -200,7 +201,7 @@ func TestPrefaceOptMux_L44(t *testing.T) {
 			t.Errorf("MuxNegotiated(%#x, %#x) = %v, %v; want %v, %v", c.sent, c.answered, mux, err, c.mux, c.err)
 		}
 	}
-	for _, c := range []struct{ in, out uint32 }{{0, 0}, {OptMux, OptMux}, {0xfffffffe, 0}, {0xffffffff, OptMux}, {0x80000001, OptMux}} {
+	for _, c := range []struct{ in, out uint32 }{{0, 0}, {OptMux, OptMux}, {0xfffffffc, 0}, {0xfffffffe, OptEndCode}, {0xffffffff, OptMux | OptEndCode}, {0x80000001, OptMux}} { // M4: OptEndCode
 		if got := EchoOpt(c.in); got != c.out {
 			t.Errorf("EchoOpt(%#x) = %#x, want %#x", c.in, got, c.out)
 		}

@@ -16,8 +16,9 @@ import (
 // PREFACE_ACK and frames, or several frames), "flow_header" (a bare valid
 // raw-UDP flow header) and "udp" (a flow header and valid rendr bytes); M3
 // decodes a JOIN_ACK on a later handle with the MUX parser when the
-// dedicated one refuses it (a coded view refusal). A single element is its
-// own decoder's, so the sets stay disjoint.
+// dedicated one refuses it (a coded view refusal); M4 (WP13 B-1) does so
+// for an UNKNOWN_SESSION on handle 1 too (an end code under OptEndCode).
+// A single element is its own decoder's, so the sets stay disjoint.
 func acceptors(b []byte) []string {
 	var out []string
 	if _, err := ParsePreface(b); err == nil {
@@ -28,8 +29,9 @@ func acceptors(b []byte) []string {
 	}
 	if f, n, err := DecodeFrame(b); err == nil && n == len(b) {
 		_, err := decodeTyped(f.Type, f.Payload)
-		if err != nil && f.Type == TypeJoinAck && f.Handle > SessionHandle {
-			// A view's JOIN_ACK on a MUX trunk may carry a refusal code.
+		if err != nil && f.Type == TypeJoinAck && (f.Handle > SessionHandle || len(f.Payload) > 0 && AckStatus(f.Payload[0]) == StatusUnknownSession) {
+			// A view's JOIN_ACK on a MUX trunk may carry a refusal code;
+			// an UNKNOWN_SESSION on handle 1 an end code (OptEndCode).
 			_, _, err = ParseJoinAckMux(f.Payload)
 		}
 		if err == nil {

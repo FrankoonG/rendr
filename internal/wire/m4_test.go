@@ -15,7 +15,10 @@ import (
 
 // goldenVectorsM4 builds the vectors M4 adds (M4 design §A3.5), after every
 // M1–M3 vector: the M1 OPEN vector (open_mlen0) with EARLY set, EARLY on a
-// packet OPEN, and flag bit 1 (still reserved).
+// packet OPEN, and flag bit 1 (still reserved); then (WP13 B-1) a PREFACE
+// and a PREFACE_ACK with OptEndCode and the JOIN_ACK(UNKNOWN_SESSION) on
+// handle 1 that carries an end code under it (the code-free form is
+// join_ack_unknown_session).
 func goldenVectorsM4() []vector {
 	var vs []vector
 	add := func(v vector) { vs = append(vs, v) }
@@ -27,8 +30,15 @@ func goldenVectorsM4() []vector {
 	bit1 := gEarlyOpen()
 	bit1.Flags = 1 << 1
 	add(rejectFrameVec("open_flags_2", TypeOpen, FirstFseq, SessionHandle, bit1, ErrReserved))
+	add(prefaceVec("preface_optendcode", Preface{Kind: KindStream, Opt: OptEndCode, Instance: gDialer, CarrierID: gCarrier}))
+	add(prefaceAckVec("preface_ack_optendcode", PrefaceAck{Status: PrefaceOK, Opt: OptEndCode, Instance: gPassive, CarrierID: gCarrier}))
+	add(frameVec("join_ack_unknown_session_endcode", TypeJoinAck, 0, FirstFseq, SessionHandle, joinAckMuxVal{A: JoinAck{Status: StatusUnknownSession}, Code: gEndCode}))
 	return vs
 }
+
+// gEndCode is the end code of the golden JOIN_ACK(UNKNOWN_SESSION) under
+// OptEndCode: an application abort code (0x5000).
+const gEndCode uint32 = 0x5000
 
 // gEarlyOpen is the M1 OPEN vector open_mlen0 with OpenFlagEarly.
 func gEarlyOpen() Open {

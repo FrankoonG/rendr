@@ -244,17 +244,20 @@ func TestTrunkOptMuxNegotiation_L44(t *testing.T) {
 	setMux := func(b []byte) { b[15] |= byte(wire.OptMux) }
 	clearOpt := func(b []byte) { b[12], b[13], b[14], b[15] = 0, 0, 0, 0 }
 	setUnknown := func(b []byte) { b[15] |= byte(optUnknown) }
+	// A stream session carrier of a mux factory, and every stream JOIN,
+	// also offers OptEndCode (M4, WP13 B-1), echoed like OptMux.
+	const ec = wire.OptEndCode
 	cases := []muxCase{
-		{name: "mux OPEN", mux: true, first: wire.TypeOpen, prefOpt: wire.OptMux, ackOpt: wire.OptMux, dialerMux: true, passiveMux: true},
-		{name: "mux JOIN", mux: true, first: wire.TypeJoin, prefOpt: wire.OptMux, ackOpt: wire.OptMux, dialerMux: true, passiveMux: true},
+		{name: "mux OPEN", mux: true, first: wire.TypeOpen, prefOpt: wire.OptMux | ec, ackOpt: wire.OptMux | ec, dialerMux: true, passiveMux: true},
+		{name: "mux JOIN", mux: true, first: wire.TypeJoin, prefOpt: wire.OptMux | ec, ackOpt: wire.OptMux | ec, dialerMux: true, passiveMux: true},
 		{name: "probe of a mux factory", mux: true, first: wire.TypePing},
 		{name: "dedicated factory", first: wire.TypeOpen},
-		{name: "passive without mux", mux: true, first: wire.TypeOpen, passive: clearOpt, prefOpt: wire.OptMux, passiveMux: true},
+		{name: "passive without mux", mux: true, first: wire.TypeOpen, passive: clearOpt, prefOpt: wire.OptMux | ec, passiveMux: true},
 		{name: "probe offering mux", first: wire.TypePing, dialer: setMux, passive: clearOpt, prefOpt: wire.OptMux},
 		{name: "unsolicited echo", first: wire.TypeOpen, passive: setMux, violation: true},
 		// Unknown optional bits are ignored and never echoed (§A3.1): the
-		// PREFACE_ACK carries exactly OptMux or nothing.
-		{name: "unknown bit with mux", mux: true, first: wire.TypeOpen, dialer: setUnknown, prefOpt: wire.OptMux | optUnknown, ackOpt: wire.OptMux, dialerMux: true, passiveMux: true},
+		// PREFACE_ACK carries exactly the known bits offered.
+		{name: "unknown bit with mux", mux: true, first: wire.TypeOpen, dialer: setUnknown, prefOpt: wire.OptMux | ec | optUnknown, ackOpt: wire.OptMux | ec, dialerMux: true, passiveMux: true},
 		{name: "unknown bit alone", first: wire.TypeOpen, dialer: setUnknown, prefOpt: optUnknown},
 	}
 	for _, tc := range cases {
@@ -453,6 +456,10 @@ func muxDatagram(t *testing.T) {
 		{name: "probe offering mux", opt: wire.OptMux, first: wire.TypePing, wantAck: wire.OptMux},
 		{name: "unknown bit with mux", opt: wire.OptMux | optUnknown, first: wire.TypeOpen, wantAck: wire.OptMux, wantMux: true},
 		{name: "unknown bit alone", opt: optUnknown, first: wire.TypeOpen},
+		// No coded JOIN_ACK on a datagram carrier: OptEndCode is never
+		// echoed there (WP13 B-1 review).
+		{name: "end code offered", opt: wire.OptMux | wire.OptEndCode, first: wire.TypeOpen, wantAck: wire.OptMux, wantMux: true},
+		{name: "end code offered on a JOIN", opt: wire.OptEndCode, first: wire.TypeJoin},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			wbBubble(t, func(t *testing.T) {
@@ -466,6 +473,10 @@ func muxDatagram(t *testing.T) {
 				h1 := pre
 				if tc.first == wire.TypePing {
 					h1 = append(h1, wbFrame(wire.TypePing, 0, first, 0, wbPingPayload(wire.Ping{ID: 1, Nonce: 42}))...)
+				} else if tc.first == wire.TypeJoin {
+					jp := make([]byte, wire.JoinLen)
+					wire.PutJoin(jp, &wire.Join{SID: wbSID, Mode: 1, RxNext: 1100}) // a packet session's cmtu offer
+					h1 = append(h1, wbFrame(wire.TypeRel, 0, first, 0, relPayloadOf(denv.Presets.firstCseq(), wire.TypeJoin, 0, wire.SessionHandle, jp))...)
 				} else {
 					h1 = append(h1, wbFrame(wire.TypeRel, 0, first, 0, relPayloadOf(denv.Presets.firstCseq(), tc.first, 0, wire.SessionHandle, wbOpen(1100)))...)
 				}
@@ -497,6 +508,9 @@ func muxDatagram(t *testing.T) {
 				}
 				if r.h.Conn.Mux() != tc.wantMux {
 					t.Errorf("passive Mux %v, want %v", r.h.Conn.Mux(), tc.wantMux)
+				}
+				if r.h.Conn.EndCodes() {
+					t.Error("a datagram passive carrier negotiated OptEndCode")
 				}
 			})
 		})

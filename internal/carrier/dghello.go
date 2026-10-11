@@ -388,7 +388,11 @@ func acceptH1(env *Env, io PacketIO, d []byte, h *helloH1) (*Hello, error) {
 		check = newNonce()
 	}
 	var ab [wire.PrefaceLen]byte
-	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Opt: echoOpt(&h.pf), Instance: env.Local, CarrierID: h.pf.CarrierID})
+	// wire.OptEndCode is never echoed on a datagram carrier: its
+	// JOIN_ACK(UNKNOWN_SESSION) has no coded form in this build (WP13
+	// B-1 covers stream carriers only), and the echo would promise one.
+	opt := echoOpt(&h.pf) &^ wire.OptEndCode
+	wire.PutPrefaceAck(ab[:], &wire.PrefaceAck{Minor: wire.Minor, Status: wire.PrefaceOK, Opt: opt, Instance: env.Local, CarrierID: h.pf.CarrierID})
 	afirst := env.Presets.fseqFrom(ab[:])
 	h2 := append(make([]byte, 0, wire.PrefaceLen+2*wire.FrameOverhead+wire.RackLen+wire.PingFixedLen), ab[:]...)
 	fcs := env.Presets.firstCseq()

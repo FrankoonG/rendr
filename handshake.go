@@ -211,13 +211,16 @@ func answerOpen(c *carrier.Conn, a wire.OpenAck, deadline time.Time) {
 
 // answerJoin writes one JOIN_ACK refusal as c's first frame and closes c
 // (on a view of a live MUX trunk: an answer in the trunk's refusal ring,
-// R1-4).
-func answerJoin(c *carrier.Conn, st wire.AckStatus, deadline time.Time) {
+// R1-4). A non-zero code is an UNKNOWN_SESSION's end code, only for a
+// carrier that negotiated wire.OptEndCode (admitJoin): its RxNext field
+// carries it (PutJoinAckMux's layout, a view's refusal code); 0 writes the
+// canonical JOIN_ACK.
+func answerJoin(c *carrier.Conn, st wire.AckStatus, code uint32, deadline time.Time) {
 	if isView(c) {
-		c.Refuse(c.Handle(), carrier.Answer{Type: wire.TypeJoinAck, Status: st})
+		c.Refuse(c.Handle(), carrier.Answer{Type: wire.TypeJoinAck, Status: st, Code: code})
 		return
 	}
 	var b [wire.JoinAckLen]byte
-	n := wire.PutJoinAck(b[:], &wire.JoinAck{Status: st})
+	n := wire.PutJoinAckMux(b[:], &wire.JoinAck{Status: st}, code)
 	c.WriteAndClose(wire.TypeJoinAck, 0, wire.SessionHandle, b[:n], deadline)
 }
