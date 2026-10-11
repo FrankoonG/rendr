@@ -193,8 +193,9 @@ type BatchIO interface {
 	// that the transport fills, as WriteDatagram writes one: ds[:n] were
 	// sent; err, if any, is ds[n]'s, classified as WriteDatagram's error
 	// would be (wire.ErrDatagramTooLarge, ErrNoise, or death). A count
-	// outside [0, len(ds)], or n < len(ds) without an error, is death
-	// (L42). The writer never passes more than MaxBatch() datagrams.
+	// outside [0, len(ds)], n < len(ds) without an error, or n == len(ds)
+	// with one (an error of no datagram), is death (L42). The writer never
+	// passes more than MaxBatch() datagrams.
 	WriteDatagrams(ds [][]byte) (n int, err error)
 	// ReadDatagrams fills rs[:n], n ≥ 1, in arrival order, each what
 	// ReadDatagram would have returned for that datagram, or returns n = 0
@@ -205,6 +206,13 @@ type BatchIO interface {
 	// stay valid until the reader's next ReadDatagrams or Release — as
 	// PacketIO.Release returns those of the latest call, the reader calls
 	// it after handling a call's results.
+	//
+	// A call ends at its first ReadCandidate result (it is rs[n-1]): the
+	// reader handles it — its challenge answer may commit a rebind (SetPeer)
+	// — before the transport classifies a later datagram, and the
+	// transport's latest candidate is that result's source, exactly as with
+	// one ReadDatagram per datagram (L55: batching on and off behave the
+	// same). A transport that cannot rebind never returns one.
 	ReadDatagrams(rs []ReadResult) (n int, err error)
 	// MaxBatch is the most datagrams one call moves now (carrier/udp
 	// Options.MaxBatch while the socket batches; 1 = one per call).

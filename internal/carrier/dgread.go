@@ -48,8 +48,12 @@ type dgReader struct {
 	timer   *time.Timer // the back-off timer, created at the first back-off
 
 	// A transport with a BatchIO but no depth (a flow, M5 design §A4.5):
-	// the results of one ReadDatagrams call.
-	rs []ReadResult
+	// the results of one ReadDatagrams call. While they are handled
+	// (batch), a pause is deferred (pend, the longest asked for) until the
+	// call's buffers went back (M2: a buffer goes back before any pause).
+	rs    []ReadResult
+	batch bool
+	pend  time.Duration
 
 	// The adaptive depth of a dialer socket (depthIO; M5 design §A4.4,
 	// Revision 1 R1-4, R1-5). Depth 1 reads into buf through the socket's
@@ -90,7 +94,8 @@ type depthIO interface {
 	// arrival order: into slot0 alone, or — while the reader holds the
 	// lent h — up to h.k into slot0 and h.slots[1:h.k]. A transient error
 	// (noise, a Windows truncation) is n = 0 with its event; any other
-	// error is returned.
+	// error is returned. As BatchIO.ReadDatagrams, a call ends at its
+	// first ReadCandidate (OwnedUDP cannot rebind and never returns one).
 	readDepth(slot0 *Buf, h *ioHdr) (n int, ev ReadEvent, err error)
 	// result is the i-th datagram of the latest readDepth, classified as
 	// ReadDatagram classifies one (Data aliases its slot).
@@ -247,6 +252,13 @@ func (c *Conn) dgHandle(rd *dgReader, data []byte, src PeerKey, ev ReadEvent) bo
 // and no depth (a flow: its inbox, M5-D14) and handles its results in
 // arrival order; then the transport gets the call's buffers back
 // (Release). It reports whether the reader continues.
+//
+// A pause one of them asks for (noise back-off, the spin guard) is taken
+// after Release, the longest of them once: the transport's buffers never
+// wait out a pause, as in M2's per-datagram path; the results after the
+// one that asked are handled before it instead of after it (they were read
+// already). The transport ends a call at its first ReadCandidate (BatchIO),
+// so a rebind that result commits applies to every later datagram.
 func (c *Conn) dgReadBatch(rd *dgReader, bio BatchIO) bool {
 	n, err := bio.ReadDatagrams(rd.rs)
 	if err != nil {
@@ -254,14 +266,20 @@ func (c *Conn) dgReadBatch(rd *dgReader, bio BatchIO) bool {
 		return false
 	}
 	ok := true
+	rd.batch = true
 	for i := 0; i < n && ok; i++ {
 		r := &rd.rs[i]
 		ok = c.dgHandle(rd, r.Data, r.Src, r.Ev)
 	}
+	rd.batch = false
 	for i := range n {
 		rd.rs[i].Data, rd.rs[i].Src = nil, PeerKey{}
 	}
 	c.dg.io.Release()
+	if d := rd.pend; d > 0 {
+		rd.pend = 0
+		ok = ok && c.dgPause(rd, d)
+	}
 	return ok
 }
 
@@ -301,13 +319,16 @@ func (c *Conn) dgReadDepth(rd *dgReader) bool {
 		rd.collect()
 		if errors.Is(err, os.ErrDeadlineExceeded) && rd.woke.Swap(false) {
 			// The idle release's wake, not a caller's deadline: the read
-			// goes on (a closer that also set one closes the socket next).
+			// goes on. Every closer's SetDeadline(now) follows the close of
+			// dying (setDeath, then startCloser), so dying is checked after
+			// the deadline was cleared: a closer's deadline this clear may
+			// have erased belongs to a carrier whose reader exits here.
+			_ = d.SetReadDeadline(time.Time{})
 			select {
 			case <-c.dying:
 				return false
 			default:
 			}
-			_ = d.SetReadDeadline(time.Time{})
 			return true
 		}
 		c.readFailed(err)
@@ -513,13 +534,18 @@ func (c *Conn) dgBackoff(rd *dgReader) bool {
 	return c.dgPause(rd, rd.backoff)
 }
 
-// dgPause sleeps d on the reader's timer; it reports whether the reader
-// continues (false: the carrier is dying).
+// dgPause sleeps d on the reader's timer — or, while dgReadBatch handles a
+// call's results, defers it until the call's buffers went back; it reports
+// whether the reader continues (false: the carrier is dying).
 func (c *Conn) dgPause(rd *dgReader, d time.Duration) bool {
 	select {
 	case <-c.dying:
 		return false
 	default:
+	}
+	if rd.batch {
+		rd.pend = max(rd.pend, d) // after the call's buffers went back (dgReadBatch)
+		return true
 	}
 	if rd.timer == nil {
 		rd.timer = time.NewTimer(d)

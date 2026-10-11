@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"fmt"
 	"os"
 	"strconv"
 	"sync"
@@ -13,45 +14,68 @@ import (
 
 // The batched datagram paths under the M2/M3 rows (M5 design W1.2, WP2:
 // every M2/M3 datagram row green in both MaxBatch settings). The harness's
-// in-memory transport (fakeIO) reaches its carriers through dgBatchOf as
-// RENDR_TEST_DGBATCH says:
+// in-memory transport (fakeIO) reaches its carriers through dgBatchOf in
+// one of three settings:
 //
-//   - unset or empty: through fakeBatch with MaxBatch 32 (the default of
-//     carrier/udp): the writer's flushes, the arena and the dialer reader's
-//     adaptive depth with its idle release;
-//   - "1": through fakeBatch with MaxBatch 1 (the batched code paths, one
-//     datagram per call);
-//   - a number n ≥ 2: MaxBatch n;
-//   - "off": as M2 wrote them (one ReadDatagram and one WriteDatagram per
+//   - MaxBatch 32 (the default of carrier/udp): through fakeBatch — the
+//     writer's flushes, the arena and the dialer reader's adaptive depth
+//     with its idle release;
+//   - MaxBatch 1: through fakeBatch, the batched code paths with one
+//     datagram per call;
+//   - off: as M2 wrote them (one ReadDatagram and one WriteDatagram per
 //     datagram: the path of QUIC and embedder conns).
 //
-// Tests of their own transports (the WP2 rows) set what they need.
-var dgTestMaxBatch = func() int {
-	v := os.Getenv("RENDR_TEST_DGBATCH")
-	switch v {
-	case "":
-		return DefaultMaxBatch
-	case "off":
-		return 0
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 || n > udpsocket.MaxMsgs {
-		panic("RENDR_TEST_DGBATCH: want off, or 1 … 64")
-	}
-	return n
-}()
+// A plain `go test` of the package runs every test in all three settings,
+// one after the other (TestMain). RENDR_TEST_DGBATCH selects one: "off",
+// or a MaxBatch of 1 … 64. Tests of their own transports (the WP2 rows)
+// set what they need.
+var dgTestMaxBatch atomic.Int32
 
-func init() {
-	if dgTestMaxBatch == 0 {
-		return
+// dgSettings returns the settings TestMain runs: RENDR_TEST_DGBATCH's, or
+// the default, 1 and off (0).
+func dgSettings() []int {
+	switch v := os.Getenv("RENDR_TEST_DGBATCH"); v {
+	case "":
+		return []int{DefaultMaxBatch, 1, 0}
+	case "off":
+		return []int{0}
+	default:
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > udpsocket.MaxMsgs {
+			panic("RENDR_TEST_DGBATCH: want off, or 1 … 64")
+		}
+		return []int{n}
 	}
+}
+
+// dgSettingName names a setting in the output.
+func dgSettingName(n int) string {
+	if n == 0 {
+		return "off"
+	}
+	return "MaxBatch " + strconv.Itoa(n)
+}
+
+func TestMain(m *testing.M) {
 	base := dgBatchOf
 	dgBatchOf = func(io PacketIO) BatchIO {
 		if f, ok := io.(*fakeIO); ok {
-			return newFakeBatch(f, dgTestMaxBatch)
+			if n := int(dgTestMaxBatch.Load()); n > 0 {
+				return newFakeBatch(f, n)
+			}
 		}
 		return base(io)
 	}
+	code := 0
+	for _, n := range dgSettings() {
+		dgTestMaxBatch.Store(int32(n))
+		fmt.Fprintf(os.Stderr, "carrier: datagram rows with the harness transport at %s\n", dgSettingName(n))
+		if c := m.Run(); c != 0 {
+			fmt.Fprintf(os.Stderr, "carrier: FAIL at %s\n", dgSettingName(n))
+			code = c
+		}
+	}
+	os.Exit(code)
 }
 
 // The four states of fakeBatch.state: udpsocket.Reader's (R1-5).
@@ -73,7 +97,7 @@ const (
 // in slot 0.
 type fakeBatch struct {
 	*fakeIO
-	max int
+	mx atomic.Int32 // MaxBatch; setMax lowers it to 1 as a socket's fallback does (M5-D15)
 
 	state  atomic.Uint32
 	nparks atomic.Uint64
@@ -103,9 +127,16 @@ type fbRes struct {
 	ev   ReadEvent
 }
 
-func newFakeBatch(f *fakeIO, max int) *fakeBatch { return &fakeBatch{fakeIO: f, max: max} }
+func newFakeBatch(f *fakeIO, max int) *fakeBatch {
+	a := &fakeBatch{fakeIO: f}
+	a.mx.Store(int32(max))
+	return a
+}
 
-func (a *fakeBatch) MaxBatch() int { return a.max }
+func (a *fakeBatch) MaxBatch() int { return int(a.mx.Load()) }
+
+// setMax changes MaxBatch while the carrier runs.
+func (a *fakeBatch) setMax(n int) { a.mx.Store(int32(n)) }
 
 func (a *fakeBatch) WriteDatagrams(ds [][]byte) (int, error) {
 	a.mu.Lock()
@@ -177,7 +208,7 @@ func (a *fakeBatch) queued() bool {
 	return s.err == nil && s.ev == ReadOK
 }
 
-func (a *fakeBatch) depthMax() int { return a.max }
+func (a *fakeBatch) depthMax() int { return a.MaxBatch() }
 
 func (a *fakeBatch) readDepth(slot0 *Buf, h *ioHdr) (int, ReadEvent, error) {
 	clear(a.res[:]) // no reference to the previous call's slots
@@ -203,13 +234,17 @@ func (a *fakeBatch) readDepth(slot0 *Buf, h *ioHdr) (int, ReadEvent, error) {
 	}
 	a.res[0] = fbRes{data, src, ev}
 	n := 1
-	if ext {
-		for ; n < h.k && a.queued(); n++ {
+	if ext && ev != ReadCandidate { // a call ends at its first candidate (BatchIO)
+		for n < h.k && a.queued() {
 			data, src, ev, err := a.fakeIO.ReadDatagram(h.slots[n].B)
 			if err != nil || ev == ReadNoise {
 				break // not expected: queued() saw a datagram
 			}
 			a.res[n] = fbRes{data, src, ev}
+			n++
+			if ev == ReadCandidate {
+				break
+			}
 		}
 	}
 	a.mu.Lock()

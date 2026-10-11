@@ -380,9 +380,9 @@ const dgArenaSize = 64 << 10
 // packed again from the frame after it if the budget shrank, else the
 // flush goes on with ds[n+1:] — lost to noise (the flush goes on with
 // ds[n+1:]) or fatal (the round's unsent datagrams are never written). A
-// count outside [0, len], or a short count without an error, is fatal
-// (L42). Counters move only for the written indexes, at the call's return
-// (L55).
+// count outside [0, len], a short count without an error, or a full count
+// with one, is fatal (L42). Counters move only for the written indexes, at
+// the call's return (L55).
 func (c *Conn) dgWriteFlushes(w *writer, b *Batch, rs *dgRound, now time.Time) {
 	if b.Len() == 0 {
 		return
@@ -420,7 +420,9 @@ func (c *Conn) dgWriteFlushes(w *writer, b *Batch, rs *dgRound, now time.Time) {
 		for sent := 0; sent < nd && rs.fatal == nil; {
 			k, err := bio.WriteDatagrams(ds[sent:nd])
 			ret := time.Now()
-			if k < 0 || k > nd-sent || (err == nil && k != nd-sent) {
+			if k < 0 || k > nd-sent || (err == nil) != (k == nd-sent) {
+				// Out of range, short without an error, or an error for a
+				// datagram past the last (L42).
 				rs.fatal = errBatchCount
 				break
 			}
@@ -454,8 +456,8 @@ func dgStart(first int, ends []int, j int) int {
 }
 
 // errBatchCount: a batched write reported a count outside the datagrams it
-// was given, or fewer without an error (L42: the carrier dies, never
-// retried).
+// was given, fewer without an error, or all of them with an error (L42:
+// the carrier dies, never retried).
 var errBatchCount = errors.New("rendr/carrier: batched datagram write returned an invalid count")
 
 // errBudgetFloor: a refusal lowered the budget below wire.ControlFloor.

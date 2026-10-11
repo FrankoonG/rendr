@@ -688,36 +688,39 @@ func frameTypes(fs []wire.Frame) []string {
 
 // TestDgBatchHarnessSeam: the harness's in-memory transport reaches its
 // carriers through the batched paths — the writer's flushes and the
-// dialer reader's depth — with the MaxBatch RENDR_TEST_DGBATCH sets, or
-// through the per-datagram path with "off" (the setting of the M2/M3
-// rows in this package).
+// dialer reader's depth — with the MaxBatch of the current setting, or
+// through the per-datagram path at "off" (TestMain runs the package in
+// each setting).
 func TestDgBatchHarnessSeam(t *testing.T) {
 	f, _ := newFakeIOPair(1200)
 	bio := dgBatchOf(f)
-	if dgTestMaxBatch == 0 {
+	n := int(dgTestMaxBatch.Load())
+	if n == 0 {
 		if bio != nil {
-			t.Fatalf("RENDR_TEST_DGBATCH=off, yet the harness's transport has a BatchIO (%T)", bio)
+			t.Fatalf("setting off, yet the harness's transport has a BatchIO (%T)", bio)
 		}
 		return
 	}
 	fb, ok := bio.(*fakeBatch)
-	if !ok || fb.max != dgTestMaxBatch || fb.fakeIO != f {
-		t.Fatalf("the harness's transport reaches its carriers as %T, want a fakeBatch of %d", bio, dgTestMaxBatch)
+	if !ok || fb.MaxBatch() != n || fb.fakeIO != f {
+		t.Fatalf("the harness's transport reaches its carriers as %T, want a fakeBatch of %d", bio, n)
 	}
 	if _, ok := bio.(depthIO); !ok {
 		t.Fatal("the harness's batched transport has no depth")
 	}
-	t.Logf("M2/M3 datagram rows of this package run with MaxBatch %d", dgTestMaxBatch)
+	t.Logf("M2/M3 datagram rows of this package run with MaxBatch %d", n)
 }
 
 // TestDgramBatchCountOutOfRange_L42: a batched write that reports a count
-// outside the datagrams it was given, or fewer without an error, ends the
-// carrier (transport_error): never retried on it (L42).
+// outside the datagrams it was given, fewer without an error, or all of
+// them with an error (an error of no datagram), ends the carrier
+// (transport_error): never retried on it (L42), and never a panic of the
+// writer.
 func TestDgramBatchCountOutOfRange_L42(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		n    func(k int) int
-	}{{"short", func(k int) int { return k - 1 }}, {"over", func(k int) int { return k + 1 }}, {"negative", func(int) int { return -1 }}} {
+		n    func(k int) int // nil: the full count, with ErrNoise
+	}{{"short", func(k int) int { return k - 1 }}, {"over", func(k int) int { return k + 1 }}, {"negative", func(int) int { return -1 }}, {"full-with-error", nil}} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				a, b, fa := wp2Pair(t, 1200, 8)
@@ -726,7 +729,11 @@ func TestDgramBatchCountOutOfRange_L42(t *testing.T) {
 				a.ep.setFill(burstFill(&n, &seq, fixed(100), false))
 				settle(a, b, StartOptions{})
 				mark := len(fa.writeCalls())
-				fa.setReport(tc.n)
+				if tc.n != nil {
+					fa.setReport(tc.n)
+				} else {
+					fa.setScript(0, func(_ int, ds [][]byte) (int, error) { return len(ds), ErrNoise })
+				}
 				n.Store(8)
 				a.c.Wake()
 				hWait(t, a.c)

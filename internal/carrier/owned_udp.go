@@ -174,8 +174,8 @@ func (o *OwnedUDP) WriteDatagrams(ds [][]byte) (int, error) {
 	}
 	n, err := ob.uc.WriteBatch(h.b, ms)
 	h.put()
-	if n < 0 || n > len(ds) || (err == nil && n != len(ds)) {
-		return 0, errUDPWriteCount
+	if n < 0 || n > len(ds) || (err == nil) != (n == len(ds)) {
+		return 0, errUDPWriteCount // a full count with an error included (L42)
 	}
 	if err != nil {
 		return n, udpWriteResult(0, 1, err, false)
