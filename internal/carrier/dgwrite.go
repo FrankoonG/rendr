@@ -268,7 +268,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		c.closeSent.Store(true) // attempted: REL{CLOSE} is retransmitted until RACKed
 	}
 	c.mu.Lock()
-	c.commitLocked(w, b, end) // w.ping is false here: the PING was committed with its datagram
+	c.commitLocked(w, b, end, end) // w.ping is false here: the PING was committed with its datagram
 	c.st.txBytes += rs.txb
 	c.relAttemptedLocked(w.retx, w.retxCseq, end)
 	if rs.rackWritten && dg.peerCloseSeen && !wire.SeqLess(w.rackCum, dg.peerCloseCseq) {

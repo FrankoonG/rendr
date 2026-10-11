@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -71,15 +72,22 @@ func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Dura
 
 // lrDuplex is the passive endpoint of a duplex flow: its first Fill places
 // OPEN_ACK(OK) (ltSink), later ones bulk DATA from src; DATA it receives is
-// checked like ltSink's.
+// checked like ltSink's. With gate set, no DATA goes out until the time it
+// holds (Unix ns; 0: not yet).
 type lrDuplex struct {
 	*ltSink
-	src *hSource
+	src  *hSource
+	gate *atomic.Int64
 }
 
 func (d *lrDuplex) Fill(c *Conn, b *Batch) {
 	if !d.placed {
 		if d.ltSink.Fill(c, b); !d.placed {
+			return
+		}
+	}
+	if g := d.gate; g != nil {
+		if at := g.Load(); at == 0 || time.Now().UnixNano() < at {
 			return
 		}
 	}

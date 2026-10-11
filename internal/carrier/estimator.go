@@ -97,6 +97,10 @@ type carrierState struct {
 	dlvRate float64
 	dlvMark uint64
 	dlvAt   time.Time
+	// wlag is the write lag (writeLagLocked): how long the conn took to
+	// take a batch whose PING led its DATA, followed at once when it rises
+	// and with gain 1/8 when it falls, as revQ.
+	wlag time.Duration
 
 	// Carrier-level control.
 	pong       wire.Ping // latest PING received: answered by the next PONG (latest wins, L08)
@@ -308,16 +312,18 @@ func (t *trunk) clockStepLocked() int64 {
 	return step
 }
 
-// commitLocked accounts a batch whose write returned at at: DATA becomes
-// submitted, and the batch's PING is committed (RTT counts from here, L23;
-// a new backlog interval starts when the PING judged the previous one,
-// X4). A batch that ended cap-blocked after writing DATA asks for a cap-hit
-// PING, so the cap is released one RTT later rather than at the next PING
-// timer (msess, R13), unless a PING ended the batch (endPing) and so proves
-// all of its DATA already. A PONG that raced this write proved the bytes
-// before its PING; those of the batch itself count from here, now that
-// they are submitted (onPongLocked).
-func (t *trunk) commitLocked(w *writer, b *Batch, at time.Time) {
+// commitLocked accounts a batch whose write began at start and returned
+// at at: DATA becomes submitted, and the batch's PING is committed (RTT
+// counts from here, L23; a new backlog interval starts when the PING
+// judged the previous one, X4); a PING that led the batch's DATA gives a
+// write-lag sample (writeLagLocked). A batch that ended cap-blocked after
+// writing DATA asks for a cap-hit PING, so the cap is released one RTT
+// later rather than at the next PING timer (msess, R13), unless a PING
+// ended the batch (endPing) and so proves all of its DATA already. A PONG
+// that raced this write proved the bytes before its PING; those of the
+// batch itself count from here, now that they are submitted
+// (onPongLocked).
+func (t *trunk) commitLocked(w *writer, b *Batch, start, at time.Time) {
 	st := &t.st
 	data := uint64(b.dataBytes())
 	st.submitted += data
@@ -326,6 +332,9 @@ func (t *trunk) commitLocked(w *writer, b *Batch, at time.Time) {
 	st.frames += uint64(b.Len())
 	if w.ping {
 		t.commitPingLocked(w, at)
+		if data > 0 && !w.pingAtEnd {
+			st.noteWriteLag(at.Sub(start))
+		}
 	}
 	if data > 0 && b.CapBlocked() && !w.pingAtEnd {
 		st.pingReq = true
@@ -605,6 +614,51 @@ func (st *carrierState) noteDelivered(now time.Time) {
 		st.dlvRate = float64(st.pongMark-st.dlvMark) / dt.Seconds()
 		st.dlvMark, st.dlvAt = st.pongMark, now
 	}
+}
+
+// noteWriteLag takes a write-lag sample d (commitLocked): wlag follows a
+// rising lag at once and a falling one with gain 1/8, as revQ.
+func (st *carrierState) noteWriteLag(d time.Duration) {
+	if d > st.wlag {
+		st.wlag = d
+	} else {
+		st.wlag += (d - st.wlag) / owdGain
+	}
+}
+
+// writeLagLocked is the write-lag part of the capacity's allowance
+// (sched.CapacityDuplex): the time a conn whose Write blocks takes to take
+// a batch, which the round trip never shows. A PING that leads its batch
+// (every PING while the byte clock is off) proves the DATA submitted
+// before the batch, and its RTT counts from the batch's commit, when the
+// Write returned (L23); the bytes it proves were counted in flight since
+// the previous commit, when the PING went into the conn. Where the conn's
+// buffer (a socket buffer, a shallow bottleneck queue) is smaller than a
+// batch the Write blocks while the buffer drains, so those bytes stay in
+// flight the write lag plus the RTT (the RTT then reads short: KL-17 (d)),
+// and a capacity sized from the RTT caps the flow below the path: with
+// bulk both ways over a 128-KiB queue at 2 MiB/s, the side that lost the
+// phase of the two writers carried 0.828 of the link (KL-20; the late row
+// of TestDuplexKeepsBothDirections_L15). A PING that ends its batch
+// (endPing) proves the batch itself from its commit and gives no sample,
+// nor does a batch without DATA (TestWriteLagAllowance).
+//
+// It applies with or without the peer's BUSY (the lag is this side's
+// writes) and is at most one batch at the allowance's rate,
+// BatchBudget/min(delivered, rate): the bytes a blocked Write holds in
+// flight beyond the round trip are those the path drained meanwhile, about
+// one batch, and a write that stalls (WriteStall, a blackhole) adds no
+// more. It is measured on this side's clock and needs nothing from the
+// peer. It is 0 while Writes do not block; where bulk both ways fills a
+// deep buffer the Writes block too, and the allowance adds up to a batch
+// to the standing queue (KL-16: srtt +7–17 % on the 4 MiB/s, 2-MiB rows).
+func (t *trunk) writeLagLocked() time.Duration {
+	st := &t.st
+	r := min(st.dlvRate, st.rate)
+	if st.wlag <= 0 || !(r > 0) {
+		return 0
+	}
+	return min(st.wlag, time.Duration(float64(t.tm.BatchBudget)/r*float64(time.Second)))
 }
 
 // revDelayLocked is the reverse-path allowance of the capacity

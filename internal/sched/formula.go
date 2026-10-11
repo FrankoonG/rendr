@@ -72,10 +72,14 @@ func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) i
 
 // CapacityDuplex is the in-flight cap with an allowance for the reverse
 // path (M3 estimator amendment): clamp(2·rate·(minRTT + pingBusy + 50 ms) +
-// min(revRate, rate)·rev, floor, ceil), where rev is the queueing delay our
-// PONGs meet on their way back behind the peer's own DATA (bulk both ways
-// on one carrier) and revRate the rate this side delivered recently; a
-// non-positive (or NaN) rev, revRate or rate adds nothing.
+// min(revRate, rate)·rev, floor, ceil), where rev is the delay our proofs
+// meet beyond the round trip: the queueing our PONGs meet on their way
+// back behind the peer's own DATA (bulk both ways on one carrier), plus
+// the write lag, the time a blocking Write takes to take a batch whose
+// leading PING proves only the bytes before it (the carrier's
+// writeLagLocked, at most one batch at revRate); revRate is the rate this
+// side delivered recently. A non-positive (or NaN) rev, revRate or rate
+// adds nothing.
 //
 // A byte is proven a forward trip, the reverse queue and the rest of the
 // return trip after it is written. A cap sized from minRTT alone leaves

@@ -3,6 +3,7 @@ package carrier
 import (
 	"fmt"
 	"math"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -26,6 +27,10 @@ type duplexCase struct {
 	// since is the virtual time since the run began, before the handshake
 	// (a peer clock that drifts or steps against the dialer's).
 	pingTS func(ts uint64, since time.Duration) uint64
+	// late: the passive's bulk starts this long after the dialer's Start
+	// (it sends nothing but its OPEN_ACK before), which sets the phase of
+	// the two writers' blocking Writes.
+	late time.Duration
 }
 
 // duplexResult is what duplexRun measured over the judged window.
@@ -76,11 +81,18 @@ func duplexRun(t *testing.T, c duplexCase) duplexResult {
 	back := newSource(envP, ChunkSize, true)
 	defer back.chunk.Release()
 	back.offer(total)
-	dc, pc := lrLinkPair(t, envD, envP, c.rate, c.rtt/2, c.buf, &lrDuplex{ltSink: sink, src: back})
+	ep := &lrDuplex{ltSink: sink, src: back}
+	if c.late > 0 {
+		ep.gate = new(atomic.Int64)
+	}
+	dc, pc := lrLinkPair(t, envD, envP, c.rate, c.rtt/2, c.buf, ep)
 	src := newSource(envD, ChunkSize, true)
 	defer src.chunk.Release()
 	src.offer(total)
 	start := time.Now()
+	if ep.gate != nil {
+		ep.gate.Store(start.Add(c.late).UnixNano())
+	}
 	dc.Start(src, &hBell{}, StartOptions{})
 
 	var r duplexResult
@@ -194,9 +206,23 @@ func requireShares(t *testing.T, r duplexResult) {
 // 1.5 × (3·minRTT + 4·PingBusy + 200 ms), held over 6 s and fails on all
 // four 60-s rows: srtt up to 2.25 × the exact-estimate figure).
 //
+// The late row is the 2 MiB/s, 128-KiB row with the passive's bulk
+// starting 100 ms after the dialer's (M5, KL-20): both writers' Writes
+// block on the queue, shorter than a 256-KiB batch, and the start sets the
+// phase of the two. In this phase the passive carried 0.828 of the link
+// before the write-lag allowance (sched.CapacityDuplex, writeLagLocked):
+// its leading PINGs prove the bytes before each batch, so those bytes stay
+// in flight for the batch's blocking Write as well as the round trip, and
+// the cap held the passive below the link. A start 74–122 ms late gave
+// that phase deterministically (0.828; every other start from 0 to 400 ms
+// in 2-ms steps passed, the worst at 0.854); the race build reaches it at
+// random (KL-20: 0.844 in 19 of 7200 host -race runs of the unshifted
+// row). With the allowance every start in that sweep carries at least
+// 0.896 both ways.
+//
 // Under -race (R1-23 lever 1, I3: the rows took 43 s of the Linux race
-// lane's carrier package) the three 6-s rows and the cheapest 60-s row
-// (1 MiB/s) run, with the same criteria; the non-race lanes run all seven.
+// lane's carrier package) the four 6-s rows and the cheapest 60-s row
+// (1 MiB/s) run, with the same criteria; the non-race lanes run all eight.
 //
 // PASS: over the window after the warm-up, while both flows run, each
 // direction carries ≥ 0.85 of the link; the price of the allowance is
@@ -215,22 +241,28 @@ func TestDuplexKeepsBothDirections_L15(t *testing.T) {
 		rate float64
 		buf  int // the link's buffer per direction
 		span time.Duration
-		race bool // runs under -race too
+		race bool          // runs under -race too
+		late time.Duration // the passive's bulk starts this much later
 	}{
-		{20 * time.Millisecond, 4 << 20, 2 << 20, 6 * time.Second, true},
-		{20 * time.Millisecond, 2 << 20, (2 << 20) / 16, 6 * time.Second, true},
-		{100 * time.Millisecond, 16 << 20, 64 << 20, 6 * time.Second, true},
-		{20 * time.Millisecond, 4 << 20, 2 << 20, time.Minute, false},
-		{20 * time.Millisecond, 2 << 20, 2 << 20, time.Minute, false},
-		{20 * time.Millisecond, 1 << 20, 1 << 20, time.Minute, true},
-		{20 * time.Millisecond, 8 << 20, 8 << 20, time.Minute, false},
+		{20 * time.Millisecond, 4 << 20, 2 << 20, 6 * time.Second, true, 0},
+		{20 * time.Millisecond, 2 << 20, (2 << 20) / 16, 6 * time.Second, true, 0},
+		{20 * time.Millisecond, 2 << 20, (2 << 20) / 16, 6 * time.Second, true, 100 * time.Millisecond},
+		{100 * time.Millisecond, 16 << 20, 64 << 20, 6 * time.Second, true, 0},
+		{20 * time.Millisecond, 4 << 20, 2 << 20, time.Minute, false, 0},
+		{20 * time.Millisecond, 2 << 20, 2 << 20, time.Minute, false, 0},
+		{20 * time.Millisecond, 1 << 20, 1 << 20, time.Minute, true, 0},
+		{20 * time.Millisecond, 8 << 20, 8 << 20, time.Minute, false, 0},
 	} {
 		if carrierRace && !tc.race {
 			continue
 		}
-		t.Run(fmt.Sprintf("rtt%v/%gMiBps/buf%dKiB/%v", tc.rtt, tc.rate/(1<<20), tc.buf>>10, tc.span), func(t *testing.T) {
+		name := fmt.Sprintf("rtt%v/%gMiBps/buf%dKiB/%v", tc.rtt, tc.rate/(1<<20), tc.buf>>10, tc.span)
+		if tc.late > 0 {
+			name += fmt.Sprintf("/late%v", tc.late)
+		}
+		t.Run(name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				r := duplexRun(t, duplexCase{rtt: tc.rtt, rate: tc.rate, buf: tc.buf, warm: 2 * time.Second, span: tc.span})
+				r := duplexRun(t, duplexCase{rtt: tc.rtt, rate: tc.rate, buf: tc.buf, warm: 2 * time.Second, span: tc.span, late: tc.late})
 				requireShares(t, r)
 				for i, who := range []string{"dialer", "passive"} {
 					if bound := latencyBound(r, i, tc.rate); r.srttMax[i] > bound {
@@ -598,5 +630,110 @@ func TestDeliveredRateWindow(t *testing.T) {
 	st.noteDelivered(t0.Add(600 * time.Millisecond))
 	if want := float64(1<<20) / 0.4; st.dlvRate != want {
 		t.Fatalf("second window: delivered rate %v, want %v", st.dlvRate, want)
+	}
+}
+
+// TestWriteLagAllowance (M5, KL-20; writeLagLocked, sched.CapacityDuplex):
+// the write-lag part of the capacity's allowance, driven through
+// commitLocked with chosen write times.
+//
+//   - A write that carried DATA behind its leading PING gives a sample:
+//     the time the write took. wlag follows a rising sample at once and a
+//     falling one with gain 1/8.
+//   - A PING that ends its batch (endPing), a batch without DATA and a
+//     batch without a PING give none.
+//   - The allowance applies with or without the peer's BUSY, adds
+//     min(delivered, rate)·wlag on top of the reverse queue's part, and
+//     never more than one batch (BatchBudget) of bytes.
+func TestWriteLagAllowance(t *testing.T) {
+	const rate = 2 << 20
+	t0 := time.Unix(1000, 0)
+	env := hEnv()
+	chunk := env.Bufs.Get(ChunkSize, nil)
+	defer chunk.Release()
+	tr := &trunk{tm: hTiming(), base: t0}
+	st := &tr.st
+	st.rate, st.dlvRate = rate, rate
+	st.srtt, st.minRTT, st.rttSeen = 80*time.Millisecond, 10*time.Millisecond, true
+	allow := func(rev time.Duration, r float64) int64 {
+		return sched.CapacityDuplex(rate, st.minRTT, tr.tm.PingBusy, r, rev, tr.tm.CapFloor, tr.tm.Window)
+	}
+	capNow := func() int64 {
+		tr.mu.Lock()
+		defer tr.mu.Unlock()
+		return tr.capacityLocked()
+	}
+	if got, want := capNow(), allow(0, rate); got != want {
+		t.Fatalf("no sample yet: capacity %d, want the plain %d", got, want)
+	}
+	// write commits a batch written over [at, at+took): with a PING (led
+	// or, atEnd, ending its DATA) and data bytes of DATA.
+	var id uint32
+	write := func(at, took time.Duration, ping, atEnd bool, data int) {
+		b := NewBatch(tr.tm.BatchBudget)
+		b.Reset(t0.Add(at))
+		w := &writer{}
+		if ping {
+			id++
+			st.push(pingRecord{id: id})
+			w.ping, w.pingID, w.pingAtEnd = true, id, atEnd
+		}
+		for off := 0; off < data; off += ChunkSize {
+			if !b.AddData(wire.SessionHandle, uint64(off), chunk.B[:min(ChunkSize, data-off)], chunk, false) {
+				t.Fatal("AddData refused")
+			}
+		}
+		tr.mu.Lock()
+		tr.commitLocked(w, b, t0.Add(at), t0.Add(at+took))
+		tr.mu.Unlock()
+		b.ReleaseRefs()
+	}
+
+	write(0, 90*time.Millisecond, true, false, 192<<10)
+	if st.wlag != 90*time.Millisecond {
+		t.Fatalf("a led write of 90 ms: wlag %v, want 90ms", st.wlag)
+	}
+	if st.peerBusy {
+		t.Fatal("the peer is not BUSY in this test")
+	}
+	if got, want := capNow(), allow(90*time.Millisecond, rate); got != want {
+		t.Fatalf("wlag 90 ms without the peer's BUSY: capacity %d, want %d", got, want)
+	}
+	// None of these is a sample.
+	write(100*time.Millisecond, 500*time.Millisecond, true, true, 192<<10)   // the PING ends its DATA
+	write(700*time.Millisecond, 500*time.Millisecond, true, false, 0)        // no DATA
+	write(1300*time.Millisecond, 500*time.Millisecond, false, false, 64<<10) // no PING
+	if st.wlag != 90*time.Millisecond {
+		t.Fatalf("after writes that give no sample: wlag %v, want 90ms", st.wlag)
+	}
+	// A falling sample moves it by 1/8; a rising one at once.
+	write(2*time.Second, 10*time.Millisecond, true, false, 64<<10)
+	if want := 90*time.Millisecond - 80*time.Millisecond/owdGain; st.wlag != want {
+		t.Fatalf("a falling sample: wlag %v, want %v", st.wlag, want)
+	}
+	write(3*time.Second, 100*time.Millisecond, true, false, 256<<10)
+	if st.wlag != 100*time.Millisecond {
+		t.Fatalf("a rising sample: wlag %v, want 100ms", st.wlag)
+	}
+	// Priced at the delivered rate when it is lower, and added to the
+	// reverse queue's part.
+	st.dlvRate = rate / 2
+	if got, want := capNow(), allow(100*time.Millisecond, rate/2); got != want {
+		t.Fatalf("delivered rate/2: capacity %d, want %d", got, want)
+	}
+	st.peerBusy, st.revQ = true, 30*time.Millisecond
+	if got, want := capNow(), allow(130*time.Millisecond, rate/2); got != want {
+		t.Fatalf("with a 30-ms reverse queue: capacity %d, want %d", got, want)
+	}
+	st.peerBusy, st.revQ, st.dlvRate = false, 0, rate
+	// At most one batch of bytes: a stalled write of 2 s adds BatchBudget.
+	write(4*time.Second, 2*time.Second, true, false, 64<<10)
+	if got, want := capNow(), allow(0, rate)+int64(tr.tm.BatchBudget); got != want {
+		t.Fatalf("a 2-s write: capacity %d, want %d (one batch more than without the lag)", got, want)
+	}
+	// Nothing without a rate.
+	st.dlvRate = 0
+	if got, want := capNow(), allow(0, rate); got != want {
+		t.Fatalf("no delivered rate: capacity %d, want %d", got, want)
 	}
 }

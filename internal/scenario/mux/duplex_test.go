@@ -43,6 +43,18 @@ import (
 // BUSY, adds it to the capacity at the delivered rate (sched.CapacityDuplex,
 // bounded by srtt − minRTT; the floor follows a drifting or stepping peer
 // clock, TestDuplexPeerClockSkew_L15).
+//
+// The shallow Link's queue is shorter than one 256-KiB batch, so both
+// writers' Writes block, and in some interleavings of the race build
+// (about 1 in 300 host -race runs) one direction carried 0.844 (KL-20):
+// a PING leads its batch and proves only the bytes before it, which stay
+// in flight for the blocking Write as well as the round trip. The capacity
+// now also adds that write lag (M5; writeLagLocked in internal/carrier,
+// at most one batch): 0 failures in 300 host -race runs, the worst
+// direction 0.902. With the write lag the shallow Link keeps the link even
+// without the reverse-queue allowance (0.906/0.887); the deep Link, whose
+// Writes block only once its 2-MiB queue fills, is the row that needs it
+// (0.209 without).
 func TestMuxBulkBothWaysKeepsTheLink(t *testing.T) {
 	for _, c := range []struct {
 		name   string
