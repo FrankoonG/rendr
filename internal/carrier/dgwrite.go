@@ -192,6 +192,11 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	srtt := c.st.srtt
 	check := dg.chal.check
 	c.mu.Unlock()
+	// One arm per round, as in M2 (M5 design A4.3 item 5 as decided at
+	// R3-21): the stall window and the write deadline cover the whole
+	// round's bytes (wireLen), however many WriteDatagrams calls its
+	// flushes take. The watchdog guards against a stalled socket, not
+	// against latency, and a round's bytes are bounded by the queue budget.
 	stall := sched.StallWindow(srtt, b.wireLen(), 0, c.tm.WriteStall, c.tm.DeadMax)
 	gen := c.wstate.Load() >> 1
 	c.armWatchdog(gen, now, stall)

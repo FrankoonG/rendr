@@ -369,10 +369,12 @@ func (c *Conn) dgAdapt(rd *dgReader, n int, parked bool) {
 }
 
 // grow raises the depth to nk: the slots k … nk−1 taken with TryGet on
-// Env.Budget — a refusal keeps the depth and counts ChargeRefused (R1-4)
-// — and, when the held header is too small (or none is held), a header of
-// nk's class lent to the transport. A lend refused while an idle release
-// still returns earlier extras keeps depth 1.
+// Env.Budget — a refusal keeps the depth k, returns the slots the growth
+// got and counts the nk − k slots it would have added in ChargeRefused
+// (R1-4; refused receive slots on both readers, M5 design R3-23) — and,
+// when the held header is too small (or none is held), a header of nk's
+// class lent to the transport. A lend refused while an idle release still
+// returns earlier extras keeps depth 1.
 func (rd *dgReader) grow(nk int) {
 	h, k := rd.hdr, 1
 	if h != nil {
@@ -386,7 +388,7 @@ func (rd *dgReader) grow(nk int) {
 		s := rd.pool.TryGet(rd.size, rd.budget)
 		if s == nil {
 			if rd.refused != nil {
-				rd.refused.Add(1)
+				rd.refused.Add(uint64(nk - k))
 			}
 			releaseSlots(nh, k, i)
 			if nh != h {

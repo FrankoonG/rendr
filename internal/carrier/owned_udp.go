@@ -54,9 +54,10 @@ type OwnedUDP struct {
 	// The batched I/O (M5 design §A4.3, §A4.4): bound once, by the
 	// carrier's writer or reader goroutine, whichever starts first (bind).
 	// Until then — the handshake — the token reads and writes with single
-	// calls of its own, not counted.
+	// calls of its own, counted in ctr (count; R1-2, R3-31).
 	bindOnce sync.Once
 	bat      atomic.Pointer[ownedBatch]
+	ctr      *udpsocket.Counters // the Runtime's DgramStats.IO for the unbound calls; nil: not counted
 
 	// The reader half (the carrier's reader goroutine; after Start).
 	one    [1]udpsocket.Msg // a read of one datagram (slot 0)
@@ -137,6 +138,18 @@ func (o *OwnedUDP) bind(env *Env) {
 		ob.rd = udpsocket.NewReader(uc, o.releaseExtras)
 		o.bat.Store(ob)
 	})
+}
+
+// count makes the token count its unbound single calls — the dialer's
+// datagram handshake, before bind — in env's DgramStats.IO, as the bound
+// Conn counts its own (R1-2: every system call on a rendr-owned socket;
+// M5 design R3-31). The dialer's establishment calls it before the
+// handshake's first write. The calls themselves stay the plain path's
+// (no allocation, the socket's deadlines, the same errors).
+func (o *OwnedUDP) count(env *Env) {
+	if env.Dgram != nil {
+		o.ctr = &env.Dgram.IO
+	}
 }
 
 // MaxBatch implements BatchIO: the configured MaxBatch while the bound
@@ -267,6 +280,9 @@ func (o *OwnedUDP) readDepth(slot0 *Buf, h *ioHdr) (int, ReadEvent, error) {
 		m.N, _, flags, m.Addr, err = o.u.ReadMsgUDPAddrPort(m.Buf, nil)
 		m.Trunc = flags&udpMsgTrunc != 0 || m.N == len(m.Buf)
 		n = 1
+		if err == nil && m.N >= 0 && m.N <= len(m.Buf) {
+			o.ctr.AddRecv(1, 1) // unbound (bind failed): counted as a Conn counts it
+		}
 	} else {
 		n, err = ob.rd.ReadBatch(ms)
 	}
@@ -465,6 +481,9 @@ func (o *OwnedUDP) ReadDatagram(buf []byte) ([]byte, PeerKey, ReadEvent, error) 
 		return data, key, ev, nil
 	}
 	n, _, flags, src, err := o.u.ReadMsgUDPAddrPort(b, nil)
+	if err == nil && n >= 0 && n <= len(b) {
+		o.ctr.AddRecv(1, 1) // unbound (the handshake): counted as a Conn counts it
+	}
 	return o.readResult(b, n, flags, src, err)
 }
 
@@ -539,6 +558,9 @@ func (o *OwnedUDP) WriteDatagram(b []byte) error {
 		return nil
 	}
 	n, err := o.u.WriteToUDPAddrPort(b, o.peer)
+	if err == nil && n == len(b) {
+		o.ctr.AddSend(1, 1) // unbound (the handshake): counted as a Conn counts it
+	}
 	return udpWriteResult(n, len(b), err, false)
 }
 

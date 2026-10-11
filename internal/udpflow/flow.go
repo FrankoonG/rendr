@@ -61,6 +61,7 @@ type Flow struct {
 	head, n    int
 	cur        entry   // the datagram the last ReadDatagram returned, until the next call or Release
 	held       []entry // the datagrams the last ReadDatagrams returned, until the next call or Release
+	heldBytes  int64   // held's capacity, charged to Env.Stages (R3-28); 0 once Close returned it
 	reserveOut int     // control-reserve buffers in the inbox, cur or held
 	limit      int     // the receive limit in rendr bytes (SetLimit, R1-6)
 	peer       netip.AddrPort
@@ -223,13 +224,17 @@ func (f *Flow) wakeLocked() {
 }
 
 // releaseHeldLocked returns the buffers of the datagrams the reader holds:
-// the last ReadDatagram's and the last ReadDatagrams'.
+// the last ReadDatagram's and the last ReadDatagrams'. A closed flow also
+// drops the held slice itself (its charge went back at Close).
 func (f *Flow) releaseHeldLocked() {
 	f.releaseLocked(&f.cur)
 	for i := range f.held {
 		f.releaseLocked(&f.held[i])
 	}
 	f.held = f.held[:0]
+	if f.closed {
+		f.held = nil
+	}
 }
 
 // releaseLocked returns e's buffer (and its reserve slot).
@@ -451,13 +456,14 @@ func (f *Flow) SetWriteDeadline(t time.Time) error {
 }
 
 // Close implements carrier.PacketIO: removes the flow (pointer compare),
-// releases its inbox (the queued buffers and the ring) and wakes its
-// reader; the socket stays open. The buffers of the datagrams the reader
-// holds are returned by its next ReadDatagram, ReadDatagrams or Release,
-// never under it: Close may run on another goroutine while the reader
-// still uses them (PacketIO's reader half belongs to the reader), so the
-// reader must call Release (or a read, which then fails) when it exits,
-// or the buffers stay charged to Env.Budget. Close is idempotent.
+// releases its inbox (the queued buffers and the ring) and the charge of
+// its held-entry slice (R3-28) and wakes its reader; the socket stays
+// open. The buffers of the datagrams the reader holds are returned by its
+// next ReadDatagram, ReadDatagrams or Release, never under it: Close may
+// run on another goroutine while the reader still uses them (PacketIO's
+// reader half belongs to the reader), so the reader must call Release (or
+// a read, which then fails) when it exits, or the buffers stay charged to
+// Env.Budget. Close is idempotent.
 func (f *Flow) Close() error {
 	f.mu.Lock()
 	if f.closed {
@@ -471,6 +477,12 @@ func (f *Flow) Close() error {
 		f.n--
 	}
 	f.ring, f.head = nil, 0 // a stale *Flow pins no inbox (every ring access checks closed first)
+	if f.heldBytes > 0 {
+		// The slice itself may still carry the reader's datagrams: the
+		// reader's next read or Release returns them and drops it.
+		f.src.stages.Release(f.heldBytes)
+		f.heldBytes = 0
+	}
 	if f.rdlTimer != nil {
 		f.rdlTimer.Stop()
 	}

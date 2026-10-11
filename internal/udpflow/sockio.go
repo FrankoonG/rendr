@@ -3,6 +3,7 @@ package udpflow
 import (
 	"net"
 	"net/netip"
+	"unsafe"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
 	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
@@ -48,6 +49,11 @@ type sockIO interface {
 type batchToken interface {
 	NewBatchConn(ctr *udpsocket.Counters) (*udpsocket.Conn, error)
 }
+
+// rendr's own listening socket is a batchToken: a change of either side's
+// signature fails the build instead of leaving every rendr-owned Source on
+// tokenIO (R3-25).
+var _ batchToken = (*carrier.OwnedUDPSocket)(nil)
 
 // ownedIO returns the sockIO of rendr's own listening socket: the token's
 // udpsocket.Conn, counted in env.Dgram.IO, or — for a token without the
@@ -105,6 +111,13 @@ func (tokenIO) MaxBatch() int        { return 1 }
 
 // setIO makes io the Source's socket path (NewSource for rendr's own
 // socket; tests). It runs before Run.
+//
+// The writers' pool (wpool) is the one recorded exception to "every held
+// buffer is visible in BufferedBytes" (R1-5 rule 1, M5 design R3-28): an
+// idle wbatch resting in it is not charged. The garbage collector may
+// reclaim it at any time, a Batch in use is charged to Env.Stages for its
+// call (writeBatch), and the idle ones number at most the flows that
+// wrote at once.
 func (s *Source) setIO(io sockIO) {
 	s.bio = io
 	mb := io.MaxBatch()
@@ -232,9 +245,22 @@ func (f *Flow) WriteDatagrams(ds [][]byte) (int, error) {
 // ReadDatagrams implements carrier.BatchIO: it waits as ReadDatagram does
 // and then drains up to min(len(rs), MaxBatch()) inbox datagrams in
 // arrival order under one lock (no system call), each what ReadDatagram
-// would have returned for it. The buffers stay valid until the next
-// ReadDatagrams or ReadDatagram call or Release; a flow keeps the slice of
-// them (one entry per datagram of its largest batch) for its life.
+// would have returned for it. The call ends at its first ReadCandidate
+// (BatchIO; M5 design R3-14): the carrier's reader handles it — its
+// challenge answer may commit the rebind (SetPeer) — before a later
+// datagram is classified against the peer, so a datagram from another
+// source behind it in the inbox cannot replace the candidate first. The
+// buffers stay valid until the next ReadDatagrams or ReadDatagram call or
+// Release.
+//
+// A call of two or more holds its datagrams in a slice the flow keeps for
+// its life (no allocation per call). The slice is charged when it is
+// allocated and returned at Close, so BufferedBytes sees it (R3-28). The
+// charge is a holding for the flow's life, so it goes to the stage account
+// (Env.Stages, forced; design §0.14 B2, R3-28 option (b)), not to
+// MaxBufferedBytes: idle flows never shrink the advertised windows or the
+// send chunks' room, and the charge is never refused. A call of one
+// datagram holds it as ReadDatagram does and takes no slice.
 func (f *Flow) ReadDatagrams(rs []carrier.ReadResult) (int, error) {
 	k := min(len(rs), f.MaxBatch())
 	if k < 1 {
@@ -245,19 +271,49 @@ func (f *Flow) ReadDatagrams(rs []carrier.ReadResult) (int, error) {
 		f.mu.Unlock()
 		return 0, err
 	}
-	if cap(f.held) < k {
-		f.held = make([]entry, 0, k)
+	if k == 1 {
+		e, key, ev := f.popLocked()
+		if ev != carrier.ReadTruncated {
+			f.cur = e
+		}
+		rs[0] = carrier.ReadResult{Data: e.data, Src: key, Ev: ev}
+		f.mu.Unlock()
+		return 1, nil
 	}
+	f.heldRoomLocked(k)
 	n := 0
-	for ; n < k && f.n > 0; n++ {
+	for n < k && f.n > 0 {
 		e, key, ev := f.popLocked()
 		if ev != carrier.ReadTruncated {
 			f.held = append(f.held, e)
 		}
 		rs[n] = carrier.ReadResult{Data: e.data, Src: key, Ev: ev}
+		n++
+		if ev == carrier.ReadCandidate {
+			break // the call ends at its first candidate (R3-14)
+		}
 	}
 	f.mu.Unlock()
 	return n, nil
+}
+
+// heldEntryBytes is what one entry of a flow's held slice costs the stage
+// account (R3-28).
+const heldEntryBytes = int64(unsafe.Sizeof(entry{}))
+
+// heldRoomLocked makes the held slice (empty: the caller waited, which
+// returned its datagrams) able to hold k entries: a new slice is charged
+// to the Source's stage account (forced) and the old one's charge goes
+// back.
+func (f *Flow) heldRoomLocked(k int) {
+	if cap(f.held) >= k {
+		return
+	}
+	nb := int64(k) * heldEntryBytes
+	st := f.src.stages
+	st.Acquire(nb)
+	st.Release(f.heldBytes)
+	f.held, f.heldBytes = make([]entry, 0, k), nb
 }
 
 var _ carrier.BatchIO = (*Flow)(nil)

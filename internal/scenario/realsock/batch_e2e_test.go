@@ -1,13 +1,10 @@
 package realsock
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"net"
 	"runtime"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,8 +44,8 @@ const beCount = 50000
 // accepted was read or counted as a receive-queue drop; nothing arrived
 // that was not sent. Counters (Status.Datagram, both Runtimes): calls and
 // datagrams moved in both directions, no batch fallback, and the final
-// counts conserve datagrams (what one Runtime received the other sent, up
-// to the dialer handshakes' uncounted writes, beUncounted).
+// counts conserve datagrams exactly (neither Runtime received more than
+// the other sent; R1-2 rule 1).
 // Arm "default" (MaxBatch 0 = 32): on Linux amd64/arm64 SentDatagrams/
 // SendCalls > 1 on both Runtimes — sends were batched — and one datagram
 // per call elsewhere. Arm "one" (MaxBatch 1): one datagram per send and
@@ -71,16 +68,6 @@ func TestRealUDPBatchE2E(t *testing.T) {
 // sockets' buffers (beWindow), so loopback loses next to nothing.
 const beMinShare = 0.90
 
-// beUncounted bounds the datagrams one dialer carrier writes through its
-// socket before its writer and reader bind the token's counted I/O: the
-// dialer's datagram handshake (H1 and its repeats, the REL) runs on the
-// token's single calls before the carrier's writer and reader start, and
-// those calls are not counted yet, short of DatagramStatus's godoc. Until
-// that gap is closed, the dialer's SentDatagrams may fall short of what
-// the passive received by at most this many per dial; once the handshake
-// is counted, beUncounted is 0.
-const beUncounted = 8
-
 func beRun(t *testing.T, maxBatch int) {
 	o := udp.Options{MaxBatch: maxBatch}
 	sock, err := udp.Listen("udp4", "127.0.0.1:0", o)
@@ -88,12 +75,6 @@ func beRun(t *testing.T, maxBatch int) {
 		t.Fatal(err)
 	}
 	c := udp.Carrier("u", "udp4", sock.LocalAddr().String(), o)
-	var dials atomic.Uint64 // every dial of the factory, probes included
-	dial := c.Dial
-	c.Dial = func(ctx context.Context) (net.PacketConn, net.Addr, error) {
-		dials.Add(1)
-		return dial(ctx)
-	}
 	m := newMsPair(t, rendr.Config{}, nil, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromPacketConn(sock)}}, []rendr.Carrier{c})
 	dc, pc := m.openPacket(rendr.ModeSelector)
 
@@ -163,12 +144,10 @@ func beRun(t *testing.T, maxBatch int) {
 		}
 	}
 	// Conservation: loopback creates no datagram, so neither Runtime
-	// received more than the other sent — but for the dialer handshakes'
-	// uncounted writes (beUncounted).
-	if ps.RecvDatagrams > ds.SentDatagrams+beUncounted*dials.Load() || ds.RecvDatagrams > ps.SentDatagrams {
-		t.Errorf("received more datagrams than were sent (%d dials): dialer %s, passive %s", dials.Load(), beIO(ds), beIO(ps))
+	// received more than the other sent.
+	if ps.RecvDatagrams > ds.SentDatagrams || ds.RecvDatagrams > ps.SentDatagrams {
+		t.Errorf("received more datagrams than were sent: dialer %s, passive %s", beIO(ds), beIO(ps))
 	}
-	t.Logf("%d dials; the passive received %d datagrams the dialer counted no send for", dials.Load(), int64(ps.RecvDatagrams)-int64(ds.SentDatagrams))
 }
 
 // beWindow bounds the datagrams of one direction in flight end to end:

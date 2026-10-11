@@ -322,6 +322,7 @@ func (d *dgDial) run(payload []byte, check func(*wire.PrefaceAck) error, rb **Bu
 		return d.fail(&EstablishError{Stage: "dial", Cause: cause, Err: err})
 	}
 	if o, ok := pc.(*OwnedUDP); ok { // the exact token type (L57)
+		o.count(env) // the handshake's single calls are counted too (R1-2, M5 design R3-31)
 		d.io = o
 	} else {
 		d.pc = pc

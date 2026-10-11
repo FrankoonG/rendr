@@ -164,27 +164,46 @@ func (b *Batch) reset() {
 // sockets that fell back to ModePlain (each at most once). They are
 // updated when a WriteBatch or ReadBatch returns, from the calls it made,
 // never per datagram and never inside a lock.
+//
+// Each direction's datagram count is added before its call count and
+// loaded after it (M5 design R3-32): every call moves at least one
+// datagram, so a snapshot taken while calls run never shows fewer
+// datagrams than calls.
 type Counters struct {
 	sendCalls, sent, recvCalls, recvd, fallbacks atomic.Uint64
 }
 
 // Load returns the counters (rendr.DatagramStatus SendCalls,
-// SentDatagrams, RecvCalls, RecvDatagrams, BatchFallbacks).
+// SentDatagrams, RecvCalls, RecvDatagrams, BatchFallbacks). Each call
+// count is loaded before its datagram count.
 func (c *Counters) Load() (sendCalls, sent, recvCalls, recvd, fallbacks uint64) {
-	return c.sendCalls.Load(), c.sent.Load(), c.recvCalls.Load(), c.recvd.Load(), c.fallbacks.Load()
+	sendCalls = c.sendCalls.Load()
+	sent = c.sent.Load()
+	recvCalls = c.recvCalls.Load()
+	recvd = c.recvd.Load()
+	return sendCalls, sent, recvCalls, recvd, c.fallbacks.Load()
 }
+
+// AddSend counts calls send calls that moved n datagrams on a rendr-owned
+// socket outside a Conn: a carrier/udp dialer token's single calls before
+// it binds its Conn — the datagram handshake (R1-2, M5 design R3-31). A
+// nil c or calls ≤ 0 counts nothing.
+func (c *Counters) AddSend(calls, n int) { c.addSend(calls, n) }
+
+// AddRecv is AddSend for receive calls.
+func (c *Counters) AddRecv(calls, n int) { c.addRecv(calls, n) }
 
 func (c *Counters) addSend(calls, n int) {
 	if c != nil && calls > 0 {
+		c.sent.Add(uint64(n)) // the datagrams first (R3-32)
 		c.sendCalls.Add(uint64(calls))
-		c.sent.Add(uint64(n))
 	}
 }
 
 func (c *Counters) addRecv(calls, n int) {
 	if c != nil && calls > 0 {
+		c.recvd.Add(uint64(n)) // the datagrams first (R3-32)
 		c.recvCalls.Add(uint64(calls))
-		c.recvd.Add(uint64(n))
 	}
 }
 

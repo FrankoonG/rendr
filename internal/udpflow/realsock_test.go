@@ -58,6 +58,14 @@ func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limit
 // for maxBatch < 0, the token's single-datagram tokenIO.
 func newRealSourceIO(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits, maxBatch int) *realSource {
 	t.Helper()
+	return newRealSourceTok(t, maxDatagram, env, lim, maxBatch, 0)
+}
+
+// newRealSourceTok is newRealSourceIO over a token built with
+// carrier/udp's Options.MaxBatch tokBatch (NewOwnedUDPSocketBatch; 0: the
+// default).
+func newRealSourceTok(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits, maxBatch, tokBatch int) *realSource {
+	t.Helper()
 	u, err := net.ListenUDP("udp4", loopback4())
 	if err != nil {
 		t.Fatal(err)
@@ -69,7 +77,7 @@ func newRealSourceIO(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits
 	}
 	rs := &realSource{t: t, env: env, u: u, cl: cl, admitted: make(chan *Flow, 128),
 		dst: u.LocalAddr().(*net.UDPAddr).AddrPort()}
-	own := carrier.NewOwnedUDPSocket(u, maxDatagram)
+	own := carrier.NewOwnedUDPSocketBatch(u, maxDatagram, tokBatch)
 	rs.s = NewSource(rs.env, own, lim)
 	c, built := rs.s.bio.(*udpsocket.Conn)
 	switch {
