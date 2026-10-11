@@ -1,9 +1,13 @@
 package carrier
 
 import (
+	"flag"
 	"fmt"
 	"os"
+	"runtime"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,6 +33,15 @@ import (
 // one after the other (TestMain). RENDR_TEST_DGBATCH selects one: "off",
 // or a MaxBatch of 1 … 64. Tests of their own transports (the WP2 rows)
 // set what they need.
+//
+// Under -race (the race lane's 5-minute pass, M3 R1-23 lever 1 as M5 I1
+// applies it) the settings after the first run only the tests that built
+// the harness's transport in the first (dgNote; fuzz targets alike): every
+// other test never reaches dgBatchOf's fakeIO branch, so a second and
+// third run of it would repeat the first exactly. A transport built for no
+// known test, or an explicit -test.run, keeps the plain behaviour, and
+// TestMain says which applies. Without -race every setting runs every
+// test.
 var dgTestMaxBatch atomic.Int32
 
 // dgSettings returns the settings TestMain runs: RENDR_TEST_DGBATCH's, or
@@ -56,6 +69,83 @@ func dgSettingName(n int) string {
 	return "MaxBatch " + strconv.Itoa(n)
 }
 
+// dgNoted are the top-level tests (and fuzz targets) that built the
+// harness's transport during the first setting (dgNote); dgLost reports a
+// build none of them is known for.
+var (
+	dgNotedMu sync.Mutex
+	dgNoted   map[string]bool
+	dgLost    atomic.Value // string: the first stack without a Test or Fuzz frame
+)
+
+// dgNote records the top-level test that builds a fakeIO pair: tb's, or
+// without tb (a fuzz target's builder) the first carrier.Test… or
+// carrier.Fuzz… function on the caller's stack. Only under -race and only
+// while TestMain records (dgNoted non-nil); the race lane asserts no
+// allocation gate.
+func dgNote(tb testing.TB) {
+	if !carrierRace {
+		return
+	}
+	dgNotedMu.Lock()
+	defer dgNotedMu.Unlock()
+	if dgNoted == nil {
+		return
+	}
+	if tb != nil {
+		name, _, _ := strings.Cut(tb.Name(), "/")
+		dgNoted[name] = true
+		return
+	}
+	pcs := make([]uintptr, 64)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	var stack []string
+	for {
+		f, more := frames.Next()
+		i := strings.Index(f.Function, "/internal/carrier.Test")
+		if i < 0 {
+			i = strings.Index(f.Function, "/internal/carrier.Fuzz")
+		}
+		if i >= 0 {
+			name := f.Function[i+len("/internal/carrier."):]
+			if j := strings.IndexByte(name, '.'); j >= 0 {
+				name = name[:j]
+			}
+			dgNoted[name] = true
+			return
+		}
+		stack = append(stack, f.Function)
+		if !more {
+			dgLost.CompareAndSwap(nil, strings.Join(stack, " < "))
+			return
+		}
+	}
+}
+
+// dgLaterRun returns the -test.run pattern of the settings after the
+// first under -race: the tests dgNote recorded; "" keeps every test, and
+// why says why.
+func dgLaterRun() (run, why string) {
+	dgNotedMu.Lock()
+	defer dgNotedMu.Unlock()
+	switch lost, _ := dgLost.Load().(string); {
+	case !carrierRace:
+		return "", ""
+	case lost != "":
+		return "", "a transport built outside a Test function: " + lost
+	case len(dgNoted) == 0:
+		return "", "no test built the transport"
+	case flag.Lookup("test.run").Value.String() != "":
+		return "", "an explicit -test.run"
+	}
+	names := make([]string, 0, len(dgNoted))
+	for n := range dgNoted {
+		names = append(names, n)
+	}
+	slices.Sort(names)
+	return "^(" + strings.Join(names, "|") + ")$", ""
+}
+
 func TestMain(m *testing.M) {
 	base := dgBatchOf
 	dgBatchOf = func(io PacketIO) BatchIO {
@@ -67,8 +157,25 @@ func TestMain(m *testing.M) {
 		return base(io)
 	}
 	code := 0
-	for _, n := range dgSettings() {
+	for i, n := range dgSettings() {
 		dgTestMaxBatch.Store(int32(n))
+		switch {
+		case i == 0 && carrierRace:
+			dgNotedMu.Lock()
+			dgNoted = map[string]bool{}
+			dgNotedMu.Unlock()
+		case i == 1:
+			switch run, why := dgLaterRun(); {
+			case run != "":
+				flag.Set("test.run", run)
+				fmt.Fprintf(os.Stderr, "carrier: -race: the later settings run the %d tests that built the harness's transport\n", strings.Count(run, "|")+1)
+			case why != "":
+				fmt.Fprintf(os.Stderr, "carrier: -race: the later settings run every test (%s)\n", why)
+			}
+			dgNotedMu.Lock()
+			dgNoted = nil
+			dgNotedMu.Unlock()
+		}
 		fmt.Fprintf(os.Stderr, "carrier: datagram rows with the harness transport at %s\n", dgSettingName(n))
 		if c := m.Run(); c != 0 {
 			fmt.Fprintf(os.Stderr, "carrier: FAIL at %s\n", dgSettingName(n))

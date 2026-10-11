@@ -252,7 +252,7 @@ func TestBatchMemoryBounded_L16(t *testing.T) {
 			sides := make([]side, n)
 			byIO := make(map[*fakeIO]*fakeBatch, n)
 			for i := range sides {
-				ia, ib := lightFakeIOPair(1200)
+				ia, ib := lightFakeIOPair(t, 1200)
 				fb := newFakeBatch(ia, max)
 				fb.norec = true
 				byIO[ia] = fb
@@ -318,7 +318,8 @@ func TestBatchMemoryBounded_L16(t *testing.T) {
 
 // lightFakeIOPair is newFakeIOPair without the preallocated inbox buffers
 // (a slot's buffer grows at its first datagram): a thousand links fit.
-func lightFakeIOPair(limit int) (a, b *fakeIO) {
+func lightFakeIOPair(tb testing.TB, limit int) (a, b *fakeIO) {
+	dgNote(tb)
 	a = &fakeIO{wake: make(chan struct{}, 1), done: make(chan struct{}), addr: fakeAddr(1), limit: limit, recv: limit}
 	b = &fakeIO{wake: make(chan struct{}, 1), done: make(chan struct{}), addr: fakeAddr(2), limit: limit, recv: limit}
 	a.other, b.other = b, a
