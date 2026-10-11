@@ -35,7 +35,9 @@ import (
 // triggerOpen starts the opening of a session that Dial returned with
 // EarlyReturn: the first caller to clear dialer.deferred posts startOpen
 // (M4-D9). After Close or Abort (dialer.closed is closed) it does nothing,
-// so a Read or CloseWrite that follows them opens nothing (M4-D12). Read
+// so a Read or CloseWrite that follows them opens nothing (M4-D12); a Write
+// whose round was reserved before the Close is opened by earlyCloseLocked
+// instead (never triggered and nothing reserved: a local end). Read
 // and CloseWrite call it first; Write calls it right after a
 // round's bytes were committed, so the first attempt's early span
 // includes them (R1-15), and earlyCapLocked calls it when the cap holds a
@@ -56,8 +58,9 @@ func (s *Session) triggerOpen() {
 	}
 	select {
 	case <-d.closed:
-		// Close or Abort came first: the session ends locally and sends
-		// nothing (M4-D12); earlyCloseLocked claims deferred.
+		// Close or Abort came first: earlyCloseLocked claims deferred and
+		// ends the session locally if nothing was reserved before the
+		// Close (M4-D12), or opens it for a round reserved before it.
 		return
 	default:
 	}
@@ -95,8 +98,17 @@ func earlyMax(p *Params) int {
 // earlyCloseLocked is terminationLocked's branch for a dialer still in its
 // opening phase (M4-D12, M4-D20, AM-8). Nothing applies until the
 // application closed (Close or Abort):
-//   - never triggered (dialer.deferred still set): the session ends
-//     locally with net.ErrClosed — nothing was sent, nothing is;
+//   - never triggered and nothing reserved (dialer.deferred still set,
+//     st.resEnd == FirstOffset): the session ends locally with
+//     net.ErrClosed — nothing was sent, nothing is;
+//   - never triggered but a round reserved (WP13-A-2): the first Write's
+//     round was reserved before the Close, which fixed the FIN offset above
+//     it, and its trigger after the commit saw the Close; the round keeps
+//     Close's meaning, so the opening starts now as below (an Abort still
+//     ends the session in this step, before anything is dialled: Abort
+//     discards unsent data). If the round is still being copied, the early
+//     span (committed bytes only, k0 = min(end, EarlyDataMax)) excludes it:
+//     it is committed afterwards and sent after the verdict, below the FIN;
 //   - triggered but startOpen not handled yet (a Write committed its
 //     bytes, or a Read or CloseWrite ran, and Close followed before this
 //     step): the opening starts now, so those bytes keep Close's meaning
@@ -112,12 +124,14 @@ func (a *actor) earlyCloseLocked(now time.Time) {
 	if !st.closed {
 		return
 	}
-	if d.deferred.Load() && d.deferred.CompareAndSwap(true, false) {
+	if d.deferred.Load() && d.deferred.CompareAndSwap(true, false) && st.resEnd == a.s.p.FirstOffset {
 		a.earlyEndLocked(now, net.ErrClosed)
 		return
 	}
 	if !d.started {
-		a.onStartOpenLocked(now) // the trigger's startOpen is still on its way
+		// The trigger's startOpen is still on its way, or the claim above
+		// found a round reserved before the Close.
+		a.onStartOpenLocked(now)
 	}
 	if st.abortReq != nil {
 		a.earlyEndLocked(now, net.ErrClosed)
