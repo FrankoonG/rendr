@@ -612,6 +612,8 @@ func TestGolden_L44(t *testing.T) {
 		"join_ack_mux_capacity_muxfull",
 		// M4 (design §A3.5).
 		"open_early", "open_early_packet", "open_flags_2",
+		// M4 WP13 B-1 (OptEndCode).
+		"preface_optendcode", "preface_ack_optendcode", "join_ack_unknown_session_endcode",
 	} {
 		if _, ok := enc[want]; !ok {
 			t.Errorf("golden file lacks %q", want)
@@ -620,7 +622,7 @@ func TestGolden_L44(t *testing.T) {
 	// M1's, M2's and M3's vectors keep their positions and bytes (M3
 	// design §A3, M4 design §A3: no existing encoding changes); the resent
 	// H1 is byte-identical to the first (PA-21).
-	if names[0] != "preface" || names[len(names)-1] != "open_flags_2" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
+	if names[0] != "preface" || names[len(names)-1] != "join_ack_unknown_session_endcode" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
 		t.Errorf("golden order or H1 resend: first %q, last %q", names[0], names[len(names)-1])
 	}
 	m1, m12, m123 := 0, 0, 0

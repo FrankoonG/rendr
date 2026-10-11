@@ -114,6 +114,13 @@ func (a *actor) terminateLocked(now time.Time, err error, rst *wire.Rst, goAway 
 	a.endErr = err
 	if a.opened {
 		a.verdict = Verdict{Opened: true}
+		if rst != nil && s.st.rstIn == nil {
+			// The RST this side decided: the tombstone answers a later
+			// JOIN with it (OptEndCode), so a dialer whose carriers all
+			// died before the RST reached it still ends with its code
+			// (WP13 B-1, L47). Every RST code is at least 1.
+			a.verdict.Code = rst.Code
+		}
 	}
 	if ctl.state == StatePending {
 		a.leavePendingLocked() // M4: every exit from StatePending

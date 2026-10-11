@@ -62,6 +62,11 @@ type Established struct {
 	// partial first flight, a fast-path or coalesced view of the Pool.
 	// EstablishEarly fills it (M4 WP8); until then it is always 0.
 	Early int
+	// EndCode is the end code of a JOIN_ACK(UNKNOWN_SESSION) on a carrier
+	// that negotiated wire.OptEndCode: the RST code the ended session
+	// decided (0: none, or the form was not negotiated). Payload then
+	// holds the canonical JOIN_ACK (RxNext field zero) (WP13 B-1, L47).
+	EndCode uint32
 }
 
 // EstablishError describes a failed attempt. It wraps the underlying error.
@@ -247,6 +252,12 @@ func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.
 	salt := binary.LittleEndian.Uint64(sb[:])
 
 	opt := prefaceOpt(f, t)
+	if t == wire.TypeJoin || opt&wire.OptMux != 0 {
+		// A stream JOIN carrier, and a MUX trunk offer (whose later views
+		// may JOIN), accept an end code in JOIN_ACK(UNKNOWN_SESSION)
+		// (WP13 B-1, L47).
+		opt |= wire.OptEndCode
+	}
 	size := wire.PrefaceLen + wire.FrameOverhead + max(len(payload), wire.PingFixedLen)
 	if len(early) > 0 {
 		size += wire.FrameOverhead + wire.DataPrefixLen + len(early)
@@ -479,6 +490,13 @@ func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.
 	if wire.CRCUpdate(wire.CRC(hb[:]), p) != wire.Trailer(rb[h.Len:]) {
 		return failed("response", CauseProtocolViolation, true, ack.Instance, fmt.Errorf("%v: %w", h.Type, wire.ErrCRC), false)
 	}
+	var endCode uint32
+	if h.Type == wire.TypeJoinAck && opt&ack.Opt&wire.OptEndCode != 0 {
+		var err error
+		if endCode, err = takeEndCode(p); err != nil {
+			return failed("response", CauseProtocolViolation, true, ack.Instance, fmt.Errorf("%v: %w", h.Type, err), false)
+		}
+	}
 	if err := validateResponse(h, p, pingID, salt); err != nil {
 		return failed("response", CauseProtocolViolation, true, ack.Instance, err, false)
 	}
@@ -490,6 +508,7 @@ func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.
 	c := newConn(env, nc, id, ack.Instance, f.Index, f.Name, true)
 	c.salt = salt
 	c.mux = muxed(opt, &ack)
+	c.endCode = opt&ack.Opt&wire.OptEndCode != 0
 	c.wr.fseq, c.rd.fseq = first+1, rfirst+1
 	if len(early) > 0 {
 		c.wr.fseq++ // the DATA frame of the first flight (awaitHello: written completely)
@@ -498,7 +517,31 @@ func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.
 		c.st.nextPingID = pingID + 1
 	}
 	returned = true
-	return &Established{Conn: c, Ack: ack, Resp: h, Payload: p, Fresh: c.mux, Early: len(early)}, nil
+	return &Established{Conn: c, Ack: ack, Resp: h, Payload: p, Fresh: c.mux, Early: len(early), EndCode: endCode}, nil
+}
+
+// EndCodes reports whether c's carrier negotiated wire.OptEndCode (WP13
+// B-1, L47): a JOIN_ACK(UNKNOWN_SESSION) answering a JOIN on any of its
+// views may carry the ended session's RST code. Immutable.
+func (c *Conn) EndCodes() bool { return c.trunk != nil && c.endCode }
+
+// takeEndCode reads the end code of JOIN_ACK payload p on a carrier that
+// negotiated wire.OptEndCode (WP13 B-1, L47): only an UNKNOWN_SESSION may
+// carry one, in its RxNext field's low 32 bits with the high 32 bits zero
+// (wire.ParseJoinAckMux's layout); every other status keeps the canonical
+// rule (ErrReserved). The field is then zeroed, so p is the canonical
+// JOIN_ACK that validateResponse and the session decode.
+func takeEndCode(p []byte) (uint32, error) {
+	a, code, err := wire.ParseJoinAckMux(p)
+	switch {
+	case err != nil:
+		return 0, err
+	case code != 0 && a.Status != wire.StatusUnknownSession:
+		return 0, wire.ErrReserved
+	case a.Status != wire.StatusOK:
+		clear(p[1:wire.JoinAckLen])
+	}
+	return code, nil
 }
 
 // prefaceOpt returns the optional feature bits of the dialer's PREFACE for
@@ -513,13 +556,16 @@ func prefaceOpt(f Factory, t wire.Type) uint32 {
 }
 
 // ackOptErr checks the optional bits of a PREFACE_ACK(OK) against the
-// PREFACE's opt (§A3.1): the passive echoes wire.OptMux only when the
-// PREFACE carried it, so an OptMux the dialer did not offer is a carrier
-// error (never a version error: it fails the attempt as a protocol
-// violation). Other optional bits are ignored.
+// PREFACE's opt (§A3.1): the passive echoes wire.OptMux and wire.OptEndCode
+// only when the PREFACE carried them, so such a bit the dialer did not
+// offer is a carrier error (never a version error: it fails the attempt as
+// a protocol violation). Other optional bits are ignored.
 func ackOptErr(opt uint32, ack *wire.PrefaceAck) error {
 	if ack.Opt&wire.OptMux != 0 && opt&wire.OptMux == 0 {
 		return errors.New("PREFACE_ACK echoes OptMux for a PREFACE without it")
+	}
+	if ack.Opt&wire.OptEndCode != 0 && opt&wire.OptEndCode == 0 {
+		return errors.New("PREFACE_ACK echoes OptEndCode for a PREFACE without it")
 	}
 	return nil
 }

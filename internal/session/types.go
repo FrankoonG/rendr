@@ -91,8 +91,14 @@ type EventSink interface{ Emit(ev Event) }
 type Verdict struct {
 	Opened bool           // the session reached StateOpen: tombstone answers UNKNOWN_SESSION
 	Status wire.AckStatus // never-opened sessions: REJECTED, CAPACITY or GOING_AWAY; a withdrawn one: UNKNOWN_SESSION
-	Code   uint32
-	Msg    string
+	// Code: a never-opened session's OPEN_ACK code; an opened one's RST
+	// code that this side decided (Abort, idle, linger, exhausted, ...; 0
+	// when it ended otherwise, e.g. by the peer's RST), which the
+	// tombstone puts in a JOIN_ACK(UNKNOWN_SESSION) on a carrier that
+	// negotiated wire.OptEndCode (WP13 B-1, L47). OpenAck ignores it for
+	// an opened session.
+	Code uint32
+	Msg  string
 }
 
 // OpenAck returns the OPEN_ACK that repeats this verdict.

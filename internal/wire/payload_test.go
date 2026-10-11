@@ -90,3 +90,46 @@ func TestJoinAckMux(t *testing.T) {
 		t.Fatalf("dedicated JOIN_ACK with a non-zero reserved field: %v, want ErrReserved", err)
 	}
 }
+
+// TestJoinAckEndCode_L47 (M4, WP13 B-1; L47): OptEndCode is optional
+// PREFACE bit 1, echoed like OptMux, and the golden PREFACE and
+// PREFACE_ACK with it differ from M1's only in that bit and the CRC. Under
+// it a JOIN_ACK(UNKNOWN_SESSION) on handle 1 carries the ended session's
+// RST code in PutJoinAckMux's layout (golden
+// join_ack_unknown_session_endcode, 0x5000 in the low half of the RxNext
+// field); without it the canonical JOIN_ACK is unchanged (golden
+// join_ack_unknown_session), and ParseJoinAck — a dialer that did not
+// negotiate the bit — rejects the coded form as ErrReserved.
+func TestJoinAckEndCode_L47(t *testing.T) {
+	if OptEndCode != 2 || KnownOptional&OptEndCode == 0 || EchoOpt(OptEndCode) != OptEndCode || EchoOpt(OptMux) != OptMux {
+		t.Fatalf("OptEndCode %#x, KnownOptional %#x", OptEndCode, KnownOptional)
+	}
+	for _, pair := range [][2]string{{"preface", "preface_optendcode"}, {"preface_ack_ok", "preface_ack_optendcode"}} {
+		plain, ec := goldenByName(t, pair[0]).b, goldenByName(t, pair[1]).b
+		if !bytes.Equal(plain[:12], ec[:12]) || !bytes.Equal(plain[16:36], ec[16:36]) || ec[12] != 0 || ec[13] != 0 || ec[14] != 0 || ec[15] != byte(OptEndCode) {
+			t.Errorf("%s:\n% x\nwant %s with only opt bit 1 (and the CRC) changed:\n% x", pair[1], ec, pair[0], plain)
+		}
+	}
+	coded := goldenByName(t, "join_ack_unknown_session_endcode").b
+	plain := goldenByName(t, "join_ack_unknown_session").b
+	pc, pp := coded[HeaderLen:HeaderLen+JoinAckLen], plain[HeaderLen:HeaderLen+JoinAckLen]
+	if want := []byte{byte(StatusUnknownSession), 0, 0, 0, 0, 0, 0, 0x50, 0}; !bytes.Equal(pc, want) {
+		t.Errorf("coded JOIN_ACK payload % x, want % x", pc, want)
+	}
+	if !bytes.Equal(coded[:HeaderLen], plain[:HeaderLen]) {
+		t.Errorf("the coded JOIN_ACK's header differs from the canonical one's")
+	}
+	if a, code, err := ParseJoinAckMux(pc); err != nil || a.Status != StatusUnknownSession || a.RxNext != 0 || code != 0x5000 {
+		t.Errorf("ParseJoinAckMux(coded) = %+v, %d, %v", a, code, err)
+	}
+	if _, err := ParseJoinAck(pc); !errors.Is(err, ErrReserved) {
+		t.Errorf("ParseJoinAck(coded) = %v, want ErrReserved (a dialer without OptEndCode)", err)
+	}
+	var b [JoinAckLen]byte
+	if PutJoinAckMux(b[:], &JoinAck{Status: StatusUnknownSession}, 0); !bytes.Equal(b[:], pp) {
+		t.Errorf("code 0 encodes % x, want the canonical % x", b, pp)
+	}
+	if a, code, err := ParseJoinAckMux(pp); err != nil || code != 0 || a.Status != StatusUnknownSession {
+		t.Errorf("ParseJoinAckMux(canonical) = %+v, %d, %v", a, code, err)
+	}
+}

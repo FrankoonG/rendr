@@ -85,10 +85,28 @@ const (
 	// PREFACE_ACK with OptMux for a PREFACE without it fails the dialer's
 	// attempt as a carrier error.
 	OptMux uint32 = 1 << 0
+	// OptEndCode is optional PREFACE feature bit 1 (M4, WP13 B-1; L47):
+	// end codes in JOIN_ACK. A dialer that sets it accepts, on that
+	// carrier, a JOIN_ACK(UNKNOWN_SESSION) whose RxNext field carries the
+	// RST code the ended session decided — the code in the field's low 32
+	// bits, its high 32 bits zero (PutJoinAckMux's layout, also on handle
+	// 1) — and 0 when the session ended without an RST of its own; a
+	// passive that implements it echoes it in PREFACE_ACK(OK) iff the
+	// PREFACE carried it, like OptMux. Only when both carry it may a
+	// JOIN_ACK(UNKNOWN_SESSION) carry a non-zero field; every other
+	// JOIN_ACK keeps the canonical rule (ParseJoinAck), and a PREFACE_ACK
+	// echoing it for a PREFACE without it fails the dialer's attempt as a
+	// carrier error. M4 dialers set it on stream JOIN carriers and on
+	// stream MUX trunk offers (OptMux); M4 passives answer a JOIN that
+	// meets an opened session's tombstone with the code on any view of
+	// such a carrier — on a view of a MUX trunk the field already carries
+	// a refusal's code (PutJoinAckMux), which for UNKNOWN_SESSION is then
+	// this end code.
+	OptEndCode uint32 = 1 << 1
 	// KnownOptional is the set of optional PREFACE feature bits this build
-	// implements (OptMux). A passive echoes only these (EchoOpt); every
-	// other optional bit is ignored in both directions.
-	KnownOptional uint32 = OptMux
+	// implements (OptMux, OptEndCode). A passive echoes only these
+	// (EchoOpt); every other optional bit is ignored in both directions.
+	KnownOptional uint32 = OptMux | OptEndCode
 )
 
 // Session modes as OPEN.mode and JOIN.mode carry them (1 selector, 2 bond,
