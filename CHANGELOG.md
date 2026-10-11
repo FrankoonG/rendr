@@ -262,9 +262,11 @@ Scheduling and estimation:
   at 4 MiB/s and 20 ms: echo P99 237 ms).
 - Estimator residuals: with socket or link buffers below one 256-KiB batch
   a PONG waits behind the peer's write (0.41–0.63 of the link at 1 MiB/s);
-  one way, below about 1.25 MiB/s with blocking writes, a flow reaches
-  about 0.6–0.8 of the link; two-way bulk over buffers shallower than a
-  batch at 1.5–2 MiB/s with a 30–40 ms RTT can still leave one direction
+  one way, with blocking writes below a rate of one batch / (minRTT +
+  2 × PingBusy + 100 ms) (256 KiB / 220 ms ≈ 1.14 MiB/s at a 20-ms minRTT
+  with the default PingBusy), a flow reaches about 0.6–0.8 of the link;
+  two-way bulk over buffers shallower than a batch at 1.5–2 MiB/s with a
+  30–40 ms RTT can still leave one direction
   below 85 % of the link in some interleavings; low rates with deep
   buffers vary between 0.62 and 0.98 of the link per run; a one-way flow
   at 1 MiB/s and 100 ms reaches about 0.8 of the link;

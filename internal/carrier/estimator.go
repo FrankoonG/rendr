@@ -650,8 +650,9 @@ func (st *carrierState) noteWriteLag(d time.Duration) {
 // batch the Write blocks while the buffer drains, so those bytes stay in
 // flight the write lag plus the RTT (the RTT then reads short: KL-17 (d)),
 // and a capacity sized from the RTT caps the flow below the path. One way
-// the base term's headroom absorbs it above about BatchBudget/(minRTT +
-// 2·PingBusy + 100 ms) (about 1.2 MB/s at 20 ms); with bulk both ways the
+// the base term's headroom absorbs it above a rate of BatchBudget/(minRTT
+// + 2·PingBusy + 100 ms) (with the defaults, 256 KiB / 220 ms ≈ 1.14
+// MiB/s, 1.19 MB/s, at a 20-ms minRTT); with bulk both ways the
 // headroom goes to the reverse queue and to our PONG's wait behind the
 // peer's Write in progress, and the side that lost the phase of the two
 // writers carried 0.75–0.85 of the link (KL-20; the late, dlate and stalls
