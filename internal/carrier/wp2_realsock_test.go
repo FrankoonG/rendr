@@ -73,7 +73,16 @@ func TestBatchWireIdentical(t *testing.T) {
 			}
 			out = append(out, append(append([]byte(nil), d[:9]...), maskPings(t, d[9:])...))
 		}
-		sc, sd, _, _, _ := env.Dgram.IO.Load()
+		// The writer counts a call when it returns, which may be after the
+		// raw receiver read its datagram: wait (bounded) until every
+		// datagram received is counted as sent, then snapshot.
+		var sc, sd uint64
+		for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(time.Millisecond) {
+			sc, sd, _, _, _ = env.Dgram.IO.Load()
+			if sd >= uint64(len(out)) || time.Now().After(deadline) {
+				break
+			}
+		}
 		return out, sc, sd
 	}
 	off, offCalls, offSent := run(1)
