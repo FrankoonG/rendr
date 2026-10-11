@@ -389,6 +389,14 @@ func TestMmsgAddrFamilies(t *testing.T) {
 	if !errors.As(perr, &poe) || !errors.As(perr, &pae) || *pae != *ae || poe.Op != oe.Op || poe.Addr.String() != oe.Addr.String() || poe.Source.String() != oe.Source.String() {
 		t.Fatalf("batch error %#v; the plain path returns %#v", err, perr)
 	}
+	// A batch whose first message cannot be addressed sends nothing and
+	// returns the same shape (the error before any sendmmsg).
+	n, err = c4.WriteBatch(NewBatch(4), []Msg{ms[2], ms[0]})
+	var fae *net.AddrError
+	var foe *net.OpError
+	if n != 0 || !errors.As(err, &foe) || !errors.As(err, &fae) || *fae != *pae || foe.Op != poe.Op || foe.Addr.String() != poe.Addr.String() {
+		t.Fatalf("first message unaddressable: n %d, err %#v; want 0 and %#v", n, err, perr)
+	}
 	for i, m := range read(v4b, 2) {
 		if want := []string{"a", "b"}[i]; string(m.Buf[:m.N]) != want || m.Addr != addrOf(v4a) {
 			t.Fatalf("IPv4: %q from %v; want %q from %v", m.Buf[:m.N], m.Addr, want, addrOf(v4a))
