@@ -622,8 +622,14 @@ var (
 // V1). The handshake waits for the writer (awaitHello) before anything
 // follows the first frame, and joins it (join) before it returns. left
 // tells a concurrent RST(withdrawn) that the handshake goroutine itself
-// left the conn; the writer is not waited for there, so the close that
-// follows a cut first frame also ends a Write that ignores its deadline.
+// left the conn; the RST's goroutine then also waits for the writer,
+// bounded by the same drainMax as its wait for left (pickWithdrawal), so
+// that it decides on the writer's final flags: a Write that delivered the
+// first flight but returns late is still followed by the RST (WP13 A-1).
+// That goroutine, not the handshake, then joins the writer (rstJoins), so
+// a withdrawal returns at once although a Write that ignores its deadline
+// is ended only by the close, drainMax later (no frame follows a cut first
+// flight).
 //
 // With early data (M4-D4) the first flight is PREFACE ‖ OPEN(EARLY) ‖
 // DATA: without DialEarly the hello writer writes it in one Write; with
@@ -652,6 +658,7 @@ type hsGuard struct {
 	wfinished    bool  // the hello writer's Write returned; werr is final
 	werr         error // the hello Write's error
 	wabandoned   bool  // the hello writer was counted in the abandoned-call pool
+	rstJoins     bool  // a concurrent withdrawal RST's goroutine joins the hello writer, not the handshake (pickWithdrawal)
 }
 
 func newHsGuard(ctx context.Context, env *Env, nc net.Conn, firstWritten bool) *hsGuard {
@@ -780,10 +787,10 @@ func (g *hsGuard) helloFailed() error {
 // frame next (P18), and the attempt's deadline bounds the wait (abort). It
 // does not wait for the writer once the close of the conn began: it then
 // returns the Write's error, or errAttemptEnded, at once, and the handshake
-// leaves the conn (finish), so that a withdrawal's RST is decided — and a
-// cut first frame closed, which also ends a Write that ignores its deadline
-// — without waiting for this goroutine. Only the handshake goroutine calls
-// it.
+// leaves the conn (finish) and returns; a withdrawal's RST is decided on
+// the RST's own goroutine, which waits for the writer (bounded by
+// drainMax) and joins it (pickWithdrawal). Only the handshake goroutine
+// calls it.
 func (g *hsGuard) awaitHello() error {
 	if g.wdone == nil {
 		return nil // DialEarly: the factory sent PREFACE ‖ first frame
@@ -802,12 +809,25 @@ func (g *hsGuard) awaitHello() error {
 // join waits for the hello writer before the handshake returns. Its caller
 // left the conn (finish) and began its close (closeWith), which ends a
 // hello Write still in progress on a conn that honours its deadline or
-// Close: at once, or, after a withdrawal, as soon as the RST's goroutine
-// sees that the first frame is incomplete. Only a writer still inside a
-// Write that ignores both AbandonWait later is counted in the
-// abandoned-call pool, until its Write returns (L52). Only the handshake
+// Close. After a concurrent withdrawal the RST's goroutine joins the
+// writer instead (rstJoins, pickWithdrawal), after the close it begins
+// once it decided the RST, and join returns at once. Only the handshake
 // goroutine calls it.
 func (g *hsGuard) join() {
+	g.mu.Lock()
+	handed := g.rstJoins
+	g.mu.Unlock()
+	if !handed {
+		g.joinWriter()
+	}
+}
+
+// joinWriter waits for the hello writer, whose conn is closing. Only a
+// writer still inside a Write that ignores both AbandonWait later is
+// counted in the abandoned-call pool, until its Write returns (L52). Its
+// caller is the handshake goroutine (join) or, after a concurrent
+// withdrawal, the RST's goroutine (pickWithdrawal), never both.
+func (g *hsGuard) joinWriter() {
 	if g.wdone == nil {
 		return // DialEarly: no writer
 	}
@@ -839,16 +859,25 @@ func (g *hsGuard) join() {
 // withdrawal RST in the L05 order (writeThenClose), but only when the
 // whole first flight was written (rstFrame) — nothing may follow a partial
 // frame. concurrent says that the handshake may still be inside a conn
-// call (abort): the RST then waits until the handshake goroutine left the
-// conn (left), and rstFrame decides only then.
+// call (abort): the RST's goroutine then waits until the handshake
+// goroutine left the conn and the hello writer returned, and rstFrame
+// decides only then (pickWithdrawal); that goroutine joins the writer
+// (rstJoins, set here under the lock join reads it under, together with
+// the close's claim).
 func (g *hsGuard) closeWith(rst, concurrent bool) {
-	if !g.closed.CompareAndSwap(false, true) {
+	g.mu.Lock()
+	won := g.closed.CompareAndSwap(false, true)
+	if won && rst && concurrent {
+		g.rstJoins = true
+	}
+	g.mu.Unlock()
+	if !won {
 		return
 	}
 	close(g.closing)
 	switch {
 	case rst && concurrent:
-		writeThenClose(g.env, g.nc, nil, g.left, g.rstFrame)
+		writeThenClose(g.env, g.nc, nil, g.pickWithdrawal, g.joinAfterWithdrawal)
 	case rst:
 		if frame := g.rstFrame(); frame != nil {
 			writeThenClose(g.env, g.nc, frame, nil, nil)
@@ -860,6 +889,60 @@ func (g *hsGuard) closeWith(rst, concurrent bool) {
 	}
 }
 
+// pickWithdrawal is the pick of a concurrent withdrawal RST (closeWith),
+// run on the RST's goroutine while expired (drainMax after the close
+// began) has not fired. It waits until the handshake goroutine left the
+// conn (left) and then until the hello writer returned (wdone), so that
+// rstFrame decides on the writer's final flags: a Write that delivered the
+// first flight but had not returned when the close began is still followed
+// by the RST (WP13 A-1, L49), and a Write that honours the SetDeadline(now)
+// which already ran returns at once. It returns nil — no frame, and the
+// conn is closed at once — when expired fires first: a handshake still
+// inside a conn call (the close ends it, and the handshake then joins its
+// writer itself: rstJoins is cleared), or a hello Write that ignores its
+// deadline (the close ends it; best effort, L49).
+func (g *hsGuard) pickWithdrawal(expired <-chan time.Time) []byte {
+	timedOut := false
+	select {
+	case <-g.left:
+	case <-expired:
+		timedOut = true
+	}
+	g.mu.Lock()
+	if !g.finished {
+		g.rstJoins = false // the handshake has not reached join yet: it joins its writer
+	}
+	var wdone chan struct{}
+	if g.rstJoins {
+		wdone = g.wdone // set before finish, which this lock follows
+	}
+	own := g.rstJoins
+	g.mu.Unlock()
+	if timedOut || !own {
+		return nil
+	}
+	if wdone != nil {
+		select {
+		case <-wdone:
+		case <-expired:
+			return nil
+		}
+	}
+	return g.rstFrame()
+}
+
+// joinAfterWithdrawal joins the hello writer on a concurrent withdrawal
+// RST's goroutine after the close began, when that goroutine owns it
+// (rstJoins, pickWithdrawal).
+func (g *hsGuard) joinAfterWithdrawal() {
+	g.mu.Lock()
+	own := g.rstJoins
+	g.mu.Unlock()
+	if own {
+		g.joinWriter()
+	}
+}
+
 // writeThenClose writes frame and closes nc in the L05 order — the frame
 // (bounded by drainMax), CloseWrite on an OwnedTCP, a drain bounded by
 // drainMax, then SetDeadline(now) and Close on guarded goroutines of their
@@ -868,19 +951,22 @@ func (g *hsGuard) closeWith(rst, concurrent bool) {
 // already sent (an OPEN_ACK racing a withdrawal), so the close never
 // answers unread bytes with a TCP reset that could discard the frame before
 // the passive read it (Windows drops buffered data on a reset).
-// When left is non-nil the handshake goroutine may still be inside a conn
+// When pick is non-nil the handshake goroutine may still be inside a conn
 // call: the goroutine first unblocks it with SetDeadline(now) — the
 // handshake's read and a hello Write in progress return at once on a conn
-// that honours deadlines — and waits until it left the conn, at most
-// drainMax, so that the drain never competes with it; pick, if non-nil,
-// then supplies the frame, or nil when none may be written at all (the
+// that honours deadlines — and pick, given a timer that fires drainMax
+// later, waits until the handshake left the conn and the hello writer
+// returned (pickWithdrawal), so that the drain never competes with them;
+// it then supplies the frame, or nil when none may be written at all (the
 // first flight was not written completely: rstFrame), and the conn is
-// then closed at once, which also ends a hello Write that ignores its
-// deadline. A handshake still inside its call after drainMax — a read that
-// ignores its deadline, or a conn whose deadline setters wait for the call
-// in progress (a websocket adapter that honours gorilla's one-reader rule;
-// design §0.14 B3) — gets no frame (it is best effort, L49): the conn is
-// closed at once, which ends the call on a conn that honours Close. The
+// then closed at once. A handshake still inside its call, or a hello Write
+// still in progress, after drainMax — a call that ignores its deadline, or
+// a conn whose deadline setters wait for the call in progress (a websocket
+// adapter that honours gorilla's one-reader rule; design §0.14 B3) — gets
+// no frame (it is best effort, L49): the conn is closed then, which ends
+// the call on a conn that honours Close. after, if non-nil, runs last on
+// the goroutine, once the close began (it joins the hello writer: the
+// handshake left without waiting for it, pickWithdrawal). The
 // SetDeadline therefore runs on a goroutine of its own (closeOnce's
 // deadline step, goDeadline; the final close then calls Close only), which
 // such a conn holds until that close; the frame's write deadline is set
@@ -891,26 +977,22 @@ func (g *hsGuard) closeWith(rst, concurrent bool) {
 // ignores the write or the drain's read deadline and a peer that does not
 // read or close — its conn is closed exactly once as a last resort (design
 // §0.8 V2, closeOnce.last), which unblocks it on a conn that honours Close.
-func writeThenClose(env *Env, nc net.Conn, frame []byte, left <-chan struct{}, pick func() []byte) {
+func writeThenClose(env *Env, nc net.Conn, frame []byte, pick func(expired <-chan time.Time) []byte, after func()) {
 	k := &closeOnce{nc: nc}
 	wait := env.Timing.withDefaults().AbandonWait
 	w := armWatch(env.Abandon, wait+3*drainMax, func() { k.last(env) })
 	go func() {
+		if after != nil {
+			defer after() // last: the close began and the watch ended
+		}
 		defer w.finish()
 		defer k.async(env) // exactly once, also on runtime.Goexit in a conn call (L51)
-		if left != nil {
+		if pick != nil {
 			set := k.goDeadline(env, wait+drainMax) // the close below comes drainMax after it at the latest
 			t := time.NewTimer(drainMax)
 			defer t.Stop()
-			select {
-			case <-left:
-			case <-t.C:
-				return // still inside a conn call: no frame; the close ends the call
-			}
-			if pick != nil {
-				if frame = pick(); frame == nil {
-					return
-				}
+			if frame = pick(t.C); frame == nil {
+				return // no frame may follow, or a call still in progress after drainMax: the close ends it
 			}
 			select {
 			case <-set: // the frame's write deadline follows SetDeadline(now)

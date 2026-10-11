@@ -856,7 +856,8 @@ func TestEarlyWithdrawalRstFseq_L49(t *testing.T) {
 			// it never follows the partial frame.
 			g.finish()
 			g.closeWith(true, true)
-			g.join()
+			g.join()        // the withdrawal's goroutine joins the writer
+			synctest.Wait() // its SetDeadline(now) ended the Write, cut, before the decision
 			close(resume)
 			<-read
 			synctest.Wait()
