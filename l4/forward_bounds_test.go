@@ -453,7 +453,10 @@ func (c *plainConn) WriteTo(w io.Writer) (int64, error) {
 // TestForwardEmbedderConnNoUpgrade_L57 (§A7.1): Forward calls only the
 // net.Conn methods of a conn that offers neither CloseWrite nor SetLinger
 // (never its ReadFrom or WriteTo): a clean exchange closes it once, plainly;
-// a reset closes it once, plainly.
+// a reset closes it once, plainly. The reset row aborts before the
+// dialer's FIN: after its CloseWrite the passive could complete the clean
+// exchange (the response and both FINs acknowledged) before the RST, and
+// the row then saw no reset (the race lane: 89 of 2,000 runs).
 func TestForwardEmbedderConnNoUpgrade_L57(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newWorld(t, worldOpts{})
@@ -470,11 +473,13 @@ func TestForwardEmbedderConnNoUpgrade_L57(t *testing.T) {
 			if err := writePRNG(d, 1, req); err != nil {
 				t.Fatal(err)
 			}
-			d.CloseWrite()
 			if reset {
 				d.Abort(testAbort, "test")
-			} else if n, sum, err := readAll(d); err != io.EOF || n != resp || sum != prngSum(0, resp) {
-				t.Fatalf("dialer read %d bytes (SHA ok: %v), then %v", n, sum == prngSum(0, resp), err)
+			} else {
+				d.CloseWrite()
+				if n, sum, err := readAll(d); err != io.EOF || n != resp || sum != prngSum(0, resp) {
+					t.Fatalf("dialer read %d bytes (SHA ok: %v), then %v", n, sum == prngSum(0, resp), err)
+				}
 			}
 			r := <-out
 			if r.Clean == reset || local.closes.Load() != 1 || local.upgrades.Load() != 0 {

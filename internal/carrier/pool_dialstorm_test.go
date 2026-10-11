@@ -548,6 +548,9 @@ func TestPoolWaitJoinsWatchers(t *testing.T) {
 			if err := short(pt.p); err != nil {
 				t.Fatalf("Wait once the watcher ended: %v", err)
 			}
+			// The watcher returns right after it counted itself out, which
+			// is what Wait waits for: let it leave before the sample (L66).
+			synctest.Wait()
 			if k := poolGoroutines(); k != 0 {
 				t.Fatalf("%d pool goroutines after Wait, want none", k)
 			}
@@ -580,6 +583,9 @@ func TestPoolWaitJoinsWatchers(t *testing.T) {
 			default:
 				t.Fatal("Wait returned before the discarded trunk was done")
 			}
+			// The watcher returns right after it counted itself out, which
+			// is what Wait waits for: let it leave before the sample (L66).
+			synctest.Wait()
 			if k := poolGoroutines(); k != 0 {
 				t.Fatalf("%d pool goroutines after Wait, want none", k)
 			}
@@ -616,6 +622,9 @@ func TestPoolWaitJoinsWatchers(t *testing.T) {
 			if err := short(pt.p); err != nil {
 				t.Fatalf("Wait once the watcher ended: %v", err)
 			}
+			// The watcher returns right after it counted itself out, which
+			// is what Wait waits for: let it leave before the sample (L66).
+			synctest.Wait()
 			if k := poolGoroutines(); k != 0 {
 				t.Fatalf("%d pool goroutines after Wait, want none", k)
 			}
