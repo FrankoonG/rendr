@@ -590,7 +590,11 @@ func TestL4RealTCPE2E(t *testing.T) {
 		t.Errorf("the dialer's session ended with %v, want io.EOF", err)
 	}
 	c.Close()
-	msUntil(t, 10*time.Second, "the Server's forward ended", func() bool { return n.srv.Status().Live == 0 })
+	// The passive's EventSessionEnd reaches OnEvent asynchronously (L53),
+	// possibly after the Server's forward ended: wait for it, then judge it.
+	msUntil(t, 10*time.Second, "the Server's forward ended and the passive's end reported", func() bool {
+		return n.srv.Status().Live == 0 && len(n.passiveEnds()) > 0
+	})
 	ends := n.passiveEnds()
 	if len(ends) != 1 || ends[0].Err != io.EOF {
 		t.Errorf("the passive's session ends %+v, want one with io.EOF", ends)
@@ -708,7 +712,11 @@ func TestL4RealTargetResetMapsToAbort(t *testing.T) {
 	}
 	l4rDone(t, c, 10*time.Second, "after the reset")
 	c.Close()
-	msUntil(t, 10*time.Second, "the Server's forward ended", func() bool { return n.srv.Status().Live == 0 })
+	// The passive's EventSessionEnd reaches OnEvent asynchronously (L53),
+	// possibly after the Server's forward ended: wait for it, then judge it.
+	msUntil(t, 10*time.Second, "the Server's forward ended and the passive's end reported", func() bool {
+		return n.srv.Status().Live == 0 && len(n.passiveEnds()) > 0
+	})
 	if ends := n.passiveEnds(); len(ends) != 1 || ends[0].Err == io.EOF {
 		t.Errorf("the passive's session ends %+v, want one that is not io.EOF", ends)
 	}
@@ -795,7 +803,11 @@ func TestForwardCleanCloseNoReset_L05(t *testing.T) {
 		t.Errorf("the dialer's session ended with %v, want io.EOF", err)
 	}
 	c.Close()
-	msUntil(t, 10*time.Second, "the Server's forward ended", func() bool { return n.srv.Status().Live == 0 })
+	// The passive's EventSessionEnd reaches OnEvent asynchronously (L53),
+	// possibly after the Server's forward ended: wait for it, then judge it.
+	msUntil(t, 10*time.Second, "the Server's forward ended and the passive's end reported", func() bool {
+		return n.srv.Status().Live == 0 && len(n.passiveEnds()) > 0
+	})
 	if ends := n.passiveEnds(); len(ends) != 1 || ends[0].Err != io.EOF {
 		t.Errorf("the passive's session ends %+v, want one with io.EOF", ends)
 	}
@@ -970,7 +982,11 @@ func l4rHalfCloseEnd(t *testing.T, n *l4rNet, c *rendr.Conn, tg *l4rTarget, targ
 		t.Errorf("the dialer's session ended with %v, want io.EOF", err)
 	}
 	c.Close()
-	msUntil(t, 10*time.Second, "the Server's forward ended", func() bool { return n.srv.Status().Live == 0 })
+	// The passive's EventSessionEnd reaches OnEvent asynchronously (L53),
+	// possibly after the Server's forward ended: wait for it, then judge it.
+	msUntil(t, 10*time.Second, "the Server's forward ended and the passive's end reported", func() bool {
+		return n.srv.Status().Live == 0 && len(n.passiveEnds()) > 0
+	})
 	if ends := n.passiveEnds(); len(ends) != 1 || ends[0].Err != io.EOF {
 		t.Errorf("the passive's session ends %+v, want one with io.EOF", ends)
 	}
