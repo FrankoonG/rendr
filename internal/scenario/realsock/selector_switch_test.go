@@ -105,7 +105,11 @@ func ssRun(t *testing.T, maxBatch int) ssResult {
 		}
 		return false
 	})
-	time.Sleep(1500 * time.Millisecond)
+	if msRace {
+		time.Sleep(750 * time.Millisecond) // the race lane's budget (m3 R1-23's first lever)
+	} else {
+		time.Sleep(1500 * time.Millisecond)
+	}
 	close(stop)
 	gens.Wait()
 	end := time.Now()

@@ -723,7 +723,11 @@ func TestMuxDetachBothOrders_L12(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			d, p, ia, ib := dgMuxPair(t, 1200, nil)
 			var lost atomic.Int64
-			ia.setFilter(lossy(0.01, 7, &lost))
+			// The seeded 1 % may fall on PINGs and DATA only (it did once
+			// in the race lane: which datagram is the n-th depends on the
+			// scheduler), so the dialer's first REL is dropped as well: a
+			// REL retransmission is certain, not likely.
+			ia.setFilter(dropFirstRel(lossy(0.01, 7, &lost), &lost))
 			ib.setFilter(lossy(0.01, 11, &lost))
 			orders := []string{"ours", "theirs", "crossing"}
 			exchanged := 0
@@ -751,6 +755,25 @@ func TestMuxDetachBothOrders_L12(t *testing.T) {
 			}
 		})
 	})
+}
+
+// dropFirstRel drops the first datagram that carries a REL frame (counted
+// in n), then filters with next.
+func dropFirstRel(next func([]byte) bool, n *atomic.Int64) func([]byte) bool {
+	var done atomic.Bool
+	return func(d []byte) bool {
+		if !done.Load() {
+			if fs, ok := dgDecode(d); ok {
+				for _, f := range fs {
+					if f.Type == wire.TypeRel && done.CompareAndSwap(false, true) {
+						n.Add(1)
+						return false
+					}
+				}
+			}
+		}
+		return next(d)
+	}
 }
 
 // TestMuxDetachBound (§A5.5): a peer that never answers our DETACH: the

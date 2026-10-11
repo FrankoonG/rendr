@@ -23,14 +23,22 @@ import (
 // moves one datagram per system call.
 var beBatching = runtime.GOOS == "linux" && (runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64")
 
-// beCount is the datagrams each direction writes.
-const beCount = 50000
+// beCount is the datagrams each direction writes: 50,000, and 20,000
+// under -race (the race lane's 5-minute pass, m3 R1-23's first lever, from
+// I1 of M5), with the same criteria.
+var beCount = func() int {
+	if msRace {
+		return 20000
+	}
+	return 50000
+}()
 
 // TestRealUDPBatchE2E (§A10.1 WP4; M5-D16, M5-D17, R1-2; L55, L57): a
 // selector packet session between two Runtimes over carrier/udp on
 // loopback — the dialer on udp.Carrier, the passive on one udp.Listen
 // socket through FromPacketConn, both with the arm's Options.MaxBatch —
-// writes 50,000 test datagrams (24 … 1,000 bytes) each way at full speed:
+// writes 50,000 test datagrams (24 … 1,000 bytes; 20,000 under -race)
+// each way at full speed:
 // both generators at once, each calling WriteTo back to back while fewer
 // than beWindow of its datagrams are in flight end to end, so the
 // carriers' writers always find a backlog and neither the send queue nor
@@ -304,13 +312,13 @@ func beJudge(t *testing.T, d *beFlow) {
 	if err, _ := d.s.verr.Load().(error); err != nil {
 		t.Errorf("%s: %v", d.name, err)
 	}
-	if got := d.s.accepted.Load(); got != beCount {
+	if got := d.s.accepted.Load(); got != uint64(beCount) {
 		t.Errorf("stimulus %s: %d of %d WriteTo calls accepted", d.name, got, beCount)
 	}
-	if acc := tp.Sent + tp.DropQueue + tp.DropAge + tp.DropNoPath + tp.DropTooLarge; acc != beCount {
+	if acc := tp.Sent + tp.DropQueue + tp.DropAge + tp.DropNoPath + tp.DropTooLarge; acc != uint64(beCount) {
 		t.Errorf("stimulus %s: the sender's counters account for %d of %d datagrams", d.name, acc, beCount)
 	}
-	if floor := uint64(beMinShare * beCount); res.Unique < floor {
+	if floor := uint64(beMinShare * float64(beCount)); res.Unique < floor {
 		t.Errorf("load %s: %d of %d datagrams arrived, want ≥ %d", d.name, res.Unique, beCount, floor)
 	}
 	if res.Corrupt != 0 || res.BadSize != 0 || res.Duplicates != 0 || rp.Duplicates != 0 {

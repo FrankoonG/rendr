@@ -38,14 +38,15 @@ func realLossWindows() (pre, post time.Duration) {
 // (1,000 back), one carrier closed under rendr at 5 s (an embedder-closed
 // socket: transport_error at once); the session moves to a new carrier and
 // keeps every datagram that was not in flight on the dead one. Under the
-// race detector the timeline is 6 s with the kill at 3 s (m3 R1-23's
-// first lever, I3 of M4: the race-unit pass budget), with the same
-// criteria; the non-race lanes keep 10 s.
+// race detector the timeline is 4 s with the kill at 2 s (m3 R1-23's
+// first lever: 6 s with the kill at 3 s from I3 of M4 until I1 of M5,
+// whose race-unit passes reached 306 s), with the same criteria; the
+// non-race lanes keep 10 s.
 func TestUDPEndToEnd(t *testing.T) {
 	pre, post := realLossWindows()
 	duration, every := 10*time.Second, 5*time.Second
 	if loopbackRace {
-		duration, every = 6*time.Second, 3*time.Second
+		duration, every = 4*time.Second, 2*time.Second
 	}
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(mode.String(), func(t *testing.T) {
@@ -64,8 +65,9 @@ func TestUDPEndToEnd(t *testing.T) {
 // turn). It is a long real-time load, so -short skips it; the pool lanes
 // run it without -short.
 //
-// Under the race detector it runs 12 s per mode (two kills, 4 s apart: in
-// bond mode each member once; 30 s with kills 10 s apart until I3 of M4)
+// Under the race detector it runs 8 s per mode (two kills, 3 s apart: in
+// bond mode each member once; 30 s with kills 10 s apart until I3 of M4,
+// 12 s with kills 4 s apart until I1 of M5)
 // with the same criteria: the unit suite's -race lane has a 5-minute
 // wall-clock budget (plan §9.0; m3 R1-23's first lever) and a required
 // test must not skip there, while the 60-s timeline at full rate stays in
@@ -76,7 +78,7 @@ func TestPacketSmokeUDP60_CA(t *testing.T) {
 	}
 	rate, duration, every := 10000, 60*time.Second, 10*time.Second
 	if loopbackRace {
-		rate, duration, every = 2000, 12*time.Second, 4*time.Second
+		rate, duration, every = 2000, 8*time.Second, 3*time.Second
 	}
 	pre, post := realLossWindows()
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
