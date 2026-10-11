@@ -54,8 +54,13 @@
 // (its local conn resets during an outage) has no path to travel, even if
 // one returns at once: it reaches the passive as rendr.ErrNoPath once the
 // passive's PassiveRetain runs out (the dialer's NoPathGrace + PingIdle +
-// DeadMax + 5 s, 34 s with the defaults, counted from the outage), and the
-// target is reset then: late, but never a clean end.
+// DeadMax + 5 s, 34 s with the defaults, counted from the passive's loss of
+// its last carrier), and the target is reset then: late, but never a clean
+// end. The opposite direction keeps its code: a reset decided on the
+// passive while no carrier is alive (its target resets during an outage)
+// reaches the dialer as a *rendr.AbortError with that code once a stream
+// carrier returns while the ended session's tombstone lasts, because the
+// tombstone answers the dialer's rejoin with the code.
 //
 // A dial that fails reaches the dialer as a *rendr.RejectError whose
 // CodeOf is the class of the failure (refused, unreachable, timeout, name
