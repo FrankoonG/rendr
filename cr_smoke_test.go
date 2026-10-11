@@ -291,7 +291,8 @@ func runStreamSmoke(t *testing.T, mode rendr.Mode, size int64) {
 
 // TestPacketRaceSmoke_CR: the C-A packet smoke (runSmoke) for a race
 // session over the DatagramLink and the DatagramHub: 60 virtual seconds
-// at 10,000 datagrams per second (30 s at 1,000 under -race) and 1,000 back, a
+// at 10,000 datagrams per second and 1,000 back (30 s at 400 each way
+// under -race), a
 // member's carrier closed every 10 s in turn. On top of runSmoke's
 // checks (no corrupt, resized or application-duplicated datagram, losses
 // only near kills or counted, the counters adding up, nothing left after
@@ -299,12 +300,13 @@ func runStreamSmoke(t *testing.T, mode rendr.Mode, size int64) {
 // direction, the receiver counts the members' copies as Duplicates, and
 // the sender's copies as Race.Copies.
 func TestPacketRaceSmoke_CR(t *testing.T) {
-	rate, duration := 10000, 60*time.Second
+	rate, back, duration := 10000, 1000, 60*time.Second
 	if loopbackRace {
 		// R1-23's first lever (R2-37): the race lane runs 30 virtual
-		// seconds (two kills) at 1,000 datagrams per second, with the
-		// same criteria.
-		rate, duration = 1000, 30*time.Second
+		// seconds (two kills) at 400 datagrams per second each way (1,000
+		// and 1,000 back until I3 of M4, when the race-unit passes
+		// exceeded 300 s), with the same criteria.
+		rate, back, duration = 400, 400, 30*time.Second
 	}
 	for _, tr := range []struct {
 		name string
@@ -316,7 +318,7 @@ func TestPacketRaceSmoke_CR(t *testing.T) {
 				n := tr.net()
 				defer n.close()
 				runSmoke(t, n, smokeRun{mode: rendr.ModeRace, duration: duration, every: 10 * time.Second,
-					rate: rate, back: 1000, lossWin: 200 * time.Millisecond}, rendr.Config{})
+					rate: rate, back: back, lossWin: 200 * time.Millisecond}, rendr.Config{})
 				crRegistryBack(t, live0, parked0)
 			})
 		})

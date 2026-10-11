@@ -37,13 +37,20 @@ func realLossWindows() (pre, post time.Duration) {
 // TestUDPEndToEnd: selector and bond, 10 s at 2,000 datagrams per second
 // (1,000 back), one carrier closed under rendr at 5 s (an embedder-closed
 // socket: transport_error at once); the session moves to a new carrier and
-// keeps every datagram that was not in flight on the dead one.
+// keeps every datagram that was not in flight on the dead one. Under the
+// race detector the timeline is 6 s with the kill at 3 s (m3 R1-23's
+// first lever, I3 of M4: the race-unit pass budget), with the same
+// criteria; the non-race lanes keep 10 s.
 func TestUDPEndToEnd(t *testing.T) {
 	pre, post := realLossWindows()
+	duration, every := 10*time.Second, 5*time.Second
+	if loopbackRace {
+		duration, every = 6*time.Second, 3*time.Second
+	}
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Cleanup(rendrtest.AssertNoLeak(t))
-			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: 10 * time.Second, every: 5 * time.Second,
+			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: duration, every: every,
 				rate: 2000, back: 1000, lossWin: post, preWin: pre}, rendr.Config{})
 		})
 	}
@@ -57,24 +64,25 @@ func TestUDPEndToEnd(t *testing.T) {
 // turn). It is a long real-time load, so -short skips it; the pool lanes
 // run it without -short.
 //
-// Under the race detector it runs 30 s per mode (two kills, 10 s apart:
-// in bond mode each member once) with the same criteria: the unit suite's
-// -race lane has a 5-minute wall-clock budget (plan §9.0) and a required
+// Under the race detector it runs 12 s per mode (two kills, 4 s apart: in
+// bond mode each member once; 30 s with kills 10 s apart until I3 of M4)
+// with the same criteria: the unit suite's -race lane has a 5-minute
+// wall-clock budget (plan §9.0; m3 R1-23's first lever) and a required
 // test must not skip there, while the 60-s timeline at full rate stays in
 // the non-race lanes.
 func TestPacketSmokeUDP60_CA(t *testing.T) {
 	if testing.Short() {
 		t.Skip("60-s real-time smoke")
 	}
-	rate, duration := 10000, 60*time.Second
+	rate, duration, every := 10000, 60*time.Second, 10*time.Second
 	if loopbackRace {
-		rate, duration = 2000, 30*time.Second
+		rate, duration, every = 2000, 12*time.Second, 4*time.Second
 	}
 	pre, post := realLossWindows()
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Cleanup(rendrtest.AssertNoLeak(t))
-			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: duration, every: 10 * time.Second,
+			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: duration, every: every,
 				rate: rate, back: 1000, lossWin: post, preWin: pre}, rendr.Config{})
 		})
 	}
