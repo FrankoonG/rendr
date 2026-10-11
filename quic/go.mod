@@ -1,4 +1,4 @@
-module github.com/FrankoonG/rendr/v2/quic
+module github.com/FrankoonG/rendr/quic/v2
 
 go 1.26.3
 

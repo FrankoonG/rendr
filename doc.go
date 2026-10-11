@@ -35,7 +35,7 @@
 // when a bounded queue drops them (counted). Their carriers are datagram
 // carriers — the built-in raw UDP carrier (package carrier/udp, with a
 // listening socket served through FromPacketConn), the QUIC carriers of
-// the nested module github.com/FrankoonG/rendr/v2/quic, or an embedder's
+// the nested module github.com/FrankoonG/rendr/quic/v2, or an embedder's
 // net.PacketConn (DatagramCarrier, Listener.HandlePacket) — and stream
 // carriers too. ReadFrom returns io.EOF only after the peer closed its end
 // and the datagrams this side holds were read; a carrier change is as

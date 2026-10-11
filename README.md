@@ -15,7 +15,7 @@ carriers bonded for throughput, or every byte raced over every carrier).
 Carriers are rendr-to-rendr connections that the embedder supplies as
 `net.Conn` or `net.PacketConn` factories — typically L7 tunnels — or the
 built-in plaintext TCP and UDP carriers, or the QUIC carriers of the nested
-module `github.com/FrankoonG/rendr/v2/quic`.
+module `github.com/FrankoonG/rendr/quic/v2`.
 Besides byte-stream sessions (`net.Conn`), rendr carries packet sessions
 (`net.PacketConn`): datagrams delivered at most once, never retransmitted.
 
@@ -62,7 +62,7 @@ transport layer meant to run inside the embedder's own protocol:
   network or inside an authenticated encrypted channel. The UDP carrier's
   random flow ID keeps blind off-path injection out but is no
   authentication: anyone who sees the traffic can kill or retire a carrier.
-- The QUIC carriers (module `github.com/FrankoonG/rendr/v2/quic`) always
+- The QUIC carriers (module `github.com/FrankoonG/rendr/quic/v2`) always
   encrypt, but encryption is not authentication: they authenticate only
   what the embedder's `tls.Config` verifies.
 - [`examples/mtls`](examples/mtls) shows mutually authenticated TLS carriers
