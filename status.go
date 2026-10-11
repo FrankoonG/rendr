@@ -82,7 +82,9 @@ type DatagramStatus struct {
 	// BatchFallbacks counts sockets that stopped batching because the
 	// kernel or a sandbox refused sendmmsg/recvmmsg (each socket at most
 	// once). ChargeRefused counts receive slots the memory budget refused;
-	// the reader then kept its depth.
+	// the reader then kept, or fell back to, the depth it could charge (a
+	// dialer carrier keeps its depth; a listening socket reads with the
+	// slots it has).
 	BatchFallbacks uint64
 	ChargeRefused  uint64
 }
