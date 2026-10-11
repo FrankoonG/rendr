@@ -12,7 +12,8 @@ import (
 // TestG4PktMiniature: gold/G4-pkt-sel and gold/G4-pkt-bond (M2 design
 // B1.3) at reduced scale (§A8.3): the zero Config, two DatagramLinks of
 // 20 ms RTT (u1, u2), one packet session with 1000-byte datagrams at 2,000
-// per second B → A and 200 per second A → B (F3). After a 30-s warm-up the
+// per second B → A and 200 per second A → B (F3; half both under -race:
+// goldRateBA). After a 30-s warm-up the
 // path of the carrier that carries data — selector: the dialer's active
 // one; bond: B's member with the largest Tx growth over the last second
 // (F13, which must be at least 25 % of B's offered bytes) — drops

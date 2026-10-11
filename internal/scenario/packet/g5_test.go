@@ -12,7 +12,8 @@ import (
 // TestG5PktMiniature: gold/G5-pkt-sel and gold/G5-pkt-bond (M2 design
 // B1.4) at reduced scale (§A8.3): B1.3's topology and workload in the
 // miniature (the zero Config, two DatagramLinks p1 and p2 of 20 ms RTT,
-// 1000-byte datagrams at 2,000 per second B → A and 200 per second A → B),
+// 1000-byte datagrams at 2,000 per second B → A and 200 per second A → B;
+// half both under -race: goldRateBA),
 // streams until the end. G5Bound_pkt = T_gap + 3·RTT + S + 1 s = 4.06 s
 // (F15, PA-13).
 //
