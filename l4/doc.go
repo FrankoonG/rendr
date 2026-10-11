@@ -50,9 +50,16 @@
 //	carrier death, migration               nothing                           nothing
 //
 // A reset is SetLinger(0) and Close where the local conn offers it, else a
-// plain Close. A dial that fails reaches the dialer as a *rendr.RejectError
-// whose CodeOf is the class of the failure (refused, unreachable, timeout,
-// name not found, …); its message is the code's fixed text, never the raw
+// plain Close. A reset decided on the dialer while no carrier is alive
+// (its local conn resets during an outage) has no path to travel, even if
+// one returns at once: it reaches the passive as rendr.ErrNoPath once the
+// passive's PassiveRetain runs out (the dialer's NoPathGrace + PingIdle +
+// DeadMax + 5 s, 34 s with the defaults, counted from the outage), and the
+// target is reset then: late, but never a clean end.
+//
+// A dial that fails reaches the dialer as a *rendr.RejectError whose
+// CodeOf is the class of the failure (refused, unreachable, timeout, name
+// not found, …); its message is the code's fixed text, never the raw
 // error, which stays on the passive (ServerStatus.LastErr). The message is
 // empty when the refusal is repeated for an OPEN retried on a shared
 // carrier (after a carrier death took the first answer down): such a
