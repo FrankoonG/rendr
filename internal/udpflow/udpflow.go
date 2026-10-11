@@ -6,7 +6,11 @@
 //
 // One goroutine per Source reads the socket and routes each datagram by its
 // flow ID into that flow's bounded inbox (tail drop when full or when the
-// Budget refuses the buffer, counted). A datagram of an unknown flow
+// Budget refuses the buffer, counted). rendr's own listening socket is
+// read up to min(MaxBatch, 32) datagrams per system call where it batches
+// (recvmmsg on Linux amd64/arm64) and written by the flows several per call
+// (sendmmsg); every flow that received datagrams of a read is woken once
+// after the read (M5-D13, M5-D14). A datagram of an unknown flow
 // creates a flow only when its rendr bytes are a complete valid first
 // datagram H1 (a PREFACE of kind datagram and exactly one first frame whose
 // header and CRC verify): before that nothing is allocated (plan:324).
@@ -122,15 +126,20 @@ type Admit func(f *Flow)
 // socket call or a callback (M2 design §A4.2).
 type Source struct {
 	env *carrier.Env
-	pc  net.PacketConn // a *carrier.OwnedUDPSocket gets the AddrPort fast path; any other conn is used through its methods only (L57)
+	pc  net.PacketConn // a *carrier.OwnedUDPSocket is read and written through bio; any other conn through its methods only (L57)
 	lim Limits
 
-	own       *carrier.OwnedUDPSocket // pc when it is exactly rendr's own listening socket, else nil
-	maxDgram  int                     // the largest datagram read: own.MaxDatagram(), else wire.MaxDatagram
-	dbufs     *carrier.BufPool        // Env.DBufs (a private pool when the Env has none)
-	stages    *carrier.Budget         // the account of the flows' control reserve (Env.Stages, else Env.Budget)
-	firstCseq uint32                  // the REL cseq of a valid H1 (Presets.FirstCseq or wire.FirstCseq)
-	firstFseq uint32                  // Presets.FirstFseq (0: an H1's first frame carries its PREFACE's fseq)
+	// bio moves datagrams on pc when pc is exactly rendr's own listening
+	// socket (several per system call where it batches, M5-D10); nil for
+	// a foreign conn. wpool holds the flow writers' call state (wbatch).
+	bio   sockIO
+	wpool sync.Pool
+
+	maxDgram  int              // the largest datagram read: the token's MaxDatagram(), else wire.MaxDatagram
+	dbufs     *carrier.BufPool // Env.DBufs (a private pool when the Env has none)
+	stages    *carrier.Budget  // the account of the flows' control reserve and the Batches (Env.Stages, else Env.Budget)
+	firstCseq uint32           // the REL cseq of a valid H1 (Presets.FirstCseq or wire.FirstCseq)
+	firstFseq uint32           // Presets.FirstFseq (0: an H1's first frame carries its PREFACE's fseq)
 
 	halted atomic.Bool   // the socket close started: Run returns, flow writes fail
 	killed atomic.Bool   // Abort, a permanent read error or the end of Run: every flow's reads fail
@@ -194,9 +203,6 @@ func NewSource(env *carrier.Env, pc net.PacketConn, lim Limits) *Source {
 		dbufs: env.DBufs, stages: env.Stages, firstCseq: env.Presets.FirstCseq, firstFseq: env.Presets.FirstFseq,
 		quit: make(chan struct{}), flows: make(map[uint64]*Flow), perIP: make(map[netip.Addr][2]int32),
 		tombs: make(map[uint64]time.Time), done: make(chan struct{})}
-	if own, ok := pc.(*carrier.OwnedUDPSocket); ok {
-		s.own, s.maxDgram = own, own.MaxDatagram()
-	}
 	if s.dbufs == nil {
 		s.dbufs = carrier.NewDatagramBufPool()
 	}
@@ -205,6 +211,10 @@ func NewSource(env *carrier.Env, pc net.PacketConn, lim Limits) *Source {
 	}
 	if s.firstCseq == 0 {
 		s.firstCseq = wire.FirstCseq
+	}
+	if own, ok := pc.(*carrier.OwnedUDPSocket); ok {
+		s.maxDgram = own.MaxDatagram()
+		s.setIO(ownedIO(own, env))
 	}
 	return s
 }
@@ -246,9 +256,10 @@ func (l *Limits) quota(c uint8) int32 {
 // other sources of the Listener go on, L50), admits flows through admit and
 // routes datagrams to their inboxes. Transient errors (ICMP class,
 // ECONNABORTED on a listening socket, Temporary) back off 5 → 100 ms (L58).
-// An *carrier.OwnedUDPSocket classifies its own errors; a foreign conn's
-// read and write errors are classified by carrier.ClassifyPacketErr, an
-// abort (PacketErrAbort) being noise on the shared socket (integration 1).
+// Read and write errors — of rendr's own socket and of a foreign conn —
+// are classified by carrier.ClassifyPacketErr, an abort (PacketErrAbort)
+// being noise on the shared socket (integration 1); rendr's own socket is
+// read up to min(MaxBatch, 32) datagrams per call (M5-D13).
 func (s *Source) Run(admit Admit) {
 	s.mu.Lock()
 	if s.run != runIdle {
@@ -259,7 +270,7 @@ func (s *Source) Run(admit Admit) {
 	s.mu.Unlock()
 	r := &reader{s: s, admit: admit}
 	defer r.exit() // also on runtime.Goexit inside the conn's ReadFrom
-	if s.own != nil {
+	if s.bio != nil {
 		r.loopOwned()
 	} else {
 		r.loopForeign()
