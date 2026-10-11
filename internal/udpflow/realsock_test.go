@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -24,6 +25,7 @@ func loopback4() *net.UDPAddr {
 }
 
 // realSource is a Source over an OwnedUDPSocket with a client socket.
+// admitted holds up to 128 flows not taken yet.
 type realSource struct {
 	t        *testing.T
 	env      *carrier.Env
@@ -43,6 +45,17 @@ func newRealSource(t *testing.T, maxDatagram int) *realSource {
 
 func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits) *realSource {
 	t.Helper()
+	rs := newRealSourceIO(t, maxDatagram, env, lim, defaultMaxBatch)
+	rs.start()
+	return rs
+}
+
+// newRealSourceIO returns a realSource whose Source reads and writes the
+// socket through a udpsocket.Conn of maxBatch counted in env.Dgram.IO —
+// the path of a token that exposes its socket (M5 WP3) — without starting
+// Run (start).
+func newRealSourceIO(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits, maxBatch int) *realSource {
+	t.Helper()
 	u, err := net.ListenUDP("udp4", loopback4())
 	if err != nil {
 		t.Fatal(err)
@@ -52,15 +65,18 @@ func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limit
 		u.Close()
 		t.Fatal(err)
 	}
-	rs := &realSource{t: t, env: env, u: u, cl: cl, admitted: make(chan *Flow, 16),
+	rs := &realSource{t: t, env: env, u: u, cl: cl, admitted: make(chan *Flow, 128),
 		dst: u.LocalAddr().(*net.UDPAddr).AddrPort()}
 	rs.s = NewSource(rs.env, carrier.NewOwnedUDPSocket(u, maxDatagram), lim)
-	go rs.s.Run(func(f *Flow) {
-		rs.mu.Lock()
-		rs.all = append(rs.all, f)
-		rs.mu.Unlock()
-		rs.admitted <- f
-	})
+	if maxBatch > 0 {
+		c, err := udpsocket.New(u, maxBatch, &env.Dgram.IO)
+		if err != nil {
+			u.Close()
+			cl.Close()
+			t.Fatal(err)
+		}
+		rs.s.setIO(c)
+	}
 	t.Cleanup(func() {
 		rs.s.Abort()
 		rs.mu.Lock()
@@ -78,6 +94,16 @@ func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limit
 		cl.Close()
 	})
 	return rs
+}
+
+// start runs the Source's demux.
+func (rs *realSource) start() {
+	go rs.s.Run(func(f *Flow) {
+		rs.mu.Lock()
+		rs.all = append(rs.all, f)
+		rs.mu.Unlock()
+		rs.admitted <- f
+	})
 }
 
 func (rs *realSource) send(b []byte) {
