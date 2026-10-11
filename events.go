@@ -26,8 +26,8 @@ import "time"
 type Event struct {
 	Seq     uint64    // Runtime-wide, assigned at enqueue; gaps are dropped events
 	Time    time.Time // when the change was published
-	Kind    EventKind
-	Session SessionID
+	Kind    EventKind // what changed
+	Session SessionID // the session it changed in
 	Carrier CarrierID // EventCarrierUp/Down: the carrier
 	From    CarrierID // EventMigration: the carrier the data left (see Event)
 	To      CarrierID // EventMigration: the carrier the data moved to, or 0 (see Event)

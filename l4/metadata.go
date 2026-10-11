@@ -187,8 +187,8 @@ func Match(md []byte) bool {
 // MetadataError is ParseMetadata's error: the Reject code a Server answers
 // the malformed metadata with, and what was wrong.
 type MetadataError struct {
-	Code RejectCode
-	Msg  string
+	Code RejectCode // CodeBadRequest, CodeBadVersion, CodeBadCommand or CodeBadAddress
+	Msg  string     // what was wrong (stays on the passive)
 }
 
 // Error implements error.

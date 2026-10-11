@@ -39,7 +39,11 @@
 // net.PacketConn (DatagramCarrier, Listener.HandlePacket) — and stream
 // carriers too. ReadFrom returns io.EOF only after the peer closed its end
 // and the datagrams this side holds were read; a carrier change is as
-// invisible as for a stream session.
+// invisible as for a stream session. On Linux amd64 and arm64 the sockets
+// package carrier/udp creates move up to its Options.MaxBatch datagrams
+// per system call (sendmmsg, recvmmsg), with a one-way fallback to one
+// call per datagram where the kernel refuses them; Status.Datagram counts
+// the calls and the datagrams they moved.
 //
 // Race sessions (ModeRace) take their member carriers as bond sessions do
 // and send every byte or datagram on each of them; the receiver keeps the

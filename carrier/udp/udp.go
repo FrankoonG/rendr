@@ -109,6 +109,11 @@ type Options struct {
 // address must be a loopback IP or a host name whose every address is
 // loopback, checked before and after binding (ErrNonLoopback); an empty
 // host (wildcard) requires AllowNonLoopback.
+//
+// A wildcard socket is single-homed: replies leave from the source address
+// the routing table chooses, not necessarily the address a datagram
+// arrived at (rendr does not use IP_PKTINFO). Bind a specific address on a
+// multi-homed host.
 func Listen(network, address string, o Options) (net.PacketConn, error) {
 	return listen(context.Background(), network, address, o)
 }

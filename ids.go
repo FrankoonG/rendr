@@ -311,7 +311,7 @@ func (e Evidence) String() string {
 // across migrations and never reveals carrier addresses.
 type Addr struct {
 	Instance InstanceID // the Runtime at this end
-	Session  SessionID
+	Session  SessionID  // the session, the same at both ends
 }
 
 // Network returns "rendr".

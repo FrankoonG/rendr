@@ -26,6 +26,13 @@ type Carrier interface{ isCarrier() }
 // a conn returned late is closed exactly once, byte counts are validated,
 // and conns are only ever used through the net.Conn interface, except the
 // connections package carrier/tcp creates (see that package).
+//
+// Limitation: probe round trips are measured from a PING's write commit,
+// so a conn whose Write returns only after the far end read the bytes (a
+// net.Pipe-like conn, such as an in-process tunnel) may yield no probe
+// evidence at GOMAXPROCS=1. Its factory then stays EvidenceUnknown: a
+// cold-start Dial waits the whole Probe.DialWait, and ranking falls back to
+// the configured order.
 type StreamCarrier struct {
 	// Name identifies the factory in Status, PeerStatus and ranking ties;
 	// unique and non-empty within a Peer.
@@ -50,7 +57,7 @@ func (StreamCarrier) isCarrier() {}
 // order breaks ranking ties). Every session snapshots it at Dial; a later
 // change of the Peer does not affect existing sessions.
 type PeerConfig struct {
-	Carriers []Carrier
+	Carriers []Carrier // 1–16 StreamCarrier and DatagramCarrier factories
 }
 
 // DialOptions configure one session.
@@ -293,7 +300,7 @@ type PeerStatus struct {
 // FactoryStatus is one factory's probe state (see ProbePolicy, Evidence
 // and SelectorPolicy).
 type FactoryStatus struct {
-	Name          string
+	Name          string        // the factory's Name
 	Evidence      Evidence      // at the time of the call
 	RTT           time.Duration // aggregated probe RTT (fresh or held), else 0
 	Samples       uint64        // probe samples accepted, loaded ones included

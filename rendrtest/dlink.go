@@ -742,9 +742,9 @@ func (l *DatagramLink) Close() error {
 
 // DatagramCounts count one class of carriers of a datagram link or hub.
 type DatagramCounts struct {
-	Sent, Delivered, Lost, Duplicated, Reordered uint64
-	Oversize, Injected, Corrupted, Truncated     uint64
-	Foreign, ScriptedWrites, ReadFaults          uint64
+	Sent, Delivered, Lost, Duplicated, Reordered uint64 // datagrams written, read by the far end, and lost, duplicated or reordered by the link's faults
+	Oversize, Injected, Corrupted, Truncated     uint64 // datagrams refused as larger than the MTU, injected (replays, splices), corrupted and truncated
+	Foreign, ScriptedWrites, ReadFaults          uint64 // datagrams read from a foreign address, scripted WriteTo results, injected read faults
 	// Held counts the datagrams a stall held: written while it lasted, or on
 	// their way with an arrival time inside it. Killed counts the carriers
 	// Kill failed, Captured the datagrams CaptureNext copied. A DatagramHub
@@ -754,10 +754,10 @@ type DatagramCounts struct {
 
 // DatagramStats are a datagram link's or hub's counters.
 type DatagramStats struct {
-	All, Session, Probe DatagramCounts
-	Dials, DialFailures uint64
-	Carriers            int // carriers created
-	Rebinds, Spoofed    uint64
+	All, Session, Probe DatagramCounts // over all carriers, session carriers, probe carriers
+	Dials, DialFailures uint64         // factory calls; those that failed
+	Carriers            int            // carriers created
+	Rebinds, Spoofed    uint64         // DatagramHub: Rebind calls; foreign datagrams delivered to the passive socket (Spoof, Replay, Flood)
 	// Replayed counts the datagrams DatagramLink.ReplayInto and
 	// DatagramHub.ReplayFlow delivered into this link or hub, Spliced the
 	// ones DatagramLink.SpliceFrom delivered (M3 design §A9.2); each also

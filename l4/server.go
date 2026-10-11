@@ -403,13 +403,13 @@ func Serve(ctx context.Context, ln *rendr.Listener) error {
 
 // ServerStatus counts what a Server does.
 type ServerStatus struct {
-	Dialing, Live       int    // sessions being dialled for; connections being forwarded
-	Hooks               int    // custom hook calls running, in flight or abandoned (≤ 192)
-	Abandoned           int    // hook calls still running past their bound
-	Confirmed, Rejected uint64 // totals (Rejected: Reject calls, also one that found the session decided)
-	Unconfirmed         uint64 // dialled, then reset because Confirm failed
-	Lost                uint64 // the pending phase ended during the dial; no Reject sent
-	ByCode              map[RejectCode]uint64
-	Panics              uint64 // recovered hook panics and Goexits
-	LastErr             error  // the last raw dial error (never sent to the dialer)
+	Dialing, Live       int                   // sessions being dialled for; connections being forwarded
+	Hooks               int                   // custom hook calls running, in flight or abandoned (≤ 192)
+	Abandoned           int                   // hook calls still running past their bound
+	Confirmed, Rejected uint64                // totals (Rejected: Reject calls, also one that found the session decided)
+	Unconfirmed         uint64                // dialled, then reset because Confirm failed
+	Lost                uint64                // the pending phase ended during the dial; no Reject sent
+	ByCode              map[RejectCode]uint64 // Rejected by code
+	Panics              uint64                // recovered hook panics and Goexits
+	LastErr             error                 // the last raw dial error (never sent to the dialer)
 }

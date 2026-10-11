@@ -4,12 +4,12 @@ import "time"
 
 // Status is a Runtime snapshot.
 type Status struct {
-	Instance           InstanceID
-	Sessions           SessionCounts
-	Handshakes         int    // occupied handshake slots
-	HandshakeEvictions uint64 // unfinished handshakes evicted because the slots were full
-	AcceptBacklog      [2]int // pending sessions across Listeners: [0] stream (Accept), [1] packet (AcceptPacket)
-	Sessionless        int    // probe carriers held by this (passive) Runtime
+	Instance           InstanceID    // this Runtime's InstanceID
+	Sessions           SessionCounts // live sessions by category, and tombstones
+	Handshakes         int           // occupied handshake slots
+	HandshakeEvictions uint64        // unfinished handshakes evicted because the slots were full
+	AcceptBacklog      [2]int        // pending sessions across Listeners: [0] stream (Accept), [1] packet (AcceptPacket)
+	Sessionless        int           // probe carriers held by this (passive) Runtime
 
 	// BufferedBytes is the use of the MaxBufferedBytes budget (send,
 	// receive and write buffers, and the datagrams queued for raw-UDP
@@ -103,27 +103,27 @@ type SessionCounts struct {
 
 // SessionStatus is a session snapshot.
 type SessionStatus struct {
-	ID           SessionID
-	Kind         Kind
-	Mode         Mode
-	Role         Role
-	PeerInstance InstanceID
-	State        State
-	Err          error // the end error once State == StateEnded (io.EOF after a clean finish), else nil
+	ID           SessionID  // the session ID, the same on both ends
+	Kind         Kind       // KindStream or KindPacket
+	Mode         Mode       // fixed at OPEN
+	Role         Role       // RoleDialer or RolePassive
+	PeerInstance InstanceID // the bound peer Runtime (zero while an EarlyReturn dialer waits for the answer)
+	State        State      // lifecycle state
+	Err          error      // the end error once State == StateEnded (io.EOF after a clean finish), else nil
 
 	SchedEpoch  uint32 // dialer: last epoch published; passive: last epoch applied
 	SchedEchoed uint32 // dialer: highest epoch echoed by the passive; passive: equals SchedEpoch
 
 	Migrations     MigrationCounts // never counts the initial attach
 	Rejoins        uint64          // dialer only: carriers attached on a factory slot that already had one; not migrations
-	NoPathEpisodes uint64
-	InNoPath       bool
+	NoPathEpisodes uint64          // times the session lost its last carrier (EventNoPathStart)
+	InNoPath       bool            // the session has no carrier now
 
 	TxBytes            uint64 // accepted from the application
 	AckedBytes         uint64 // acknowledged as delivered to the peer application
 	RxBytes            uint64 // received in order
 	DeliveredBytes     uint64 // read by the application (or discarded after Close)
-	RetransmittedBytes uint64
+	RetransmittedBytes uint64 // DATA payload bytes sent again after a carrier death or a bond rescue
 
 	Window     int64 // currently advertised receive window
 	PeerWindow int64 // peer's right edge minus AckedBytes
@@ -182,7 +182,7 @@ type PacketCounters struct {
 // passive takes the dialer's cumulative counts from every scheduling update
 // it applies, so they agree once the passive has followed the latest one.
 type MigrationCounts struct {
-	Death, Quality, Explicit uint64
+	Death, Quality, Explicit uint64 // by cause: a carrier death, a selector quality switch, a carrier retired by the peer (CLOSE, GOAWAY)
 }
 
 // CarrierStatus is one carrier of a session. A dead carrier's figures are
@@ -198,24 +198,24 @@ type MigrationCounts struct {
 // session — and a dead row keeps the values it had when the session left
 // the carrier.
 type CarrierStatus struct {
-	ID       CarrierID
-	Name     string // factory name ("" on the passive side)
-	Kind     Kind
-	Gen      uint32 // incarnation number of the factory slot (dialer) or attach order (passive)
-	State    CarrierState
-	SRTT     time.Duration
-	MinRTT   time.Duration
-	Rate     float64 // bytes/s proven by PONG watermarks
-	Inflight int     // bytes written and not yet proven received
-	Cap      int     // in-flight capacity cap
+	ID       CarrierID     // allocated by the dialer; the same on both ends
+	Name     string        // factory name ("" on the passive side)
+	Kind     Kind          // KindStream or KindDatagram
+	Gen      uint32        // incarnation number of the factory slot (dialer) or attach order (passive)
+	State    CarrierState  // the carrier's role in the session
+	SRTT     time.Duration // smoothed PING round trip (0 before the first PONG)
+	MinRTT   time.Duration // smallest PING round trip seen
+	Rate     float64       // bytes/s proven by PONG watermarks
+	Inflight int           // bytes written and not yet proven received
+	Cap      int           // in-flight capacity cap
 
-	TxBytes   uint64
-	RxBytes   uint64
-	RetxBytes uint64
-	Frames    uint64
+	TxBytes   uint64 // DATA and DGRAM payload bytes sent on this carrier
+	RxBytes   uint64 // DATA and DGRAM payload bytes received on this carrier
+	RetxBytes uint64 // of TxBytes: retransmitted DATA payload bytes
+	Frames    uint64 // frames written
 
-	DeathCause  Cause
-	DeathDetail string
+	DeathCause  Cause  // why the carrier ended (CauseNone while it lives)
+	DeathDetail string // diagnostic text for DeathCause, such as the transport error
 
 	// Datagram carriers (zero on stream carriers).
 	MTU         int    // current frame budget: bytes of rendr frames per datagram

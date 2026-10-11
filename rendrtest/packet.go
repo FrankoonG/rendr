@@ -103,7 +103,7 @@ func PacketSink(count *atomic.Int64) PacketBehaviour {
 
 // PacketGenConfig configures PacketGen.
 type PacketGenConfig struct {
-	Seed  uint64
+	Seed  uint64  // distinguishes generators; a PacketVerifier checks one seed
 	Size  int     // datagram size, ≥ PacketHeaderLen
 	Count int     // datagrams to send
 	Rate  float64 // datagrams per second (0: as fast as WriteTo returns)
@@ -326,10 +326,10 @@ func (v *PacketVerifier) Result() PacketResult {
 
 // PacketResult is a PacketVerifier's verdict.
 type PacketResult struct {
-	Unique, Duplicates, Corrupt, BadSize uint64
-	Highest                              uint64     // the highest seq received
-	Missing                              []SeqRange // seqs below Highest never received, ascending
-	MaxGap                               time.Duration
+	Unique, Duplicates, Corrupt, BadSize uint64        // distinct valid seqs, seqs seen again, CRC or body mismatches, wrong sizes (see Add)
+	Highest                              uint64        // the highest seq received
+	Missing                              []SeqRange    // seqs below Highest never received, ascending
+	MaxGap                               time.Duration // longest interval between arrivals of consecutive new seqs
 }
 
 // SeqRange is the closed range [From, To] of seqs.

@@ -101,7 +101,8 @@ func (packetSource) isSource() {}
 // AcceptBacklog per session kind, MaxSessions and the flow bound above —
 // so one such address can hold the whole packet backlog, and further
 // OPENs, from any address, are then answered CAPACITY. A datagram beyond a
-// quota is dropped silently.
+// quota is dropped silently. The defence against such a source is the
+// embedder's: authentication in front of the socket and its Accept policy.
 //
 // Ownership of pc moves to the Listener: Listener.Close stops admitting new
 // flows (a new carrier is refused with CAPACITY) and closes pc once its
