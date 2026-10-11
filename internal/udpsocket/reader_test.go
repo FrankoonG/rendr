@@ -1,3 +1,5 @@
+//go:build !plan9
+
 package udpsocket
 
 import (
@@ -8,6 +10,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // readerRig is a Reader over a forced-ModeBatch Conn with a fake netpoller
@@ -378,5 +381,153 @@ func TestReaderReleaseRace(t *testing.T) {
 	}
 	if releases.Load() == 0 || lost.Load() == 0 || deep.Load() == 0 || deadReleased.Load() == 0 {
 		t.Fatalf("stimulus: %d releases, %d reads that lost the CAS, %d deep reads, %d deadlines after a release; want each > 0", releases.Load(), lost.Load(), deep.Load(), deadReleased.Load())
+	}
+}
+
+// TestReaderFallbackPlainReadReleases (R1-5 rules 3 and 5, M5-D15; real
+// loopback socket, every target): a reader holding extras whose socket
+// falls back to ModePlain reads one datagram plainly into slot 0 — and
+// while that read blocks, the extras count as parked, so the idle release
+// returns them at its next firing instead of failing its CAS until a
+// datagram arrives. Both fallbacks: before the call (the writer's
+// sendmmsg was refused) and inside it (its recvmmsg was refused, the
+// re-probe confirms). The datagram that ends the read lands in slot 0; the
+// Batch was released once and the reader holds nothing. A plain read
+// without extras counts no park. Mutants: the plain read of ReadBatch's
+// plain branch, or of the fallback inside the read, with the extras left
+// held (no release while it blocks).
+func TestReaderFallbackPlainReadReleases(t *testing.T) {
+	t.Run("before", func(t *testing.T) { readerFallbackRelease(t, false) })
+	t.Run("during", func(t *testing.T) { readerFallbackRelease(t, true) })
+}
+
+func readerFallbackRelease(t *testing.T, during bool) {
+	p := newProbe(syscall.EBADF, syscall.EBADF)
+	forceBatch(t, p)
+	u, tx := listen4(t), listen4(t)
+	c := newConn(t, u, 32, nil)
+	var released []*Batch // TryRelease runs on this goroutine
+	r := NewReader(c, func(b *Batch) { released = append(released, b) })
+	b8 := NewBatch(8)
+	if _, ok := r.Hold(b8); !ok {
+		t.Fatal("Hold refused")
+	}
+	if during {
+		p.set(syscall.EPERM, syscall.EPERM) // a policy installed: the re-probe confirms the refusal
+		recvmmsgFn = func(fd uintptr, b *Batch, n int) (int, error) { return 0, syscall.EPERM }
+	} else {
+		c.fallback() // the writer's sendmmsg was refused: the socket is plain now
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	ms := slots(8, 64)
+	done := make(chan result, 1)
+	go func() {
+		n, err := r.ReadBatch(ms)
+		done <- result{n, err}
+	}()
+	// The read blocks in the plain call. The timer's previous firing sees
+	// it parked (it waits for the state, bounded: a reader that never
+	// parks fails below); the next one releases.
+	limit := time.Now().Add(2 * time.Second)
+	for (r.Held() || !r.Holding()) && time.Now().Before(limit) {
+		runtime.Gosched()
+	}
+	seq := r.Parks()
+	ok := r.TryRelease(seq)
+	if ok {
+		if _, err := tx.WriteToUDPAddrPort([]byte("after"), addrOf(u)); err != nil {
+			t.Fatal(err)
+		}
+	} else {
+		u.SetReadDeadline(time.Now()) // end the blocked read
+	}
+	got := <-done
+	if !ok {
+		t.Fatalf("idle release of a reader blocked in a plain read with extras: refused (held %v, holding %v, parks %d; read ended with %d, %v)", r.Held(), r.Holding(), r.Parks(), got.n, got.err)
+	}
+	if got.n != 1 || got.err != nil || string(ms[0].Buf[:ms[0].N]) != "after" {
+		t.Fatalf("the read after the release: n %d, err %v; want the datagram in slot 0", got.n, got.err)
+	}
+	if r.Held() || r.Holding() || len(released) != 1 || released[0] != b8 || b8.ms != nil || c.Mode() != ModePlain {
+		t.Fatalf("held %v, holding %v, released %d, mode %v; want b8 released once, nothing held, plain", r.Held(), r.Holding(), len(released), c.Mode())
+	}
+	// Without extras a plain read counts no park.
+	pk := r.Parks()
+	tx.WriteToUDPAddrPort([]byte("next"), addrOf(u))
+	if n, err := r.ReadBatch(ms); n != 1 || err != nil || string(ms[0].Buf[:ms[0].N]) != "next" || r.Parks() != pk || r.Holding() {
+		t.Fatalf("an idle plain read: n %d, err %v, parks %d → %d", n, err, pk, r.Parks())
+	}
+}
+
+// TestReaderReleaseSeqAtomic (R1-5 rule 3, M5-D61; fake netpoller,
+// deterministic): TryRelease's sequence check and its parked → releasing
+// transition are one step. The timer is descheduled between them (the
+// releaseSeam), and meanwhile the reader wakes, reads a full batch and
+// parks again: the release must fail — the reader parked since the
+// timer's firing — and the extras stay held. Mutant: the check and the
+// transition as two steps (the release then takes a busy reader's
+// extras).
+func TestReaderReleaseSeqAtomic(t *testing.T) {
+	forceBatch(t, newProbe(syscall.EBADF, syscall.EBADF))
+	c := newConn(t, listen4(t), 32, nil)
+	var released atomic.Int64
+	r := NewReader(c, func(*Batch) { released.Add(1) })
+	wake := make(chan error)
+	parked := make(chan struct{})
+	c.rawRead = func(f func(uintptr) bool) error {
+		for !f(0) {
+			parked <- struct{}{}
+			if err := <-wake; err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	eagain := false // the reader's goroutine only
+	recvmmsgFn = func(fd uintptr, b *Batch, n int) (int, error) {
+		if eagain = !eagain; eagain {
+			return 0, syscall.EAGAIN
+		}
+		for i := range n {
+			b.ms[i].N = 1
+		}
+		return n, nil
+	}
+	if _, ok := r.Hold(NewBatch(8)); !ok {
+		t.Fatal("Hold refused")
+	}
+	reads := make(chan int, 4)
+	go func() {
+		ms := slots(8, 16)
+		for {
+			n, err := r.ReadBatch(ms)
+			if err != nil {
+				close(reads)
+				return
+			}
+			reads <- n
+		}
+	}()
+	<-parked
+	seq := r.Parks() // the timer's previous firing
+	releaseSeam = func() {
+		wake <- nil // the reader wakes, reads 8 …
+		<-parked    // … and parks again with its extras
+	}
+	ok := r.TryRelease(seq)
+	releaseSeam = nil
+	n := <-reads
+	holding, parks := r.Holding(), r.Parks()
+	wake <- os.ErrDeadlineExceeded // end the reader
+	for range reads {
+	}
+	if ok || released.Load() != 0 {
+		t.Fatalf("TryRelease(%d) released (%v, %d releases) a reader that read %d and parked again (parks %d)", seq, ok, released.Load(), n, parks)
+	}
+	if n != 8 || !holding || parks != seq+1 {
+		t.Fatalf("read %d, holding %v, parks %d; want 8, the extras held, parks %d", n, holding, parks, seq+1)
 	}
 }

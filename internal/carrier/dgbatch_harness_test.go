@@ -208,9 +208,14 @@ type fakeBatch struct {
 
 	state  atomic.Uint32
 	nparks atomic.Uint64
-	relHdr *ioHdr
-	relFn  func(*ioHdr)
-	res    [udpsocket.MaxMsgs]fbRes
+	// plainHold: at MaxBatch 1 a read that holds the extras reads slot 0
+	// alone without parking, the extras left held — the weakest socket
+	// fallback a transport may show (a read that started after the socket
+	// stopped batching); dgReadDepth returns the extras before such a read.
+	plainHold atomic.Bool
+	relHdr    *ioHdr
+	relFn     func(*ioHdr)
+	res       [udpsocket.MaxMsgs]fbRes
 
 	mu     sync.Mutex
 	rcalls []int // the datagrams of each read call that moved any
@@ -320,7 +325,9 @@ func (a *fakeBatch) depthMax() int { return a.MaxBatch() }
 func (a *fakeBatch) readDepth(slot0 *Buf, h *ioHdr) (int, ReadEvent, error) {
 	clear(a.res[:]) // no reference to the previous call's slots
 	ext := h != nil && a.state.Load() == fbHeld
-	if ext && a.waits() {
+	if ext && a.plainHold.Load() && a.MaxBatch() < 2 {
+		ext = false // a plain read: slot 0, no park, the extras stay held
+	} else if ext && a.waits() {
 		a.nparks.Add(1)
 		a.state.Store(fbParked)
 		a.mu.Lock()
