@@ -447,7 +447,18 @@ func TestPoolClaimantEnds(t *testing.T) {
 				time.Sleep(time.Second)
 				start := time.Now()
 				cancel(c.cause)
-				claim := collect(t, ch, 1)[0]
+				// The waiter that dials in the claimant's place does not
+				// hang, so its result may arrive before the cancelled
+				// claimant's own: take both in either order (the other
+				// waiters answer only after the attach below).
+				var claim, next poolRes
+				for _, r := range collect(t, ch, 2) {
+					if r.sid == 1 {
+						claim = r
+					} else {
+						next = r
+					}
+				}
 				if claim.sid != 1 || !errors.Is(claim.err, c.cause) {
 					t.Fatalf("claimant: sid %d, %v", claim.sid, claim.err)
 				}
@@ -455,8 +466,7 @@ func TestPoolClaimantEnds(t *testing.T) {
 				if d := pt.srv.dials.Load(); d != 2 || time.Since(start) > time.Millisecond {
 					t.Fatalf("%d factory calls %v after the cancellation, want 2 within 1 ms", d, time.Since(start))
 				}
-				next := collect(t, ch, 1)[0]
-				if next.err != nil || !next.est.Fresh {
+				if next.sid == 0 || next.err != nil || !next.est.Fresh {
 					t.Fatalf("next claimant %d: %v", next.sid, next.err)
 				}
 				pt.attach(next.est)

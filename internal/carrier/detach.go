@@ -122,8 +122,9 @@ func refusalPayload(typ wire.Type, st wire.AckStatus, code uint32) []byte {
 // follows (M2's CLOSE rule, per view); so does a held passive view (OK
 // placed, no go frame yet) once the go frame ended its hold, so that its
 // session's last frames — the RST of a session that ended right after its
-// Confirm — reach the dialer (M4 checkpoint C-L; its session's close bound
-// Kills it, DETACH(ended) only, when the go frame never comes); a view
+// Confirm — reach the dialer (M4 checkpoint C-L; at the hold bound, drainMax
+// after the request, it is abandoned with its DETACH only when the go frame
+// never came); a view
 // that carries no session frames yet (opening, awaiting, attached-pending,
 // pending, joining) is abandoned at once. The view's end record becomes CauseRetired when
 // the DETACH exchange completes or at the DETACH bound.
@@ -147,11 +148,13 @@ func (c *Conn) retireView(r wire.DetachReason) {
 			t.readyLocked(c)
 		}
 	case c.state == viewHeld:
-		// Retired after the go frame (the hold's end readies it).
+		// Retired after the go frame (the hold's end readies it), or
+		// abandoned at the hold bound.
 		if !c.vx.retireQ.Load() {
 			c.vx.reason = r
 			c.vx.retireQ.Store(true)
 			t.markWorkLocked()
+			t.boundHeldRetireLocked(c)
 		}
 	default:
 		t.abandonLocked(c, r, &p)
@@ -159,6 +162,24 @@ func (c *Conn) retireView(r wire.DetachReason) {
 	t.mx.Unlock()
 	t.runPost(&p)
 	t.wakeWriter()
+}
+
+// boundHeldRetireLocked bounds the planned retirement of a held view (OK
+// placed, no go frame yet): a view still held drainMax after the request
+// — the dialer's go frame lost for good, or a dialer that never answers —
+// is abandoned, its DETACH only (R1-9), as its session's close bound would
+// (M4 checkpoint C-L).
+func (t *trunk) boundHeldRetireLocked(v *Conn) {
+	time.AfterFunc(drainMax, func() {
+		var p postList
+		t.mx.Lock()
+		if v.state == viewHeld && v.vx.retireQ.Load() {
+			t.abandonLocked(v, v.vx.reason, &p)
+		}
+		t.mx.Unlock()
+		t.runPost(&p)
+		t.wakeWriter()
+	})
 }
 
 // goAwayView is GoAway on a view of a started MUX trunk: GOAWAY once on the

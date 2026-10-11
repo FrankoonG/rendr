@@ -3,6 +3,7 @@ package carrier
 import (
 	"testing"
 	"testing/synctest"
+	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -83,6 +84,77 @@ func heldViewRetireRow(t *testing.T, during bool) {
 	}
 	if d, err := wire.ParseDetach(got[2].p); err != nil || d.Handle != h {
 		t.Fatalf("DETACH %+v (%v), want one for handle %d", d, err, h)
+	}
+	if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
+		t.Fatalf("trunk died: %v %s", cause, detail)
+	}
+}
+
+// TestHeldViewRetireBound (M4 checkpoint C-L): a held view retired while
+// the dialer's go frame never comes (lost for good, or a dialer that never
+// answers) is not held forever: drainMax after the Retire it is abandoned
+// with its DETACH only (R1-9), as before the C-L fix; nothing else is
+// placed for it before that. Rows as TestHeldViewRetireAfterGo's.
+func TestHeldViewRetireBound(t *testing.T) {
+	for _, during := range []bool{false, true} {
+		name := "held"
+		if during {
+			name = "during the OK"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { heldViewRetireBoundRow(t, during) })
+		})
+	}
+}
+
+func heldViewRetireBoundRow(t *testing.T, during bool) {
+	const h = 2
+	rst := hFrame{t: wire.TypeRst, payload: rstPayload(4242)}
+	s, p := muxRawPassive(t, nil)
+	s.admit = func(s *muxSide, v *Conn, hd wire.Header, pl []byte) {
+		mv := &mView{c: v, ep: &dEP{}, src: newVSource(s.env), bell: &hBell{}, done: &hBell{}}
+		mv.ep.fill = mv.src.fill // no verdict yet
+		s.add(mv)
+		v.Start(mv.ep, mv.bell, StartOptions{})
+	}
+	_ = p.send(wire.TypeOpen, 0, h, mOpenPayload(h, false))
+	synctest.Wait()
+	mv := s.view(h)
+	if mv == nil {
+		t.Fatal("OPEN not admitted")
+	}
+	src := mv.src
+	start := time.Now()
+	src.mu.Lock()
+	src.resp, src.respSt = wire.TypeOpenAck, wire.StatusOK
+	if during {
+		once := false
+		src.hook = func(c *Conn, b *Batch) {
+			if !once {
+				once = true
+				src.ctl = append(src.ctl, rst)
+				c.Retire(wire.CloseRetire)
+			}
+		}
+	}
+	src.mu.Unlock()
+	mv.c.Wake()
+	synctest.Wait()
+	if !during {
+		wantState(t, mv.c, viewHeld, "Confirm")
+		src.addCtl(rst)
+		mv.c.Retire(wire.CloseRetire)
+	}
+	time.Sleep(drainMax - time.Millisecond)
+	synctest.Wait()
+	if got := forHandle(p.received2(), h); len(got) != 1 || got[0].h.Type != wire.TypeOpenAck {
+		t.Fatalf("held view %v after its Retire placed %v, want its OPEN_ACK only", time.Since(start), types(got))
+	}
+	time.Sleep(time.Millisecond)
+	synctest.Wait()
+	got := forHandle(p.received2(), h)
+	if len(got) != 2 || got[0].h.Type != wire.TypeOpenAck || got[1].h.Type != wire.TypeDetach {
+		t.Fatalf("held view at the hold bound placed %v, want OPEN_ACK, DETACH", types(got))
 	}
 	if dead, cause, detail, _ := s.c.KillTrunkDeath(); dead {
 		t.Fatalf("trunk died: %v %s", cause, detail)

@@ -183,11 +183,16 @@ func (c *Conn) writeRound(w *writer) bool {
 	var reason wire.CloseReason
 	if w.held {
 		// The first frame on the wire is the endpoint's first response
-		// (OPEN_ACK or JOIN_ACK); PONGs and PINGs follow it.
+		// (OPEN_ACK or JOIN_ACK); PONGs and PINGs follow it. A retirement
+		// counts only if it was requested before this Fill call (§7.3): one
+		// requested during it — a session's refusal sets the response and
+		// retires the carrier while the call runs — gets the next round,
+		// which places the response first (M4 checkpoint C-L).
+		wasRetiring := c.isRetiring()
 		c.fillRound(b)
 		if b.Len() > 0 {
 			w.held, epFrames = false, true
-		} else if !c.isRetiring() {
+		} else if !wasRetiring {
 			c.capBlocked.Store(b.CapBlocked())
 			return c.sleep(w, now)
 		}

@@ -253,7 +253,7 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	l := a.newLaneLocked(now, ad.conn, -1, a.gen, LaneJoining)
 	if ad.early {
 		// M4-D5: recorded before the carrier starts; earlyDataLocked
-		// reads it (WP9b).
+		// (early_recv.go) reads it.
 		l.early = true
 		s.st.earlyOpen = true
 	}

@@ -39,10 +39,13 @@ func (r ForwardResult) Err() error {
 // When the session ends uncleanly while local still has a direction open (a
 // peer that ignores FIN or never reads), local is reset at once; after a
 // clean end the last bytes and the FIN are written first, within a bound.
-// (Pending, R1-15: a Conn still opening (EarlyReturn) is read at once
-// until the first-read hold lands; with it, such a Conn is read only after
-// local's first bytes were written to it, or after 20 ms.) ctx ending
-// aborts the session (AbortShutdown) and resets local. Forward owns c and
+// A Conn still pending at the call (an EarlyReturn dialer whose session has
+// not opened) is first read only after local's first bytes were written to
+// it, after local's direction ended, or 20 ms after the call, whichever
+// comes first: a Read would open the session without early bytes, so the
+// client's first bytes ride with the OPEN, and a protocol whose server
+// speaks first pays at most 20 ms. ctx ending aborts the session
+// (AbortShutdown) and resets local. Forward owns c and
 // local from the call on, sets no deadlines on them during the transfer,
 // and starts two goroutines that end before it returns.
 //
@@ -59,6 +62,11 @@ func (r ForwardResult) Err() error {
 // net.Conn methods, CloseWrite and SetLinger of local.
 func Forward(ctx context.Context, c *rendr.Conn, local net.Conn) ForwardResult {
 	f := &forwarder{c: c, local: local, done: make(chan struct{}, 2)}
+	if c.Status().State == rendr.StatePending {
+		// R1-15, M4-D57: pump B's first Read waits for pump A's first
+		// Write (or its end), at most earlyFirstWriteWait.
+		f.firstWrite, f.holdFor = make(chan struct{}), earlyFirstWriteWait
+	}
 	go f.pumpA()
 	go f.pumpB()
 	f.reap(ctx)
@@ -71,7 +79,7 @@ var (
 	// (R1-1): Linger's default; l4's tests lower it.
 	cleanJoinMax = 30 * time.Second
 	// earlyFirstWriteWait bounds pump B's hold of its first Read on a
-	// Conn still opening (R1-15, M4-D57); l4's tests change it.
+	// Conn still pending at Forward's call (R1-15, M4-D57).
 	earlyFirstWriteWait = 20 * time.Millisecond
 	// bufPool holds the pumps' 32 KiB buffers (M4-D36: one per pump, no
 	// allocation per chunk in steady state).
@@ -124,6 +132,12 @@ type forwarder struct {
 
 	toSession, toLocal int64
 	eofA, eofB         bool // pump A ended with local's FIN; pump B with the session's io.EOF
+
+	// firstWrite is closed by pump A once its first c.Write returned or it
+	// ended; pump B's first Read waits for it at most holdFor. nil unless
+	// c was pending at Forward's call (R1-15).
+	firstWrite chan struct{}
+	holdFor    time.Duration
 
 	mu                sync.Mutex
 	failed            bool  // a cause was recorded: the end is not clean
@@ -181,6 +195,12 @@ func (f *forwarder) failSession(err error) {
 // pumpA moves local → session: local's FIN becomes c.CloseWrite.
 func (f *forwarder) pumpA() {
 	defer func() { f.done <- struct{}{} }()
+	held := f.firstWrite != nil
+	defer func() {
+		if held {
+			close(f.firstWrite) // pump A ended before its first Write
+		}
+	}()
 	bp := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bp)
 	buf := *bp
@@ -201,6 +221,10 @@ func (f *forwarder) pumpA() {
 		empty = 0
 		if n > 0 {
 			w, werr := f.c.Write(buf[:n])
+			if held {
+				held = false
+				close(f.firstWrite) // the bytes were admitted before the opening (R1-15)
+			}
 			f.toSession += int64(w)
 			if werr == nil && w != n {
 				werr = io.ErrShortWrite
@@ -233,6 +257,14 @@ func (f *forwarder) pumpB() {
 	bp := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bp)
 	buf := *bp
+	if f.firstWrite != nil {
+		hold := time.NewTimer(f.holdFor)
+		select {
+		case <-f.firstWrite:
+		case <-hold.C:
+		}
+		hold.Stop()
+	}
 	for {
 		n, err := f.c.Read(buf)
 		if n > 0 {
