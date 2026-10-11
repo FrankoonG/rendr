@@ -129,7 +129,7 @@ func TestMuxDRRFairness(t *testing.T) {
 		env := hEnv()
 		chunk := env.Bufs.Get(ChunkSize, nil)
 		a := &drrEP{chunk: chunk, avail: 1 << 10, wake: true}
-		b := &drrEP{chunk: chunk, avail: 1 << 40}
+		b := &drrEP{chunk: chunk, avail: 1 << 30} // unbounded for the run; fits a 32-bit int
 		c, views := bareMuxTrunk(env, &nopConn{}, 3, nil)
 		views[0].ep = &drrEP{chunk: chunk}
 		views[1].ep, views[2].ep = a, b
