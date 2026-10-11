@@ -5,9 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -341,16 +341,21 @@ const secret = "192.0.2.53 via if-x7"
 
 // TestServerRejectMessageFixed (M4-D32): whatever the raw error says, the
 // dialer's refusal carries only the code's fixed text; the raw error stays
-// on the passive (Status().LastErr).
+// on the passive (Status().LastErr). The errno row is left out on plan9,
+// which has no syscall.Errno (wsaErrno).
 func TestServerRejectMessageFixed(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newSrvWorld(t, srvOpts{})
 		errs := map[string]error{
-			"denied.test:1":  fmt.Errorf("policy %s: %w", secret, ErrDenied),
-			"dns.test:1":     &net.DNSError{Err: "server misbehaving", Name: "dns.test", Server: secret},
-			"nx.test:1":      &net.DNSError{Err: "no such host", Name: "nx.test", Server: secret, IsNotFound: true},
-			"refused.test:1": &net.OpError{Op: "dial", Net: "tcp", Source: &net.TCPAddr{}, Addr: strAddr(secret), Err: syscall.Errno(10061)},
-			"other.test:1":   errors.New("route " + secret),
+			"denied.test:1": fmt.Errorf("policy %s: %w", secret, ErrDenied),
+			"dns.test:1":    &net.DNSError{Err: "server misbehaving", Name: "dns.test", Server: secret},
+			"nx.test:1":     &net.DNSError{Err: "no such host", Name: "nx.test", Server: secret, IsNotFound: true},
+			"other.test:1":  errors.New("route " + secret),
+		}
+		if e := wsaErrno(10061); e != nil { // WSAECONNREFUSED
+			errs["refused.test:1"] = &net.OpError{Op: "dial", Net: "tcp", Source: &net.TCPAddr{}, Addr: strAddr(secret), Err: e}
+		} else if runtime.GOOS != "plan9" {
+			t.Fatal("wsaErrno left the errno row out on " + runtime.GOOS)
 		}
 		s := &Server{Dial: func(ctx context.Context, r Request) (net.Conn, error) { return nil, errs[r.Addr] }}
 		sv := serve(w, s)
@@ -377,7 +382,8 @@ func (a strAddr) Network() string { return "tcp" }
 func (a strAddr) String() string  { return string(a) }
 
 // TestServerRejectCodes (M4-D33, §A8.1): every classification row through
-// a hook and a Runtime pair reaches the dialer as its code.
+// a hook and a Runtime pair reaches the dialer as its code. The errno rows
+// are left out on plan9, which has no syscall.Errno (wsaErrno).
 func TestServerRejectCodes(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newSrvWorld(t, srvOpts{})
@@ -388,14 +394,12 @@ func TestServerRejectCodes(t *testing.T) {
 		fail := func(err error) func(context.Context, string) (net.Conn, error) {
 			return func(context.Context, string) (net.Conn, error) { return nil, err }
 		}
-		connectErr := func(errno syscall.Errno) error {
-			return &net.OpError{Op: "dial", Net: "tcp", Err: fmt.Errorf("connect: %w", errno)}
-		}
-		rows := []struct {
+		type rejectRow struct {
 			name string
 			dial func(context.Context, string) (net.Conn, error)
 			code RejectCode
-		}{
+		}
+		rows := []rejectRow{
 			{"refused", scripted(rendrtest.OutcomeRefuse()), CodeRefused},
 			{"net unreachable", scripted(rendrtest.OutcomeNetUnreachable()), CodeNetUnreachable},
 			{"host unreachable", scripted(rendrtest.OutcomeHostUnreachable()), CodeHostUnreachable},
@@ -407,11 +411,24 @@ func TestServerRejectCodes(t *testing.T) {
 			{"goexit", scripted(rendrtest.OutcomeGoexit()), CodeDialFailed},
 			{"nil nil", scripted(rendrtest.OutcomeNilNil()), CodeDialFailed},
 			{"denied", fail(fmt.Errorf("policy: %w", ErrDenied)), CodeNotAllowed},
-			{"access", fail(connectErr(syscall.Errno(10013))), CodeNotAllowed},
-			{"no buffers", fail(connectErr(syscall.Errno(10055))), CodeCapacity},
-			{"errno timeout", fail(connectErr(syscall.Errno(10060))), CodeTimeout},
 			{"resolver cancelled", fail(&net.DNSError{Err: context.Canceled.Error(), Name: "x.test", UnwrapErr: context.Canceled}), CodeDialFailed},
 			{"other", fail(errors.New("unclassified")), CodeDialFailed},
+		}
+		for _, r := range []struct {
+			name  string
+			errno uintptr
+			code  RejectCode
+		}{
+			{"access", 10013, CodeNotAllowed},     // WSAEACCES
+			{"no buffers", 10055, CodeCapacity},   // WSAENOBUFS
+			{"errno timeout", 10060, CodeTimeout}, // WSAETIMEDOUT
+		} {
+			if e := wsaErrno(r.errno); e != nil {
+				connectErr := &net.OpError{Op: "dial", Net: "tcp", Err: fmt.Errorf("connect: %w", e)}
+				rows = append(rows, rejectRow{r.name, fail(connectErr), r.code})
+			} else if runtime.GOOS != "plan9" {
+				t.Fatalf("wsaErrno left the %s row out on %s", r.name, runtime.GOOS)
+			}
 		}
 		byAddr := make(map[string]func(context.Context, string) (net.Conn, error))
 		for i, row := range rows {

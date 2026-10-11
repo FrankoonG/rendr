@@ -7,6 +7,11 @@ import (
 	"syscall"
 )
 
+// wsaErrno is the syscall.Errno numbered n (a Windows socket error number,
+// compared by number on every OS but plan9); on plan9, which has no
+// syscall.Errno, it is nil and the callers leave the row out.
+func wsaErrno(n uintptr) error { return syscall.Errno(n) }
+
 // errnoRows are TestClassify's errno rows: the Windows numbers, compared by
 // number on every OS but plan9 (bare, and wrapped as the net package
 // returns them), then this OS's symbols (symRows).
