@@ -211,9 +211,10 @@ func TestDialPacketEarlyReturnRefused(t *testing.T) {
 // TestEarlyReturnSkipsProbeWait (M4-D13): on a Peer with two factories
 // whose probes are cold, a classic Dial waits for the first probe samples
 // (Probe.DialWait, 800 ms: a probe needs about 1.2 s over these links),
-// an EarlyReturn Dial returns at once. Health.Use still runs (the probes
-// start without any session byte on the links), and the session then
-// opens with its first Write.
+// an EarlyReturn Dial returns at once. Probing still starts without any
+// session byte on the links (Health.Use; the session's Health.Hold at
+// session.Dial starts it as well, so the row cannot tell the two apart),
+// and the session then opens with its first Write.
 func TestEarlyReturnSkipsProbeWait(t *testing.T) {
 	const oneWay = 300 * time.Millisecond
 	newPair := func(t *testing.T) *e2ePair {
@@ -253,7 +254,7 @@ func TestEarlyReturnSkipsProbeWait(t *testing.T) {
 				probes += st.Dials
 			}
 			if probes == 0 {
-				t.Fatal("no probe carrier was dialled: Health.Use did not run")
+				t.Fatal("no probe carrier was dialled: probing did not start (Health.Use, or Hold at the session's Dial)")
 			}
 			msg := erPattern(0, 1000)
 			if _, err := dc.Write(msg); err != nil {
@@ -520,8 +521,9 @@ func TestEarlyBytesStatus(t *testing.T) {
 // answered. Unopened (no Write, Read or CloseWrite yet): nothing is sent —
 // no factory call — and the Conn ends with net.ErrClosed. Opening (the
 // OPEN and its early bytes are pending at the passive): the session
-// withdraws, so the passive's Confirm fails and nothing is left on either
-// side.
+// withdraws: the passive session ends with ErrSessionLost, as one of a
+// classic Dial withdrawn by Runtime.Close does (its EventSessionEnd), so
+// the passive's Confirm fails and nothing is left on either side.
 func TestEarlyReturnRuntimeClose(t *testing.T) {
 	t.Run("unopened", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -541,7 +543,8 @@ func TestEarlyReturnRuntimeClose(t *testing.T) {
 	})
 	t.Run("opening", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
-			e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a")
+			pev := &erEvents{}
+			e := e2eNew(t, Config{}, Config{OnEvent: pev.add}, nil, ListenConfig{}, "a")
 			dc := erDial(t, e.peer(), DialOptions{})
 			if _, err := dc.Write(erPattern(0, 2000)); err != nil {
 				t.Fatalf("Write: %v", err)
@@ -560,6 +563,15 @@ func TestEarlyReturnRuntimeClose(t *testing.T) {
 			case <-pc.Context().Done():
 			default:
 				t.Fatal("the pending context is not done after the withdrawal")
+			}
+			var ended error
+			for _, ev := range pev.of(pc.ID()) {
+				if ev.Kind == EventSessionEnd {
+					ended = ev.Err
+				}
+			}
+			if !errors.Is(ended, ErrSessionLost) {
+				t.Fatalf("the passive session ended with %v, want ErrSessionLost (withdrawn by the dialer's Runtime.Close)", ended)
 			}
 			// The withdrawn carrier's reader stage is released within its
 			// close bound (about 1 s), not at once.
