@@ -38,44 +38,45 @@ type sockIO interface {
 	MaxBatch() int
 }
 
-// batchToken is the part of *carrier.OwnedUDPSocket a batched Source needs:
-// the socket and its Options.MaxBatch. It is asserted on the ownership
-// token only, never on an embedder conn (L57, M5-D10).
+// batchToken is the part of *carrier.OwnedUDPSocket a batched Source needs
+// (M5 WP2's accessor): a udpsocket.Conn over the listening socket at its
+// normalised Options.MaxBatch, counted in ctr. It is asserted on the
+// ownership token only, never on an embedder conn (L57, M5-D10).
+// TestSourceAdoptsTokenSocket fails when the token has a NewBatchConn of
+// any other signature, so a mismatch cannot silently keep rendr's own
+// socket at one datagram per call.
 type batchToken interface {
-	UDPConn() *net.UDPConn
-	MaxBatch() int
+	NewBatchConn(ctr *udpsocket.Counters) (*udpsocket.Conn, error)
 }
 
-// ownedIO returns the sockIO of rendr's own listening socket: a
-// udpsocket.Conn over the token's socket, counted in env.Dgram.IO, or —
-// for a token without the socket accessor — tokenIO (one datagram per
-// call, uncounted).
+// ownedIO returns the sockIO of rendr's own listening socket: the token's
+// udpsocket.Conn, counted in env.Dgram.IO, or — for a token without the
+// accessor, or one whose socket refuses it — tokenIO (one datagram per
+// call, uncounted; M2's path).
 func ownedIO(own *carrier.OwnedUDPSocket, env *carrier.Env) sockIO {
 	if t, ok := any(own).(batchToken); ok {
 		var ctr *udpsocket.Counters
 		if env.Dgram != nil {
 			ctr = &env.Dgram.IO
 		}
-		if c, err := udpsocket.New(t.UDPConn(), normMaxBatch(t.MaxBatch()), ctr); err == nil {
+		if c, err := t.NewBatchConn(ctr); err == nil {
 			return c
 		}
 	}
 	return tokenIO{own}
 }
 
-// normMaxBatch normalises Options.MaxBatch as carrier/udp does: 0 or
-// negative → 32, above udpsocket.MaxMsgs → MaxMsgs (M5-D16).
-func normMaxBatch(n int) int {
-	if n <= 0 {
-		return defaultMaxBatch
-	}
-	return min(n, udpsocket.MaxMsgs)
+// addrPortIO is the single-datagram I/O of an ownership token
+// (*carrier.OwnedUDPSocket; tests substitute fakes).
+type addrPortIO interface {
+	ReadAddrPort(p []byte) (n int, src netip.AddrPort, ev carrier.ReadEvent, err error)
+	WriteAddrPort(p []byte, dst netip.AddrPort) error
 }
 
 // tokenIO moves one datagram per call through the token's own AddrPort
 // methods and their classification (M2): a noise read is carrier.ErrNoise,
 // a truncated one a Msg with Trunc.
-type tokenIO struct{ own *carrier.OwnedUDPSocket }
+type tokenIO struct{ own addrPortIO }
 
 func (t tokenIO) ReadBatch(_ *udpsocket.Batch, ms []udpsocket.Msg) (int, error) {
 	m := &ms[0]
@@ -158,8 +159,8 @@ func (s *Source) writeBatch(ds [][]byte, dst netip.AddrPort, addr *net.UDPAddr) 
 	}
 	w := s.wpool.Get().(*wbatch)
 	var b *udpsocket.Batch
-	if len(ds) > 1 && w.b != nil {
-		b = w.b
+	if len(ds) > 1 && w.b != nil && s.bio.Mode() == udpsocket.ModeBatch {
+		b = w.b // a plain socket writes one call per datagram: no Batch, no charge
 		s.stages.Acquire(w.bytes)
 	}
 	n := 0

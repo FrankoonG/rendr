@@ -50,10 +50,12 @@ func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limit
 	return rs
 }
 
-// newRealSourceIO returns a realSource whose Source reads and writes the
-// socket through a udpsocket.Conn of maxBatch counted in env.Dgram.IO —
-// the path of a token that exposes its socket (M5 WP3) — without starting
-// Run (start).
+// newRealSourceIO returns a realSource, without starting Run (start),
+// whose Source reads and writes the socket through: NewSource's own
+// construction for maxBatch 0, and for a maxBatch that construction
+// already gives (the production path once the token exposes its socket,
+// M5 WP3); else a udpsocket.Conn of maxBatch counted in env.Dgram.IO; or,
+// for maxBatch < 0, the token's single-datagram tokenIO.
 func newRealSourceIO(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits, maxBatch int) *realSource {
 	t.Helper()
 	u, err := net.ListenUDP("udp4", loopback4())
@@ -67,8 +69,13 @@ func newRealSourceIO(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits
 	}
 	rs := &realSource{t: t, env: env, u: u, cl: cl, admitted: make(chan *Flow, 128),
 		dst: u.LocalAddr().(*net.UDPAddr).AddrPort()}
-	rs.s = NewSource(rs.env, carrier.NewOwnedUDPSocket(u, maxDatagram), lim)
-	if maxBatch > 0 {
+	own := carrier.NewOwnedUDPSocket(u, maxDatagram)
+	rs.s = NewSource(rs.env, own, lim)
+	c, built := rs.s.bio.(*udpsocket.Conn)
+	switch {
+	case maxBatch < 0:
+		rs.s.setIO(tokenIO{own})
+	case maxBatch > 0 && !(built && c.MaxBatch() == maxBatch):
 		c, err := udpsocket.New(u, maxBatch, &env.Dgram.IO)
 		if err != nil {
 			u.Close()

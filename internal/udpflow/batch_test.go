@@ -8,9 +8,12 @@ package udpflow
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"os"
+	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"testing/synctest"
@@ -34,29 +37,34 @@ func slotBytes(env *carrier.Env, n int) int64 {
 // pingSeq returns the fseq a pingFrame datagram carries (rendr bytes).
 func pingSeq(b []byte) uint32 { return u32(b[5:9]) }
 
-// countWakes counts testWake per flow for the rest of the test.
-func countWakes(t *testing.T) func(f *Flow) int {
+// recordWakes records, for the rest of the test, every wake of a flow
+// with the number of datagrams its inbox held at that wake (testWake runs
+// under f.mu): the result returns a flow's list.
+func recordWakes(t *testing.T) func(f *Flow) []int {
 	var mu sync.Mutex
-	n := map[*Flow]int{}
+	held := map[*Flow][]int{}
 	fn := func(f *Flow) {
 		mu.Lock()
-		n[f]++
+		held[f] = append(held[f], f.n)
 		mu.Unlock()
 	}
 	testWake.Store(&fn)
 	t.Cleanup(func() { testWake.Store(nil) })
-	return func(f *Flow) int {
+	return func(f *Flow) []int {
 		mu.Lock()
 		defer mu.Unlock()
-		return n[f]
+		return slices.Clone(held[f])
 	}
 }
 
 // TestSourceBatchOneWakePerFlow_L54 (M5-D14, §A4.5): one read of 32
 // datagrams for three flows wakes each flow's waiting reader exactly once,
-// after every datagram of the read was routed; each reader then drains
-// its inbox in arrival order; the flow whose inbox fills within the read
-// drops the rest and counts them (M2's inbox rule, L58).
+// after every datagram of the read was routed (at its wake each inbox
+// already holds all the read gave it, so a reader that drained early
+// cannot stall); each reader then drains its inbox in arrival order; the
+// flow whose inbox fills within the read drops the rest and counts them
+// (M2's inbox rule, L58), and the slots of those drops keep their charge
+// (R1-4: afterwards the Budget holds exactly the 31 waiting extras).
 func TestSourceBatchOneWakePerFlow_L54(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
@@ -99,7 +107,7 @@ func TestSourceBatchOneWakePerFlow_L54(t *testing.T) {
 			})
 		}
 		synctest.Wait()
-		wakes := countWakes(t)
+		wakes := recordWakes(t)
 
 		// One read: flows 1 and 2 get 8 each, flow 3 gets 16 (its inbox
 		// holds 8): the pattern 1, 2, 3, 3 eight times.
@@ -122,8 +130,8 @@ func TestSourceBatchOneWakePerFlow_L54(t *testing.T) {
 			t.Fatalf("stimulus: the last read moved %d datagrams, want 32 (reads %v)", g[len(g)-1], g)
 		}
 		for i, f := range fs {
-			if n := wakes(f); n != 1 {
-				t.Errorf("flow %d: %d wakes for one read, want 1", i+1, n)
+			if w := wakes(f); !slices.Equal(w, []int{8}) {
+				t.Errorf("flow %d: wakes with %v queued, want one wake with all 8 of the read queued", i+1, w)
 			}
 		}
 		mu.Lock()
@@ -138,6 +146,9 @@ func TestSourceBatchOneWakePerFlow_L54(t *testing.T) {
 		}
 		if d := env.Dgram.InboxDrops.Load(); d != 8 {
 			t.Errorf("Runtime InboxDrops %d, want 8", d)
+		}
+		if b, want := env.Budget.Used(), 31*slotBytes(env, seamDgram); b != want {
+			t.Errorf("Budget %d after the drain, want %d (the 31 extras of the waiting read, each charged once)", b, want)
 		}
 		h.s.Abort()
 		wg.Wait()
@@ -478,6 +489,13 @@ func TestFlowWriteDatagramsSeam(t *testing.T) {
 		if err := f.WriteDatagram(ds[0]); err != nil || c.wbatched[len(c.wbatched)-1] {
 			t.Fatalf("a single datagram: %v, batched %v", err, c.wbatched[len(c.wbatched)-1])
 		}
+		// A socket that does not batch writes one call per datagram: the
+		// writer takes no Batch (and no Stages charge) for it.
+		c.mode.Store(uint32(udpsocket.ModePlain))
+		if n, err := f.WriteDatagrams(ds[:4]); n != 4 || err != nil || c.wbatched[len(c.wbatched)-1] {
+			t.Fatalf("plain mode: %d, %v, batched %v", n, err, c.wbatched[len(c.wbatched)-1])
+		}
+		c.mode.Store(uint32(udpsocket.ModeBatch))
 		if s := env.Stages.Used(); s != stages {
 			t.Fatalf("Stages %d after the calls, want %d: an idle writer holds no Batch", s, stages)
 		}
@@ -559,16 +577,12 @@ func TestSourceOwnedErrnos_L58(t *testing.T) {
 	})
 }
 
-// TestSourceTokenIO: a token that does not expose its socket is read and
-// written one datagram per call through its own AddrPort methods and
-// classes (M2's path; uncounted until carrier.OwnedUDPSocket carries the
-// socket accessor, see the WP3 contract note).
+// TestSourceTokenIO: tokenIO — the path of a token without the batched
+// accessor, or whose socket refuses it — reads and writes one datagram
+// per call through the token's own AddrPort methods and classes (M2).
 func TestSourceTokenIO(t *testing.T) {
 	env := testEnv(1 << 30)
-	rs := newRealSourceIO(t, 1232, env, Limits{}, 0)
-	if _, ok := rs.s.bio.(tokenIO); !ok {
-		t.Skipf("the token exposes its socket: the Source uses %T", rs.s.bio)
-	}
+	rs := newRealSourceIO(t, 1232, env, Limits{}, -1)
 	rs.start()
 	const id = 0x61
 	rs.send(h1(id, wire.TypeOpen, 1))
@@ -597,23 +611,113 @@ func TestSourceTokenIO(t *testing.T) {
 	}
 }
 
-// TestSourceAdoptsTokenSocket: NewSource reads rendr's own socket through
-// a udpsocket.Conn counted in Env.Dgram.IO as soon as the token exposes
-// its socket and MaxBatch (the WP3 ↔ carrier contract note).
+// TestSourceAdoptsTokenSocket (A2.1, A4.4, R1-2, R1-6): NewSource alone —
+// no test seam — reads and writes rendr's own socket through the token's
+// counted udpsocket.Conn (M5 WP2's NewBatchConn) at depth min(MaxBatch,
+// 32), and every read and write of the traffic is counted in
+// Env.Dgram.IO. It skips only while carrier.OwnedUDPSocket has no
+// NewBatchConn at all (before WP2 merges); a NewBatchConn that does not
+// match batchToken fails, so the Source can never silently stay at one
+// uncounted datagram per call.
 func TestSourceAdoptsTokenSocket(t *testing.T) {
-	u, err := net.ListenUDP("udp4", loopback4())
-	if err != nil {
-		t.Fatal(err)
+	env := testEnv(1 << 30)
+	rs := newRealSourceIO(t, 1232, env, Limits{}, 0)
+	rs.start()
+	c, ok := rs.s.bio.(*udpsocket.Conn)
+	if !ok {
+		if _, has := reflect.TypeFor[*carrier.OwnedUDPSocket]().MethodByName("NewBatchConn"); has {
+			t.Fatalf("carrier.OwnedUDPSocket has NewBatchConn, yet NewSource uses %T: the method set does not match batchToken, or the socket refused it", rs.s.bio)
+		}
+		t.Skip("contract pending: carrier.OwnedUDPSocket has no NewBatchConn yet (M5 WP2; WP3 contract note 1)")
 	}
-	defer u.Close()
-	own := carrier.NewOwnedUDPSocket(u, 1232)
-	if _, ok := any(own).(batchToken); !ok {
-		t.Skip("contract pending: carrier.OwnedUDPSocket has no UDPConn and MaxBatch yet (M5 WP3 report)")
+	if c.MaxBatch() != defaultMaxBatch {
+		t.Fatalf("the Conn's MaxBatch is %d, want the token's default %d", c.MaxBatch(), defaultMaxBatch)
 	}
-	s := NewSource(testEnv(1<<30), own, Limits{})
-	if _, ok := s.bio.(*udpsocket.Conn); !ok {
-		t.Fatalf("the Source uses %T, want a *udpsocket.Conn", s.bio)
+	want := 1
+	if c.Mode() == udpsocket.ModeBatch {
+		want = min(defaultMaxBatch, srcMaxDepth)
 	}
+	if d := rs.s.readDepth(); d != want {
+		t.Fatalf("read depth %d, want %d (mode %v)", d, want, c.Mode())
+	}
+	const id = 0x77
+	rs.send(h1(id, wire.TypeOpen, 1))
+	f := rs.flow()
+	readOne(t, f, realWait)
+	if f.MaxBatch() != defaultMaxBatch {
+		t.Fatalf("Flow MaxBatch %d, want %d", f.MaxBatch(), defaultMaxBatch)
+	}
+	for i := range 3 {
+		rs.send(dg(id, pingFrame(uint32(2+i))))
+	}
+	for range 3 {
+		readOne(t, f, realWait)
+	}
+	wb := make([]byte, wire.FlowHeaderLen+5)
+	if n, err := f.WriteDatagrams([][]byte{wb, wb}); n != 2 || err != nil {
+		t.Fatalf("WriteDatagrams: %d, %v", n, err)
+	}
+	for range 2 {
+		rs.recv()
+	}
+	sc, sent, rc, rd, _ := env.Dgram.IO.Load()
+	if sc == 0 || sent != 2 || rc == 0 || rd != 4 {
+		t.Fatalf("IO counters: SendCalls %d, SentDatagrams %d, RecvCalls %d, RecvDatagrams %d; want sends and 4 datagrams read, all counted", sc, sent, rc, rd)
+	}
+}
+
+// noiseToken is an ownership token whose next reads report ReadNoise
+// (an ICMP-class error of the socket) before it reads its fakeSock.
+type noiseToken struct {
+	c     *fakeSock
+	noise atomic.Int32
+}
+
+func (t *noiseToken) ReadAddrPort(p []byte) (int, netip.AddrPort, carrier.ReadEvent, error) {
+	if t.noise.Add(-1) >= 0 {
+		return 0, netip.AddrPort{}, carrier.ReadNoise, nil
+	}
+	ms := []udpsocket.Msg{{Buf: p}}
+	if _, err := t.c.ReadBatch(nil, ms); err != nil {
+		return 0, netip.AddrPort{}, carrier.ReadOK, err
+	}
+	return ms[0].N, ms[0].Addr, carrier.ReadOK, nil
+}
+
+func (t *noiseToken) WriteAddrPort(p []byte, dst netip.AddrPort) error {
+	_, err := t.c.WriteBatch(nil, []udpsocket.Msg{{Buf: p, Addr: dst}})
+	return err
+}
+
+// TestSourceTokenIONoise_L58: through tokenIO, a token's ReadNoise is a
+// transient error — the Source counts it, backs off and keeps reading —
+// not the end of every flow of the socket.
+func TestSourceTokenIONoise_L58(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		env := testEnv(1 << 30)
+		c := newFakeSock(32)
+		tok := &noiseToken{c: c}
+		tok.noise.Store(2)
+		s := newSeamSource(env, c, tokenIO{tok}, seamDgram, Limits{})
+		admitted := make(chan *Flow, 1)
+		go s.Run(func(f *Flow) { admitted <- f })
+		c.queue(apOf(2, 1000), h1(1, wire.TypeOpen, 1))
+		time.Sleep(time.Second) // past the backoffs
+		synctest.Wait()
+		var f *Flow
+		select {
+		case f = <-admitted:
+		default:
+			t.Fatal("no flow admitted after two noise reads: the Source stopped")
+		}
+		readOne(t, f, time.Second)
+		if st := s.Stats(); st.ReadErrors != 2 {
+			t.Fatalf("ReadErrors %d, want 2", st.ReadErrors)
+		}
+		s.Abort()
+		f.Close()
+		<-s.Done()
+	})
 }
 
 // TestSourceChargedSlotMoves_L16 (R1-4): a datagram read into a charged
