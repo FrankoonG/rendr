@@ -50,7 +50,14 @@ func TestServerMaxConns_L48(t *testing.T) {
 		if st := s.Status(); st.Live != 2 || st.Dialing != 1 {
 			t.Fatalf("stimulus: %+v", st)
 		}
+		// Dialing counts the handler before its hook goroutine records the
+		// call: wait until that goroutine blocks in the hanging dial (the
+		// pool's sweep read the count early 2 times in 600).
+		synctest.Wait()
 		calls, _, _, _ := hl.snapshot()
+		if calls != 3 {
+			t.Fatalf("premise: %d hook calls before the newcomer, want 3 (two forwards and the hanging dial)", calls)
+		}
 		start := time.Now()
 		_, err := Dial(context.Background(), w.peer, kitTarget, rendr.DialOptions{})
 		wantReject(t, err, CodeCapacity)
