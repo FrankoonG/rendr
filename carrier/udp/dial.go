@@ -24,6 +24,12 @@ var (
 	sysConfigure      = configure
 )
 
+// newOwnedUDP builds a dialer socket's token with Options.MaxBatch (the
+// token normalises it, M5-D16). TestUDPOptionsMaxBatch replaces it to see
+// the value Dial hands over: the token shows its depth only once a carrier
+// bound it on Linux amd64/arm64. Nothing else changes it.
+var newOwnedUDP = carrier.NewOwnedUDPBatch
+
 // dial implements the factory's Dial: resolve the peer (loopback only
 // without AllowNonLoopback), clamp MaxDatagram to the interface MTU (R1-16),
 // draw a fresh flow ID (L58: a redial never reuses one) and open an
@@ -62,7 +68,7 @@ func dial(ctx context.Context, network, address string, o Options) (net.PacketCo
 		u.Close()
 		return nil, nil, err
 	}
-	return carrier.NewOwnedUDP(u, peer, newFlowID(), maxDatagram), net.UDPAddrFromAddrPort(peer), nil
+	return newOwnedUDP(u, peer, newFlowID(), maxDatagram, o.MaxBatch), net.UDPAddrFromAddrPort(peer), nil
 }
 
 // literalClamp is Carrier's advance clamp of maxDatagram (W4 L3-1): for an
