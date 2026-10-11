@@ -579,40 +579,50 @@ func (t *trunk) withdrawResponseLocked(v *Conn) bool {
 	return true
 }
 
-// The tolerance ring: handles whose crossing frames are legal although no
+// The tolerance rings: handles whose crossing frames are legal although no
 // view holds them any more — a refused handle (the dialer's RST and DETACH
 // may cross the refusal) and a view retired at the DETACH bound (the
-// peer's frames and DETACH may still come). The ring holds MuxMaxViews
-// entries (the kind's): the oldest entry is overwritten.
+// peer's frames and DETACH may still come). Each kind has its own ring of
+// MuxMaxViews entries (the trunk kind's); a ring overwrites its oldest
+// entry. Most refused handles never see a crossing frame, so their entries
+// are never cleared: in one shared ring a burst of refusals pushed out a
+// retired view whose peer's DETACH was still to come, and that legal
+// DETACH killed the trunk (TestToleranceRingRefusalsKeepRetiredHandles).
 
 func (t *trunk) tolerateLocked(h uint32, all bool) {
-	n := t.maxViews()
-	if t.ms.tol == nil {
-		t.ms.tol = make([]tolEntry, n)
+	k := 0
+	if all {
+		k = 1
 	}
-	t.ms.tol[t.ms.tolHead] = tolEntry{h: h, all: all}
-	t.ms.tolHead = (t.ms.tolHead + 1) % n
+	n := t.maxViews()
+	if t.ms.tol[k] == nil {
+		t.ms.tol[k] = make([]tolEntry, n)
+	}
+	t.ms.tol[k][t.ms.tolHead[k]] = tolEntry{h: h, all: all}
+	t.ms.tolHead[k] = (t.ms.tolHead[k] + 1) % n
 }
 
 // toleratedLocked reports whether a frame of type typ for h is a tolerated
-// crossing frame: h is in the ring, and the entry covers every session
+// crossing frame: h is in a ring, and the entry covers every session
 // frame or typ is an RST, a response or the DETACH. With drop (the
 // handle's last frame, its DETACH) the entry leaves the ring.
 func (t *trunk) toleratedLocked(h uint32, typ wire.Type, drop bool) bool {
 	if h == 0 {
 		return false
 	}
-	for i, e := range t.ms.tol {
-		if e.h != h {
-			continue
+	for k := range t.ms.tol {
+		for i, e := range t.ms.tol[k] {
+			if e.h != h {
+				continue
+			}
+			if !e.all && typ != wire.TypeRst && typ != wire.TypeOpenAck && typ != wire.TypeJoinAck && typ != wire.TypeDetach {
+				return false
+			}
+			if drop {
+				t.ms.tol[k][i] = tolEntry{}
+			}
+			return true
 		}
-		if !e.all && typ != wire.TypeRst && typ != wire.TypeOpenAck && typ != wire.TypeJoinAck && typ != wire.TypeDetach {
-			return false
-		}
-		if drop {
-			t.ms.tol[i] = tolEntry{}
-		}
-		return true
 	}
 	return false
 }

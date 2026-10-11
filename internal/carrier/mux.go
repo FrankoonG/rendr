@@ -58,11 +58,11 @@ type muxState struct {
 	full     bool         // dialer: a CAPACITY CodeMuxFull answer arrived; cleared when a view leaves (the pool's usable rule)
 	linger   int          // dialer: views whose Done closed while they are still in the view table (each still holds its place under the cap, WP16 MUX-1)
 
-	detq     []*Conn    // views whose DETACH is due (abandoned, killed, after their last frame, the peer's DETACH answered)
-	lasts    []*Conn    // views with a WriteAndClose frame to place
-	retiring []*Conn    // views whose DETACH was placed and whose exchange is not complete
-	tol      []tolEntry // ring: handles whose late crossing frames are dropped (refused, or retired at the DETACH bound)
-	tolHead  int
+	detq     []*Conn       // views whose DETACH is due (abandoned, killed, after their last frame, the peer's DETACH answered)
+	lasts    []*Conn       // views with a WriteAndClose frame to place
+	retiring []*Conn       // views whose DETACH was placed and whose exchange is not complete
+	tol      [2][]tolEntry // rings: handles whose late crossing frames are dropped ([0] refused, [1] retired at the DETACH bound)
+	tolHead  [2]int
 	opHead   int // the opens FIFO: t.opens[opHead : opHead+opN] (mod cap)
 	opN      int
 
@@ -80,7 +80,7 @@ type muxState struct {
 	rpost    postList // the reader's
 }
 
-// tolEntry is one entry of the tolerance ring: a handle no view holds any
+// tolEntry is one entry of a tolerance ring: a handle no view holds any
 // more whose crossing frames are legal. all: every session frame and the
 // DETACH (a view retired at the DETACH bound, whose peer may still be
 // sending); otherwise only RST, a response and the DETACH (a refused
