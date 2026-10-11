@@ -6,11 +6,13 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
@@ -25,10 +27,14 @@ import (
 // each counted in the passive's Sent − PeerReceived; every lost reply
 // written by the passive between one one-way delay before the close and
 // the instant it applied the first SCHED the dialer published after the
-// close; no DGRAM byte of the churn session on the closed trunk from the
-// next instant on, although that trunk lives on at the passive; the
+// close; no reply datagram on the closed trunk after that instant (the
+// passive's Hooks.BeforeWrite; the close falls half a millisecond between
+// two requests' arrivals) and no DGRAM byte of the churn session there
+// from the next poll on, although that trunk lives on at the passive; the
 // passive learned within one one-way delay (race, bond) or within the
-// failover view's JOIN round trip plus one one-way delay (selector).
+// failover view's JOIN round trip plus one one-way delay (selector); and
+// the dialer's direction loses nothing (a request whose write failed on
+// the closed conn is placed again: TestMuxPacketCarrierCloseUnsentReplaced_L39).
 func TestMuxPacketCarrierCloseLossInFlight_L39(t *testing.T) {
 	for _, mode := range []rendr.Mode{rendr.ModeRace, rendr.ModeBond, rendr.ModeSelector} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
@@ -54,10 +60,48 @@ const (
 	mclSize     = 200
 	mclPoll     = 100 * time.Microsecond
 	mclSelClose = 8 * time.Millisecond
+	// A datagram holding a reply DGRAM has [mclSize + 25 (wire.DgramOverhead),
+	// mclSize + 400) bytes; control datagrams are smaller, padded probes and
+	// their PONGs larger.
+	mclReplyLo = mclSize + 25
+	mclReplyHi = mclSize + 400
 )
 
+// muxReplyWrites records when the passive's writer wrote a datagram holding
+// a reply DGRAM on the victim trunk (its Hooks.BeforeWrite: the instant of
+// the write, not of the commit that moves TxBytes).
+type muxReplyWrites struct {
+	vic atomic.Uint32
+	mu  sync.Mutex
+	at  []time.Time
+}
+
+func (r *muxReplyWrites) before(id uint32, frames, bytes int) {
+	if v := r.vic.Load(); v == 0 || id != v || bytes < mclReplyLo || bytes >= mclReplyHi {
+		return
+	}
+	r.mu.Lock()
+	r.at = append(r.at, time.Now())
+	r.mu.Unlock()
+}
+
+// after returns the recorded writes later than t.
+func (r *muxReplyWrites) after(t time.Time) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, at := range r.at {
+		if at.After(t) {
+			n++
+		}
+	}
+	return n
+}
+
 func muxCloseLossInFlight(t *testing.T, mode rendr.Mode) {
-	w := newWorld(t, worldOpts{}, linkSpec{name: "u1", oneWay: mclOneWay, dgram: true}, linkSpec{name: "u2", oneWay: mclOneWay, dgram: true})
+	rec := &muxReplyWrites{}
+	w := newWorld(t, worldOpts{pov: testhooks.Overrides{Hooks: &testhooks.Hooks{BeforeWrite: rec.before}}},
+		linkSpec{name: "u1", oneWay: mclOneWay, dgram: true}, linkSpec{name: "u2", oneWay: mclOneWay, dgram: true})
 	peer := w.peer("u1", "u2")
 	// The long session holds a trunk on each link (G6's lu sessions).
 	long := w.openPacket(peer, "L", rendr.ModeBond)
@@ -69,6 +113,7 @@ func muxCloseLossInFlight(t *testing.T, mode rendr.Mode) {
 	if !ok {
 		t.Fatalf("no trunk on u1: %+v", long.d.Status().Carriers)
 	}
+	rec.vic.Store(uint32(trunk.ID))
 
 	s := w.openPacket(peer, "C", mode)
 	opened := time.Now()
@@ -156,7 +201,7 @@ func muxCloseLossInFlight(t *testing.T, mode rendr.Mode) {
 	}()
 
 	if mode == rendr.ModeSelector {
-		sleepUntil(opened.Add(mclSelClose))
+		sleepUntil(opened.Add(mclSelClose + mclGap/2))
 	} else {
 		for {
 			if _, ok := liveNamed(dc.Status(), "u2"); ok {
@@ -167,6 +212,7 @@ func muxCloseLossInFlight(t *testing.T, mode rendr.Mode) {
 			}
 			time.Sleep(mclPoll)
 		}
+		sleepUntil(opened.Add(time.Since(opened).Truncate(mclGap) + mclGap/2))
 	}
 	ePre := dc.Status().SchedEpoch
 	tClose := time.Now()
@@ -226,6 +272,12 @@ func muxCloseLossInFlight(t *testing.T, mode rendr.Mode) {
 		t.Fatalf("(a): the passive placed %d DGRAM bytes of the churn session on trunk %d after it applied the SCHED that dropped it (%v after the close)",
 			last.pTx-after.pTx, trunk.ID, learn)
 	}
+	if late := rec.after(tLearn); late > 0 {
+		t.Fatalf("(a): the passive wrote %d reply datagrams on trunk %d after it applied the SCHED that dropped it (%v after the close)", late, trunk.ID, learn)
+	}
+	if rec.after(tClose) == 0 {
+		t.Fatalf("stimulus: the passive wrote no reply on trunk %d after the close", trunk.ID)
+	}
 	mu.Lock()
 	var lost []uint64
 	late := 0
@@ -259,8 +311,8 @@ func muxCloseLossInFlight(t *testing.T, mode rendr.Mode) {
 	if n := ps.Sent - ps.PeerReceived; n != uint64(len(lost)) || ps.Sent != uint64(nw) {
 		t.Fatalf("accounting: the passive's Sent %d − PeerReceived %d = %d, want the %d replies lost (%d echoed)", ps.Sent, ps.PeerReceived, n, len(lost), nw)
 	}
-	if n := ds.Sent - ds.PeerReceived; n != uint64(mclRequests-nr) || ds.Sent != mclRequests {
-		t.Fatalf("accounting: the dialer's Sent %d − PeerReceived %d, but the passive read %d of %d requests", ds.Sent, ds.PeerReceived, nr, mclRequests)
+	if ds.Sent != mclRequests || ds.PeerReceived != mclRequests || nr != mclRequests {
+		t.Fatalf("the dialer's direction lost a request: Sent %d, PeerReceived %d, the passive read %d of %d", ds.Sent, ds.PeerReceived, nr, mclRequests)
 	}
 	if res := ver.Result(); res.Duplicates+res.Corrupt+res.BadSize != 0 {
 		t.Fatalf("integrity: %+v", res)

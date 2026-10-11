@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
@@ -52,10 +54,15 @@ import (
 //   - Classification (the decisive part): every lost reply was written by
 //     the passive no earlier than one one-way delay before the close and
 //     no later than the instant the passive applied the first SCHED the
-//     dialer published after the close; from the next instant on the
-//     passive placed no DGRAM byte on the closed carrier (its TxBytes on
-//     that carrier is frozen), although the carrier stays alive on the
-//     passive for seconds (until its ping_timeout) and the echo goes on.
+//     dialer published after the close; after that instant the passive
+//     wrote no datagram holding a reply on the closed carrier (its
+//     Hooks.BeforeWrite on that carrier, and its TxBytes there frozen),
+//     although the carrier stays alive on the passive for seconds (until
+//     its ping_timeout) and the echo goes on. The close falls half a
+//     millisecond between two requests' arrivals, so the SCHED's arrival
+//     (one one-way delay, or the selector's failover, later) never shares
+//     an instant with a reply's write, and a passive that wrote even one
+//     more reply on the closed carrier after applying that SCHED is seen.
 //   - Timeliness: the dialer published that SCHED in the instant of its
 //     death verdict, so the passive learned within one one-way delay of
 //     the close (race, bond); a selector dialer has no other session
@@ -67,11 +74,19 @@ import (
 //
 // Because the passive cannot know earlier, rendr has nothing more to
 // count than PeerReceived already shows: the gap is the G6 judge's
-// attribution of a loss on a carrier its own stimulus ended (no_other_
-// error_class reads only the Drop* counters of m2 §B1.0's table, which
-// cover the losses rendr itself decides, not the in-flight loss of
-// plan:742 and plan:749). A mutant that keeps the passive writing on a
-// carrier the applied SCHED dropped fails the classification here.
+// attribution of a loss on a carrier its own stimulus ended (its
+// no_other_error_class counts every incomplete packet churn echo, "k of
+// n replies", as error class other, and it has no row for the in-flight
+// loss of plan:742 and plan:749). A mutant that keeps the passive writing
+// on a carrier the applied SCHED dropped, even for one more reply, fails
+// the classification here.
+//
+// The dialer's direction loses nothing: a request written before the
+// close is in flight on a path that still delivers it, and a request the
+// dialer placed in a round whose write failed on the closed conn goes back
+// to the session and is placed again on the surviving carrier
+// (TestPacketCarrierCloseUnsentReplaced_L39), so the passive reads every
+// request and the dialer's Sent equals its PeerReceived.
 func TestPacketCarrierCloseLossInFlight_L39(t *testing.T) {
 	for _, mode := range []rendr.Mode{rendr.ModeRace, rendr.ModeBond, rendr.ModeSelector} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
@@ -96,17 +111,24 @@ const (
 	clRequests = 64                     // G6's 16 plus enough to echo well past the close
 	clSize     = 200                    // bytes per request (PktChurn.EchoSize order)
 	clPoll     = 100 * time.Microsecond // observer period: below every link delay
-	clSelClose = 8 * time.Millisecond   // selector: the close 8 ms after the open (8 requests out)
+	clSelClose = 8 * time.Millisecond   // selector: the close 8.5 ms after the open (9 requests out)
+	// A datagram holding a reply DGRAM has [clSize + clDgramOverhead,
+	// clSize + clSpan) bytes; control datagrams are smaller, padded probes
+	// and their PONGs larger.
+	clDgramOverhead = 25 // wire.DgramOverhead: the DGRAM frame's header, seq and trailer
+	clSpan          = 400
 )
 
 func closeLossInFlight(t *testing.T, mode rendr.Mode) {
-	w := newWorld(t, worldOpts{oneWay: clOneWay}, "u1", "u2")
+	rec := &replyWrites{lo: clSize + clDgramOverhead, hi: clSize + clSpan}
+	w := newWorldHooked(t, worldOpts{oneWay: clOneWay}, nil, &testhooks.Hooks{BeforeWrite: rec.before}, "u1", "u2")
 	dc, pc := w.open(w.peer("u1", "u2"), rendr.DialOptions{Mode: mode})
 	opened := time.Now()
 	vic, ok := liveNamed(dc.Status(), "u1")
 	if !ok {
 		t.Fatalf("the session did not open on u1: %+v", dc.Status().Carriers)
 	}
+	rec.vic.Store(uint32(vic.ID))
 	const seed = 0x6abe
 	echo := startEcho(pc, seed)
 
@@ -167,11 +189,12 @@ func closeLossInFlight(t *testing.T, mode rendr.Mode) {
 		}
 	}()
 
-	// The stimulus: race and bond close the victim in the instant the
-	// dialer's second member is up (G6 ps2298: 2 ms after it), before the
-	// passive heard of that member; selector closes its active carrier.
+	// The stimulus: race and bond close the victim as the dialer's second
+	// member comes up (G6 ps2298: 2 ms after it), at the next half
+	// millisecond between two requests; selector closes its active carrier
+	// half a millisecond after a request.
 	if mode == rendr.ModeSelector {
-		sleepUntil(opened.Add(clSelClose))
+		sleepUntil(opened.Add(clSelClose + clGap/2))
 	} else {
 		for {
 			if _, ok := liveNamed(dc.Status(), "u2"); ok {
@@ -182,6 +205,7 @@ func closeLossInFlight(t *testing.T, mode rendr.Mode) {
 			}
 			time.Sleep(clPoll)
 		}
+		sleepUntil(opened.Add(time.Since(opened).Truncate(clGap) + clGap/2))
 	}
 	ePre := dc.Status().SchedEpoch
 	tClose := time.Now()
@@ -252,6 +276,13 @@ func closeLossInFlight(t *testing.T, mode rendr.Mode) {
 		t.Fatalf("(a): the passive placed %d DGRAM bytes on carrier %d after it applied the SCHED that dropped it (%v after the close)",
 			last.pTx-after.pTx, vic.ID, learn)
 	}
+	if late := rec.after(tLearn); late > 0 {
+		t.Fatalf("(a): the passive wrote %d reply datagrams on carrier %d after it applied the SCHED that dropped it (%v after the close)",
+			late, vic.ID, learn)
+	}
+	if rec.after(tClose) == 0 {
+		t.Fatalf("stimulus: the passive wrote no reply on carrier %d after the close", vic.ID)
+	}
 	if echo.writes.Load() <= int64(clRequests/2) || echoedAfter(echo, after.at) == 0 {
 		t.Fatalf("load: the passive echoed %d requests, none after it learned", echo.writes.Load())
 	}
@@ -284,8 +315,8 @@ func closeLossInFlight(t *testing.T, mode rendr.Mode) {
 		t.Fatalf("accounting: the passive's Sent %d − PeerReceived %d = %d, want the %d replies lost (%d echoed)",
 			ps.Sent, ps.PeerReceived, n, len(lost), echo.writes.Load())
 	}
-	if n := ds.Sent - ds.PeerReceived; n != uint64(clRequests)-uint64(echo.reads.Load()) || ds.Sent != clRequests {
-		t.Fatalf("accounting: the dialer's Sent %d − PeerReceived %d, but the passive read %d of %d requests",
+	if ds.Sent != clRequests || ds.PeerReceived != clRequests || echo.reads.Load() != clRequests {
+		t.Fatalf("the dialer's direction lost a request: Sent %d, PeerReceived %d, the passive read %d of %d",
 			ds.Sent, ds.PeerReceived, echo.reads.Load(), clRequests)
 	}
 	res := ver.Result()
@@ -293,10 +324,9 @@ func closeLossInFlight(t *testing.T, mode rendr.Mode) {
 		t.Fatalf("integrity: %+v", res)
 	}
 	t.Logf("%v: closed carrier %d %v after the open; passive learned %v later (epoch %d → %d); %d of %d replies lost "+
-		"(written %v … %v after the close), the link lost %d datagrams on it; passive Sent %d, PeerReceived %d; requests lost %d",
+		"(written %v … %v after the close), the link lost %d datagrams on it; passive Sent %d, PeerReceived %d",
 		mode, vic.ID, tClose.Sub(opened), learn, ePre, obs[learnIdx].pEpoch, len(lost), echo.writes.Load(),
-		lostSpan(echo, lost, tClose, true), lostSpan(echo, lost, tClose, false), lostOnVictim, ps.Sent, ps.PeerReceived,
-		clRequests-echo.reads.Load())
+		lostSpan(echo, lost, tClose, true), lostSpan(echo, lost, tClose, false), lostOnVictim, ps.Sent, ps.PeerReceived)
 
 	// Clean end: the dialer closes, the echo reads io.EOF and closes.
 	dc.Close()
@@ -325,6 +355,38 @@ func closeLossInFlight(t *testing.T, mode rendr.Mode) {
 	}
 	w.noViolation()
 	w.close()
+}
+
+// replyWrites records when the passive's writer wrote a datagram holding a
+// reply DGRAM ([lo, hi) bytes) on the victim carrier (its Hooks.BeforeWrite:
+// the instant of the write, not of the commit that moves TxBytes).
+type replyWrites struct {
+	vic    atomic.Uint32
+	lo, hi int
+	mu     sync.Mutex
+	at     []time.Time
+}
+
+func (r *replyWrites) before(id uint32, frames, bytes int) {
+	if v := r.vic.Load(); v == 0 || id != v || bytes < r.lo || bytes >= r.hi {
+		return
+	}
+	r.mu.Lock()
+	r.at = append(r.at, time.Now())
+	r.mu.Unlock()
+}
+
+// after returns the recorded writes later than t.
+func (r *replyWrites) after(t time.Time) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, at := range r.at {
+		if at.After(t) {
+			n++
+		}
+	}
+	return n
 }
 
 // echoedAfter is the number of requests the echo answered after at.

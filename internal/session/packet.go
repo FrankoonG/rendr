@@ -21,7 +21,8 @@ import (
 // WriteTo and ReadFrom; pkt_fill.go Fill, the wake policy and the routing
 // helpers; pkt_recv.go the DGRAM hand-over; pkt_pack.go PACK placement,
 // cadence and receipt; pkt_end.go Close, the peer's FIN, the end and
-// ageing.
+// ageing; pkt_unsent.go the DGRAMs a dying carrier never wrote (M5
+// pktloss).
 
 // packet is a packet session's data-plane state.
 type packet struct {
@@ -48,6 +49,8 @@ type packet struct {
 	bigHeld   bool         // mixed by stream members awaiting their SCHED only: txBig waits for one, aged by the actor (C4-F2)
 	rcopy     *carrier.Buf // a datagram ReadFrom detached and copies outside the lock (L07: released at its commit)
 	copies    uint64       // race sender: extra placements of datagrams another lane already placed (Race.Copies, M3-D35)
+	redo      []predo      // DGRAMs a dying carrier handed back unwritten, oldest first from redoHead (pkt_unsent.go; ≤ maxRedo)
+	redoHead  int          // the first waiting entry of redo
 
 	base        time.Time // immutable: the origin of pdesc.at (monotonic)
 	stale       *lane     // bond minimum share (R1-19): the lane found stale, remembered until it places a DGRAM

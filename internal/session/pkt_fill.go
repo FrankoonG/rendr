@@ -104,6 +104,11 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 	if !dg && pk.mixed {
 		headroom = int64(pk.maxPayload + wire.DgramOverhead)
 	}
+	if p, stop := s.placeRedoLocked(l, b, dg, &left); stop {
+		return p
+	} else if p {
+		placed = true
+	}
 	limit := s.offsetLimit()
 	queues := [2]*pring{&pk.txBig, &pk.tx}
 	first := 0
@@ -370,7 +375,8 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 		return
 	}
 	s.refreshOrderLocked(now, false)
-	if pk.tx.n == 0 && pk.txBig.n == 0 {
+	ntx := pk.tx.n + pk.redoN() // the returned DGRAMs go first (pkt_unsent.go)
+	if ntx == 0 && pk.txBig.n == 0 {
 		if st.fin.requested && !st.fin.acked && st.fin.lane == nil {
 			s.pktWalkLocked(1, false, nil, 0, -1)
 		}
@@ -378,7 +384,7 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 	}
 	var counted *lane
 	covered := 0
-	if pk.tx.n > 0 {
+	if ntx > 0 {
 		if sl := s.pktStaleLocked(now); sl != nil {
 			if sl.idle {
 				sl.idle = false
@@ -389,7 +395,7 @@ func (s *Session) pktWakeDataLocked(now time.Time) {
 			// member whose writer would drain it first.
 			counted, covered = sl, carrier.MaxBatchFrames
 		}
-		if head := int(pk.tx.front().n); covered < pk.tx.n && !s.pktWalkLocked(pk.tx.n, false, counted, covered, head) &&
+		if head := s.pktTxHeadLocked(); covered < ntx && !s.pktWalkLocked(ntx, false, counted, covered, head) &&
 			!s.pktOtherCarrierLocked(nil, head, true) {
 			// No live data lane can ever carry the head: it is larger than
 			// every datagram member's DgramMax and no stream member is left
@@ -517,10 +523,11 @@ func (s *Session) pktCanPlaceLocked(l *lane, n int) bool {
 // The scan runs at most once per PacketPing/max(8, 4·lanes): one stale
 // lane is served per scan, so with k members each is served at least every
 // max((k−1)·period, PacketPing/4 + period) < PacketPing/2 for every bond up
-// to MaxCarriersPerSession (and beyond). Called with tx non-empty.
+// to MaxCarriersPerSession (and beyond). Called with tx or the redo list
+// non-empty.
 func (s *Session) pktStaleLocked(now time.Time) *lane {
 	pk := s.pk
-	head := int(pk.tx.front().n)
+	head := s.pktTxHeadLocked()
 	if sl := pk.stale; sl != nil {
 		if sl.data && sl.state != LaneDead && s.pktCanPlaceLocked(sl, head) {
 			return sl
