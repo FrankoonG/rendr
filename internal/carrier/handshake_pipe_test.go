@@ -435,10 +435,14 @@ func TestWithdrawOverRawPipe_L49(t *testing.T) {
 // PREFACE_ACK(OK), and then stalls — is cut on a plain pipe end and on one
 // that ignores write deadlines but honours Close (design §0.8 V2):
 // Establish returns at the withdrawal, the conn is closed exactly once,
-// right then, and nothing follows the partial first frame on the wire (an
-// RST there would sit inside a broken frame); nothing is abandoned. Waiting
-// for a hello writer that only the close can end would hold both until
-// AbandonWait.
+// and nothing follows the partial first frame on the wire (an RST there
+// would sit inside a broken frame); nothing is abandoned. The pipe end is
+// closed at the withdrawal (its Write returns at the withdrawal's
+// SetDeadline(now)); the end that ignores its write deadline drainMax
+// later, when the withdrawal's goroutine stops waiting for a hello Write
+// that might still have delivered the whole flight (WP13 A-1: a delivered
+// flight is followed by the RST). The handshake never waits for that
+// writer: the withdrawal's goroutine joins it.
 func TestWithdrawCutsUnreadHello_L49(t *testing.T) {
 	const withdraw = 100 * time.Millisecond
 	for _, tc := range []struct {
@@ -500,8 +504,12 @@ func TestWithdrawCutsUnreadHello_L49(t *testing.T) {
 					t.Fatalf("after the PREFACE the passive read %d bytes (%v), want nothing after a cut first frame", len(rest), restErr)
 				}
 				synctest.Wait()
-				if n, at := nc.closes.Load(), nc.closedAfter(start); n != 1 || at != withdraw {
-					t.Fatalf("conn closed %d times, first after %v; want once, at the withdrawal", n, at)
+				wantClose := withdraw
+				if !tc.writeDeadlines {
+					wantClose += drainMax // the bounded wait for the hello writer (pickWithdrawal)
+				}
+				if n, at := nc.closes.Load(), nc.closedAfter(start); n != 1 || at != wantClose {
+					t.Fatalf("conn closed %d times, first after %v; want once, after %v", n, at, wantClose)
 				}
 				if nc.writes.Load() != 1 || env.IDs.inUse() != 0 || env.Abandon.Len() != 0 {
 					t.Fatalf("writes %d, IDs in use %d, abandoned %d", nc.writes.Load(), env.IDs.inUse(), env.Abandon.Len())

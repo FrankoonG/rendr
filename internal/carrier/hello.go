@@ -181,6 +181,7 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 	}
 	c := newConn(env, nc, p.CarrierID, p.Instance, -1, "", false)
 	c.mux = passiveMux(&p, h.Type)
+	c.endCode = echoOpt(&p)&wire.OptEndCode != 0
 	c.rd.fseq = first + 1
 	c.wr.fseq = env.Presets.fseqFrom(ab[:]) // ours starts at our PREFACE_ACK's
 	if h.Type == wire.TypePing {
@@ -191,10 +192,11 @@ func readHello(env *Env, k *closeOnce, deadline time.Time, maxMeta int, gate Gat
 }
 
 // echoOpt returns the optional bits of the passive's PREFACE_ACK(OK) for
-// PREFACE p (§A3.1, M3-D3): wire.OptMux iff p carried it; every other
-// optional bit is ignored and never echoed.
+// PREFACE p (§A3.1, M3-D3): wire.OptMux and wire.OptEndCode (WP13 B-1)
+// iff p carried them (wire.EchoOpt); every other optional bit is ignored
+// and never echoed.
 func echoOpt(p *wire.Preface) uint32 {
-	return p.Opt & wire.OptMux
+	return wire.EchoOpt(p.Opt)
 }
 
 // passiveMux reports whether an accepted passive carrier is a MUX trunk:

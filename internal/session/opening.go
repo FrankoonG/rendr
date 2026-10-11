@@ -1034,7 +1034,9 @@ func (a *actor) pktBadAnswerLocked(now time.Time, i int, at *attempt, est *carri
 }
 
 // joinRefusedLocked handles a non-OK JOIN_ACK from the bound instance
-// (§6.7): UNKNOWN_SESSION ends the session (ErrSessionLost, L19),
+// (§6.7): UNKNOWN_SESSION ends the session (ErrSessionLost, L19; with
+// the end code the passive's tombstone carried under wire.OptEndCode,
+// *AbortError{code, Remote} instead, as the lost RST would have, L47),
 // BAD_REQUEST with ErrProtocol, GOING_AWAY like a GOAWAY; CAPACITY backs
 // off. UNKNOWN_SESSION and GOING_AWAY end cleanly (io.EOF) once our DONE
 // was sent (D4, doneOr); BAD_REQUEST proves no peer gone and keeps its
@@ -1046,6 +1048,10 @@ func (a *actor) joinRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 	a.switchFailedLocked(now, i)
 	switch st {
 	case wire.StatusUnknownSession:
+		if est.EndCode != 0 {
+			a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortCode(est.EndCode), Remote: true}), nil, false)
+			return
+		}
 		a.terminateLocked(now, a.doneOr(fmt.Errorf("%w: JOIN_ACK UNKNOWN_SESSION", ErrSessionLost)), nil, false)
 	case wire.StatusBadRequest:
 		a.terminateLocked(now, fmt.Errorf("%w: JOIN_ACK BAD_REQUEST", ErrProtocol), nil, false)

@@ -1293,7 +1293,11 @@ func (c *Conn) awaitResponseMux(ctx context.Context, check func(*wire.PrefaceAck
 				return nil, &EstablishError{Stage: "preface", Cause: CauseInstanceMismatch, PrefaceOK: true, Instance: t.peer, Err: err}
 			}
 		}
-		return &Established{Conn: c, Ack: ack, Resp: hdr, Payload: p}, nil
+		est := &Established{Conn: c, Ack: ack, Resp: hdr, Payload: p}
+		if hdr.Type == wire.TypeJoinAck && st == wire.StatusUnknownSession && t.endCode {
+			est.EndCode = c.respCode() // the trunk negotiated OptEndCode (WP13 B-1, L47)
+		}
+		return est, nil
 	}
 	if err := ctx.Err(); err != nil {
 		if c.vx.first == wire.TypeOpen && errors.Is(context.Cause(ctx), ErrWithdrawn) {

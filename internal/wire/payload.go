@@ -249,7 +249,9 @@ func ParseJoinAck(p []byte) (JoinAck, error) {
 // field, which a refusal leaves zero on a dedicated carrier: the code is
 // the field's low 32 bits, its high 32 bits stay zero. An OK JOIN_ACK is
 // unchanged. Handle 1's JOIN_ACK (the handshake's, any carrier) keeps
-// ParseJoinAck's rule.
+// ParseJoinAck's rule, except on a carrier that negotiated OptEndCode (M4):
+// there a JOIN_ACK(UNKNOWN_SESSION) carries the ended session's RST code
+// in the same layout (PutJoinAckMux, ParseJoinAckMux), 0 for none.
 
 // PutJoinAckMux writes a into dst as a view's JOIN_ACK on a MUX trunk and
 // returns JoinAckLen: PutJoinAck, with code in the RxNext field of a

@@ -103,8 +103,12 @@ type trunk struct {
 	wd1At, wd2At   atomic.Int64 // nanoseconds after base when each stage is due
 
 	// The mux state (M3-D1 … M3-D13).
-	mux   bool  // OptMux negotiated: both PREFACE and PREFACE_ACK carried it (M3-D3); immutable after the handshake
-	owner *Pool // dialer MUX trunks: the pool that publishes and closes it; nil on the passive side
+	mux bool // OptMux negotiated: both PREFACE and PREFACE_ACK carried it (M3-D3); immutable after the handshake
+	// endCode: wire.OptEndCode negotiated on a stream carrier (WP13 B-1):
+	// a JOIN_ACK(UNKNOWN_SESSION) on any of its views may carry an end
+	// code. Immutable after the handshake.
+	endCode bool
+	owner   *Pool // dialer MUX trunks: the pool that publishes and closes it; nil on the passive side
 	// kinds is the session kind a dialer MUX trunk carries, as the data
 	// frame type (wire.TypeData: stream sessions, wire.TypeDgram: packet
 	// sessions): its claimant's, set by the pool under Pool.mu before the
