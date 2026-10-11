@@ -109,7 +109,7 @@ func (b *Batch) doSend(fd uintptr) bool {
 				return true
 			}
 		case err == syscall.EINTR:
-		case err == syscall.EAGAIN:
+		case err == errAgain:
 			return false
 		default:
 			b.err = err
@@ -129,7 +129,7 @@ func (b *Batch) doRecv(fd uintptr) bool {
 		switch {
 		case err == syscall.EINTR:
 			continue
-		case err == syscall.EAGAIN:
+		case err == errAgain:
 			return false
 		case err != nil:
 			b.err = err
@@ -405,7 +405,7 @@ func (c *Conn) endRead(b *Batch, m0 *Msg, err error) (int, error) {
 // drop of one datagram (R1-3).
 func (c *Conn) denied(err error, call int) bool {
 	switch err {
-	case syscall.ENOSYS:
+	case errNoSys:
 		return true
 	case syscall.EPERM:
 		return !c.permitted(call)
@@ -422,7 +422,7 @@ func (c *Conn) permitted(call int) bool {
 	if t := at.Load(); t != 0 && now >= t && now-t < int64(probeCache) {
 		return true
 	}
-	if probeFn(call) != syscall.EBADF {
+	if probeFn(call) != errBadF {
 		return false
 	}
 	at.Store(now)
@@ -449,7 +449,7 @@ func (c *Conn) addrError(err error, dst netip.AddrPort) error {
 // caller's classification (errors.As to syscall.Errno) is the same in
 // both modes.
 func (c *Conn) opError(op, call string, err error) error {
-	if errno, ok := err.(syscall.Errno); ok {
+	if errno, ok := sysErrno(err); ok {
 		return &net.OpError{Op: op, Net: "udp", Source: c.laddr, Err: os.NewSyscallError(call, errno)}
 	}
 	return err
@@ -656,7 +656,7 @@ func batchPermitted() bool {
 // such call) and EPERM (a sandbox policy) — and anything else — keep the
 // socket plain (M5-D15).
 func probeAllows(sendErr, recvErr error) bool {
-	return sendErr == syscall.EBADF && recvErr == syscall.EBADF
+	return sendErr == errBadF && recvErr == errBadF
 }
 
 // zoneTable maps IPv6 zones (interface names) to interface indexes and
