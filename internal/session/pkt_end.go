@@ -70,6 +70,7 @@ func (s *Session) pktFinLocked(final uint64) error {
 		// worth sending and our FIN follows at once (PA-6).
 		st.fin.requested = true
 		pk.ctr.DropQueue += uint64(pk.tx.releaseAll() + pk.txBig.releaseAll())
+		s.pktRedoReleaseLocked()
 	}
 	if st.closed {
 		s.pktDeliverFinLocked()
@@ -138,6 +139,7 @@ func (s *Session) pktDeliverFinLocked() {
 func (s *Session) pktReleaseLocked() {
 	st, pk := &s.st, s.pk
 	pk.ctr.DropQueue += uint64(pk.tx.releaseAll() + pk.txBig.releaseAll())
+	s.pktRedoReleaseLocked()
 	pk.ctr.DropRecvQueue += uint64(pk.rx.releaseAll())
 	pk.stale = nil
 	if st.rwaiting {
@@ -149,14 +151,14 @@ func (s *Session) pktReleaseLocked() {
 }
 
 // pktAgeOutLocked is pktAgeLocked, the actor's no-path ageing step: the
-// tx datagrams older than MaxAge are dropped (DropNoPath: no data lane
-// exists) and the time the next queued one ages out is returned (zero:
-// nothing queued).
+// tx datagrams and the returned DGRAMs (pkt_unsent.go) older than MaxAge
+// are dropped (DropNoPath: no data lane exists) and the time the next
+// queued one ages out is returned (zero: nothing queued).
 func (s *Session) pktAgeOutLocked(now time.Time) time.Time {
 	pk := s.pk
 	nowNs := now.Sub(pk.base).Nanoseconds()
 	maxAge := s.pktMaxAge()
-	var next time.Time
+	next := s.pktRedoAgeLocked(nowNs)
 	for _, q := range [2]*pring{&pk.tx, &pk.txBig} {
 		s.pktAgeQueueLocked(q, nowNs, true)
 		if q.n > 0 {
@@ -192,5 +194,5 @@ func (s *Session) pktAgeBigLocked(now time.Time) time.Time {
 // pktPendingBytesLocked returns the bytes of the datagrams queued for
 // sending (pendingBytesLocked of a packet session, §A5.1).
 func (s *Session) pktPendingBytesLocked() uint64 {
-	return uint64(s.pk.tx.bytes + s.pk.txBig.bytes)
+	return uint64(s.pk.tx.bytes + s.pk.txBig.bytes + s.pk.pktRedoBytes())
 }

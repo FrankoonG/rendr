@@ -97,6 +97,11 @@ func (s *Session) raceFillDgramsLocked(l *lane, b *carrier.Batch) (placed bool) 
 	if !dg {
 		left = l.port.Capacity() - l.port.Inflight() - int64(b.Taken())
 	}
+	if p, stop := s.placeRedoLocked(l, b, dg, &left); stop {
+		return p
+	} else if p {
+		placed = true
+	}
 	limit := s.offsetLimit()
 	p := max(l.rpos, q.pos)
 	for tail := q.pos + uint64(q.n); p < tail; p++ {
@@ -155,7 +160,7 @@ func (s *Session) raceFillDgramsLocked(l *lane, b *carrier.Batch) (placed bool) 
 // place now: a queued datagram beyond its cursor, or our FIN.
 func (s *Session) raceDgramDueLocked(l *lane) bool {
 	q := &s.pk.tx
-	return max(l.rpos, q.pos) < q.pos+uint64(q.n) || s.racePktFinDueLocked(l, time.Since(s.pk.base).Nanoseconds())
+	return s.pk.redoN() > 0 || max(l.rpos, q.pos) < q.pos+uint64(q.n) || s.racePktFinDueLocked(l, time.Since(s.pk.base).Nanoseconds())
 }
 
 // racePktFinDueLocked is the packet FIN rule of a race data lane (M3-D30,

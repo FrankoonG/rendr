@@ -116,7 +116,7 @@ type RaceCounters struct {
 // Sent, so Sent + DropQueue + DropAge + DropTooLarge + DropNoPath + still
 // queued = accepted by WriteTo (M2 design §A7.2, Revision 1, R1-31).
 type PacketCounters struct {
-	Sent          uint64 // placed on a carrier (seq assigned) and not refused by it
+	Sent          uint64 // placed on a carrier (seq assigned), not refused by it and not handed back unwritten by a dying one (pkt_unsent.go)
 	Received      uint64 // accepted from carriers (new seqs)
 	Duplicates    uint64 // received again inside the dedup window, also after the peer's FIN was delivered (M3-D35); in a race session the members' copies while they arrive inside the window (KL-15)
 	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
