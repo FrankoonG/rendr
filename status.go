@@ -62,6 +62,24 @@ type DatagramStatus struct {
 	InboxDrops uint64 // datagrams a full flow inbox dropped
 	ReadErrors uint64 // transient read errors (ICMP class), backed off and ignored
 	Rebinds    uint64 // raw-UDP flows whose reply address moved after a nonce check
+
+	// I/O on rendr's own UDP sockets (carrier/udp dialer sockets and the
+	// carrier/udp Listen sockets adopted by FromPacketConn). SendCalls and
+	// RecvCalls count the system calls that moved at least one datagram
+	// (sendmmsg/recvmmsg on Linux amd64/arm64, single-datagram calls
+	// otherwise and for H2 repeats, challenges and plain-mode writes); a
+	// call that ended in EAGAIN, EINTR or an error before its first
+	// datagram is not counted. SentDatagrams/SendCalls > 1 shows that
+	// sends were batched. QUIC and embedder sockets are not counted.
+	SendCalls, SentDatagrams uint64
+	RecvCalls, RecvDatagrams uint64
+
+	// BatchFallbacks counts sockets that stopped batching because the
+	// kernel or a sandbox refused sendmmsg/recvmmsg (each socket at most
+	// once). ChargeRefused counts receive slots the memory budget refused;
+	// the reader then kept its depth.
+	BatchFallbacks uint64
+	ChargeRefused  uint64
 }
 
 // SessionCounts counts sessions of both roles. Open, Pending, Lingering and

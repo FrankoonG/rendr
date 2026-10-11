@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 )
 
 // PacketIO is the transport of one datagram carrier (M2-D4): exactly one
@@ -166,6 +168,50 @@ type DgramStats struct {
 	InboxDrops atomic.Uint64 // datagrams a full or refused flow inbox dropped
 	ReadErrors atomic.Uint64 // transient read errors (noise) of sources and datagram carriers
 	Rebinds    atomic.Uint64 // committed rebinds of raw-UDP flows
+
+	// IO counts the system calls on rendr's own UDP sockets and the
+	// datagrams they moved, and the sockets that stopped batching
+	// (rendr.DatagramStatus SendCalls, SentDatagrams, RecvCalls,
+	// RecvDatagrams, BatchFallbacks; M5-D17, R1-2): every udpsocket.Conn
+	// of the Runtime — OwnedUDP's and an owned Source's — is created with
+	// &IO.
+	IO udpsocket.Counters
+	// ChargeRefused counts the receive slots beyond the first that the
+	// memory budget refused to a batched reader (a dialer carrier's or an
+	// owned Source's); the reader then kept its depth (R1-4).
+	ChargeRefused atomic.Uint64
+}
+
+// BatchIO is implemented only by rendr-owned transports (OwnedUDP and the
+// flows of a Source over rendr's own socket; L57, M5-D10): a datagram
+// carrier whose PacketIO also implements it writes a round's datagrams and
+// reads its datagrams through it, several per system call where the
+// socket batches. Its writer half belongs to the writer goroutine and its
+// reader half to the reader goroutine, as PacketIO's.
+type BatchIO interface {
+	// WriteDatagrams writes ds in order, each with Headroom bytes in front
+	// that the transport fills, as WriteDatagram writes one: ds[:n] were
+	// sent; err, if any, is ds[n]'s, classified as WriteDatagram's error
+	// would be (wire.ErrDatagramTooLarge, ErrNoise, or death).
+	WriteDatagrams(ds [][]byte) (n int, err error)
+	// ReadDatagrams fills rs[:n], n ≥ 1, in arrival order, each what
+	// ReadDatagram would have returned for that datagram, or returns n = 0
+	// and the error ReadDatagram would have returned. It moves at most
+	// MaxBatch() datagrams.
+	ReadDatagrams(rs []ReadResult) (n int, err error)
+	// MaxBatch is the most datagrams one call moves (carrier/udp
+	// Options.MaxBatch; 1 = one per call).
+	MaxBatch() int
+}
+
+// ReadResult is one datagram of a BatchIO.ReadDatagrams call: what
+// PacketIO.ReadDatagram returns for it. Data aliases buf, the slot it was
+// read into, until the reader releases the slot.
+type ReadResult struct {
+	Data []byte
+	Src  PeerKey
+	Ev   ReadEvent
+	buf  *Buf
 }
 
 // NewPacketIO adapts an embedder net.PacketConn whose datagrams come from

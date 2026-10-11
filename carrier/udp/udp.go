@@ -93,6 +93,13 @@ type Options struct {
 	// selects 4 MiB and 1 MiB (on Linux raised past rmem_max/wmem_max with
 	// the FORCE options when the process may).
 	ReadBuffer, WriteBuffer int
+	// MaxBatch is the most datagrams one send or receive system call moves
+	// on Linux amd64/arm64 (sendmmsg, recvmmsg): 0 or a negative value
+	// selects 32, 1 moves one datagram per call, values above 64 become 64;
+	// a listening socket reads at most 32 per call. Batching never delays
+	// a datagram: a writer sends what it has when it wakes. Other
+	// platforms always move one datagram per call.
+	MaxBatch int
 }
 
 // Listen opens a rendr-owned UDP socket on network ("udp", "udp4", "udp6")

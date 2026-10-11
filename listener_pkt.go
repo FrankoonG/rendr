@@ -97,6 +97,8 @@ func (rt *Runtime) datagramStatus(srcs []*udpflow.Source) DatagramStatus {
 		ds.InboxDrops = d.InboxDrops.Load()
 		ds.ReadErrors = d.ReadErrors.Load()
 		ds.Rebinds = d.Rebinds.Load()
+		ds.SendCalls, ds.SentDatagrams, ds.RecvCalls, ds.RecvDatagrams, ds.BatchFallbacks = d.IO.Load()
+		ds.ChargeRefused = d.ChargeRefused.Load()
 	}
 	return ds
 }

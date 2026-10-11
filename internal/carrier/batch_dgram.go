@@ -328,6 +328,29 @@ func (b *Batch) appendDatagram(dst []byte, i, end int) []byte {
 	return append(dst, b.arena[seg:stop]...)
 }
 
+// appendDatagramArena packs the datagram of the sealed frames [i, end) —
+// the range nextDatagram returned — into arena, the round's arena (one
+// DBufs buffer of the 64-KiB class), as appendDatagram packs it: arena
+// holds the flush's earlier slots and then the new datagram's Headroom
+// bytes, which the caller appended; the new slot runs from the end of the
+// flush's previous slot (0 for its first) to the end of the datagram. It
+// records that slot as the flush's next one and returns the flush's slots,
+// the new one last, each with its Headroom in front (the argument of
+// BatchIO.WriteDatagrams), and arena's new length. It allocates nothing,
+// runs before ReleaseRefs and panics unless 0 ≤ i < end ≤ Len() and the
+// datagram fits cap(arena) (M5 design §A4.3; WP2).
+func (b *Batch) appendDatagramArena(i, end int, arena []byte) ([][]byte, int) {
+	panic("WP2")
+}
+
+// datagramIsDgramOnly reports whether the datagram that starts at sealed
+// frame i consists of DGRAM frames only — its one frame is a DGRAM, since
+// a DGRAM always ends its datagram (M2-D12) — the run rule of a GSO send
+// (M5-D23; used only if GSO ships).
+func (b *Batch) datagramIsDgramOnly(i int) bool {
+	return b.frames[i].hdr.Type == wire.TypeDgram
+}
+
 // Writer-side helpers added to the WP3c ↔ WP3a contract at integration 1
 // (M2 design §A11.5): datagramDgram gives each datagram's TxBytes and
 // Refused, dgramBytes the round's DGRAM bytes in both modes, and relRefused
