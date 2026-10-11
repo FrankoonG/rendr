@@ -58,9 +58,14 @@ import (
 // deep Link, whose Writes block only once its 2-MiB queue fills, needs the
 // reverse-queue part; the shallow Links need the write-lag part. Without
 // the allowance: deep 0.209/0.939, shallow 0.750/0.996. Without the write
-// lag: shallow-late6ms 0.859/0.820 in every run (a start 3–10 ms late
-// gives that phase; the A → B start swept over 0–400 ms in 4-ms steps
-// failed in 18 of 101 cells, the B → A start in 3). With both parts: 0
+// lag: shallow-late6ms 0.859/0.820 in nearly every run (139 of 140 host
+// runs without -race; synctest without -race still varies the select
+// order), so this row is a strong rather than a certain check of the
+// write lag; the late100ms and dlate292ms rows of internal/carrier's
+// TestDuplexKeepsBothDirections_L15 and its TestWriteLagAllowance carry
+// the guarantee. A start 3–10 ms late gives that phase; the A → B start swept
+// over 0–400 ms in 4-ms steps failed in 18 of 101 cells, the B → A start
+// in 3. With both parts: 0
 // failures in 2,371 host -race runs of shallow (the worst direction
 // 0.910), and no sweep cell below 0.910.
 func TestMuxBulkBothWaysKeepsTheLink(t *testing.T) {

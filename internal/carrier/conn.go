@@ -651,7 +651,9 @@ func (c *Conn) Inflight() int64 {
 	return c.st.inflight()
 }
 
-// Capacity returns the current in-flight cap (sched.Capacity).
+// Capacity returns the current in-flight cap (sched.CapacityDuplex: the
+// plan section 4 cap, plus the duplex allowance while the peer reports
+// BUSY: its reverse queue and this side's write lag, duplexLocked).
 func (c *Conn) Capacity() int64 {
 	if c.trunk == nil {
 		return 0
