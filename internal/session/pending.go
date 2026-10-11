@@ -282,13 +282,19 @@ func (s *Session) joinAckRxLocked(l *lane) uint64 {
 }
 
 // refuseAdopt answers an adopted carrier of an ended session and closes it:
-// JOIN_ACK(UNKNOWN_SESSION), or the session's verdict to a duplicate OPEN.
-// The carrier joins the exit join (§6.8).
+// JOIN_ACK(UNKNOWN_SESSION) — with an opened session's end code on a
+// carrier that negotiated wire.OptEndCode, as its tombstone would answer
+// (WP13 B-1, L47) — or the session's verdict to a duplicate OPEN. The
+// carrier joins the exit join (§6.8).
 func (a *actor) refuseAdopt(ad *adopt) {
 	defer a.dropConn(ad.conn)
 	if ad.kind == adoptJoin {
+		var code uint32
+		if a.verdict.Opened && ad.conn.EndCodes() {
+			code = a.verdict.Code
+		}
 		var p [wire.JoinAckLen]byte
-		n := wire.PutJoinAck(p[:], &wire.JoinAck{Status: wire.StatusUnknownSession})
+		n := wire.PutJoinAckMux(p[:], &wire.JoinAck{Status: wire.StatusUnknownSession}, code)
 		ad.conn.WriteAndClose(wire.TypeJoinAck, 0, ad.conn.Handle(), p[:n], time.Time{})
 		return
 	}

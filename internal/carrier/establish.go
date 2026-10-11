@@ -305,9 +305,7 @@ func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.
 			return
 		}
 		if g != nil {
-			g.finish()
-			g.closeWith(false, false)
-			g.join()
+			g.leave(false)
 		}
 		if env.IDs != nil {
 			env.IDs.Release(id)
@@ -371,17 +369,13 @@ func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.
 	// joins the hello writer, and maps an I/O error caused by the abort to
 	// the context's outcome.
 	failed := func(stage string, cause Cause, prefaceOK bool, inst [16]byte, err error, rst bool) (*Established, error) {
-		if g.finish() { // aborted: ctx ended or the attempt deadline passed
+		if g.leave(rst) { // aborted: ctx ended or the attempt deadline passed
 			if ctx.Err() != nil {
 				cause, err = CauseLocalClose, fmt.Errorf("%w (%v)", context.Cause(ctx), err)
 			} else {
 				cause, err = CauseTransportError, fmt.Errorf("%w (%v)", errDialTimeout, err)
 			}
-		} else if rst {
-			g.closeWith(true, false)
 		}
-		g.closeWith(false, false)
-		g.join()
 		e := &EstablishError{Stage: stage, Cause: cause, PrefaceOK: prefaceOK, Err: err}
 		if prefaceOK {
 			e.Instance = inst
@@ -442,13 +436,11 @@ func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.
 		if !errors.Is(perr, wire.ErrMajor) {
 			e.Instance = ack.Instance // a v2 answer: e.g. the instance a GOING_AWAY names
 		}
-		if g.finish() && ctx.Err() != nil {
+		// Closed first (leave), so a hello Write the passive will not read
+		// ends now: the typed answer never waits for the deadline (L44).
+		if g.leave(false) && ctx.Err() != nil {
 			e.Cause, e.Err = CauseLocalClose, context.Cause(ctx)
 		}
-		// Closed first, so a hello Write the passive will not read ends
-		// now: the typed answer never waits for the deadline (L44).
-		g.closeWith(false, false)
-		g.join()
 		return fail(e)
 	}
 	if err := ackOptErr(opt, &ack); err != nil {
@@ -675,7 +667,10 @@ var (
 // That goroutine, not the handshake, then joins the writer (rstJoins), so
 // a withdrawal returns at once although a Write that ignores its deadline
 // is ended only by the close, drainMax later (no frame follows a cut first
-// flight).
+// flight). The withdrawal claims the close in the critical section in
+// which abort decides it (abortDecide), so a handshake that leaves on its
+// own after that decision (an OPEN_ACK from a racing Confirm) never closes
+// the conn without the RST.
 //
 // With early data (M4-D4) the first flight is PREFACE ‖ OPEN(EARLY) ‖
 // DATA: without DialEarly the hello writer writes it in one Write; with
@@ -711,22 +706,52 @@ func newHsGuard(ctx context.Context, env *Env, nc net.Conn, firstWritten bool) *
 	return &hsGuard{env: env, nc: nc, ctx: ctx, firstWritten: firstWritten, left: make(chan struct{}), closing: make(chan struct{})}
 }
 
-func (g *hsGuard) abort() {
+// abort is the attempt context's AfterFunc: the decision (abortDecide),
+// then the close it claimed.
+func (g *hsGuard) abort() { g.abortDecide()() }
+
+// abortDecide is abort's decision, in one critical section of g.mu: unless
+// the handshake already left the conn (finish), it marks the attempt
+// aborted, decides whether this is a withdrawal (an OPEN and the cause
+// ErrWithdrawn: the RST(withdrawn) may follow the first flight) and claims
+// the close of the conn (claimLocked). It returns the rest of the close,
+// to run outside the lock; a no-op when the handshake left first or the
+// close was claimed before (a failed hello Write). The claim is made under
+// the lock that finish takes, so a handshake that leaves after this
+// decision (finish reports aborted) never claims the close first: its
+// code-free closeWith loses to the withdrawal, which then still decides
+// the RST (pickWithdrawal). Releasing the lock unclaimed let an OPEN_ACK
+// that ended the response read on its own (a racing Confirm) close the
+// conn with no RST (WP13 review, L49;
+// TestWithdrawalClaimsCloseBeforeHandshakeLeaves_L49).
+func (g *hsGuard) abortDecide() (closeConn func()) {
 	g.mu.Lock()
 	if g.finished {
 		g.mu.Unlock()
-		return
+		return func() {}
 	}
 	g.aborted = true
 	withdraw := g.rstOpen && errors.Is(context.Cause(g.ctx), ErrWithdrawn)
+	won := g.claimLocked(withdraw)
 	g.mu.Unlock()
-	if withdraw {
-		// Whether the RST may follow is decided once the handshake left
-		// the conn: only after a first flight that was written completely.
-		g.closeWith(true, true)
-		return
+	if !won {
+		return func() {}
+	}
+	return func() { g.runClose(withdraw, withdraw) }
+}
+
+// leave is the handshake goroutine's exit after a failure: it leaves the
+// conn (finish), closes it once — after RST(withdrawn) when rst asks and no
+// abort came first (closeWith; rstFrame decides) — and joins the hello
+// writer. It reports whether abort ran first.
+func (g *hsGuard) leave(rst bool) (aborted bool) {
+	aborted = g.finish()
+	if !aborted && rst {
+		g.closeWith(true, false)
 	}
 	g.closeWith(false, false)
+	g.join()
+	return aborted
 }
 
 // finish ends the guarded phase — the handshake goroutine makes no further
@@ -905,21 +930,34 @@ func (g *hsGuard) joinWriter() {
 // withdrawal RST in the L05 order (writeThenClose), but only when the
 // whole first flight was written (rstFrame) — nothing may follow a partial
 // frame. concurrent says that the handshake may still be inside a conn
-// call (abort): the RST's goroutine then waits until the handshake
-// goroutine left the conn and the hello writer returned, and rstFrame
-// decides only then (pickWithdrawal); that goroutine joins the writer
-// (rstJoins, set here under the lock join reads it under, together with
-// the close's claim).
+// call (abort, which claims the close inside its decision: abortDecide):
+// the RST's goroutine then waits until the handshake goroutine left the
+// conn and the hello writer returned, and rstFrame decides only then
+// (pickWithdrawal); that goroutine joins the writer (rstJoins, set with
+// the close's claim under the lock join reads it under: claimLocked).
 func (g *hsGuard) closeWith(rst, concurrent bool) {
 	g.mu.Lock()
-	won := g.closed.CompareAndSwap(false, true)
-	if won && rst && concurrent {
+	won := g.claimLocked(rst && concurrent)
+	g.mu.Unlock()
+	if won {
+		g.runClose(rst, concurrent)
+	}
+}
+
+// claimLocked claims the close of the conn, once; g.mu is held. A
+// concurrent withdrawal that wins it (rstJoins) hands the join of the
+// hello writer to the RST's goroutine (pickWithdrawal).
+func (g *hsGuard) claimLocked(rstJoins bool) (won bool) {
+	won = g.closed.CompareAndSwap(false, true)
+	if won && rstJoins {
 		g.rstJoins = true
 	}
-	g.mu.Unlock()
-	if !won {
-		return
-	}
+	return won
+}
+
+// runClose begins the close that its caller claimed (claimLocked); see
+// closeWith.
+func (g *hsGuard) runClose(rst, concurrent bool) {
 	close(g.closing)
 	switch {
 	case rst && concurrent:

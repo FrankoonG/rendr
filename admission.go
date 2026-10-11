@@ -266,7 +266,13 @@ func (rt *Runtime) admitJoin(ln *Listener, h *carrier.Hello, deadline time.Time,
 		}
 		return false
 	}
-	answerJoin(c, st, 0, deadline)
+	var code uint32
+	if st == wire.StatusUnknownSession && c.EndCodes() {
+		// Ended before Registry.Ended made it a tombstone: the same code
+		// (WP13 B-1, L47).
+		code = r.sess.EndCode()
+	}
+	answerJoin(c, st, code, deadline)
 	return true
 }
 

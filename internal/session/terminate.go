@@ -98,6 +98,31 @@ func (a *actor) terminationLocked(now time.Time) {
 	}
 }
 
+// EndCode returns the code of the RST this session decided once it ended
+// (Abort, idle, linger, exhausted, closed, going away), else 0: while it
+// has not ended, and when it ended without an RST of its own (the peer's
+// RST, a clean end, ErrNoPath). It is the Verdict.Code of an opened
+// session's tombstone, available while the session is still in the
+// table: a JOIN that Join answers UNKNOWN_SESSION because the session
+// ended (or whose adopt the exiting actor no longer takes) gets the same
+// end code as one that meets the tombstone (OptEndCode; WP13 B-1, L47).
+func (s *Session) EndCode() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.endCodeLocked()
+}
+
+// endCodeLocked is EndCode under s.mu. A passive session places an RST of
+// its own only once it was opened (terminationLocked; a pending one is
+// answered with an OPEN_ACK), and every RST code is at least 1, so 0
+// means none.
+func (s *Session) endCodeLocked() uint32 {
+	if s.ctl.state != StateEnded || s.ctl.rst == nil || s.st.rstIn != nil {
+		return 0
+	}
+	return s.ctl.rst.Code
+}
+
 // terminateLocked is the end procedure (§4.7): state Ended, the RST to
 // place (if any), endLocked, every lane data-ineligible and retired (GOAWAY
 // first on shutdown) — Fill places the RST before each writer's CLOSE —,
@@ -112,22 +137,19 @@ func (a *actor) terminateLocked(now time.Time, err error, rst *wire.Rst, goAway 
 	ctl := &s.ctl
 	a.ending = true
 	a.endErr = err
-	if a.opened {
-		a.verdict = Verdict{Opened: true}
-		if rst != nil && s.st.rstIn == nil {
-			// The RST this side decided: the tombstone answers a later
-			// JOIN with it (OptEndCode), so a dialer whose carriers all
-			// died before the RST reached it still ends with its code
-			// (WP13 B-1, L47). Every RST code is at least 1.
-			a.verdict.Code = rst.Code
-		}
-	}
 	if ctl.state == StatePending {
 		a.leavePendingLocked() // M4: every exit from StatePending
 	}
 	ctl.state = StateEnded
 	if rst != nil {
 		ctl.rst = rst
+	}
+	if a.opened {
+		// The RST this side decided (endCodeLocked): the tombstone answers
+		// a later JOIN with it (OptEndCode), so a dialer whose carriers all
+		// died before the RST reached it still ends with its code (WP13
+		// B-1, L47).
+		a.verdict = Verdict{Opened: true, Code: s.endCodeLocked()}
 	}
 	s.endLocked(err)
 	for _, l := range s.lanes {

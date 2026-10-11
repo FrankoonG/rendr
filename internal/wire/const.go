@@ -96,8 +96,10 @@ const (
 	// JOIN_ACK(UNKNOWN_SESSION) carry a non-zero field; every other
 	// JOIN_ACK keeps the canonical rule (ParseJoinAck), and a PREFACE_ACK
 	// echoing it for a PREFACE without it fails the dialer's attempt as a
-	// carrier error. M4 dialers set it on stream JOIN carriers and on
-	// stream MUX trunk offers (OptMux); M4 passives answer a JOIN that
+	// carrier error. It is negotiated on stream carriers only: M4 dialers
+	// set it on stream JOIN carriers and on stream MUX trunk offers
+	// (OptMux), never on a datagram carrier, whose passive never echoes it;
+	// M4 passives answer a JOIN that
 	// meets an opened session's tombstone with the code on any view of
 	// such a carrier — on a view of a MUX trunk the field already carries
 	// a refusal's code (PutJoinAckMux), which for UNKNOWN_SESSION is then
