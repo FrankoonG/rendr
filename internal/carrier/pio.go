@@ -180,9 +180,8 @@ type DgramStats struct {
 	// memory budget refused to a batched reader (R1-4; one unit on every
 	// reader, M5 design R3-23): a dialer carrier's refused growth counts
 	// the slots it would have added and keeps its depth; an owned Source
-	// counts each extra slot whose refill was refused; a flow whose
-	// held-entry slice was refused counts its slots beyond the first and
-	// reads one datagram (R3-28).
+	// counts each extra slot whose refill was refused. A flow's
+	// held-entry slice is charged to Stages and never refused (R3-28).
 	ChargeRefused atomic.Uint64
 }
 

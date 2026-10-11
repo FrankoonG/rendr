@@ -384,7 +384,7 @@ func TestFlowReadDatagramsOrder(t *testing.T) {
 		}
 		readOne(t, f, time.Second)
 		f.SetLimit(600)
-		base := env.Budget.Used()
+		base, sbase := env.Budget.Used(), env.Stages.Used()
 
 		c.queue(peer, dg(1, pingFrame(2)))
 		c.queue(other, dg(1, pingFrame(3)))
@@ -432,8 +432,8 @@ func TestFlowReadDatagramsOrder(t *testing.T) {
 			t.Fatalf("the rest: %d, %v", n, err)
 		}
 		f.Release()
-		if u, want := env.Budget.Used(), base+32*entrySize; u != want {
-			t.Fatalf("Budget %d after Release, want %d (the held slice of 32 entries)", u, want)
+		if u, s, want := env.Budget.Used(), env.Stages.Used(), sbase+32*entrySize; u != base || s != want {
+			t.Fatalf("after Release: Budget %d, Stages %d; want %d and %d (the held slice of 32 entries, in Stages)", u, s, base, want)
 		}
 		if _, err := f.ReadDatagrams(nil); err == nil {
 			t.Fatal("ReadDatagrams without a result slot succeeded")
@@ -445,14 +445,14 @@ func TestFlowReadDatagramsOrder(t *testing.T) {
 			t.Fatalf("an empty inbox: %v, want the deadline", err)
 		}
 		f.Close()
-		if u := env.Budget.Used(); u != base {
-			t.Fatalf("Budget %d after Close, want %d: Close returns the slice's charge", u, base)
+		if u, s := env.Budget.Used(), env.Stages.Used(); u != base || s != sbase {
+			t.Fatalf("after Close: Budget %d, Stages %d; want %d and %d: Close returns the slice's charge", u, s, base, sbase)
 		}
 		if _, err := f.ReadDatagrams(big); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("a closed flow: %v", err)
 		}
-		if f.held != nil || env.Budget.Used() != base {
-			t.Fatalf("a closed flow's read kept its slice (cap %d) or charged one (Budget %d, want %d)", cap(f.held), env.Budget.Used(), base)
+		if f.held != nil || env.Budget.Used() != base || env.Stages.Used() != sbase {
+			t.Fatalf("a closed flow's read kept its slice (cap %d) or charged one (Budget %d, Stages %d; want %d and %d)", cap(f.held), env.Budget.Used(), env.Stages.Used(), base, sbase)
 		}
 	})
 }

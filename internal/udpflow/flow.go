@@ -61,7 +61,7 @@ type Flow struct {
 	head, n    int
 	cur        entry   // the datagram the last ReadDatagram returned, until the next call or Release
 	held       []entry // the datagrams the last ReadDatagrams returned, until the next call or Release
-	heldBytes  int64   // held's capacity, charged to Env.Budget (R3-28); 0 once Close returned it
+	heldBytes  int64   // held's capacity, charged to Env.Stages (R3-28); 0 once Close returned it
 	reserveOut int     // control-reserve buffers in the inbox, cur or held
 	limit      int     // the receive limit in rendr bytes (SetLimit, R1-6)
 	peer       netip.AddrPort
@@ -480,7 +480,7 @@ func (f *Flow) Close() error {
 	if f.heldBytes > 0 {
 		// The slice itself may still carry the reader's datagrams: the
 		// reader's next read or Release returns them and drops it.
-		f.src.env.Budget.Release(f.heldBytes)
+		f.src.stages.Release(f.heldBytes)
 		f.heldBytes = 0
 	}
 	if f.rdlTimer != nil {

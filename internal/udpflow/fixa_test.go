@@ -2,8 +2,8 @@ package udpflow
 
 // The integrator's rows of M5 design Revision 3 (FIXA): a flow's batched
 // read ends at its first rebind candidate (R3-14), and its held-entry
-// slice is charged to Env.Budget (R3-28, R3-23). Seam sources inside
-// synctest bubbles (every OS).
+// slice is charged to the stage account, Env.Stages (R3-28 option (b),
+// design §0.14 B2). Seam sources inside synctest bubbles (every OS).
 
 import (
 	"testing"
@@ -16,8 +16,8 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// entrySize is what one held entry costs the Budget: the size of the
-// inbox entry (R3-28).
+// entrySize is what one held entry costs the stage account: the size of
+// the inbox entry (R3-28).
 const entrySize = int64(unsafe.Sizeof(entry{}))
 
 // queueFrom queues datagrams of several sources at once (one socket read
@@ -83,11 +83,12 @@ func TestFlowReadDatagramsEndsAtCandidate_L55(t *testing.T) {
 
 // TestFlowHeldSliceCharged_L16 (R3-28, R1-4, L16): 1,000 flows each read
 // once through ReadDatagrams (8 result slots, MaxBatch 32) hold exactly
-// 1,000 held-entry slices of 8 entries, charged to Env.Budget —
-// BufferedBytes is the source's baseline plus that, to the byte — and
-// once every flow closed BufferedBytes is back at the baseline. A flow
-// whose socket moves one datagram per call (MaxBatch 1) takes no slice.
-// Mutants: the slice not charged; Close not returning its charge.
+// 1,000 held-entry slices of 8 entries, charged to Env.Stages and not to
+// the Budget — BufferedBytes is the source's baseline plus that, to the
+// byte — and once every flow closed BufferedBytes is back at the
+// baseline. A flow whose socket moves one datagram per call (MaxBatch 1)
+// takes no slice. Mutants: the slice not charged; charged to the Budget;
+// Close not returning its charge.
 func TestFlowHeldSliceCharged_L16(t *testing.T) {
 	t.Run("1000 flows", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -99,6 +100,7 @@ func TestFlowHeldSliceCharged_L16(t *testing.T) {
 			from := apOf(2, 1000)
 			synctest.Wait()
 			base := buffered(env) // the Source's waiting extras and Batch
+			bbase := env.Budget.Used()
 
 			for i := range flows {
 				c.queue(from, h1(uint64(1+i), wire.TypeOpen, 1))
@@ -119,8 +121,11 @@ func TestFlowHeldSliceCharged_L16(t *testing.T) {
 			if got, want := buffered(env), base+flows*8*entrySize; got != want {
 				t.Fatalf("BufferedBytes %d after %d flows read once, want %d (baseline %d + %d slices of 8 × %d B)", got, flows, want, base, flows, entrySize)
 			}
+			if got := env.Budget.Used(); got != bbase {
+				t.Fatalf("Budget %d after %d flows read once, want its baseline %d: the slices are a holding for the flow's life (Stages, B2)", got, flows, bbase)
+			}
 			if r := env.Dgram.ChargeRefused.Load(); r != 0 {
-				t.Fatalf("ChargeRefused %d with room in the Budget", r)
+				t.Fatalf("ChargeRefused %d: no read was refused", r)
 			}
 			for _, f := range fs {
 				f.Close()
@@ -156,14 +161,15 @@ func TestFlowHeldSliceCharged_L16(t *testing.T) {
 	})
 }
 
-// TestFlowHeldSliceRefused_L16 (R3-28, R3-23): with Env.Budget full a
-// flow's first ReadDatagrams cannot charge its held slice; the read never
-// fails — it moves one datagram — and ChargeRefused counts the 7 slots
-// beyond the first; each later call while the Budget stays full asks
-// again (+7 each). Once the Budget has room the next call charges the
-// slice and moves the rest of the inbox in one call. Mutant: a refused
-// charge still reads at full depth (or uncharged).
-func TestFlowHeldSliceRefused_L16(t *testing.T) {
+// TestFlowHeldSliceOutsideBudget_L16 (R3-28 option (b), design §0.14
+// B2, L16): with Env.Budget full a flow's first ReadDatagrams still
+// allocates its held slice and moves the whole inbox in one call: the
+// slice's charge goes to Env.Stages (forced), the Budget — the account
+// behind the advertised windows and the send chunks' room — does not
+// move, and nothing is refused. Close returns the charge. Mutants: the
+// slice charged to the Budget (forced: the Budget moves; by TryAcquire:
+// the call is refused and moves one datagram).
+func TestFlowHeldSliceOutsideBudget_L16(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
 		c := newFakeSock(32)
@@ -181,36 +187,26 @@ func TestFlowHeldSliceRefused_L16(t *testing.T) {
 		synctest.Wait()
 
 		bud := env.Budget
-		charge := bud.Max()
-		bud.Acquire(charge) // a test charge keeps the Budget full while buffers go back
-		before := bud.Used()
+		charge := bud.Max() - bud.Used()
+		bud.Acquire(charge) // the Budget is full
+		before, sbefore := bud.Used(), env.Stages.Used()
 		rs := make([]carrier.ReadResult, 8)
-		for i := range 2 {
-			n, err := f.ReadDatagrams(rs)
-			if err != nil || n != 1 || rs[0].Ev != carrier.ReadOK || pingSeq(rs[0].Data) != uint32(2+i) {
-				t.Fatalf("call %d with the Budget full: %d results, %v; want datagram %d alone", i, n, err, 2+i)
-			}
-			if r := env.Dgram.ChargeRefused.Load(); r != uint64(7*(i+1)) {
-				t.Fatalf("call %d: ChargeRefused %d, want %d (7 refused slots per call)", i, r, 7*(i+1))
-			}
-		}
-		f.Release()
-		if got := bud.Used(); got >= before {
-			t.Fatalf("Budget %d after the refused calls' Release, want below %d: no slice was charged and the datagrams' buffers went back", got, before)
-		}
-		bud.Release(charge)
-		used := bud.Used()
 		n, err := f.ReadDatagrams(rs)
-		if err != nil || n != 3 || pingSeq(rs[0].Data) != 4 || pingSeq(rs[2].Data) != 6 {
-			t.Fatalf("with room: %d results, %v; want the other 3 in one call", n, err)
+		if err != nil || n != 5 || pingSeq(rs[0].Data) != 2 || pingSeq(rs[4].Data) != 6 {
+			t.Fatalf("with the Budget full: %d results, %v; want all 5 in one call", n, err)
 		}
-		if got := bud.Used() - used; got != 8*entrySize {
-			t.Fatalf("the slice charged %d, want %d", got, 8*entrySize)
+		if b, s := bud.Used(), env.Stages.Used(); b != before || s != sbefore+8*entrySize {
+			t.Fatalf("after the read: Budget %d, Stages %d; want %d (unchanged) and %d (the slice of 8 entries)", b, s, before, sbefore+8*entrySize)
 		}
-		if r := env.Dgram.ChargeRefused.Load(); r != 14 {
-			t.Fatalf("ChargeRefused %d after the charge succeeded, want 14", r)
+		if r := env.Dgram.ChargeRefused.Load(); r != 0 {
+			t.Fatalf("ChargeRefused %d: the stage charge is never refused", r)
 		}
 		f.Release()
+		bud.Release(charge)
+		f.Close()
+		if s := env.Stages.Used(); s != sbefore {
+			t.Fatalf("Stages %d after Close, want %d", s, sbefore)
+		}
 	})
 }
 

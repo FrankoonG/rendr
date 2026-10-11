@@ -254,11 +254,13 @@ func (f *Flow) WriteDatagrams(ds [][]byte) (int, error) {
 // Release.
 //
 // A call of two or more holds its datagrams in a slice the flow keeps for
-// its life (no allocation per call), charged to Env.Budget — the account
-// of receive slots (R1-4) — when it is allocated and returned at Close, so
-// BufferedBytes sees it (R3-28). A refused charge never fails the read:
-// the call moves one datagram, held as ReadDatagram holds it, and its
-// slots beyond the first count in ChargeRefused; the next call asks again.
+// its life (no allocation per call). The slice is charged when it is
+// allocated and returned at Close, so BufferedBytes sees it (R3-28). The
+// charge is a holding for the flow's life, so it goes to the stage account
+// (Env.Stages, forced; design §0.14 B2, R3-28 option (b)), not to
+// MaxBufferedBytes: idle flows never shrink the advertised windows or the
+// send chunks' room, and the charge is never refused. A call of one
+// datagram holds it as ReadDatagram does and takes no slice.
 func (f *Flow) ReadDatagrams(rs []carrier.ReadResult) (int, error) {
 	k := min(len(rs), f.MaxBatch())
 	if k < 1 {
@@ -269,9 +271,6 @@ func (f *Flow) ReadDatagrams(rs []carrier.ReadResult) (int, error) {
 		f.mu.Unlock()
 		return 0, err
 	}
-	if k > 1 && !f.heldRoomLocked(k) {
-		k = 1
-	}
 	if k == 1 {
 		e, key, ev := f.popLocked()
 		if ev != carrier.ReadTruncated {
@@ -281,6 +280,7 @@ func (f *Flow) ReadDatagrams(rs []carrier.ReadResult) (int, error) {
 		f.mu.Unlock()
 		return 1, nil
 	}
+	f.heldRoomLocked(k)
 	n := 0
 	for n < k && f.n > 0 {
 		e, key, ev := f.popLocked()
@@ -297,30 +297,23 @@ func (f *Flow) ReadDatagrams(rs []carrier.ReadResult) (int, error) {
 	return n, nil
 }
 
-// heldEntryBytes is what one entry of a flow's held slice costs the
-// Budget (R3-28).
+// heldEntryBytes is what one entry of a flow's held slice costs the stage
+// account (R3-28).
 const heldEntryBytes = int64(unsafe.Sizeof(entry{}))
 
 // heldRoomLocked makes the held slice (empty: the caller waited, which
-// returned its datagrams) able to hold k entries, charging a new slice to
-// Env.Budget by TryAcquire and returning the old one's charge; false, with
-// nothing changed, when the Budget refuses — ChargeRefused then counts the
-// k − 1 slots beyond the first (R1-4's unit, R3-23).
-func (f *Flow) heldRoomLocked(k int) bool {
+// returned its datagrams) able to hold k entries: a new slice is charged
+// to the Source's stage account (forced) and the old one's charge goes
+// back.
+func (f *Flow) heldRoomLocked(k int) {
 	if cap(f.held) >= k {
-		return true
+		return
 	}
-	env := f.src.env
 	nb := int64(k) * heldEntryBytes
-	if !env.Budget.TryAcquire(nb) {
-		if dg := env.Dgram; dg != nil {
-			dg.ChargeRefused.Add(uint64(k - 1))
-		}
-		return false
-	}
-	env.Budget.Release(f.heldBytes)
+	st := f.src.stages
+	st.Acquire(nb)
+	st.Release(f.heldBytes)
 	f.held, f.heldBytes = make([]entry, 0, k), nb
-	return true
 }
 
 var _ carrier.BatchIO = (*Flow)(nil)
