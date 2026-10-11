@@ -5,7 +5,6 @@ package udpsocket
 import (
 	"net"
 	"net/netip"
-	"strconv"
 	"syscall"
 	"unsafe"
 
@@ -164,18 +163,18 @@ func (s *batchSys) received(b *Batch, cnt, n int) (int, error) {
 	return cnt, nil
 }
 
-// probe runs sendmmsg and recvmmsg on fd −1 and returns their errors:
-// EBADF from both means the calls are permitted; ENOSYS or EPERM means
-// absent or denied (M5-D15). Neither call reaches a socket or netfilter.
-func probe() (sendErr, recvErr error) {
-	bad := ^uintptr(0)
-	if _, _, e := unix.Syscall6(unix.SYS_SENDMMSG, bad, 0, 0, 0, 0, 0); e != 0 {
-		sendErr = e
+// probe runs call (sendmmsg or recvmmsg) on fd −1 and returns its error:
+// EBADF means the call is permitted; ENOSYS or EPERM means absent or
+// denied (M5-D15). It never reaches a socket or netfilter.
+func probe(call int) error {
+	nr := uintptr(unix.SYS_SENDMMSG)
+	if call == callRecv {
+		nr = unix.SYS_RECVMMSG
 	}
-	if _, _, e := unix.Syscall6(unix.SYS_RECVMMSG, bad, 0, 0, 0, 0, 0); e != 0 {
-		recvErr = e
+	if _, _, e := unix.Syscall6(nr, ^uintptr(0), 0, 0, 0, 0, 0); e != 0 {
+		return e
 	}
-	return sendErr, recvErr
+	return nil
 }
 
 // encodeAddr writes ap into sa as the net package would for a socket of
@@ -207,7 +206,8 @@ func encodeAddr(sa *unix.RawSockaddrInet6, family int, ap netip.AddrPort) (uint3
 // decodeAddr reads a source address as the net package's
 // ReadMsgUDPAddrPort returns it: AF_INET as an IPv4 address, AF_INET6 as
 // an IPv6 one (an IPv4 peer of a dual-stack socket stays IPv4-mapped),
-// with the scope's zone. It allocates nothing unless a scope is set.
+// with the scope's zone. It allocates nothing (a scope's zone comes from
+// the zone table; an unknown scope's decimal name allocates).
 func decodeAddr(sa *unix.RawSockaddrInet6) netip.AddrPort {
 	switch sa.Family {
 	case unix.AF_INET:
@@ -232,24 +232,4 @@ func putPort(p *uint16, port uint16) {
 func getPort(p *uint16) uint16 {
 	b := (*[2]byte)(unsafe.Pointer(p))
 	return uint16(b[0])<<8 | uint16(b[1])
-}
-
-// zoneIndex and zoneName map an IPv6 zone to its interface index and back
-// as the net package does (an interface name, else a decimal index).
-func zoneIndex(zone string) uint32 {
-	if zone == "" {
-		return 0
-	}
-	if ifi, err := net.InterfaceByName(zone); err == nil {
-		return uint32(ifi.Index)
-	}
-	n, _ := strconv.ParseUint(zone, 10, 32)
-	return uint32(n)
-}
-
-func zoneName(index uint32) string {
-	if ifi, err := net.InterfaceByIndex(int(index)); err == nil {
-		return ifi.Name
-	}
-	return strconv.FormatUint(uint64(index), 10)
 }

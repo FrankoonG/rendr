@@ -27,22 +27,25 @@ import (
 // leaves its answer to the next test.
 func seams(t *testing.T) {
 	t.Helper()
-	send, recv, pr, target := sendmmsgFn, recvmmsgFn, probeFn, batchTarget
+	send, recv, pr, target, ifs := sendmmsgFn, recvmmsgFn, probeFn, batchTarget, interfacesFn
 	resetProbe()
 	t.Cleanup(func() {
-		sendmmsgFn, recvmmsgFn, probeFn, batchTarget = send, recv, pr, target
+		sendmmsgFn, recvmmsgFn, probeFn, batchTarget, interfacesFn = send, recv, pr, target, ifs
 		resetProbe()
 	})
 }
 
+// resetProbe re-arms the process probe and empties the zone table.
 func resetProbe() {
 	probeOnce = sync.Once{}
 	probeOK = false
+	zones.Store(nil)
+	zoneFetch.Store(0)
 }
 
-// probeAnswer is a fake fd −1 probe that counts its runs.
+// probeAnswer is a fake fd −1 probe that counts its runs per call.
 type probeAnswer struct {
-	runs             atomic.Int64
+	sends, recvs     atomic.Int64 // probes of sendmmsg and of recvmmsg
 	sendErr, recvErr atomic.Value // error (syscall.Errno)
 }
 
@@ -57,9 +60,13 @@ func (p *probeAnswer) set(sendErr, recvErr syscall.Errno) {
 	p.recvErr.Store(recvErr)
 }
 
-func (p *probeAnswer) fn() (error, error) {
-	p.runs.Add(1)
-	return p.sendErr.Load().(syscall.Errno), p.recvErr.Load().(syscall.Errno)
+func (p *probeAnswer) fn(call int) error {
+	if call == callRecv {
+		p.recvs.Add(1)
+		return p.recvErr.Load().(syscall.Errno)
+	}
+	p.sends.Add(1)
+	return p.sendErr.Load().(syscall.Errno)
 }
 
 // forceBatch makes New put sockets in ModeBatch on this target, with a

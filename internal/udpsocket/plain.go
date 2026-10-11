@@ -35,4 +35,4 @@ func sendmmsg(fd uintptr, b *Batch, k, n int) (int, error) { return 0, errors.Er
 
 func recvmmsg(fd uintptr, b *Batch, n int) (int, error) { return 0, errors.ErrUnsupported }
 
-func probe() (sendErr, recvErr error) { return errors.ErrUnsupported, errors.ErrUnsupported }
+func probe(int) error { return errors.ErrUnsupported }

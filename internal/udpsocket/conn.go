@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -209,9 +210,10 @@ type Conn struct {
 	// netpoller).
 	rawRead, rawWrite func(func(uintptr) bool) error
 
-	// permittedAt is the time (Unix nanoseconds) of the last fd −1 probe
-	// that found the batch calls permitted (R1-3 rule 3).
-	permittedAt atomic.Int64
+	// permittedAt is, per call (callSend, callRecv), the time (Unix
+	// nanoseconds) of the last fd −1 probe that found it permitted (R1-3
+	// rule 3).
+	permittedAt [2]atomic.Int64
 
 	sys connSys // the platform's per-socket state (the socket's family)
 }
@@ -329,7 +331,7 @@ func (c *Conn) writeBatch(b *Batch, ms []Msg) (int, error) {
 		end := min(len(ms), k+b.max)
 		e, perr := b.sys.prepSend(c, ms, k, end)
 		if e == k {
-			err = perr // ms[k] cannot be addressed on this socket
+			err = c.addrError(perr, ms[k].Addr) // ms[k] cannot be addressed on this socket
 			break
 		}
 		b.ms, b.base, b.k, b.end, b.calls, b.err = ms, k, k, e, 0, nil
@@ -341,7 +343,7 @@ func (c *Conn) writeBatch(b *Batch, ms []Msg) (int, error) {
 		case werr != nil:
 			err = werr // the write deadline, or a closed socket
 		case cerr != nil:
-			if c.denied(cerr) {
+			if c.denied(cerr, callSend) {
 				c.ctr.addSend(calls, k)
 				c.fallback()
 				n, perr := c.writePlain(ms[k:])
@@ -350,8 +352,8 @@ func (c *Conn) writeBatch(b *Batch, ms []Msg) (int, error) {
 			err = c.opError("write", "sendmmsg", cerr)
 		case k < e:
 			err = ErrInvalidCount // the callback ended without an error short of e
-		default:
-			err = perr // nil, or the error of ms[e], which cannot be addressed
+		case perr != nil:
+			err = c.addrError(perr, ms[e].Addr) // ms[e] cannot be addressed
 		}
 	}
 	c.ctr.addSend(calls, k)
@@ -368,7 +370,7 @@ func (c *Conn) endRead(b *Batch, m0 *Msg, err error) (int, error) {
 		return 0, err
 	}
 	if cerr != nil {
-		if c.denied(cerr) {
+		if c.denied(cerr, callRecv) {
 			c.fallback()
 			return c.readPlain(m0)
 		}
@@ -378,30 +380,33 @@ func (c *Conn) endRead(b *Batch, m0 *Msg, err error) (int, error) {
 	return got, nil
 }
 
-// denied reports whether err, from a batch call, means the call itself is
-// refused: ENOSYS, or EPERM confirmed by a fresh fd −1 probe. An EPERM the
-// probe does not confirm is a filter drop of one datagram (R1-3).
-func (c *Conn) denied(err error) bool {
+// denied reports whether err, from the batch call (callSend or callRecv),
+// means the call itself is refused: ENOSYS, or EPERM confirmed by a fresh
+// fd −1 probe of that call. An EPERM the probe does not confirm is a filter
+// drop of one datagram (R1-3).
+func (c *Conn) denied(err error, call int) bool {
 	switch err {
 	case syscall.ENOSYS:
 		return true
 	case syscall.EPERM:
-		return !c.permitted()
+		return !c.permitted(call)
 	}
 	return false
 }
 
-// permitted re-runs the fd −1 probe, or trusts one that found the batch
-// calls permitted less than probeCache ago (R1-3 rule 3).
-func (c *Conn) permitted() bool {
+// permitted re-runs the fd −1 probe of call — one system call (R1-3 rule
+// 2) — or trusts one that found it permitted less than probeCache ago
+// (rule 3). A denial is never cached: it moves the socket to ModePlain.
+func (c *Conn) permitted(call int) bool {
 	now := time.Now().UnixNano()
-	if t := c.permittedAt.Load(); t != 0 && now >= t && now-t < int64(probeCache) {
+	at := &c.permittedAt[call]
+	if t := at.Load(); t != 0 && now >= t && now-t < int64(probeCache) {
 		return true
 	}
-	if !probeAllows(probeFn()) {
+	if probeFn(call) != syscall.EBADF {
 		return false
 	}
-	c.permittedAt.Store(now)
+	at.Store(now)
 	return true
 }
 
@@ -411,6 +416,13 @@ func (c *Conn) fallback() {
 	if c.mode.CompareAndSwap(uint32(ModeBatch), uint32(ModePlain)) {
 		c.ctr.addFallback()
 	}
+}
+
+// addrError wraps the error of a destination the socket cannot send to as
+// WriteToUDPAddrPort does (an *net.OpError around the *net.AddrError), so
+// both modes return the same shape.
+func (c *Conn) addrError(err error, dst netip.AddrPort) error {
+	return &net.OpError{Op: "write", Net: "udp", Source: c.laddr, Addr: net.UDPAddrFromAddrPort(dst), Err: err}
 }
 
 // opError wraps an errno of a batch call as the net package wraps a
@@ -453,7 +465,7 @@ type Reader struct {
 	one     *Batch        // the fixed one-message header
 	b       *Batch        // the extras' header; owned per state
 	cur     *Batch        // the header of the callback's last call
-	depth   int           // this call's depth
+	extras  bool          // this call started holding the extras: the callback reads through b (at any depth, even 1)
 	release func(*Batch)
 	cb      func(uintptr) bool // r.doRead
 }
@@ -470,9 +482,18 @@ func NewReader(c *Conn, release func(*Batch)) *Reader {
 
 // Hold gives the reader b (Cap ≥ 2) as the header of its extras. It
 // returns the Batch b replaces, if the reader held one, and false — nothing
-// changed — while an idle release is still returning the previous extras;
-// the caller then keeps depth 1 and returns b to its pool.
+// changed — for a nil b or one with Cap < 2, or while an idle release is
+// still returning the previous extras; the caller then keeps depth 1 and
+// returns b to its pool.
+//
+// While the reader holds extras every read goes through them, at any
+// depth (a ReadBatch with one slot included), so its parks count and the
+// idle release can return them; a caller whose depth fell to 1 may also
+// Drop them at once.
 func (r *Reader) Hold(b *Batch) (old *Batch, ok bool) {
+	if b == nil || b.max < 2 {
+		return nil, false
+	}
 	switch r.state.Load() {
 	case rIdle:
 		r.b = b
@@ -542,17 +563,14 @@ func (r *Reader) ReadBatch(ms []Msg) (int, error) {
 	if c.Mode() != ModeBatch {
 		return c.readPlain(&ms[0])
 	}
-	r.depth = 1
-	if r.state.Load() == rHeld {
-		r.depth = min(len(ms), r.b.max)
-	}
+	r.extras = r.state.Load() == rHeld
 	r.one.prepRecv(ms[:1])
-	if r.depth > 1 {
-		r.b.prepRecv(ms[:r.depth])
+	if r.extras {
+		r.b.prepRecv(ms[:min(len(ms), r.b.max)])
 	}
 	r.cur = nil
 	err := c.rawRead(r.cb)
-	held := r.depth > 1 && (r.state.CompareAndSwap(rParked, rHeld) || r.state.Load() == rHeld)
+	held := r.extras && (r.state.CompareAndSwap(rParked, rHeld) || r.state.Load() == rHeld)
 	b := r.cur
 	if held && b != r.b {
 		r.b.reset()
@@ -563,7 +581,8 @@ func (r *Reader) ReadBatch(ms []Msg) (int, error) {
 	if b == nil || (b != r.one && !held) {
 		// The callback never ran, or its last call used the extras and
 		// parked, and the idle release took them: the read ended in an
-		// error (deadline, closed socket).
+		// error (deadline, closed socket), and b — maybe already another
+		// user's — is not touched.
 		if err == nil {
 			err = ErrInvalidCount
 		}
@@ -578,7 +597,7 @@ func (r *Reader) ReadBatch(ms []Msg) (int, error) {
 // parked.
 func (r *Reader) doRead(fd uintptr) bool {
 	b := r.one
-	if r.depth > 1 {
+	if r.extras {
 		if s := r.state.Load(); s == rHeld || s == rParked && r.state.CompareAndSwap(rParked, rHeld) {
 			b = r.b
 		}
@@ -594,6 +613,13 @@ func (r *Reader) doRead(fd uintptr) bool {
 	return false
 }
 
+// The calls an fd −1 probe runs (probeFn's argument; Conn.permittedAt's
+// index).
+const (
+	callSend = iota // sendmmsg
+	callRecv        // recvmmsg
+)
+
 // The process probe (M5-D15): sendmmsg and recvmmsg on fd −1 run once;
 // EBADF from both means the calls are permitted.
 var (
@@ -602,7 +628,7 @@ var (
 )
 
 func batchPermitted() bool {
-	probeOnce.Do(func() { probeOK = probeAllows(probeFn()) })
+	probeOnce.Do(func() { probeOK = probeAllows(probeFn(callSend), probeFn(callRecv)) })
 	return probeOK
 }
 
@@ -614,12 +640,101 @@ func probeAllows(sendErr, recvErr error) bool {
 	return sendErr == syscall.EBADF && recvErr == syscall.EBADF
 }
 
+// zoneTable maps IPv6 zones (interface names) to interface indexes and
+// back, for the sockaddrs of the batch calls. It is the net package's zone
+// cache without its lock: an immutable snapshot behind an atomic pointer,
+// so a zoned (link-local) destination or source costs a map lookup — no
+// system call, no allocation — per datagram (L41, L55's equivalence with
+// the plain path, which uses the net package's cache).
+type zoneTable struct {
+	toIndex map[string]uint32
+	toName  map[uint32]string
+	at      int64 // when it was fetched (Unix nanoseconds)
+}
+
+// A snapshot is refetched when it is zoneRefresh old, as the net package
+// does, and at a miss (an interface added since) at most once per
+// zoneMissRefresh, so unknown zones never cost an interface dump per
+// datagram.
+const (
+	zoneRefresh     = 60 * time.Second
+	zoneMissRefresh = time.Second
+)
+
+var (
+	zones     atomic.Pointer[zoneTable]
+	zoneFetch atomic.Int64 // the earliest time (Unix nanoseconds) of the next fetch; the CAS winner fetches
+)
+
+// zoneLookup returns the current snapshot (nil before the first fetch),
+// fetching a new one if it is stale, or if miss and the miss period
+// passed.
+func zoneLookup(miss bool) *zoneTable {
+	t := zones.Load()
+	now := time.Now().UnixNano()
+	if t != nil && !miss && now-t.at < int64(zoneRefresh) {
+		return t
+	}
+	next := zoneFetch.Load()
+	if now < next || !zoneFetch.CompareAndSwap(next, now+int64(zoneMissRefresh)) {
+		return t // another caller fetches, or a miss fetched less than a period ago
+	}
+	ift, err := interfacesFn()
+	if err != nil {
+		return t
+	}
+	nt := &zoneTable{toIndex: make(map[string]uint32, len(ift)), toName: make(map[uint32]string, len(ift)), at: now}
+	for _, ifi := range ift {
+		nt.toIndex[ifi.Name] = uint32(ifi.Index)
+		nt.toName[uint32(ifi.Index)] = ifi.Name
+	}
+	zones.Store(nt)
+	return nt
+}
+
+// zoneIndex returns zone's interface index as the net package resolves it:
+// an interface name, else a decimal index.
+func zoneIndex(zone string) uint32 {
+	if zone == "" {
+		return 0
+	}
+	if t := zoneLookup(false); t != nil {
+		if i, ok := t.toIndex[zone]; ok {
+			return i
+		}
+	}
+	if t := zoneLookup(true); t != nil {
+		if i, ok := t.toIndex[zone]; ok {
+			return i
+		}
+	}
+	n, _ := strconv.ParseUint(zone, 10, 32)
+	return uint32(n)
+}
+
+// zoneName returns the zone of interface index as the net package names
+// it: the interface's name, else the decimal index.
+func zoneName(index uint32) string {
+	if t := zoneLookup(false); t != nil {
+		if name, ok := t.toName[index]; ok {
+			return name
+		}
+	}
+	if t := zoneLookup(true); t != nil {
+		if name, ok := t.toName[index]; ok {
+			return name
+		}
+	}
+	return strconv.FormatUint(uint64(index), 10)
+}
+
 // Test seams: tests replace them; production code never does.
 var (
-	sendmmsgFn  = sendmmsg
-	recvmmsgFn  = recvmmsg
-	probeFn     = probe
-	batchTarget = accelerated // tests set it on other targets to drive ModeBatch through fake calls
+	sendmmsgFn   = sendmmsg
+	recvmmsgFn   = recvmmsg
+	probeFn      = probe
+	batchTarget  = accelerated // tests set it on other targets to drive ModeBatch through fake calls
+	interfacesFn = net.Interfaces
 )
 
 func clampBatch(n int) int {

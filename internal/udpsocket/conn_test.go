@@ -110,8 +110,8 @@ func TestBatchProbeTable_L56(t *testing.T) {
 			if c := newConn(t, listen4(t), 1, nil); c.Mode() != ModePlain {
 				t.Fatalf("MaxBatch 1: mode %v", c.Mode())
 			}
-			if n := p.runs.Load(); n != 1 {
-				t.Fatalf("the process probe ran %d times for 4 sockets; want once", n)
+			if s, r := p.sends.Load(), p.recvs.Load(); s != 1 || r != 1 {
+				t.Fatalf("the process probe ran %d/%d times for 4 sockets; want once", s, r)
 			}
 		})
 	}
@@ -148,8 +148,8 @@ func TestBatchKeepOnFilterDrop_L56(t *testing.T) {
 	if !errors.As(err, &oe) || oe.Op != "write" {
 		t.Fatalf("error %#v is not wrapped as a write's *net.OpError", err)
 	}
-	if c.Mode() != ModeBatch || p.runs.Load() != 2 {
-		t.Fatalf("after a filter drop: mode %v, probe runs %d; want batch, 2 (process probe and one re-probe)", c.Mode(), p.runs.Load())
+	if c.Mode() != ModeBatch || p.sends.Load() != 2 || p.recvs.Load() != 1 {
+		t.Fatalf("after a filter drop: mode %v, probes %d/%d; want batch, 2/1 (the process probe and one re-probe of sendmmsg only)", c.Mode(), p.sends.Load(), p.recvs.Load())
 	}
 	if n, err := c.WriteBatch(b, ms[n+1:]); n != 4 || err != nil {
 		t.Fatalf("WriteBatch of 4 … 7: %d, %v", n, err)
@@ -225,8 +225,8 @@ func TestBatchReadFallback_L56(t *testing.T) {
 	if n != 0 || errno(err) != syscall.EPERM || !errors.As(err, &oe) || oe.Op != "read" {
 		t.Fatalf("permitted EPERM: n %d, err %v; want the read's EPERM", n, err)
 	}
-	if c.Mode() != ModeBatch || p.runs.Load() != 2 {
-		t.Fatalf("mode %v, probe runs %d; want batch, 2", c.Mode(), p.runs.Load())
+	if c.Mode() != ModeBatch || p.sends.Load() != 1 || p.recvs.Load() != 2 {
+		t.Fatalf("mode %v, probes %d/%d; want batch, 1/2 (one re-probe of recvmmsg only)", c.Mode(), p.sends.Load(), p.recvs.Load())
 	}
 	rerr = syscall.ENOSYS
 	if _, err := txu.WriteToUDPAddrPort([]byte("x1"), addrOf(rx)); err != nil {
@@ -244,21 +244,30 @@ func TestBatchReadFallback_L56(t *testing.T) {
 	}
 }
 
-// TestBatchFallbackOnce64_L56 (M5-D15): 64 writers share one socket (a
-// listening socket's flows), each with its own Batch; every sendmmsg is
-// refused and the re-probe confirms the denial. Exactly one transition is
-// counted, every writer redoes its messages plainly, every datagram
-// arrives exactly once, and the mode never moves back — not even when the
-// calls would succeed again.
+// TestBatchFallbackOnce64_L56 (M5-D15, R1-3): 64 writers share one socket
+// (a listening socket's flows), each with its own Batch, and every one's
+// sendmmsg is refused. The row's stimulus is R1-3's denied path: EPERM
+// with a re-probe that answers EPERM too (a sandbox policy), so each
+// writer runs the concurrent re-probe and none may take a denial for a
+// filter drop; a second subtest refuses with ENOSYS. Exactly one
+// transition is counted, every writer redoes its messages plainly, every
+// datagram arrives exactly once, and the mode never moves back — not even
+// when the calls would succeed again.
 func TestBatchFallbackOnce64_L56(t *testing.T) {
+	for _, refusal := range []syscall.Errno{syscall.EPERM, syscall.ENOSYS} {
+		t.Run(refusal.Error(), func(t *testing.T) { fallbackOnce64(t, refusal) })
+	}
+}
+
+func fallbackOnce64(t *testing.T, refusal syscall.Errno) {
 	p := newProbe(syscall.EBADF, syscall.EBADF)
 	forceBatch(t, p)
 	var ctr Counters
 	rx := listen4(t)
 	c := newConn(t, listen4(t), 32, &ctr)
-	fs := &fakeSend{script: func(call, n int) (int, error) { return 0, syscall.ENOSYS }}
+	fs := &fakeSend{script: func(call, n int) (int, error) { return 0, refusal }}
 	sendmmsgFn = fs.fn
-	p.set(syscall.EPERM, syscall.EPERM)
+	p.set(syscall.EPERM, syscall.EPERM) // the policy denies the calls: the re-probe confirms an EPERM
 	const writers, each = 64, 8
 	dst := addrOf(rx)
 	// Gate: every writer passed the mode check and reached the RawConn
@@ -308,6 +317,12 @@ func TestBatchFallbackOnce64_L56(t *testing.T) {
 	if len(calls) != writers {
 		t.Fatalf("%d sendmmsg calls; want one per writer (each saw ModeBatch)", len(calls))
 	}
+	if refusal == syscall.EPERM {
+		// Every writer's EPERM was re-probed (a denial is never cached).
+		if n := p.sends.Load(); n != 1+writers {
+			t.Fatalf("%d sendmmsg probes; want the process probe and one re-probe per writer", n)
+		}
+	}
 	c.rawWrite = raw
 	before := len(calls)
 	fs.mu.Lock()
@@ -348,18 +363,18 @@ func TestBatchFilterProbeCached_L56(t *testing.T) {
 		for range 100 {
 			drop("storm")
 		}
-		if n := p.runs.Load(); n != 2 {
+		if n := p.sends.Load(); n != 2 {
 			t.Fatalf("100 drops within 1 s ran the probe %d times; want 1 (+1 process probe)", n)
 		}
 		time.Sleep(probeCache - time.Nanosecond)
 		drop("just before expiry")
-		if n := p.runs.Load(); n != 2 {
+		if n := p.sends.Load(); n != 2 {
 			t.Fatalf("probe runs %d before the cache expired", n)
 		}
 		time.Sleep(time.Nanosecond)
 		drop("after expiry")
-		if n := p.runs.Load(); n != 3 {
-			t.Fatalf("probe runs %d after the cache expired; want 3", n)
+		if n := p.sends.Load(); n != 3 || p.recvs.Load() != 1 {
+			t.Fatalf("probe runs %d/%d after the cache expired; want 3/1", n, p.recvs.Load())
 		}
 		p.set(syscall.EPERM, syscall.EPERM) // a policy is installed
 		drop("policy cached")

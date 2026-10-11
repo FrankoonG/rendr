@@ -42,7 +42,7 @@ func TestMmsgHdrLayout(t *testing.T) {
 // plain.
 func TestMmsgProbeReal(t *testing.T) {
 	seams(t)
-	if s, r := probe(); s != syscall.EBADF || r != syscall.EBADF {
+	if s, r := probe(callSend), probe(callRecv); s != syscall.EBADF || r != syscall.EBADF {
 		t.Fatalf("probe: %v, %v; want EBADF, EBADF", s, r)
 	}
 	if c := newConn(t, listen4(t), 32, nil); c.Mode() != ModeBatch {
@@ -338,7 +338,8 @@ func TestMmsgTruncation_L42(t *testing.T) {
 // (an IPv4-mapped destination on an IPv4 socket is unmapped; an IPv4 peer
 // of a dual-stack socket reads as IPv4-mapped, exactly as
 // ReadMsgUDPAddrPort returns it); an address the socket cannot send to is
-// that message's error; decoding allocates nothing.
+// that message's error, shaped as the plain path's; decoding allocates
+// nothing.
 func TestMmsgAddrFamilies(t *testing.T) {
 	seams(t)
 	listen := func(network, addr string) *net.UDPConn {
@@ -376,8 +377,17 @@ func TestMmsgAddrFamilies(t *testing.T) {
 	}
 	n, err := c4.WriteBatch(NewBatch(4), ms)
 	var ae *net.AddrError
-	if n != 2 || !errors.As(err, &ae) {
-		t.Fatalf("IPv4 socket: n %d, err %v; want 2 and an address error for the IPv6 destination", n, err)
+	var oe *net.OpError
+	if n != 2 || !errors.As(err, &ae) || !errors.As(err, &oe) || oe.Op != "write" {
+		t.Fatalf("IPv4 socket: n %d, err %#v; want 2 and the address error wrapped as WriteToUDPAddrPort wraps it", n, err)
+	}
+	// The same shape as the plain path's (the Net field aside: a UDPConn
+	// does not say whether it was opened as "udp" or "udp4").
+	_, perr := v4a.WriteToUDPAddrPort([]byte("c"), ms[2].Addr)
+	var pae *net.AddrError
+	var poe *net.OpError
+	if !errors.As(perr, &poe) || !errors.As(perr, &pae) || *pae != *ae || poe.Op != oe.Op || poe.Addr.String() != oe.Addr.String() || poe.Source.String() != oe.Source.String() {
+		t.Fatalf("batch error %#v; the plain path returns %#v", err, perr)
 	}
 	for i, m := range read(v4b, 2) {
 		if want := []string{"a", "b"}[i]; string(m.Buf[:m.N]) != want || m.Addr != addrOf(v4a) {
@@ -427,7 +437,7 @@ func TestMmsgAddrFamilies(t *testing.T) {
 
 	for _, ap := range []netip.AddrPort{
 		netip.MustParseAddrPort("127.0.0.1:1"),
-		netip.MustParseAddrPort("10.1.2.3:65535"),
+		netip.MustParseAddrPort("198.51.100.3:65535"),
 		netip.MustParseAddrPort("[::1]:4660"),
 		netip.MustParseAddrPort("[2001:db8::7]:32768"),
 		netip.MustParseAddrPort("[::ffff:192.0.2.1]:80"),
@@ -452,5 +462,69 @@ func TestMmsgAddrFamilies(t *testing.T) {
 	}
 	if _, err := encodeAddr(new(unix.RawSockaddrInet6), unix.AF_INET6, netip.AddrPort{}); err == nil {
 		t.Fatal("encoding the zero address: no error")
+	}
+}
+
+// TestMmsgZonedAddr (L41, L55): a zoned IPv6 source decodes as the net
+// package names it (the interface's name; an unknown scope's decimal
+// index) and a zoned destination encodes its interface's index, through
+// the zone table: after warm-up neither allocates nor dumps the
+// interfaces. A batch to a zoned destination goes out through sendmmsg.
+func TestMmsgZonedAddr(t *testing.T) {
+	seams(t)
+	lo, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Fatalf("the Linux lanes have lo: %v", err)
+	}
+	var fetches int
+	interfacesFn = func() ([]net.Interface, error) {
+		fetches++
+		return net.Interfaces()
+	}
+	want := netip.AddrPortFrom(netip.MustParseAddr("fe80::1").WithZone(lo.Name), 4660)
+	var sa unix.RawSockaddrInet6
+	if _, err := encodeAddr(&sa, unix.AF_INET6, want); err != nil || sa.Scope_id != uint32(lo.Index) {
+		t.Fatalf("encode %v: scope %d, %v; want %d", want, sa.Scope_id, err, lo.Index)
+	}
+	if got := decodeAddr(&sa); got != want {
+		t.Fatalf("decode: %v; want %v", got, want)
+	}
+	unknown := sa
+	unknown.Scope_id = 999999
+	if got := decodeAddr(&unknown); got.Addr().Zone() != "999999" {
+		t.Fatalf("unknown scope decoded as %v; want zone 999999", got)
+	}
+	for range 1000 {
+		decodeAddr(&sa)
+		encodeAddr(&sa, unix.AF_INET6, want)
+	}
+	if fetches > 2 { // the first lookup, and at most one miss (999999)
+		t.Fatalf("%d interface fetches for 2,000 zoned lookups", fetches)
+	}
+	if !raceEnabled {
+		if a := testing.AllocsPerRun(100, func() { decodeAddr(&sa); encodeAddr(&sa, unix.AF_INET6, want) }); a != 0 {
+			t.Fatalf("%v allocations per zoned encode and decode", a)
+		}
+	}
+
+	// A real batch to [::1%lo]: the scope is ignored for a non-link-local
+	// address, so it arrives.
+	u6a, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Fatalf("the Linux lanes need IPv6 loopback: %v", err)
+	}
+	defer u6a.Close()
+	u6b, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer u6b.Close()
+	c := newConn(t, u6a, 32, nil)
+	dst := netip.AddrPortFrom(addrOf(u6b).Addr().WithZone(lo.Name), addrOf(u6b).Port())
+	if n, err := c.WriteBatch(NewBatch(4), msgs(dst, 0, 3)); n != 3 || err != nil {
+		t.Fatalf("WriteBatch to %v: %d, %v", dst, n, err)
+	}
+	if got := collect(t, u6b, 3); !eqStrings(got, seq(0, 3)) {
+		t.Fatalf("received %q", got)
 	}
 }
