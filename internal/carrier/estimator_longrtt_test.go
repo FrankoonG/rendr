@@ -19,15 +19,18 @@ import (
 // lrLinkPair is ltLinkPair with a link buffer of buf bytes per direction.
 func lrLinkPair(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint) (dialer, passive *Conn) {
 	t.Helper()
-	return lrLinkPairWrap(t, envD, envP, rate, delay, buf, sink, nil)
+	return lrLinkPairWrap(t, envD, envP, rate, delay, buf, sink, nil, nil)
 }
 
-// lrLinkPairWrap is lrLinkPair whose dialer conn is wrapped by wrap (nil:
-// none).
-func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint, wrap func(net.Conn) net.Conn) (dialer, passive *Conn) {
+// lrLinkPairWrap is lrLinkPair whose dialer conn is wrapped by wrap and
+// whose passive conn by wrapP, before its handshake (nil: none).
+func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint, wrap, wrapP func(net.Conn) net.Conn) (dialer, passive *Conn) {
 	t.Helper()
 	pass := make(chan *Conn, 1)
 	link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "wan", Buffer: buf, Accept: func(nc net.Conn) error {
+		if wrapP != nil {
+			nc = wrapP(nc)
+		}
 		h, err := ReadHello(envP, nc, time.Now().Add(10*time.Second), 4096, nil)
 		if err != nil {
 			pass <- nil

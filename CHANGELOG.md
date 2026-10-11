@@ -262,8 +262,12 @@ Scheduling and estimation:
   at 4 MiB/s and 20 ms: echo P99 237 ms).
 - Estimator residuals: with socket or link buffers below one 256-KiB batch
   a PONG waits behind the peer's write (0.41–0.63 of the link at 1 MiB/s);
-  low rates with deep buffers vary between 0.62 and 0.98 of the link per
-  run; a one-way flow at 1 MiB/s and 100 ms reaches about 0.8 of the link;
+  one way, below about 1.25 MiB/s with blocking writes, a flow reaches
+  about 0.6–0.8 of the link; two-way bulk over buffers shallower than a
+  batch at 1.5–2 MiB/s with a 30–40 ms RTT can still leave one direction
+  below 85 % of the link in some interleavings; low rates with deep
+  buffers vary between 0.62 and 0.98 of the link per run; a one-way flow
+  at 1 MiB/s and 100 ms reaches about 0.8 of the link;
   a peer clock drift of 0.2–0.5 % at 2 MiB/s exceeds the latency bound by
   up to 25 % (in-process scenarios).
 - A shared carrier that is write-blocked is not used for new sessions, so
@@ -304,9 +308,6 @@ Sessions and L4:
 
 Test coverage:
 
-- With two-way bulk traffic over a shared (mux) carrier in a shallow
-  carrier buffer, throughput in one direction occasionally falls just
-  below 85 % of its share (about 1 run in 200, at 84.4–84.8 %).
 - Two deliberately injected race-mode defects go undetected by the
   race-mode scenario tests, and replayed-frame tests reach the edges of
   the receive window only by chance.

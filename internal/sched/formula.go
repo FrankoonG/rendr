@@ -63,23 +63,23 @@ func StallWindow(srtt time.Duration, batch int, rate float64, min, max time.Dura
 
 // Capacity is a carrier's in-flight cap (plan §4):
 // clamp(2·rate·(minRTT + pingBusy + 50 ms), floor, ceil); minRTT 0 counts as
-// 50 ms. It is CapacityDuplex without a reverse-path allowance.
+// 50 ms. It is CapacityDuplex without a duplex allowance.
 //
 // When floor > ceil the ceiling wins: the cap never exceeds the window.
 func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) int64 {
-	return CapacityDuplex(rate, minRTT, pingBusy, 0, 0, floor, ceil)
+	return CapacityDuplex(rate, minRTT, pingBusy, 0, 0, 0, 0, floor, ceil)
 }
 
-// CapacityDuplex is the in-flight cap with an allowance for the reverse
-// path (M3 estimator amendment): clamp(2·rate·(minRTT + pingBusy + 50 ms) +
-// min(revRate, rate)·rev, floor, ceil), where rev is the delay our proofs
-// meet beyond the round trip: the queueing our PONGs meet on their way
-// back behind the peer's own DATA (bulk both ways on one carrier), plus
+// CapacityDuplex is the in-flight cap with an allowance for bulk both ways
+// on one carrier (M3 estimator amendment, M5-D63): clamp(2·rate·(minRTT +
+// pingBusy + 50 ms) + min(revRate, rate)·rev + min(rate·lag, batch), floor,
+// ceil). rev is the queueing our PONGs meet on their way back behind the
+// peer's own DATA, revRate the rate this side delivered recently; lag is
 // the write lag, the time a blocking Write takes to take a batch whose
 // leading PING proves only the bytes before it (the carrier's
-// writeLagLocked, at most one batch at revRate); revRate is the rate this
-// side delivered recently. A non-positive (or NaN) rev, revRate or rate
-// adds nothing.
+// duplexLocked), and batch one batch's DATA budget. A non-positive (or NaN)
+// rate or revRate adds no allowance at all; a non-positive rev, lag or
+// batch adds nothing for its own term.
 //
 // A byte is proven a forward trip, the reverse queue and the rest of the
 // return trip after it is written. A cap sized from minRTT alone leaves
@@ -97,6 +97,18 @@ func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) i
 // side's allowance is the other side's queue, so an overestimated
 // multiplier would feed the two queues into each other.
 //
+// The write-lag term is priced at the rate estimate and capped at one
+// batch. The bytes a leading PING proves stay in flight for the blocked
+// Write as well as the round trip, and those are the bytes the path
+// drained while the Write blocked: at most one batch. The delivered rate
+// would be the wrong price here: the PONG watermark moves in batch steps,
+// so over a window of two round trips it reads well below the link on the
+// side that is behind, and the allowance would shrink exactly where it is
+// needed (TestDuplexKeepsBothDirections_L15's stalls row). The one-batch
+// bound keeps the estimate's overestimate out of the term: it never
+// exceeds a batch, so no feedback between the two sides' queues can build
+// on it.
+//
 // Its price is latency. With bulk both ways over a bottleneck deeper than
 // the cap, a side's bytes in flight, link·(minRTT + q_fwd + q_rev), equal
 // its cap 2·k·link·(minRTT + pingBusy + 50 ms) + link·q_rev, k its rate
@@ -112,8 +124,10 @@ func Capacity(rate float64, minRTT, pingBusy time.Duration, floor, ceil int64) i
 // buffers at 1–16 MiB/s (TestDuplexKeepsBothDirections_L15 holds each
 // row to the bound with its measured k). A peer clock error adds the
 // floor's error (at most the forward queue): up to a quarter more at a
-// 0.5 % drift (TestDuplexPeerClockSkew_L15).
-func CapacityDuplex(rate float64, minRTT, pingBusy time.Duration, revRate float64, rev time.Duration, floor, ceil int64) int64 {
+// 0.5 % drift (TestDuplexPeerClockSkew_L15). Where the Writes block, the
+// write-lag term adds up to one batch more of standing queue (KL-16: the
+// 4 MiB/s, 1 % drift row's passive share 0.912 → 0.882).
+func CapacityDuplex(rate float64, minRTT, pingBusy time.Duration, revRate float64, rev, lag time.Duration, batch, floor, ceil int64) int64 {
 	if minRTT <= 0 {
 		minRTT = capUnknownRTT
 	}
@@ -127,8 +141,13 @@ func CapacityDuplex(rate float64, minRTT, pingBusy time.Duration, revRate float6
 		// values do not drift by one byte.
 		c = 2 * rate * (float64(minRTT) + float64(pingBusy) + float64(capSlack)) / float64(time.Second)
 	}
-	if rev > 0 && revRate > 0 && rate > 0 { // also false for NaN
-		c += min(revRate, rate) * float64(rev) / float64(time.Second)
+	if revRate > 0 && rate > 0 { // also false for NaN
+		if rev > 0 {
+			c += min(revRate, rate) * float64(rev) / float64(time.Second)
+		}
+		if lag > 0 && batch > 0 {
+			c += min(rate*float64(lag)/float64(time.Second), float64(batch))
+		}
 	}
 	if c >= float64(ceil) { // also +Inf; the integer bound, as in clampNs
 		return ceil
