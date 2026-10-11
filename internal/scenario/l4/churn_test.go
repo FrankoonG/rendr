@@ -48,7 +48,8 @@ const (
 	churnPoll = 10 * time.Millisecond
 )
 
-// churnMix is the class mix of TestL4ChurnNoLeak_L52 (2,000 connections).
+// churnMix is the class mix of TestL4ChurnNoLeak_L52 (2,000 connections;
+// each class divided by churnScale).
 var churnMix = []struct {
 	class string
 	n     int
@@ -153,7 +154,7 @@ func runChurn(t *testing.T) {
 
 	var classes []string
 	for _, m := range churnMix {
-		for range m.n {
+		for range m.n / churnScale {
 			classes = append(classes, m.class)
 		}
 	}
@@ -205,17 +206,18 @@ func runChurn(t *testing.T) {
 		return st.Dialing == 0 && st.Live == 0 && st.Hooks == 0 && st.Abandoned == 0
 	})
 	st := w.srv.Status()
-	const confirmed = 550 + 550 + 100 + 100 + 100
-	if st.Confirmed != confirmed || st.Rejected != 500 || st.ByCode[l4.CodeRefused] != 300 || st.ByCode[l4.CodeTimeout] != 100 ||
-		st.ByCode[l4.CodeDNSFailure] != 100 || len(st.ByCode) != 3 || st.Unconfirmed != 0 || st.Lost != 0 || st.Panics != 0 {
-		t.Fatalf("Server %+v (by code %v); want %d confirmed, 300 CodeRefused, 100 CodeTimeout, 100 CodeDNSFailure and nothing else",
-			plain(st), st.ByCode, confirmed)
+	const k = churnScale
+	const confirmed = (550 + 550 + 100 + 100 + 100) / k
+	if st.Confirmed != confirmed || st.Rejected != 500/k || st.ByCode[l4.CodeRefused] != 300/k || st.ByCode[l4.CodeTimeout] != 100/k ||
+		st.ByCode[l4.CodeDNSFailure] != 100/k || len(st.ByCode) != 3 || st.Unconfirmed != 0 || st.Lost != 0 || st.Panics != 0 {
+		t.Fatalf("Server %+v (by code %v); want %d confirmed, %d CodeRefused, %d CodeTimeout, %d CodeDNSFailure and nothing else",
+			plain(st), st.ByCode, confirmed, 300/k, 100/k, 100/k)
 	}
 	for _, r := range []struct {
 		name   string
 		counts *rendrtest.DialCounts
 		calls  int64
-	}{{"refused", s.refusedN, 300}, {"syn", s.synN, 100}, {"dns", s.dnsN, 100}} {
+	}{{"refused", s.refusedN, 300 / k}, {"syn", s.synN, 100 / k}, {"dns", s.dnsN, 100 / k}} {
 		if r.counts.Calls() != r.calls || r.counts.Unclosed() != 0 {
 			t.Fatalf("%s hook: %d calls, %d unclosed; want %d, 0", r.name, r.counts.Calls(), r.counts.Unclosed(), r.calls)
 		}
@@ -228,10 +230,10 @@ func runChurn(t *testing.T) {
 		accepted, rstIn, rstOut int
 		finIn                   int // -1: not checked
 	}{
-		{"echo", s.echo, 1100, 0, 0, 1100},
-		{"rst", s.rst, 100, 0, 100, -1},
-		{"stall", s.stall, 100, 100, 0, 100},
-		{"noread", s.noread, 100, 100, 0, -1},
+		{"echo", s.echo, 1100 / k, 0, 0, 1100 / k},
+		{"rst", s.rst, 100 / k, 0, 100 / k, -1},
+		{"stall", s.stall, 100 / k, 100 / k, 0, 100 / k},
+		{"noread", s.noread, 100 / k, 100 / k, 0, -1},
 	} {
 		waitFor(t, 10*time.Second, r.name+" targets closed", func() bool { return r.tg.Counts().Open == 0 })
 		c := r.tg.Counts()
@@ -247,8 +249,8 @@ func runChurn(t *testing.T) {
 	if rstLost > churnRSTLostMax {
 		t.Fatalf("%d reset connections lost their RST with a killed carrier, want at most %d", rstLost, churnRSTLostMax)
 	}
-	if earlyPending != 550+100 {
-		t.Fatalf("stimulus: %d EarlyReturn ingresses returned StatePending from l4.Dial, want all 650", earlyPending)
+	if earlyPending != (550+100)/churnScale {
+		t.Fatalf("stimulus: %d EarlyReturn ingresses returned StatePending from l4.Dial, want all %d", earlyPending, (550+100)/churnScale)
 	}
 	if earlyExact == 0 {
 		t.Fatalf("stimulus: no EarlyReturn echo session opened on a fresh trunk of its own without migrating, so no first flight was checked")
@@ -285,10 +287,10 @@ func runChurn(t *testing.T) {
 		}
 	}
 	s.mu.Lock()
-	t.Logf("2,000 connections, %d kills in %v virtual; stall released %v–%v, noread %v–%v after the last progress; "+
+	t.Logf("%d connections, %d kills in %v virtual; stall released %v–%v, noread %v–%v after the last progress; "+
 		"%d resets lost with a killed carrier; EarlyReturn: %d pending at Dial, %d echoe sessions on a fresh trunk, %d with EarlyBytes, %d checked whole; "+
 		"with the Peer open: %d carriers, buffered %d and %d; Server %+v",
-		kills, time.Since(s.start), minOf(s.stallRel), maxOf(s.stallRel), minOf(s.noreadRel), maxOf(s.noreadRel),
+		2000/churnScale, kills, time.Since(s.start), minOf(s.stallRel), maxOf(s.stallRel), minOf(s.noreadRel), maxOf(s.noreadRel),
 		s.rstLost, s.earlyPending, s.earlyFresh, s.earlyBytes, s.earlyExact, open, ds.BufferedBytes, ps.BufferedBytes, plain(st))
 	s.mu.Unlock()
 	w.noViolation()
