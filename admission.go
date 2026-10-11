@@ -104,7 +104,7 @@ func (rt *Runtime) admitOpen(ln *Listener, h *carrier.Hello, deadline time.Time,
 		DialerInstance: h.Preface.Instance,
 		PeerWindow:     o.Window,
 		Metadata:       o.Metadata,
-		Early:          o.Flags&wire.OpenFlagEarly != 0, // M4-D5 (never set while ParseOpen refuses the flag)
+		Early:          o.Flags&wire.OpenFlagEarly != 0, // M4-D5: its early DATA may follow before the verdict
 	}
 	if packet {
 		spec.Params = rt.eff.packetParams(spec.Params, maxPayload)

@@ -50,7 +50,9 @@ import (
 //     the last byte, not earlier.
 //   - rst (40): through an ingress Forward; the target resets after 64 KiB
 //     (mid-response): the client reads a PRNG(0) prefix, then a reset, never
-//     io.EOF.
+//     io.EOF; the dialer session ends with the peer's AbortReset, or with
+//     ErrSessionLost when a kill took the RST down with its carrier (the
+//     rejoin meets the tombstone, L47; at most 2).
 //   - noread (10): through an ingress Forward with a 30-s idle; the target
 //     never reads: the client's Writes stop, the session idles out, and both
 //     sockets are reset.
@@ -87,6 +89,7 @@ type clSmoke struct {
 	spies map[string]*spyConn // the target conns of the linger, idle and noread classes, by address
 
 	wg       sync.WaitGroup
+	lostRST  atomic.Int64    // rst sessions lost across a kill (their RST died with the carrier)
 	bulkRead [4]atomic.Int64 // bytes the bulk clients read so far
 	bulkConn [4]atomic.Pointer[rendr.Conn]
 }
@@ -376,7 +379,10 @@ func runL4Smoke(t *testing.T) {
 	if l, p := testhooks.LiveSessions.Load()-live0, testhooks.ParkedSessions.Load()-parked0; l != 0 || p != 0 {
 		t.Errorf("session registry after Runtime.Close: %+d live, %+d parked", l, p)
 	}
-	t.Logf("C-L smoke: %d connections in %v virtual; Server %+v", connected+70, time.Since(s.start), clStatus(srv.Status()))
+	if n := s.lostRST.Load(); n > 2 {
+		t.Errorf("%d of 40 rst sessions lost their RST across a kill, want at most 2 (one start every 560 ms, four kills)", n)
+	}
+	t.Logf("C-L smoke: %d connections in %v virtual (%d rst sessions lost across a kill); Server %+v", connected+70, time.Since(s.start), s.lostRST.Load(), clStatus(srv.Status()))
 }
 
 // clTotals is c without its per-connection records (for messages).
@@ -491,6 +497,7 @@ func (c clCounting) Read(b []byte) (int, error) {
 // runRST: the target resets after 64 KiB: a prefix, then a reset.
 func (s *clSmoke) runRST(addr string) {
 	t := s.t
+	from := time.Since(s.start)
 	cli, _, res, err := s.ingress(addr, 0)
 	if err != nil {
 		t.Errorf("%s: Dial: %v", addr, err)
@@ -505,9 +512,28 @@ func (s *clSmoke) runRST(addr string) {
 		t.Errorf("%s: read %d bytes (a PRNG(0) prefix %v), end %v; want at most %d, then a reset", addr, n, sum == prngSum(0, n), err, clRSTN)
 	}
 	r := <-res
-	if code, remote, ok := abortCode(r.SessionErr); r.Clean || !ok || code != AbortReset || !remote {
-		t.Errorf("%s: ingress Forward %+v, want *AbortError{AbortReset, Remote}", addr, r)
+	if code, remote, ok := abortCode(r.SessionErr); !r.Clean && ok && code == AbortReset && remote {
+		return
 	}
+	// A kill during the session can take the passive's RST down with its
+	// carrier: the dialer's rejoin then meets the ended session's
+	// tombstone, UNKNOWN_SESSION (L47), and the session is lost — the
+	// client still sees a reset, never io.EOF (checked above).
+	if !r.Clean && errors.Is(r.SessionErr, rendr.ErrSessionLost) && clKilledDuring(from, time.Since(s.start)) {
+		s.lostRST.Add(1)
+		return
+	}
+	t.Errorf("%s: ingress Forward %+v, want *AbortError{AbortReset, Remote} (or ErrSessionLost across a kill)", addr, r)
+}
+
+// clKilledDuring reports a kill instant in [from, to] (from the start).
+func clKilledDuring(from, to time.Duration) bool {
+	for _, k := range clKills {
+		if k >= from && k <= to {
+			return true
+		}
+	}
+	return false
 }
 
 // runRefused: the hook refuses.

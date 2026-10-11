@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -316,7 +317,11 @@ func TestServerIdleDefault(t *testing.T) {
 // Serve and Handle against a hand-written Accept, Confirm and Forward loop
 // over the same Runtimes, links and target — stay at most 64. The ceiling
 // applies to that difference, not to the end-to-end total (about 470 per
-// connection, mostly the core's session setup; recorded in the log).
+// connection, mostly the core's session setup; recorded in the log). The
+// two loops are measured in three alternating pairs and the median
+// difference is checked: one pair's baseline once came out 50 allocations
+// per connection low (the pool's l4 sweep, 1 run in 600; the sync.Pools
+// both loops draw on depend on when the collector ran).
 func TestServerAllocsPerConn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const k = 400 // enough connections that the difference of two totals is stable
@@ -348,50 +353,61 @@ func TestServerAllocsPerConn(t *testing.T) {
 
 		// The baseline: Accept, the target dial, Confirm, SetIdleTimeout and
 		// Forward written out.
-		ctx, cancel := context.WithCancel(context.Background())
-		var handlers sync.WaitGroup
-		var live atomic.Int64
-		loop := make(chan struct{})
-		go func() {
-			defer close(loop)
-			for {
-				p, err := w.ln.Accept(ctx)
-				if err != nil {
-					return
-				}
-				live.Add(1)
-				handlers.Go(func() {
-					defer live.Add(-1)
-					tc, _ := target.Dial(ctx, kitTarget)
-					c, err := p.Confirm()
+		baseline := func() float64 {
+			ctx, cancel := context.WithCancel(context.Background())
+			var handlers sync.WaitGroup
+			var live atomic.Int64
+			loop := make(chan struct{})
+			go func() {
+				defer close(loop)
+				for {
+					p, err := w.ln.Accept(ctx)
 					if err != nil {
-						tc.Close()
 						return
 					}
-					c.SetIdleTimeout(DefaultIdleTimeout)
-					Forward(ctx, c, tc)
-				})
-			}
-		}()
-		base := measure(func() {
-			waitFor(t, time.Minute, "the baseline forwards end", func() bool { return live.Load() == 0 })
-			synctest.Wait()
-		})
-		cancel()
-		<-loop
-		handlers.Wait()
-
-		s := &Server{Dial: hookOf(target.Dial)}
-		sv := serve(w, s)
-		server := measure(func() {
-			waitFor(t, time.Minute, "the forwards end", func() bool { st := s.Status(); return st.Live == 0 && st.Hooks == 0 })
-			synctest.Wait()
-		})
-		t.Logf("allocations per connection: baseline %.1f, Serve %.1f, the Server's own %.1f", base, server, server-base)
-		if !raceEnabled && server-base > 64 {
-			t.Fatalf("the Server allocates %.1f times per connection, want ≤ 64", server-base)
+					live.Add(1)
+					handlers.Go(func() {
+						defer live.Add(-1)
+						tc, _ := target.Dial(ctx, kitTarget)
+						c, err := p.Confirm()
+						if err != nil {
+							tc.Close()
+							return
+						}
+						c.SetIdleTimeout(DefaultIdleTimeout)
+						Forward(ctx, c, tc)
+					})
+				}
+			}()
+			n := measure(func() {
+				waitFor(t, time.Minute, "the baseline forwards end", func() bool { return live.Load() == 0 })
+				synctest.Wait()
+			})
+			cancel()
+			<-loop
+			handlers.Wait()
+			return n
 		}
-		sv.stop(t)
+		served := func() float64 {
+			s := &Server{Dial: hookOf(target.Dial)}
+			sv := serve(w, s)
+			n := measure(func() {
+				waitFor(t, time.Minute, "the forwards end", func() bool { st := s.Status(); return st.Live == 0 && st.Hooks == 0 })
+				synctest.Wait()
+			})
+			sv.stop(t)
+			return n
+		}
+		var own [3]float64
+		for i := range own {
+			base, server := baseline(), served()
+			own[i] = server - base
+			t.Logf("allocations per connection: baseline %.1f, Serve %.1f, the Server's own %.1f", base, server, own[i])
+		}
+		slices.Sort(own[:])
+		if !raceEnabled && own[1] > 64 {
+			t.Fatalf("the Server allocates %.1f times per connection (median of %v), want ≤ 64", own[1], own)
+		}
 		w.shutdown()
 	})
 }
