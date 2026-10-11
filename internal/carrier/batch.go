@@ -100,6 +100,12 @@ type Batch struct {
 	holdH  uint32
 	holdOn bool
 
+	// The current flush of a datagram writer's arena (appendDatagramArena,
+	// resetFlush; M5 design §A4.3): its datagrams, each with the
+	// transport's Headroom in front, aliasing the round's arena. Allocated
+	// at a datagram writer's first flush, never on a stream batch.
+	fl [][]byte
+
 	frames [MaxBatchFrames]bframe
 	arena  []byte
 }

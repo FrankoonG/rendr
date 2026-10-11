@@ -67,6 +67,13 @@ type writer struct {
 	rackCum  uint32 //
 	rackAt   int    // frame index of the RACK (−1: none)
 	pingAt   int    // frame index of the round's PING (−1: none)
+
+	// bio is the transport's BatchIO (dgBatchOf; nil: one WriteDatagram
+	// per datagram, M2), and arena the round's arena of the batched path:
+	// one DBufs buffer of the 64 KiB class, charged to the stage account,
+	// taken at a round's first datagram and released at its end (M5-D11).
+	bio   BatchIO
+	arena *Buf
 }
 
 // backlogged reports whether the writer was busy for at least 25% of the
@@ -112,6 +119,10 @@ func (c *Conn) writerInit() {
 	if dg := c.dg; dg != nil {
 		n := max(int(dg.budget.Load()), wire.MinFrameBudget) + dg.io.Headroom()
 		w.dscratch = c.dbufs().Get(n, c.env.stageBudget())
+		if o, ok := dg.io.(*OwnedUDP); ok {
+			o.bind(c.env) // the batched I/O and its counters (M5 design §A4.3)
+		}
+		w.bio = dgBatchOf(dg.io)
 	}
 }
 
@@ -137,6 +148,13 @@ func (c *Conn) writeLoop() {
 		if w.dscratch != nil {
 			w.dscratch.Release()
 			w.dscratch = nil
+		}
+		if w.arena != nil { // a round that unwound: its arena and slots go (L55)
+			if w.b != nil {
+				w.b.resetFlush()
+			}
+			w.arena.Release()
+			w.arena = nil
 		}
 		if w.timer != nil {
 			w.timer.Stop()

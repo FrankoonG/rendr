@@ -340,7 +340,46 @@ func (b *Batch) appendDatagram(dst []byte, i, end int) []byte {
 // runs before ReleaseRefs and panics unless 0 ≤ i < end ≤ Len() and the
 // datagram fits cap(arena) (M5 design §A4.3; WP2).
 func (b *Batch) appendDatagramArena(i, end int, arena []byte) ([][]byte, int) {
-	panic("WP2")
+	if i < 0 || end > b.n || i >= end {
+		panic("rendr/carrier: appendDatagramArena range out of bounds")
+	}
+	start := 0
+	if k := len(b.fl); k > 0 {
+		// The slots alias arena (two-index slices), so the previous one ends
+		// at cap(arena) − cap(prev) + len(prev).
+		prev := b.fl[k-1]
+		start = cap(arena) - cap(prev) + len(prev)
+	}
+	if len(arena) < start {
+		panic("rendr/carrier: appendDatagramArena arena shorter than its flush")
+	}
+	n := 0
+	for k := i; k < end; k++ {
+		n += wire.FrameOverhead + int(b.frames[k].hdr.Len)
+	}
+	if len(arena)+n > cap(arena) {
+		panic("rendr/carrier: appendDatagramArena datagram beyond the arena")
+	}
+	arena = b.appendDatagram(arena, i, end)
+	if b.fl == nil {
+		b.fl = make([][]byte, 0, MaxBatchFrames) // a datagram writer's first flush; reused for its life
+	}
+	b.fl = append(b.fl, arena[start:len(arena)])
+	return b.fl, len(arena)
+}
+
+// resetFlush ends the current flush of appendDatagramArena: the batch keeps
+// no reference to the arena's slots (L55: a reset clears the scratch's
+// references). The writer calls it after every flush and at the end of
+// its round.
+func (b *Batch) resetFlush() {
+	clear(b.fl)
+	b.fl = b.fl[:0]
+}
+
+// flushLen returns the datagrams of the current flush (tests).
+func (b *Batch) flushLen() int {
+	return len(b.fl)
 }
 
 // datagramIsDgramOnly reports whether the datagram that starts at sealed

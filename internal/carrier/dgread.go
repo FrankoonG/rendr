@@ -1,13 +1,17 @@
 package carrier
 
 import (
+	"errors"
+	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // The reader of a datagram carrier (M2-D13, M2-D14, M2-D30; M2 design
-// §A5.7 and Revision 1, R1-1, R1-4, R1-27).
+// §A5.7 and Revision 1, R1-1, R1-4, R1-27; the batched reads of M5 design
+// §A4.4).
 
 // Reader back-off (M2-D15): a transient read error waits noiseMin, doubling
 // to noiseMax, until a datagram is handed over. The spin guard (M2-D86,
@@ -38,17 +42,95 @@ func (c *Conn) dbufs() *BufPool {
 
 // dgReader is the datagram reader goroutine's own state.
 type dgReader struct {
-	buf     *Buf // the read buffer, io.ReadSize() bytes (nil: the transport hands out its own)
+	buf     *Buf // the read buffer, io.ReadSize() bytes (nil: the transport hands out its own); slot 0 of a batched read
 	backoff time.Duration
 	idle    int         // consecutive reads that handed nothing over
 	timer   *time.Timer // the back-off timer, created at the first back-off
+
+	// A transport with a BatchIO but no depth (a flow, M5 design §A4.5):
+	// the results of one ReadDatagrams call.
+	rs []ReadResult
+
+	// The adaptive depth of a dialer socket (depthIO; M5 design §A4.4,
+	// Revision 1 R1-4, R1-5). Depth 1 reads into buf through the socket's
+	// fixed one-message header; depth k ≥ 2 holds hdr, a pooled header
+	// whose slots 1 … k−1 are charged to Env.Budget (lent to the
+	// transport: the four-state word of R1-5 says who owns it). hdr, stale
+	// and gen belong to the reader goroutine; the atomics are shared with
+	// the idle-release timer.
+	dio     depthIO
+	hdr     *ioHdr // the lent extras; nil at depth 1
+	stale   *ioHdr // extras an idle release took: pooled once that release completed
+	gen     uint64 // lend generations (each lent header gets the next)
+	size    int    // the slots' length: ReadSize()
+	pool    *BufPool
+	budget  *Budget        // the slots' account (Env.Budget: refusable, R1-4)
+	stages  *Budget        // the headers' account (Env.Stages: forced)
+	refused *atomic.Uint64 // DgramStats.ChargeRefused (nil in component tests)
+	idleT   *time.Timer    // the idle release (batchIdleRelease), armed while extras are held
+	armed   atomic.Bool    // idleT is armed
+	lastSeq atomic.Uint64  // the reader's parks at idleT's previous firing
+	lentGen atomic.Uint64  // the generation of the latest lend
+	relGen  atomic.Uint64  // the generation the latest idle release returned (after it completed)
+	woke    atomic.Bool    // the idle release set the read deadline to wake the reader
 }
 
+// depthIO is a dialer socket's side of the adaptive receive depth (M5
+// design §A4.4; R1-4, R1-5): *OwnedUDP over its udpsocket.Reader, and the
+// in-memory transports of the tests. The reader lends it a pooled header
+// (lend) and reads at that header's depth; while the read is parked an
+// idle release (tryRelease, on the timer's goroutine) may take the header
+// back, after which the read returns one datagram in slot 0.
+type depthIO interface {
+	PacketIO
+	// depthMax is the most datagrams one read may move now: MaxBatch while
+	// the socket batches, else 1 (the depth then falls back to 1).
+	depthMax() int
+	// readDepth waits like ReadDatagram and reads n ≥ 1 datagrams in
+	// arrival order: into slot0 alone, or — while the reader holds the
+	// lent h — up to h.k into slot0 and h.slots[1:h.k]. A transient error
+	// (noise, a Windows truncation) is n = 0 with its event; any other
+	// error is returned.
+	readDepth(slot0 *Buf, h *ioHdr) (n int, ev ReadEvent, err error)
+	// result is the i-th datagram of the latest readDepth, classified as
+	// ReadDatagram classifies one (Data aliases its slot).
+	result(i int) (data []byte, src PeerKey, ev ReadEvent)
+	// lend makes h the reader's extras (replacing held ones); false, with
+	// nothing changed, while an idle release still returns earlier ones.
+	lend(h *ioHdr) bool
+	// held reports whether the reader holds the extras; false after a read
+	// that held them means an idle release took them.
+	held() bool
+	// reclaim takes held extras back (depth 1, exit, fallback).
+	reclaim() bool
+	// parks, holding and tryRelease are the idle release's side (R1-5):
+	// the reader's parks while holding extras; whether it holds them
+	// (held or parked); parked → releasing by CAS when it has not parked
+	// since seq, then the release function, then idle.
+	parks() uint64
+	holding() bool
+	tryRelease(seq uint64) bool
+	// onRelease sets the release function (before the first lend).
+	onRelease(f func(*ioHdr))
+}
+
+// batchIdleRelease is how long a dialer reader may stay parked with its
+// extras before the idle release returns them (R1-5, M5-D61). Tests lower
+// it.
+var batchIdleRelease = time.Second
+
+// flowReadDepth bounds the results one ReadDatagrams call of a flow
+// returns (a flow drains its inbox: no system call, one lock per call;
+// the Source wakes a flow once per receive batch, M5-D14).
+const flowReadDepth = 8
+
 // dgReadLoop is the reader goroutine of a datagram carrier: it walks the
-// response datagram's tail (dialer, R1-1), then reads one datagram per
-// ReadDatagram call and walks its frames (header and bounds, CRC, the fseq
-// window, the M2-D30 rule, dispatch). Loss, corruption and noise never end
-// it (PA-1); a read error, a violation or the end of a retirement does.
+// response datagram's tail (dialer, R1-1), then reads — one datagram per
+// ReadDatagram call, or through the transport's BatchIO several per call
+// (M5 design §A4.4) — and walks each datagram's frames (header and
+// bounds, CRC, the fseq window, the M2-D30 rule, dispatch) in arrival
+// order. Loss, corruption and noise never end it (PA-1); a read error, a
+// violation or the end of a retirement does.
 func (c *Conn) dgReadLoop() {
 	dg := c.dg
 	rd := &dgReader{}
@@ -61,6 +143,8 @@ func (c *Conn) dgReadLoop() {
 		// its buffer (§4.1), and it returns a flow buffer it may still hold
 		// (PacketIO.Release; Close never does, integration 2).
 		dg.io.Release()
+		rd.endDepth()
+		clear(rd.rs)
 		if rd.buf != nil {
 			rd.buf.Release()
 			rd.buf = nil
@@ -70,6 +154,9 @@ func (c *Conn) dgReadLoop() {
 		}
 		c.partDone(partReader)
 	}()
+	if o, ok := dg.io.(*OwnedUDP); ok {
+		o.bind(c.env) // the batched I/O and its counters (M5 design §A4.4)
+	}
 	if n := dg.io.ReadSize(); n > 0 {
 		// After SetBudget: recvLimit + Headroom + 1 (R1-6), a 2 KiB class for
 		// QUIC and default raw UDP, charged to the stage account.
@@ -84,7 +171,23 @@ func (c *Conn) dgReadLoop() {
 			return
 		}
 	}
-	for c.dgReadOne(rd) {
+	bio := dgBatchOf(dg.io)
+	if d, ok := bio.(depthIO); ok && rd.buf != nil {
+		rd.startDepth(c, d)
+		for c.dgReadDepth(rd) {
+		}
+	} else if bio != nil {
+		k := min(max(bio.MaxBatch(), 1), flowReadDepth)
+		if rd.buf != nil {
+			k = 1 // no slots beyond the reader's own buffer
+		}
+		rd.rs = make([]ReadResult, k)
+		rd.rs[0].buf = rd.buf
+		for c.dgReadBatch(rd, bio) {
+		}
+	} else {
+		for c.dgReadOne(rd) {
+		}
 	}
 	normal = true
 }
@@ -102,6 +205,22 @@ func (c *Conn) dgReadOne(rd *dgReader) bool {
 		c.readFailed(err) // death (transport_error), or the end of a retirement (M1 V6)
 		return false
 	}
+	handed := ev == ReadOK || ev == ReadCandidate
+	if !handed && ev != ReadNoise {
+		dg.io.Release() // a dropped datagram's buffer goes back before any pause
+	}
+	ok := c.dgHandle(rd, data, src, ev)
+	if handed {
+		dg.io.Release()
+	}
+	return ok
+}
+
+// dgHandle handles one datagram or read event of the reader (§A5.7): noise
+// backs off; an empty, truncated, foreign or badly enveloped datagram is
+// dropped and counted, under the spin guard; a datagram handed over is
+// walked (dgFrames). It reports whether the reader continues.
+func (c *Conn) dgHandle(rd *dgReader, data []byte, src PeerKey, ev ReadEvent) bool {
 	switch ev {
 	case ReadNoise:
 		c.dgReadError()
@@ -112,7 +231,6 @@ func (c *Conn) dgReadOne(rd *dgReader) bool {
 		} else {
 			c.dgDropped(1)
 		}
-		dg.io.Release()
 		rd.idle++
 		if rd.idle >= spinIdle {
 			rd.idle = 0
@@ -121,10 +239,269 @@ func (c *Conn) dgReadOne(rd *dgReader) bool {
 		return true
 	}
 	rd.backoff, rd.idle = 0, 0
-	dg.ctr.datagramsRx.Add(1)
-	ok := c.dgFrames(data, src, ev, time.Now())
-	dg.io.Release()
+	c.dg.ctr.datagramsRx.Add(1)
+	return c.dgFrames(data, src, ev, time.Now())
+}
+
+// dgReadBatch reads one ReadDatagrams call of a transport with a BatchIO
+// and no depth (a flow: its inbox, M5-D14) and handles its results in
+// arrival order; then the transport gets the call's buffers back
+// (Release). It reports whether the reader continues.
+func (c *Conn) dgReadBatch(rd *dgReader, bio BatchIO) bool {
+	n, err := bio.ReadDatagrams(rd.rs)
+	if err != nil {
+		c.readFailed(err)
+		return false
+	}
+	ok := true
+	for i := 0; i < n && ok; i++ {
+		r := &rd.rs[i]
+		ok = c.dgHandle(rd, r.Data, r.Src, r.Ev)
+	}
+	for i := range n {
+		rd.rs[i].Data, rd.rs[i].Src = nil, PeerKey{}
+	}
+	c.dg.io.Release()
 	return ok
+}
+
+// startDepth prepares the adaptive depth over d: the accounts, the release
+// function and the idle-release timer (one per dialer reader, created
+// whatever MaxBatch is, so a reader that never batches holds the same).
+func (rd *dgReader) startDepth(c *Conn, d depthIO) {
+	rd.dio, rd.size = d, d.ReadSize()
+	rd.pool, rd.budget, rd.stages = c.dbufs(), c.env.Budget, c.env.stageBudget()
+	if s := c.env.Dgram; s != nil {
+		rd.refused = &s.ChargeRefused
+	}
+	d.onRelease(rd.releaseHdr)
+	rd.idleT = time.AfterFunc(time.Hour, rd.idleFire)
+	rd.idleT.Stop()
+}
+
+// dgReadDepth reads one readDepth call of a dialer socket, handles its
+// datagrams in arrival order and then adapts the depth (§A4.4): k doubles
+// (≤ depthMax) when a call returns k datagrams; it halves when a call that
+// waited for the socket (parked) returns fewer than k/4 — a call that
+// found datagrams queued and drained them is the tail of a burst, not
+// sparse traffic, so the depth stays for the next burst (R1-5, R1-7); it
+// is 1 whenever the socket does not batch, and after an idle release. It
+// reports whether the reader continues.
+func (c *Conn) dgReadDepth(rd *dgReader) bool {
+	d := rd.dio
+	p0 := d.parks()
+	n, ev, err := d.readDepth(rd.buf, rd.hdr)
+	if rd.hdr != nil && !d.held() {
+		// An idle release took the extras while the read was parked: their
+		// slots and charge are gone; the header itself returns to its pool
+		// once that release completed (collect).
+		rd.stale, rd.hdr = rd.hdr, nil
+	}
+	if err != nil {
+		rd.collect()
+		if errors.Is(err, os.ErrDeadlineExceeded) && rd.woke.Swap(false) {
+			// The idle release's wake, not a caller's deadline: the read
+			// goes on (a closer that also set one closes the socket next).
+			select {
+			case <-c.dying:
+				return false
+			default:
+			}
+			_ = d.SetReadDeadline(time.Time{})
+			return true
+		}
+		c.readFailed(err)
+		return false
+	}
+	if n == 0 {
+		rd.collect()
+		return c.dgHandle(rd, nil, PeerKey{}, ev)
+	}
+	for i := range n {
+		data, src, ev := d.result(i)
+		if !c.dgHandle(rd, data, src, ev) {
+			return false
+		}
+	}
+	// After the results: one read through a stale header's message array
+	// (a release that won while the read was parked) is handled by now.
+	rd.collect()
+	c.dgAdapt(rd, n, d.parks() != p0)
+	return true
+}
+
+// dgAdapt applies the depth rule of dgReadDepth after a call that moved n
+// datagrams (parked: it waited for the socket).
+func (c *Conn) dgAdapt(rd *dgReader, n int, parked bool) {
+	k, hi := 1, rd.dio.depthMax()
+	if rd.hdr != nil {
+		k = rd.hdr.k
+	}
+	switch {
+	case k > hi:
+		rd.shrink(max(hi, 1)) // the socket stopped batching (M5-D15)
+	case n >= k && k < hi:
+		rd.grow(min(2*k, hi))
+	case parked && 4*n < k:
+		rd.shrink(k / 2)
+	}
+}
+
+// grow raises the depth to nk: the slots k … nk−1 taken with TryGet on
+// Env.Budget — a refusal keeps the depth and counts ChargeRefused (R1-4)
+// — and, when the held header is too small (or none is held), a header of
+// nk's class lent to the transport. A lend refused while an idle release
+// still returns earlier extras keeps depth 1.
+func (rd *dgReader) grow(nk int) {
+	h, k := rd.hdr, 1
+	if h != nil {
+		k = h.k
+	}
+	nh := h
+	if h == nil || h.cap() < nk {
+		nh = getHdr(nk, rd.stages)
+	}
+	for i := k; i < nk; i++ {
+		s := rd.pool.TryGet(rd.size, rd.budget)
+		if s == nil {
+			if rd.refused != nil {
+				rd.refused.Add(1)
+			}
+			releaseSlots(nh, k, i)
+			if nh != h {
+				nh.put()
+			}
+			return
+		}
+		nh.slots[i] = s
+	}
+	if nh == h {
+		h.k = nk
+		return
+	}
+	if h != nil {
+		copy(nh.slots[1:k], h.slots[1:k])
+	}
+	rd.gen++
+	nh.k, nh.gen = nk, rd.gen
+	if !rd.dio.lend(nh) {
+		releaseSlots(nh, k, nk)
+		clear(nh.slots[1:k])
+		nh.put()
+		return
+	}
+	rd.lentGen.Store(nh.gen)
+	if h != nil {
+		clear(h.slots[1:k]) // moved to nh
+		h.put()
+	}
+	if rd.stale != nil {
+		// The lend found the Reader idle: the release that took the stale
+		// header completed.
+		rd.stale.put()
+		rd.stale = nil
+	}
+	rd.hdr = nh
+	rd.arm()
+}
+
+// shrink lowers the depth to nk (≥ 1): the slots nk … k−1 are released; at
+// depth 1 the header goes back as well.
+func (rd *dgReader) shrink(nk int) {
+	h := rd.hdr
+	if h == nil {
+		return
+	}
+	if nk > 1 {
+		releaseSlots(h, nk, h.k)
+		h.k = nk
+		return
+	}
+	rd.dio.reclaim()
+	releaseSlots(h, 1, h.k)
+	h.put()
+	rd.hdr = nil
+}
+
+// releaseSlots releases h's slots [from, to).
+func releaseSlots(h *ioHdr, from, to int) {
+	for i := from; i < to; i++ {
+		h.slots[i].Release()
+		h.slots[i] = nil
+	}
+}
+
+// collect pools the stale header once the idle release that took it
+// completed.
+func (rd *dgReader) collect() {
+	if s := rd.stale; s != nil && rd.relGen.Load() == s.gen {
+		s.put()
+		rd.stale = nil
+	}
+}
+
+// endDepth returns the reader's extras when it exits: held ones are taken
+// back from the transport; a stale header whose release still runs is
+// left to the garbage collector.
+func (rd *dgReader) endDepth() {
+	if rd.dio == nil {
+		return
+	}
+	rd.idleT.Stop()
+	if rd.hdr != nil {
+		rd.shrink(1)
+	}
+	rd.collect()
+	rd.stale = nil
+}
+
+// arm arms the idle release once the reader holds extras.
+func (rd *dgReader) arm() {
+	if rd.armed.CompareAndSwap(false, true) {
+		rd.lastSeq.Store(rd.dio.parks())
+		rd.idleT.Reset(batchIdleRelease)
+	}
+}
+
+// idleFire is the idle release (R1-5 rule 3; on the timer's goroutine). A
+// reader that has stayed parked since the previous firing — a whole
+// period — has its extras released (parked → releasing by CAS, then
+// releaseHdr, then idle), and its read is woken by a read deadline of
+// now, so the header returns to its pool at once (its message array stays
+// referenced by the parked read until it returns). A busy reader costs one
+// O(1) firing per period; the timer touches no traffic (a resource
+// release, not a liveness trigger: invariant 7).
+func (rd *dgReader) idleFire() {
+	d := rd.dio
+	if d.holding() {
+		seq := d.parks()
+		if seq != rd.lastSeq.Load() {
+			rd.lastSeq.Store(seq) // it parked again during the period
+			rd.idleT.Reset(batchIdleRelease)
+			return
+		}
+		gen := rd.lentGen.Load()
+		if !d.tryRelease(seq) {
+			rd.idleT.Reset(batchIdleRelease) // held and reading: busy
+			return
+		}
+		rd.relGen.Store(gen)
+		rd.woke.Store(true)
+		_ = d.SetReadDeadline(time.Now())
+	}
+	rd.armed.Store(false)
+	if d.holding() && rd.armed.CompareAndSwap(false, true) {
+		rd.lastSeq.Store(d.parks())
+		rd.idleT.Reset(batchIdleRelease)
+	}
+}
+
+// releaseHdr is the release function of the idle release (on the timer's
+// goroutine, while the transport is releasing): h's slots and charge go
+// back; the reader pools the header itself (collect).
+func (rd *dgReader) releaseHdr(h *ioHdr) {
+	releaseSlots(h, 1, h.k)
+	h.uncharge()
 }
 
 // dgBackoff sleeps the reader's back-off (5 ms doubling to 100 ms); it
