@@ -332,16 +332,16 @@ func TestIdleSessionExpires(t *testing.T) {
 		case <-time.After(10 * time.Second):
 			t.Fatalf("the dialer session did not end with its Read: %+v", c.Status())
 		}
-		var pend rendr.Event
-		waitFor(t, 10*time.Second, "the passive session's end", func() bool {
-			var ok bool
-			pend, ok = endOf(w.pev, c.ID())
-			return ok
+		// Both ends' EventSessionEnd: events reach OnEvent asynchronously
+		// (L53), so the dialer's may come after its Done and after the
+		// passive's.
+		var pend, dend rendr.Event
+		waitFor(t, 10*time.Second, "both sessions' EventSessionEnd", func() bool {
+			var pok, dok bool
+			pend, pok = endOf(w.pev, c.ID())
+			dend, dok = endOf(w.dev, c.ID())
+			return pok && dok
 		})
-		dend, ok := endOf(w.dev, c.ID())
-		if !ok {
-			t.Fatal("no EventSessionEnd of the dialer session")
-		}
 		for i, ev := range []rendr.Event{dend, pend} {
 			code, _, isAbort := abortOf(ev.Err)
 			if ev.Time.Before(lo) || ev.Time.After(hi) || !errors.Is(ev.Err, rendr.ErrIdleTimeout) && !(isAbort && code == rendr.AbortIdle) {
