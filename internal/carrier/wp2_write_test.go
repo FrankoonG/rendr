@@ -692,7 +692,7 @@ func frameTypes(fs []wire.Frame) []string {
 // through the per-datagram path at "off" (TestMain runs the package in
 // each setting).
 func TestDgBatchHarnessSeam(t *testing.T) {
-	f, _ := newFakeIOPair(1200)
+	f, _ := newFakeIOPair(t, 1200)
 	bio := dgBatchOf(f)
 	n := int(dgTestMaxBatch.Load())
 	if n == 0 {
