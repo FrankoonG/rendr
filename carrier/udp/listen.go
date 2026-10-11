@@ -98,7 +98,7 @@ func listen(ctx context.Context, network, address string, o Options) (net.Packet
 			return nil, err
 		}
 	}
-	return carrier.NewOwnedUDPSocket(u, maxDatagram), nil
+	return carrier.NewOwnedUDPSocketBatch(u, maxDatagram, o.MaxBatch), nil
 }
 
 // configure gives a fresh socket don't-fragment with probe semantics and

@@ -65,12 +65,17 @@ type DatagramStatus struct {
 
 	// I/O on rendr's own UDP sockets (carrier/udp dialer sockets and the
 	// carrier/udp Listen sockets adopted by FromPacketConn). SendCalls and
-	// RecvCalls count the system calls that moved at least one datagram
-	// (sendmmsg/recvmmsg on Linux amd64/arm64, single-datagram calls
-	// otherwise and for H2 repeats, challenges and plain-mode writes); a
-	// call that ended in EAGAIN, EINTR or an error before its first
-	// datagram is not counted. SentDatagrams/SendCalls > 1 shows that
-	// sends were batched. QUIC and embedder sockets are not counted.
+	// RecvCalls count the system calls on rendr-owned sockets that moved
+	// at least one datagram: sendmmsg/recvmmsg on Linux amd64/arm64,
+	// single-datagram calls otherwise and for H2 repeats, challenges,
+	// plain-mode writes and the plain redo after a fallback; a partial
+	// sendmmsg is one call. A call that ended in EAGAIN, EINTR or an error
+	// before its first datagram is not counted. SentDatagrams and
+	// RecvDatagrams count the datagrams those calls moved, so
+	// SentDatagrams/SendCalls > 1 shows that sends were batched. Each
+	// counter is updated at its call's return and read on its own, so a
+	// snapshot taken while calls run may be off by the calls in progress.
+	// QUIC and embedder sockets are not counted.
 	SendCalls, SentDatagrams uint64
 	RecvCalls, RecvDatagrams uint64
 

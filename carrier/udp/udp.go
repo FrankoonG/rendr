@@ -98,7 +98,9 @@ type Options struct {
 	// selects 32, 1 moves one datagram per call, values above 64 become 64;
 	// a listening socket reads at most 32 per call. Batching never delays
 	// a datagram: a writer sends what it has when it wakes. Other
-	// platforms always move one datagram per call.
+	// platforms always move one datagram per call. rendr.Status.Datagram
+	// counts the calls and the datagrams they moved (SendCalls,
+	// SentDatagrams, RecvCalls, RecvDatagrams).
 	MaxBatch int
 }
 
