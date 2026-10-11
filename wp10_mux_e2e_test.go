@@ -1015,6 +1015,16 @@ func mxDgHeldWindow(t *testing.T, writes int, passiveWrites bool) {
 	fc.Dial = tap.wrap(fc.Dial)
 	p := h.peer(fc)
 	d1, p1 := peOpen(t, p, h.ln, DialOptions{}) // the started trunk (view 1)
+	// A one-way delay, so that every OPEN the REL window takes is on the
+	// wire before the first OPEN_ACK can come back: the views then attach
+	// to a window already full at the lost cseq, and their go frames find
+	// no room in every interleaving. Without it the hub answers in the
+	// same instant, and an interleaving that attached the first views
+	// before the later OPENs were placed let every go frame take a slot of
+	// the window (the race lane: 1 of 2,000 runs on m4, 11 of 6,000 on m3).
+	for _, d := range []rendrtest.Dir{rendrtest.Up, rendrtest.Down} {
+		h.hub.SetDelay(d, 5*time.Millisecond, 0)
+	}
 	synctest.Wait()
 	tap.arm(drop)
 	cycles, pcs, vs := mxDgRun(t, p, h.ln, 16, writes, 2*time.Second, passiveWrites)

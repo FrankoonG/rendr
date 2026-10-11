@@ -98,8 +98,8 @@ func g1(t *testing.T, size int64) {
 
 // TestL4G2Miniature: gold/G2-l4 (B1.2; plan:732–738, plan:806; L65)
 // at reduced scale: Links of 50 Mbit/s; one L4 connection to an echo
-// target; the client sends a 1-KiB message every 100 ms (an absolute
-// schedule) for 11 virtual minutes, each message the next 1 KiB of
+// target; the client sends a 1-KiB message every 100 ms (250 ms under
+// -race; an absolute schedule) for 11 virtual minutes, each message the next 1 KiB of
 // PRNG(seed), and reads the echo; then it half-closes. The run is longer
 // than the session's 10-min L4 idle default on both ends (l4.Dial and the
 // Server set it), so an idle clock that traffic did not move would fire
@@ -119,12 +119,18 @@ func TestL4G2Miniature(t *testing.T) {
 }
 
 const (
-	g2Span   = 11 * time.Minute // longer than the 10-min L4 idle default
-	g2Every  = 100 * time.Millisecond
-	g2Msg    = 1 << 10
-	g2Kill   = 50 * time.Second
-	g2Seed   = 21
-	g2Rate   = 50e6 / 8 // 50 Mbit/s
+	g2Span = 11 * time.Minute // longer than the 10-min L4 idle default
+	g2Msg  = 1 << 10
+	g2Kill = 50 * time.Second
+	g2Seed = 21
+	g2Rate = 50e6 / 8 // 50 Mbit/s
+)
+
+// g2Every is the message interval: 100 ms, and 250 ms under the race
+// detector (m3 R1-23's first lever, I3 of M4: the same 11 minutes, kills
+// and criteria on fewer messages); g2Echoes the messages of the run.
+var (
+	g2Every  = map[bool]time.Duration{false: 100 * time.Millisecond, true: 250 * time.Millisecond}[raceEnabled]
 	g2Echoes = int64(g2Span / g2Every)
 )
 

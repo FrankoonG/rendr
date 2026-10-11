@@ -48,7 +48,8 @@ const (
 	churnPoll = 10 * time.Millisecond
 )
 
-// churnMix is the class mix of TestL4ChurnNoLeak_L52 (2,000 connections).
+// churnMix is the class mix of TestL4ChurnNoLeak_L52 (2,000 connections;
+// each class divided by churnScale).
 var churnMix = []struct {
 	class string
 	n     int
@@ -81,6 +82,7 @@ type churn struct {
 	kills                    []churnKillRec
 	earlyPending             int // EarlyReturn ingresses whose l4.Dial returned StatePending
 	earlyFresh, earlyBytes   int // echoe sessions that used a fresh trunk (handle 1); of them, with EarlyBytes > 0
+	earlyExact               int // of them, those that never migrated: all 16 KiB rode the first flight
 }
 
 // churnKillRec is one Link kill of the churn.
@@ -105,7 +107,9 @@ type churnKillRec struct {
 // (the opening deferred to the first use); on these default Props most
 // early sessions open on the mux fast path, where the OPEN carries no
 // EARLY (M4-D17): EarlyBytes > 0 only on a session that used a fresh
-// trunk of its own (handle 1).
+// trunk of its own (handle 1), and an echo session that opened on a fresh
+// trunk and never migrated carried its whole 16-KiB request as early data
+// (Forward's first-read hold, R1-15); at least one such session per run.
 //
 // PASS: every designed outcome exact — refusals with their code (and the
 // dropped SYN at the 5-s budget, + 1 s), resets mid-response as a reset at
@@ -150,7 +154,7 @@ func runChurn(t *testing.T) {
 
 	var classes []string
 	for _, m := range churnMix {
-		for range m.n {
+		for range m.n / churnScale {
 			classes = append(classes, m.class)
 		}
 	}
@@ -202,17 +206,18 @@ func runChurn(t *testing.T) {
 		return st.Dialing == 0 && st.Live == 0 && st.Hooks == 0 && st.Abandoned == 0
 	})
 	st := w.srv.Status()
-	const confirmed = 550 + 550 + 100 + 100 + 100
-	if st.Confirmed != confirmed || st.Rejected != 500 || st.ByCode[l4.CodeRefused] != 300 || st.ByCode[l4.CodeTimeout] != 100 ||
-		st.ByCode[l4.CodeDNSFailure] != 100 || len(st.ByCode) != 3 || st.Unconfirmed != 0 || st.Lost != 0 || st.Panics != 0 {
-		t.Fatalf("Server %+v (by code %v); want %d confirmed, 300 CodeRefused, 100 CodeTimeout, 100 CodeDNSFailure and nothing else",
-			plain(st), st.ByCode, confirmed)
+	const k = churnScale
+	const confirmed = (550 + 550 + 100 + 100 + 100) / k
+	if st.Confirmed != confirmed || st.Rejected != 500/k || st.ByCode[l4.CodeRefused] != 300/k || st.ByCode[l4.CodeTimeout] != 100/k ||
+		st.ByCode[l4.CodeDNSFailure] != 100/k || len(st.ByCode) != 3 || st.Unconfirmed != 0 || st.Lost != 0 || st.Panics != 0 {
+		t.Fatalf("Server %+v (by code %v); want %d confirmed, %d CodeRefused, %d CodeTimeout, %d CodeDNSFailure and nothing else",
+			plain(st), st.ByCode, confirmed, 300/k, 100/k, 100/k)
 	}
 	for _, r := range []struct {
 		name   string
 		counts *rendrtest.DialCounts
 		calls  int64
-	}{{"refused", s.refusedN, 300}, {"syn", s.synN, 100}, {"dns", s.dnsN, 100}} {
+	}{{"refused", s.refusedN, 300 / k}, {"syn", s.synN, 100 / k}, {"dns", s.dnsN, 100 / k}} {
 		if r.counts.Calls() != r.calls || r.counts.Unclosed() != 0 {
 			t.Fatalf("%s hook: %d calls, %d unclosed; want %d, 0", r.name, r.counts.Calls(), r.counts.Unclosed(), r.calls)
 		}
@@ -225,10 +230,10 @@ func runChurn(t *testing.T) {
 		accepted, rstIn, rstOut int
 		finIn                   int // -1: not checked
 	}{
-		{"echo", s.echo, 1100, 0, 0, 1100},
-		{"rst", s.rst, 100, 0, 100, -1},
-		{"stall", s.stall, 100, 100, 0, 100},
-		{"noread", s.noread, 100, 100, 0, -1},
+		{"echo", s.echo, 1100 / k, 0, 0, 1100 / k},
+		{"rst", s.rst, 100 / k, 0, 100 / k, -1},
+		{"stall", s.stall, 100 / k, 100 / k, 0, 100 / k},
+		{"noread", s.noread, 100 / k, 100 / k, 0, -1},
 	} {
 		waitFor(t, 10*time.Second, r.name+" targets closed", func() bool { return r.tg.Counts().Open == 0 })
 		c := r.tg.Counts()
@@ -239,13 +244,16 @@ func runChurn(t *testing.T) {
 	}
 
 	s.mu.Lock()
-	rstLost, earlyPending := s.rstLost, s.earlyPending
+	rstLost, earlyPending, earlyExact := s.rstLost, s.earlyPending, s.earlyExact
 	s.mu.Unlock()
 	if rstLost > churnRSTLostMax {
 		t.Fatalf("%d reset connections lost their RST with a killed carrier, want at most %d", rstLost, churnRSTLostMax)
 	}
-	if earlyPending != 550+100 {
-		t.Fatalf("stimulus: %d EarlyReturn ingresses returned StatePending from l4.Dial, want all 650", earlyPending)
+	if earlyPending != (550+100)/churnScale {
+		t.Fatalf("stimulus: %d EarlyReturn ingresses returned StatePending from l4.Dial, want all %d", earlyPending, (550+100)/churnScale)
+	}
+	if earlyExact == 0 {
+		t.Fatalf("stimulus: no EarlyReturn echo session opened on a fresh trunk of its own without migrating, so no first flight was checked")
 	}
 
 	// W after the last connection with the Peer still open: no session, and
@@ -279,11 +287,11 @@ func runChurn(t *testing.T) {
 		}
 	}
 	s.mu.Lock()
-	t.Logf("2,000 connections, %d kills in %v virtual; stall released %v–%v, noread %v–%v after the last progress; "+
-		"%d resets lost with a killed carrier; EarlyReturn: %d pending at Dial, %d echoe sessions on a fresh trunk, %d with EarlyBytes; "+
+	t.Logf("%d connections, %d kills in %v virtual; stall released %v–%v, noread %v–%v after the last progress; "+
+		"%d resets lost with a killed carrier; EarlyReturn: %d pending at Dial, %d echoe sessions on a fresh trunk, %d with EarlyBytes, %d checked whole; "+
 		"with the Peer open: %d carriers, buffered %d and %d; Server %+v",
-		kills, time.Since(s.start), minOf(s.stallRel), maxOf(s.stallRel), minOf(s.noreadRel), maxOf(s.noreadRel),
-		s.rstLost, s.earlyPending, s.earlyFresh, s.earlyBytes, open, ds.BufferedBytes, ps.BufferedBytes, plain(st))
+		2000/churnScale, kills, time.Since(s.start), minOf(s.stallRel), maxOf(s.stallRel), minOf(s.noreadRel), maxOf(s.noreadRel),
+		s.rstLost, s.earlyPending, s.earlyFresh, s.earlyBytes, s.earlyExact, open, ds.BufferedBytes, ps.BufferedBytes, plain(st))
 	s.mu.Unlock()
 	w.noViolation()
 	w.close()
@@ -373,7 +381,12 @@ func (s *churn) run(class, addr string, seed uint64) {
 // returned StatePending (the opening deferred to the first use; without
 // EarlyReturn it returns StateOpen), and early bytes only on a session that
 // opened on a fresh trunk of its own (handle 1): on the mux fast path the
-// OPEN carries no EARLY (M4-D17), so EarlyBytes stays 0 there.
+// OPEN carries no EARLY (M4-D17), so EarlyBytes stays 0 there. A session
+// on a fresh trunk that never migrated carried the whole request early:
+// Forward held its first read until the request's Write (R1-15), so the
+// 16 KiB rode the first flight (EarlyBytes == 16 KiB). A session that
+// migrated by JOIN onto a freshly dialled trunk also shows handle 1, so the
+// exact check leaves migrated sessions out.
 func (s *churn) runEcho(addr string, seed uint64, early bool) error {
 	in, err := s.w.ingress(s.peer, addr, rendr.DialOptions{EarlyReturn: early}, 0)
 	if err != nil {
@@ -416,11 +429,18 @@ func (s *churn) runEcho(addr string, seed uint64, early bool) error {
 	case st.EarlyBytes > 0 && !fresh:
 		return fmt.Errorf("EarlyBytes %d on a session that only used shared trunks (M4-D17: no EARLY on the fast path): %+v", st.EarlyBytes, st.Carriers)
 	}
+	whole := early && fresh && st.Migrations == (rendr.MigrationCounts{})
+	if whole && st.EarlyBytes != churnEcho {
+		return fmt.Errorf("EarlyReturn session on a fresh trunk of its own, never migrated: EarlyBytes %d, want the whole %d-byte request (R1-15's first-read hold): %+v", st.EarlyBytes, churnEcho, st.Carriers)
+	}
 	if early && fresh {
 		s.mu.Lock()
 		s.earlyFresh++
 		if st.EarlyBytes > 0 {
 			s.earlyBytes++
+		}
+		if whole {
+			s.earlyExact++
 		}
 		s.mu.Unlock()
 	}
