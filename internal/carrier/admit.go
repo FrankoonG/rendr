@@ -181,7 +181,7 @@ func (t *trunk) responsePlacedLocked(v *Conn, typ wire.Type, st wire.AckStatus, 
 // canonical JOIN_ACK without it, the code is the view's, respCode). OK
 // makes the view attached-pending (the attempt returns it; it stays dark
 // until its session's Start); a refusal ends the handle (M3-D7) —
-// CodeListenerClosed marks the trunk unusable for OPENs (R1-10),
+// CAPACITY CodeListenerClosed marks the trunk unusable for OPENs (R1-10),
 // CodeMuxFull (OPEN or JOIN) full until a view leaves. A response that
 // crossed our DETACH (we abandoned the view) ends it when it is a refusal
 // and is ignored otherwise (the passive's DETACH follows). It returns the
@@ -221,7 +221,9 @@ func (t *trunk) onResponse(v *Conn, hdr wire.Header, p []byte) error {
 		if st == wire.StatusOK {
 			v.state = viewAttachedPending
 		} else {
-			if code == wire.CodeListenerClosed && v.vx.first == wire.TypeOpen {
+			// Only CAPACITY's code is a carrier code: REJECTED carries the
+			// application's own (an application may reject with 7).
+			if code == wire.CodeListenerClosed && st == wire.StatusCapacity && v.vx.first == wire.TypeOpen {
 				t.openFull = true
 			}
 			if code == wire.CodeMuxFull && st == wire.StatusCapacity {
