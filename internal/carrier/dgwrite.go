@@ -173,8 +173,10 @@ func (c *Conn) dgPingLocked(w *writer, b *Batch, now time.Time) (kill bool) {
 
 // dgWriteBatch writes the round's datagrams (§A5.8): the stored H2 first and
 // alone, the challenge alone to its candidate, then the sealed frames packed
-// into datagrams under the budget (M2-D12), each built once in the writer's
-// scratch after Headroom() bytes and handed to WriteDatagram with
+// into datagrams under the budget (M2-D12) — through the transport's
+// BatchIO in flushes of up to MaxBatch datagrams (dgWriteFlushes, M5 design
+// §A4.3), or, on a transport without one, each built once in the writer's
+// scratch after Headroom() bytes and handed to WriteDatagram, with
 // Hooks.BeforeWrite before it (M2-D29). One stall window and one
 // SetWriteDeadline cover the round. Per datagram: written; refused as too
 // large — the budget shrinks (M2-D25), its DGRAM counts Refused and its
@@ -196,9 +198,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	_ = io.SetWriteDeadline(now.Add(stall)) // a transport without deadlines still has the watchdog's stage 2
 	hr := io.Headroom()
 	hook := c.env.Hooks
-	var fatal error
-	var txb uint64
-	rackWritten := false
+	rs := dgRound{budget: int(dg.budget.Load()), pinged: w.ping}
 	if h2 {
 		d := append(w.dscratch.B[:hr], dg.hs.h2()...)
 		if check != 0 {
@@ -215,9 +215,9 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		if hook != nil && hook.BeforeWrite != nil {
 			hook.BeforeWrite(c.id, 1, len(d))
 		}
-		fatal = c.dgControlWritten(io.WriteDatagram(d))
+		rs.fatal = c.dgControlWritten(io.WriteDatagram(d))
 	}
-	if fatal == nil && chal {
+	if rs.fatal == nil && chal {
 		var pp [wire.PingFixedLen]byte
 		wire.PutPing(pp[:], &wire.Ping{ID: 0, TS: uint64(now.Sub(c.base)), Nonce: nonce})
 		d := wire.AppendFrame(w.dscratch.B[:hr], wire.Header{Type: wire.TypePing, Fseq: w.fseq}, pp[:])
@@ -225,65 +225,26 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		if hook != nil && hook.BeforeWrite != nil {
 			hook.BeforeWrite(c.id, 1, len(d))
 		}
-		fatal = c.dgControlWritten(io.WriteDatagramTo(d, cand))
+		rs.fatal = c.dgControlWritten(io.WriteDatagramTo(d, cand))
 	}
-	budget := int(dg.budget.Load())
-	pinged, pingT := w.ping, time.Time{}
-	for i := 0; fatal == nil && i < b.Len(); {
-		end, _ := b.nextDatagram(i, budget)
-		d := b.appendDatagram(w.dscratch.B[:hr], i, end)
-		if hook != nil && hook.BeforeWrite != nil {
-			hook.BeforeWrite(c.id, end-i, len(d))
+	if w.bio != nil {
+		c.dgWriteFlushes(w, b, &rs, now)
+	} else {
+		for i := 0; rs.fatal == nil && i < b.Len(); {
+			end, _ := b.nextDatagram(i, rs.budget)
+			d := b.appendDatagram(w.dscratch.B[:hr], i, end)
+			if hook != nil && hook.BeforeWrite != nil {
+				hook.BeforeWrite(c.id, end-i, len(d))
+			}
+			err := io.WriteDatagram(d)
+			c.dgOutcome(w, b, &rs, i, end, err, now, time.Now())
+			i = end
 		}
-		err := io.WriteDatagram(d)
-		n, hasDgram := b.datagramDgram(end)
-		if w.ping && w.pingAt >= i && w.pingAt < end && (err == nil || errors.Is(err, ErrNoise)) {
-			// The PING is committed at the return of the write that carried
-			// it (L23), not at the end of the round: the rest of the round's
-			// writes neither stretch its RTT sample nor let its PONG arrive
-			// before the commit.
-			pingT = time.Now()
-			c.mu.Lock()
-			c.commitPingLocked(w, pingT)
-			c.mu.Unlock()
-			w.ping = false
-		}
-		switch {
-		case err == nil:
-			dg.ctr.datagrams.Add(1)
-			if hasDgram {
-				dg.lastDgram.Store(c.dgSince(now))
-				txb += uint64(n)
-			}
-			if w.rackAt >= i && w.rackAt < end {
-				rackWritten = true
-			}
-		case errors.Is(err, wire.ErrDatagramTooLarge):
-			if hasDgram {
-				dg.ctr.refused.Add(1)
-			}
-			if w.ping && w.pingAt >= i && w.pingAt < end {
-				c.mu.Lock()
-				c.dgUnsentPingLocked(w) // it never left; a probe counts unanswered
-				c.mu.Unlock()
-				pinged = false
-			}
-			if c.dgShrink(err) {
-				fatal = errBudgetFloor
-				break
-			}
-			budget = int(dg.budget.Load())
-		case errors.Is(err, ErrNoise):
-			c.dgDropped(1) // this datagram is lost; the carrier lives
-		default:
-			fatal = err
-		}
-		i = end
 	}
 	end := time.Now()
 	c.disarmWatchdog(gen)
 	b.ReleaseRefs() // the writes returned: the chunk references go
-	if fatal != nil {
+	if fatal := rs.fatal; fatal != nil {
 		if fatal == errBudgetFloor {
 			c.killCarrier(CauseTransportError, fatal.Error())
 			return false
@@ -303,9 +264,9 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	}
 	c.mu.Lock()
 	c.commitLocked(w, b, end) // w.ping is false here: the PING was committed with its datagram
-	c.st.txBytes += txb
+	c.st.txBytes += rs.txb
 	c.relAttemptedLocked(w.retx, w.retxCseq, end)
-	if rackWritten && dg.peerCloseSeen && !wire.SeqLess(w.rackCum, dg.peerCloseCseq) {
+	if rs.rackWritten && dg.peerCloseSeen && !wire.SeqLess(w.rackCum, dg.peerCloseCseq) {
 		dg.peerCloseRacked = true
 	}
 	finish := c.dgRetireDoneLocked()
@@ -316,9 +277,9 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 			hook.RelRetransmit(c.id, w.retxCseq)
 		}
 	}
-	if pinged {
+	if rs.pinged {
 		if o := c.opts.Observer; o != nil {
-			o.PingCommitted(c, w.pingID, pingT)
+			o.PingCommitted(c, w.pingID, rs.pingT)
 		}
 	}
 	if finish {
@@ -330,6 +291,174 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	}
 	return c.death.Load() == nil
 }
+
+// dgRound is what a round's datagram writes build up for its commit.
+type dgRound struct {
+	budget      int       // the send budget the round packs under (lowered by a refusal)
+	txb         uint64    // DGRAM bytes written (Stats.TxBytes)
+	rackWritten bool      // a written datagram carried the round's RACK
+	pinged      bool      // the round's PING left: PingCommitted is reported
+	pingT       time.Time // its commit time
+	fatal       error     // the error that ends the carrier
+}
+
+// dgOutcome applies the result err of the write of the datagram of sealed
+// frames [i, end), which returned at ret, to the round (§A5.8): the PING
+// it carried is committed at ret, written or lost to noise (L23);
+// written — counted, the DGRAM's bytes and the RACK mark; too large —
+// Refused, the PING record goes, the budget shrinks (M2-D25); noise —
+// Dropped; else the error ends the carrier. It reports whether the budget
+// changed: the datagrams packed after this one under the old budget are
+// then packed again.
+func (c *Conn) dgOutcome(w *writer, b *Batch, rs *dgRound, i, end int, err error, now, ret time.Time) (shrank bool) {
+	dg := c.dg
+	n, hasDgram := b.datagramDgram(end)
+	ping := w.ping && w.pingAt >= i && w.pingAt < end
+	if ping && (err == nil || errors.Is(err, ErrNoise)) {
+		// The PING is committed at the return of the write that carried it
+		// (L23), not at the end of the round: the rest of the round's
+		// writes neither stretch its RTT sample nor let its PONG arrive
+		// before the commit.
+		rs.pingT = ret
+		c.mu.Lock()
+		c.commitPingLocked(w, ret)
+		c.mu.Unlock()
+		w.ping = false
+	}
+	switch {
+	case err == nil:
+		dg.ctr.datagrams.Add(1)
+		if hasDgram {
+			dg.lastDgram.Store(c.dgSince(now))
+			rs.txb += uint64(n)
+		}
+		if w.rackAt >= i && w.rackAt < end {
+			rs.rackWritten = true
+		}
+	case errors.Is(err, wire.ErrDatagramTooLarge):
+		if hasDgram {
+			dg.ctr.refused.Add(1)
+		}
+		if ping {
+			c.mu.Lock()
+			c.dgUnsentPingLocked(w) // it never left; a probe counts unanswered
+			c.mu.Unlock()
+			rs.pinged = false
+		}
+		if c.dgShrink(err) {
+			rs.fatal = errBudgetFloor
+			return false
+		}
+		before := rs.budget
+		rs.budget = int(dg.budget.Load())
+		return rs.budget != before
+	case errors.Is(err, ErrNoise):
+		c.dgDropped(1) // this datagram is lost; the carrier lives
+	default:
+		rs.fatal = err
+	}
+	return false
+}
+
+// dgArenaSize is the size requested for a round's arena: the 64 KiB class
+// of DBufs, which holds the largest datagram (wire.MaxDatagram with its
+// flow header) (M5-D11).
+const dgArenaSize = 64 << 10
+
+// dgWriteFlushes writes the round's sealed frames through the transport's
+// BatchIO (M5 design §A4.3; L55, L23, M2-D25, M2-D29): the datagrams are
+// packed in order into the round's arena (one DBufs buffer of the 64 KiB
+// class, charged to the stage account, taken here and released at the
+// end; it holds copies, never a chunk reference) and flushed with one
+// WriteDatagrams call when the flush holds MaxBatch datagrams, the arena
+// cannot hold the next one, the datagram carrying the round's PING was
+// just added — so that PING commits at the return of the call that wrote
+// it (L23) — or the round's frames are exhausted: batching never waits for
+// frames (L55). Hooks.BeforeWrite runs for each datagram, in order, before
+// the call that carries it. The result is mapped datagram by datagram
+// (dgOutcome): ds[:n] written; ds[n] refused — the rest of the round is
+// packed again from the frame after it if the budget shrank, else the
+// flush goes on with ds[n+1:] — lost to noise (the flush goes on with
+// ds[n+1:]) or fatal (the round's unsent datagrams are never written). A
+// count outside [0, len], a short count without an error, or a full count
+// with one, is fatal (L42). Counters move only for the written indexes, at
+// the call's return (L55).
+func (c *Conn) dgWriteFlushes(w *writer, b *Batch, rs *dgRound, now time.Time) {
+	if b.Len() == 0 {
+		return
+	}
+	bio := w.bio
+	hr := c.dg.io.Headroom()
+	hook := c.env.Hooks
+	maxB := min(max(bio.MaxBatch(), 1), MaxBatchFrames)
+	w.arena = c.dbufs().Get(dgArenaSize, c.env.stageBudget())
+	var ends [MaxBatchFrames]int // the frame end of each datagram of the flush
+	for i := 0; rs.fatal == nil && i < b.Len(); {
+		first := i
+		arena := w.arena.B[:0]
+		var ds [][]byte
+		nd := 0
+		for i < b.Len() && nd < maxB {
+			end, n := b.nextDatagram(i, rs.budget)
+			if nd > 0 && len(arena)+hr+n > cap(arena) {
+				break // the arena is full: flush, then go on
+			}
+			var ln int
+			ds, ln = b.appendDatagramArena(i, end, arena[:len(arena)+hr])
+			arena = arena[:ln]
+			if hook != nil && hook.BeforeWrite != nil {
+				hook.BeforeWrite(c.id, end-i, len(ds[nd]))
+			}
+			ends[nd] = end
+			nd++
+			ping := w.ping && w.pingAt >= i && w.pingAt < end
+			i = end
+			if ping {
+				break // the PING's datagram ends its flush (L23)
+			}
+		}
+		for sent := 0; sent < nd && rs.fatal == nil; {
+			k, err := bio.WriteDatagrams(ds[sent:nd])
+			ret := time.Now()
+			if k < 0 || k > nd-sent || (err == nil) != (k == nd-sent) {
+				// Out of range, short without an error, or an error for a
+				// datagram past the last (L42).
+				rs.fatal = errBatchCount
+				break
+			}
+			for j := sent; j < sent+k; j++ {
+				c.dgOutcome(w, b, rs, dgStart(first, ends[:], j), ends[j], nil, now, ret)
+			}
+			sent += k
+			if err == nil {
+				break
+			}
+			j := sent
+			sent++
+			if c.dgOutcome(w, b, rs, dgStart(first, ends[:], j), ends[j], err, now, ret) && sent < nd {
+				i = ends[j] // packed under the old budget: pack the rest again
+				break
+			}
+		}
+		b.resetFlush()
+	}
+	w.arena.Release()
+	w.arena = nil
+}
+
+// dgStart returns the first sealed frame of the flush's j-th datagram: the
+// end of the one before it, or first.
+func dgStart(first int, ends []int, j int) int {
+	if j == 0 {
+		return first
+	}
+	return ends[j-1]
+}
+
+// errBatchCount: a batched write reported a count outside the datagrams it
+// was given, fewer without an error, or all of them with an error (L42:
+// the carrier dies, never retried).
+var errBatchCount = errors.New("rendr/carrier: batched datagram write returned an invalid count")
 
 // errBudgetFloor: a refusal lowered the budget below wire.ControlFloor.
 var errBudgetFloor = errors.New("datagram budget below the control floor")
