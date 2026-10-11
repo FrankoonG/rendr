@@ -20,7 +20,7 @@ type Config struct {
 	JoinStagger      time.Duration // 1 s; 0.1 s–10 s; failover race stagger
 	RetireGrace      time.Duration // 2 s; 0–30 s; old carrier's retirement bound after a planned switch
 
-	Selector SelectorPolicy
+	Selector SelectorPolicy // the selector's quality-switch parameters
 
 	PingBusy time.Duration // 50 ms; 10 ms–500 ms and ≤ DeadMin/4
 	PingIdle time.Duration // 10 s; 1 s–60 s
@@ -29,7 +29,7 @@ type Config struct {
 	DeadMax    time.Duration // 4 s; DeadMin–30 s
 	WriteStall time.Duration // 2 s; 0.5 s–DeadMax
 
-	Probe ProbePolicy
+	Probe ProbePolicy // the Peer health layer (probe carriers)
 
 	DialTimeout time.Duration // 10 s; 1 s–60 s; bounds one factory call and one whole dial attempt
 	Linger      time.Duration // 30 s; 1 s–300 s; Close's background delivery bound
@@ -70,8 +70,8 @@ type Config struct {
 	// Status.BufferedBytes reports both.
 	MaxBufferedBytes int64
 
-	Handshake   HandshakeLimits
-	Sessionless SessionlessLimits
+	Handshake   HandshakeLimits   // what an unadmitted carrier may cost, OPEN metadata and early data
+	Sessionless SessionlessLimits // the probe carriers dialers keep on this (passive) Runtime
 
 	// PacketPing (1 s; 0.2 s–10 s and ≤ DeadMin/2) is the PING cadence of
 	// a datagram carrier that moved a datagram within PingIdle, and the

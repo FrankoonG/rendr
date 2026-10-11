@@ -147,14 +147,14 @@ type tparse struct {
 // were forwarded; a frame of another tamper forwarded by a Splice is
 // logged with Spliced set and that tamper's index.
 type FrameRec struct {
-	Len     int // payload length
-	Index   int
-	Off     int64
-	Handle  uint32
-	Fseq    uint32
-	Type    FrameType
-	Flags   uint8
-	Spliced bool
+	Len     int       // payload length
+	Index   int       // index in the sender's stream of frames
+	Off     int64     // offset of the frame's first byte in the forwarded stream
+	Handle  uint32    // the frame's session handle
+	Fseq    uint32    // the frame's sequence number
+	Type    FrameType // the frame's type
+	Flags   uint8     // the frame's flags
+	Spliced bool      // forwarded from another tamper by a Splice
 }
 
 // TamperStats counts the operations that fired, one counter per operation.
@@ -164,8 +164,8 @@ type FrameRec struct {
 // attempted (a replay that kills the carrier often meets a receiver that
 // closed during the write; the frame tap logs only what went out).
 type TamperStats struct {
-	Flipped, Dropped, Duplicated, Replayed int
-	Spliced, Switched, Rewritten           int
+	Flipped, Dropped, Duplicated, Replayed int   // FlipBit, DropFrame, DuplicateFrame, ReplayFrame
+	Spliced, Switched, Rewritten           int   // Splice, SwitchUpstream, RewriteHandle
 	Held                                   int   // Hold calls that stopped a direction
 	SplicedBytes                           int64 // bytes forwarded from another tamper by Splice
 	// FlipMissed counts FlipBit operations whose bit lay outside their

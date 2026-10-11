@@ -529,11 +529,11 @@ func b2i(b bool) int {
 // and RST "In" as the target saw them from its client, "Out" as it sent
 // them) and one record per connection in accept order.
 type TargetCounts struct {
-	Accepted, Open    int // connections accepted; open now
-	FINIn, FINOut     int
-	RSTIn, RSTOut     int
-	BytesIn, BytesOut int64
-	Conns             []TargetConnCounts
+	Accepted, Open    int                // connections accepted; open now
+	FINIn, FINOut     int                // FINs received from clients; FINs sent
+	RSTIn, RSTOut     int                // resets received from clients; resets sent
+	BytesIn, BytesOut int64              // bytes read and written
+	Conns             []TargetConnCounts // one per connection, in accept order
 }
 
 // TargetConnCounts is one connection of a Target. FINIn: the client's FIN
@@ -549,9 +549,9 @@ type TargetConnCounts struct {
 	Addr              string   // the address Dial was called with
 	BytesIn, BytesOut int64    // bytes the target read and wrote
 	SHAIn, SHAOut     [32]byte // SHA-256 of each direction
-	FINIn, FINOut     bool
-	RSTIn, RSTOut     bool
-	Open              bool
+	FINIn, FINOut     bool     // see the type documentation
+	RSTIn, RSTOut     bool     // see the type documentation
+	Open              bool     // the target has not closed its end yet
 }
 
 // connStats is one connection's counters, guarded by its Target's lock
