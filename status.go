@@ -123,7 +123,7 @@ type SessionStatus struct {
 	AckedBytes         uint64 // acknowledged as delivered to the peer application
 	RxBytes            uint64 // received in order
 	DeliveredBytes     uint64 // read by the application (or discarded after Close)
-	RetransmittedBytes uint64 // DATA payload bytes sent again after a carrier death or a bond rescue
+	RetransmittedBytes uint64 // DATA payload bytes sent again from the retransmit queue (requeued after a carrier death, a bond rescue or an early-data verdict)
 
 	Window     int64 // currently advertised receive window
 	PeerWindow int64 // peer's right edge minus AckedBytes

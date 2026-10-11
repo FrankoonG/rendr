@@ -196,10 +196,11 @@ func (ln *Listener) start() {
 // Handshake.Timeout). It returns net.ErrClosed after Close; c is then closed.
 //
 // Limitation: rendr drains a retiring carrier through a half-close only on
-// the connections package carrier/tcp creates. A conn pushed here (or
-// returned by a StreamCarrier) is closed at the drain bound instead, so a
-// peer that stalls reading can see its transport reset; the session has
-// already moved off that carrier and is not affected.
+// the connections package carrier/tcp creates, whichever way they arrive.
+// A conn of any other type, pushed here or returned by a StreamCarrier, is
+// closed at the drain bound instead, so a peer that stalls reading can see
+// its transport reset; the session has already moved off that carrier and
+// is not affected.
 func (ln *Listener) Handle(c net.Conn) error {
 	if c == nil {
 		return errNilConn

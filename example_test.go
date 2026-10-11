@@ -128,6 +128,9 @@ func ExamplePeer_DialPacket() {
 		if err != nil {
 			return
 		}
+		// Bound the reads by ctx, so that a lost close cannot hang the example.
+		stop := context.AfterFunc(ctx, func() { pc.SetReadDeadline(time.Now()) })
+		defer stop()
 		buf := make([]byte, pc.MaxPayload())
 		for {
 			n, _, err := pc.ReadFrom(buf) // io.EOF once the dialer closed
@@ -179,7 +182,11 @@ func ExamplePeer_DialPacket() {
 	case <-pc.Done():
 	case <-ctx.Done():
 	}
-	<-served
+	select {
+	case <-served:
+	case <-ctx.Done():
+		log.Fatal("the passive side did not end")
+	}
 	// Output:
 	// ping back over a datagram session
 }

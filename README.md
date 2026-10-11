@@ -483,7 +483,7 @@ the socket buffers (4 MiB read, 1 MiB write) and `MaxBatch` (32; 1–64).
 | the peer's FIN reached the contiguous delivery point | `Read` returns `io.EOF` — the only source of EOF |
 | a carrier's EOF, reset, timeout, read or write error, protocol violation, write stall or instance mismatch | nothing: rendr moves the session to another carrier |
 | no carrier for `NoPathGrace` (passive: `PassiveRetain`) | `ErrNoPath` |
-| the bound instance answered UNKNOWN_SESSION, or the peer restarted | `ErrSessionLost` |
+| the bound instance answered UNKNOWN_SESSION, or the peer restarted | `ErrSessionLost`; but when both ends negotiated the optional end-code feature bit on a stream carrier, a JOIN refused for a session the peer had reset returns that reset's `*AbortError` (`ErrAborted`, `Remote` true) instead |
 | the peer reset the session (its linger expired, its `Runtime.Close`, its idle timeout, `Conn.Abort`) | `ErrAborted`; `errors.As` gives `*AbortError{Code, Msg, Remote}` |
 | Dial: the peer application called `Reject` | `ErrRejected`; `*RejectError{Code, Msg}` |
 | Dial: the peer's capacity, backlog, accept timeout or shutdown; local `MaxSessions` | `ErrCapacity` |
@@ -612,7 +612,11 @@ Windows, macOS and the other architectures.
   `sendmmsg` or `recvmmsg`, the socket moves to one datagram per call for
   the rest of its life, redoing the refused call that way; nothing is lost
   or reordered by the switch. `Status.Datagram.BatchFallbacks` counts the
-  sockets that switched.
+  sockets that switched. rendr also checks once per process, before its
+  first batched socket, whether the batch calls are permitted; if they are
+  not, every socket starts with one datagram per call and `BatchFallbacks`
+  stays 0. In that case `SentDatagrams / SendCalls` and
+  `RecvDatagrams / RecvCalls` stay at 1 under load.
 - **Reading `Status.Datagram`.** `SendCalls` and `RecvCalls` count the
   system calls on rendr's own sockets that moved at least one datagram,
   `SentDatagrams` and `RecvDatagrams` the datagrams they moved:
@@ -661,10 +665,14 @@ A/A noise band {noise} %, {date}).
 **Packet rate.** A packet session over `carrier/udp` with one carrier,
 1,000-byte datagrams, one direction at a time, on a single path through a
 router namespace with no shaping (MTU 1500): the rate steps up from 50,000
-to 300,000 datagrams a second in 12-s steps (10 s measured), and the
-ceiling is the highest step delivered without loss. "A → B" is the dialer
-sending on its own socket to the passive's listening socket; "B → A" the
-passive sending through its listening socket to the dialer.
+to 300,000 datagrams a second (50, 80, 100, 125, 150, 200, 250 and 300
+thousand) in 12-s steps (10 s measured). A step passes when the receiver
+got at least 99 % and the generator sent at least 98 % of the datagrams the
+step's rate calls for; the ceiling is the highest passing step, capped at
+the ceiling of a raw-UDP reference ramp on the same path, and a direction
+stops after two failed steps. "A → B" is the dialer sending on its own
+socket to the passive's listening socket; "B → A" the passive sending
+through its listening socket to the dialer.
 
 <!-- FIGURE: packet-rate ceiling per direction (A → B, B → A) with MaxBatch default (32) and MaxBatch 1, plus the raw-UDP reference ceiling and the CPU microseconds per datagram per role, and the date; method: the ramp described above on an idle Linux VM; source case: perf/pps-ceiling at the M5 gate -->
 The packet-rate ceiling is {ceiling-ab} datagrams a second from A to B and

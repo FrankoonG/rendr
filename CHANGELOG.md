@@ -148,9 +148,11 @@ Measured on idle Linux virtual machines; the methods are in the README's
 
 <!-- FIGURE: packet-rate ceiling per direction with MaxBatch default and 1, relative to the raw-UDP reference on the same path; source case: perf/pps-ceiling at the M5 gate -->
 - Packet rate (1,000-byte datagrams, one `carrier/udp` carrier, a 12-s
-  step ramp per direction): a ceiling of {ceiling-ab} datagrams a second
-  from dialer to passive and {ceiling-ba} back, {raw-share-ab} and
-  {raw-share-ba} of raw UDP on the same path.
+  step ramp per direction; a step passes when 99 % of its datagrams
+  arrive and 98 % were sent; capped at the raw-UDP reference): a ceiling
+  of {ceiling-ab} datagrams a second from dialer to passive and
+  {ceiling-ba} back, {raw-share-ab} and {raw-share-ba} of raw UDP on the
+  same path.
 
 <!-- FIGURE: G3 at 100 kpps per mode: delivered fraction and worst switch gap; source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
 - 100,000 datagrams a second across ten switching events (G3): selector,
@@ -302,21 +304,13 @@ Sessions and L4:
 
 Test coverage:
 
-- `Runtime.Close` racing a closed Peer's failover has an untested path (a
-  carrier pool that re-registers after Close's first snapshot).
-
-- A two-way bulk row of the shared-carrier scenarios
-  (`TestMuxBulkBothWaysKeepsTheLink`/shallow) misses its 0.85 floor in
-  about 1 of 200 runs (0.844–0.848).
-- The forced open-first row of the shared-carrier idle failover test is
-  not committed; the row's premise check guards regressions.
-- Two adversarial mutants survive the race miniatures; tamper statistics
-  count successful replays only.
-- Some real-socket rows lose datagrams away from carrier kills only on a
-  heavily loaded Windows development host; the Linux runs are clean.
-- The private regression's flake sweeps ran 129–411 runs per test for four
-  scenario packages (fewer than the 600 planned), its race lane sits near
-  its time budget, and its churn resource check samples once per 30 s.
+- With two-way bulk traffic over a shared (mux) carrier in a shallow
+  carrier buffer, throughput in one direction occasionally falls just
+  below 85 % of its share (about 1 run in 200, at 84.4–84.8 %).
+- Two deliberately injected race-mode defects go undetected by the
+  race-mode scenario tests, and replayed-frame tests reach the edges of
+  the receive window only by chance.
+- The scenario packages' flake sweeps were smaller than planned.
 
 ### Dependencies
 
