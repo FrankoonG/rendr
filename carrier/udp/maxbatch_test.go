@@ -24,8 +24,10 @@ var maxBatchRows = []struct{ in, want int }{
 // which an owned Source's reads cap at 32, R1-6). Dial: the factory hands
 // the option to the dialer token's constructor (newOwnedUDP, observed
 // through the seam: the token shows its depth only once a carrier bound
-// it on Linux amd64/arm64), which normalises it as Listen's does — the
-// returned token is that constructor's. The real-socket half on Linux,
+// it on Linux amd64/arm64), which normalises it as Listen's does
+// (internal/carrier's TestOwnedUDPMaxBatchNormalised checks the stored
+// value row by row) — the returned token is that constructor's. The
+// real-socket half on Linux,
 // where MaxBatch 1 makes every call move one datagram, is
 // TestRealUDPBatchE2E (internal/scenario/realsock).
 func TestUDPOptionsMaxBatch(t *testing.T) {

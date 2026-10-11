@@ -34,7 +34,11 @@ const sioRounds = 200
 // verified: seq, size, CRC-32C, body).
 //
 // Arm "carrier/udp" (udp.Carrier to a udp.Listen socket adopted by
-// FromPacketConn): on both Runtimes calls and datagrams in both directions,
+// FromPacketConn): first a one-way burst (sioBurst) tells the send
+// counters from the receive counters — the dialer's SentDatagrams and the
+// passive's RecvDatagrams grow by at least the burst, the opposite
+// counters by much less; then, after the ping-pong, on both Runtimes calls
+// and datagrams in both directions,
 // at least sioRounds datagrams each way, each call moving at least one
 // datagram, no fallback and no refused charge, counters that never go back
 // between a snapshot during the session and the final one; one datagram
@@ -57,6 +61,7 @@ func TestStatusDatagramIOCounters(t *testing.T) {
 			t.Fatal(err)
 		}
 		dc, pc := sioOpen(t, d, ln, udp.Carrier("u", "udp4", ls.LocalAddr().String(), udp.Options{}))
+		sioBurst(t, d, p, dc, pc)
 		sioPingPong(t, dc, pc)
 		mid := [2]rendr.DatagramStatus{d.Status().Datagram, p.Status().Datagram}
 		sioEnd(t, d, p, dc, pc)
@@ -183,6 +188,69 @@ func sioOpen(t *testing.T, d *rendr.Runtime, ln *rendr.Listener, c rendr.Carrier
 		t.Fatalf("DialPacket: %v", r.err)
 	}
 	return r.c, pc
+}
+
+// sioBurst writes sioRounds test datagrams of 700 … 999 bytes from dc in
+// groups of 50, each group read and verified on pc before the next is
+// written. Every datagram is above half the carrier's MTU (1,223 bytes), so
+// no two share a UDP datagram. Between a snapshot before the burst and one
+// after the last read, the dialer's SentDatagrams and the passive's
+// RecvDatagrams grow by at least the datagrams read, and the dialer's
+// RecvDatagrams and the passive's SentDatagrams — the passive's
+// acknowledgements and keepalives only — by less than half of that. A
+// group that loopback loses part of is given up after 2 s; at least 90 %
+// must arrive.
+func sioBurst(t *testing.T, d, p *rendr.Runtime, dc, pc *rendr.PacketConn) {
+	t.Helper()
+	const group = 50
+	snap := func() [2]rendr.DatagramStatus {
+		return [2]rendr.DatagramStatus{d.Status().Datagram, p.Status().Datagram}
+	}
+	before := snap()
+	v := rendrtest.NewPacketVerifier(0xb0)
+	out := make([]byte, 1024)
+	in := make([]byte, 2048)
+	for seq := uint64(0); seq < sioRounds; {
+		for end := seq + group; seq < end; seq++ {
+			if _, err := dc.WriteTo(rendrtest.PacketPayload(out, 0xb0, seq, 700+int(seq*37%300), time.Now()), nil); err != nil {
+				t.Fatalf("burst WriteTo seq %d: %v", seq, err)
+			}
+		}
+		_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		for v.Result().Unique+v.Result().Duplicates < seq {
+			n, _, err := pc.ReadFrom(in)
+			if err != nil {
+				break // lost on loopback: judged below
+			}
+			if err := v.Add(in[:n], time.Now()); err != nil {
+				t.Fatalf("burst: %v", err)
+			}
+		}
+	}
+	_ = pc.SetReadDeadline(time.Time{})
+	r := v.Result()
+	if r.Unique < sioRounds*9/10 || r.Corrupt != 0 || r.BadSize != 0 || r.Duplicates != 0 {
+		t.Fatalf("burst: %+v, want at least %d of %d distinct and intact", r, sioRounds*9/10, sioRounds)
+	}
+	// A call's counters move at its return, which may follow the peer's
+	// read of its datagrams: wait (5 s at most) until both cover the burst.
+	got := r.Unique
+	var after [2]rendr.DatagramStatus
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+		after = snap()
+		if after[0].SentDatagrams-before[0].SentDatagrams >= got && after[1].RecvDatagrams-before[1].RecvDatagrams >= got || time.Now().After(deadline) {
+			break
+		}
+	}
+	dSent, pRecv := after[0].SentDatagrams-before[0].SentDatagrams, after[1].RecvDatagrams-before[1].RecvDatagrams
+	dRecv, pSent := after[0].RecvDatagrams-before[0].RecvDatagrams, after[1].SentDatagrams-before[1].SentDatagrams
+	t.Logf("burst of %d datagrams (%d read): dialer sent %d, received %d; passive sent %d, received %d", sioRounds, got, dSent, dRecv, pSent, pRecv)
+	if dSent < got || pRecv < got {
+		t.Errorf("burst: the dialer's SentDatagrams grew by %d, the passive's RecvDatagrams by %d: want at least the %d datagrams read", dSent, pRecv, got)
+	}
+	if dRecv >= got/2 || pSent >= got/2 {
+		t.Errorf("burst: the dialer's RecvDatagrams grew by %d, the passive's SentDatagrams by %d: want fewer than %d (control datagrams only)", dRecv, pSent, got/2)
+	}
 }
 
 // sioPingPong sends sioRounds test datagrams from dc; pc echoes each one

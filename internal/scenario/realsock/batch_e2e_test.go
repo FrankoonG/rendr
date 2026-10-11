@@ -73,9 +73,12 @@ const beMinShare = 0.90
 
 // beUncounted bounds the datagrams one dialer carrier writes through its
 // socket before its writer and reader bind the token's counted I/O: the
-// datagram handshake (H1 and its repeats, M5 report contract note 1).
-// Until the handshake is counted, the dialer's SentDatagrams may fall short
-// of what the passive received by at most this many per dial.
+// dialer's datagram handshake (H1 and its repeats, the REL) runs on the
+// token's single calls before the carrier's writer and reader start, and
+// those calls are not counted yet, short of DatagramStatus's godoc. Until
+// that gap is closed, the dialer's SentDatagrams may fall short of what
+// the passive received by at most this many per dial; once the handshake
+// is counted, beUncounted is 0.
 const beUncounted = 8
 
 func beRun(t *testing.T, maxBatch int) {
@@ -96,22 +99,29 @@ func beRun(t *testing.T, maxBatch int) {
 
 	up := &msSide{v: rendrtest.NewPacketVerifier(0xb17c4)}
 	down := &msSide{v: rendrtest.NewPacketVerifier(0x4c71b)}
+	flows := []*beFlow{
+		{name: "up", s: up, seed: 0xb17c4, tx: dc, rx: pc, rxRT: m.p},
+		{name: "down", s: down, seed: 0x4c71b, tx: pc, rx: dc, rxRT: m.d},
+	}
 	var readers, writers sync.WaitGroup
 	readers.Add(2)
 	go up.receive(pc, &readers)
 	go down.receive(dc, &readers)
 	start := make(chan struct{})
-	writers.Add(2)
-	go beGenerate(up, dc, 0xb17c4, start, &writers)
-	go beGenerate(down, pc, 0x4c71b, start, &writers)
+	presumptions := make([]int, len(flows))
+	writers.Add(len(flows))
+	for i, f := range flows {
+		go beGenerate(f, start, &writers, &presumptions[i])
+	}
 	began := time.Now()
 	close(start)
 	writers.Wait()
-	t.Logf("MaxBatch %d: both generators wrote %d datagrams in %v", maxBatch, beCount, time.Since(began).Round(time.Millisecond))
+	t.Logf("MaxBatch %d: both generators wrote %d datagrams in %v (stall presumptions: up %d, down %d)",
+		maxBatch, beCount, time.Since(began).Round(time.Millisecond), presumptions[0], presumptions[1])
 
-	beDrain(t, []beDir{{"up", up, dc, pc}, {"down", down, pc, dc}})
-	for _, d := range []beDir{{"up", up, dc, pc}, {"down", down, pc, dc}} {
-		beJudge(t, d)
+	beDrain(t, flows)
+	for _, f := range flows {
+		beJudge(t, f)
 	}
 	dmid, pmid := m.d.Status().Datagram, m.p.Status().Datagram
 
@@ -163,65 +173,102 @@ func beRun(t *testing.T, maxBatch int) {
 
 // beWindow bounds the datagrams of one direction in flight end to end:
 // accepted by WriteTo and neither read by the peer's application nor
-// dropped by the sender. At most 512 × 1,000 bytes: half the session's
-// default Queue and an eighth of the sockets' 4-MiB receive buffers, so
-// neither the send queue nor a socket overflows whatever the scheduler
-// does (one P included), and a writer that wakes always finds a backlog.
-const beWindow = 512
+// counted lost (beFlow.losses). 256 × at most 1,000 bytes: half of a raw
+// flow's inbox (udpflow.DefaultInbox, 512 datagrams, which also carries
+// the other direction's control datagrams), a quarter of the session's
+// default Queue and a sixteenth of the sockets' 4-MiB receive buffers, so
+// no queue on the path overflows whatever the scheduler does (one P under
+// -race included), and a writer that wakes always finds a backlog.
+const beWindow = 256
 
-// beStall is how long a generator waits without progress before it
-// presumes the datagrams that left the sender and were not read lost and
-// moves on (never those still in the sender's queue).
-const beStall = 50 * time.Millisecond
+// beStall is how long a blocked generator waits with nothing read and no
+// loss counted before it presumes that the datagrams which left the
+// sender vanished unseen (a socket buffer drops without a counter) and
+// moves on. Every loss rendr counts is subtracted at once (beFlow.losses),
+// so the presumption is a last resort that a run on loopback should never
+// need; the run logs each one.
+const beStall = time.Second
 
-// beGenerate writes beCount test datagrams of seed on c once start closes,
-// as fast as the path takes them: WriteTo back to back while fewer than
-// beWindow datagrams are in flight (s.read is the peer's reader of this
-// direction), 50-µs pauses while beWindow are. It counts the accepted ones
-// in s.
-func beGenerate(s *msSide, c *rendr.PacketConn, seed uint64, start <-chan struct{}, wg *sync.WaitGroup) {
+// beFlow is one direction of the run: its side, its seed, the sending and
+// the receiving conn and the receiving Runtime.
+type beFlow struct {
+	name   string
+	s      *msSide
+	seed   uint64
+	tx, rx *rendr.PacketConn
+	rxRT   *rendr.Runtime
+}
+
+// losses returns the datagrams of f that rendr counted lost — the send
+// side's drops, the receiving session's receive-queue and late drops and
+// the receiving Runtime's flow-inbox drops (which may include the other
+// direction's control datagrams: an overcount that only shrinks the
+// window) — and the ones still in the sender's queue. ok is false if a
+// conn reports no packet counters.
+func (f *beFlow) losses() (lost, queued int64, ok bool) {
+	tp, rp := f.tx.Status().Packet, f.rx.Status().Packet
+	if tp == nil || rp == nil {
+		return 0, 0, false
+	}
+	txDrops := tp.DropQueue + tp.DropAge + tp.DropNoPath + tp.DropTooLarge
+	lost = int64(txDrops + rp.DropRecvQueue + rp.DropLate + f.rxRT.Status().Datagram.InboxDrops)
+	queued = int64(f.s.accepted.Load()) - int64(tp.Sent+txDrops)
+	return lost, queued, true
+}
+
+// beGenerate writes beCount test datagrams of f once start closes, as fast
+// as the path takes them: WriteTo back to back while fewer than beWindow
+// datagrams are in flight (f.s.read is the peer's reader of this
+// direction), 50-µs pauses while beWindow are, the counted losses
+// refreshed every millisecond in which nothing was read. It counts the
+// accepted datagrams in f.s and the stall presumptions in *presumptions.
+func beGenerate(f *beFlow, start <-chan struct{}, wg *sync.WaitGroup, presumptions *int) {
 	defer wg.Done()
+	s := f.s
 	buf := make([]byte, 1024)
 	<-start
 	now := time.Now()
-	var dropped, presumed int64 // dropped by the sender; presumed lost after a stall
-	inflight := func(seq int64) int64 { return seq - int64(s.read.Load()) - dropped - presumed }
+	var lost, presumed int64 // counted lost; presumed lost after a stall (beStall)
+	inflight := func(seq int64) int64 { return seq - int64(s.read.Load()) - lost - presumed }
 	for seq := range int64(beCount) {
 		if inflight(seq) >= beWindow {
-			last, since := s.read.Load(), time.Now()
+			last, since, polled := s.read.Load(), time.Now(), time.Now()
 			for inflight(seq) >= beWindow {
+				time.Sleep(50 * time.Microsecond)
 				if r := s.read.Load(); r != last {
 					last, since = r, time.Now()
-				} else if time.Since(since) >= beStall {
-					st := c.Status().Packet
-					if st == nil {
-						s.verr.CompareAndSwap(nil, errors.New("no packet counters"))
-						return
-					}
-					dropped = int64(st.DropQueue + st.DropAge + st.DropNoPath + st.DropTooLarge)
-					presumed = max(presumed, int64(st.Sent)-int64(s.read.Load()))
-					since = time.Now()
 					continue
 				}
-				time.Sleep(50 * time.Microsecond)
+				if time.Since(polled) < time.Millisecond {
+					continue
+				}
+				polled = time.Now()
+				l, queued, ok := f.losses()
+				if !ok {
+					s.verr.CompareAndSwap(nil, errors.New("no packet counters"))
+					return
+				}
+				if l != lost {
+					lost, since = l, time.Now()
+					continue
+				}
+				if time.Since(since) >= beStall {
+					// Only what left the sender: in flight drops to queued.
+					presumed = max(presumed, seq-int64(s.read.Load())-lost-queued)
+					*presumptions++
+					since = time.Now()
+				}
 			}
 		}
 		if seq%64 == 0 {
 			now = time.Now()
 		}
-		if _, err := c.WriteTo(rendrtest.PacketPayload(buf, seed, uint64(seq), msSize(uint64(seq)), now), nil); err != nil {
+		if _, err := f.tx.WriteTo(rendrtest.PacketPayload(buf, f.seed, uint64(seq), msSize(uint64(seq)), now), nil); err != nil {
 			s.verr.CompareAndSwap(nil, err)
 			return
 		}
 		s.accepted.Add(1)
 	}
-}
-
-// beDir is one direction: its side, the sending and the receiving conn.
-type beDir struct {
-	name   string
-	s      *msSide
-	tx, rx *rendr.PacketConn
 }
 
 // beDrain waits until both directions settled: the sender's counters
@@ -230,7 +277,7 @@ type beDir struct {
 // Received), and the receive counters did not move for a quiet interval
 // (100 ms; 300 ms under -race). It gives up after 10 s and leaves the
 // verdict to beJudge.
-func beDrain(t *testing.T, dirs []beDir) {
+func beDrain(t *testing.T, dirs []*beFlow) {
 	t.Helper()
 	quiet, limit := 100*time.Millisecond, 10*time.Second
 	if msRace {
@@ -268,13 +315,13 @@ func beDrain(t *testing.T, dirs []beDir) {
 }
 
 // beJudge checks one direction: stimulus, load and per-datagram integrity.
-func beJudge(t *testing.T, d beDir) {
+func beJudge(t *testing.T, d *beFlow) {
 	t.Helper()
 	tp, rp := d.tx.Status().Packet, d.rx.Status().Packet
 	res := d.s.v.Result()
-	t.Logf("%s: accepted %d, sent %d (queue %d, age %d, no path %d, too large %d); received %d, read %d, unique %d (recv-queue %d, late %d, dup %d)",
+	t.Logf("%s: accepted %d, sent %d (queue %d, age %d, no path %d, too large %d); received %d, read %d, unique %d (recv-queue %d, late %d, dup %d; the receiving Runtime's inbox drops %d)",
 		d.name, d.s.accepted.Load(), tp.Sent, tp.DropQueue, tp.DropAge, tp.DropNoPath, tp.DropTooLarge,
-		rp.Received, d.s.read.Load(), res.Unique, rp.DropRecvQueue, rp.DropLate, rp.Duplicates)
+		rp.Received, d.s.read.Load(), res.Unique, rp.DropRecvQueue, rp.DropLate, rp.Duplicates, d.rxRT.Status().Datagram.InboxDrops)
 	if err, _ := d.s.verr.Load().(error); err != nil {
 		t.Errorf("%s: %v", d.name, err)
 	}

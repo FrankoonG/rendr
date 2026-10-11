@@ -73,8 +73,9 @@ type DatagramStatus struct {
 	// before its first datagram is not counted. SentDatagrams and
 	// RecvDatagrams count the datagrams those calls moved, so
 	// SentDatagrams/SendCalls > 1 shows that sends were batched. Each
-	// counter is updated at its call's return. QUIC and embedder sockets
-	// are not counted.
+	// counter is updated at its call's return and read on its own, so a
+	// snapshot taken while calls run may be off by the calls in progress.
+	// QUIC and embedder sockets are not counted.
 	SendCalls, SentDatagrams uint64
 	RecvCalls, RecvDatagrams uint64
 
