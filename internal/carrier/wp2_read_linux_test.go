@@ -71,7 +71,7 @@ func (r *wp2Raw) send(from, n int) {
 // datagrams queued keeps the depth, and a second burst of 20, queued while
 // the reader is busy, is read in one call.
 func TestDgramReaderDrainsQueued_L54(t *testing.T) {
-	defer g10NoLeak(t)()
+	t.Cleanup(g10NoLeak(t)) // runs after wp2RealDialer's cleanup has ended the carrier
 	c, env, raw := wp2RealDialer(t)
 	ep := &gateEP{gate: 63, at: make(chan struct{}), open: make(chan struct{})}
 	raw.send(0, 64)
@@ -101,7 +101,7 @@ func TestDgramReaderDrainsQueued_L54(t *testing.T) {
 // depth 1 — a later datagram is delivered, nothing is charged beyond the
 // baseline, the carrier lives.
 func TestDgramReaderIdleReleaseRealSocket(t *testing.T) {
-	defer g10NoLeak(t)()
+	t.Cleanup(g10NoLeak(t)) // runs after wp2RealDialer's cleanup has ended the carrier
 	setIdleRelease(t, 50*time.Millisecond)
 	c, env, raw := wp2RealDialer(t)
 	ep := &gateEP{gate: ^uint64(0)}

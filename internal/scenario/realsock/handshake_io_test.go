@@ -28,11 +28,11 @@ import (
 // uncounted.
 func TestRealUDPHandshakeCounted(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
-	sock, err := udp.Listen("udp4", "127.0.0.1:0", udp.Options{})
+	sock, err := udp.Listen("udp4", "127.0.0.1:0", udpOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
-	c := udp.Carrier("u", "udp4", sock.LocalAddr().String(), udp.Options{})
+	c := udp.Carrier("u", "udp4", sock.LocalAddr().String(), udpOpts())
 	var dials atomic.Int64
 	dial := c.Dial
 	c.Dial = func(ctx context.Context) (net.PacketConn, net.Addr, error) {

@@ -83,8 +83,10 @@ type dgWrite struct {
 }
 
 // newFakeIOPair returns the two ends of a lossless link: a (address 1) and
-// b (address 2), each with limit as Limit and receive limit.
-func newFakeIOPair(limit int) (a, b *fakeIO) {
+// b (address 2), each with limit as Limit and receive limit; tb is the
+// test that builds it (nil: a fuzz target's, found on the stack; dgNote).
+func newFakeIOPair(tb testing.TB, limit int) (a, b *fakeIO) {
+	dgNote(tb)
 	a = &fakeIO{wake: make(chan struct{}, 1), done: make(chan struct{}), addr: fakeAddr(1), limit: limit, recv: limit}
 	b = &fakeIO{wake: make(chan struct{}, 1), done: make(chan struct{}), addr: fakeAddr(2), limit: limit, recv: limit}
 	a.other, b.other = b, a
@@ -593,7 +595,7 @@ func dgPair(t testing.TB, cmtu int) (a, b *dgSide) { return dgPairWith(t, cmtu, 
 // dgPairWith is dgPair with mod applied to both sides' Env before the
 // carriers are built (Presets: the first fseq and cseq, L14 wrap rows).
 func dgPairWith(t testing.TB, cmtu int, mod func(*Env)) (a, b *dgSide) {
-	ia, ib := newFakeIOPair(cmtu)
+	ia, ib := newFakeIOPair(t, cmtu)
 	a = &dgSide{env: dgEnv(), io: ia, ep: &dEP{}, bell: &hBell{}}
 	b = &dgSide{env: dgEnv(), io: ib, ep: &dEP{}, bell: &hBell{}}
 	if mod != nil {
@@ -672,7 +674,7 @@ func rawPair(t testing.TB, cmtu int, dialer bool) (*dgSide, *rawPeer) {
 
 // rawPairWith is rawPair with mod applied to the carrier's Env first.
 func rawPairWith(t testing.TB, cmtu int, dialer bool, mod func(*Env)) (*dgSide, *rawPeer) {
-	ia, ib := newFakeIOPair(cmtu)
+	ia, ib := newFakeIOPair(t, cmtu)
 	s := &dgSide{env: dgEnv(), io: ia, ep: &dEP{}, bell: &hBell{}}
 	if mod != nil {
 		mod(s.env)

@@ -501,7 +501,7 @@ func msTCPListen(t testing.TB) net.Listener {
 // msUDPListen opens a carrier/udp listening socket on loopback.
 func msUDPListen(t testing.TB) net.PacketConn {
 	t.Helper()
-	pc, err := udp.Listen("udp4", "127.0.0.1:0", udp.Options{})
+	pc, err := udp.Listen("udp4", "127.0.0.1:0", udpOpts())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -988,7 +988,7 @@ func TestMuxUDPE2E(t *testing.T) {
 	sock := msUDPListen(t)
 	dl := &msDials{}
 	m := newMsPair(t, rendr.Config{}, nil, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromPacketConn(sock)}},
-		[]rendr.Carrier{dl.wrapDgram(udp.Carrier("u", "udp4", sock.LocalAddr().String(), udp.Options{}))})
+		[]rendr.Carrier{dl.wrapDgram(udp.Carrier("u", "udp4", sock.LocalAddr().String(), udpOpts()))})
 	dcs, pcs := make([]*rendr.PacketConn, n), make([]*rendr.PacketConn, n)
 	for i := range n {
 		dcs[i], pcs[i] = m.openPacket(rendr.ModeSelector)
@@ -1047,7 +1047,7 @@ func TestRaceUDPE2E(t *testing.T) {
 	dials := []*msDials{{}, {}}
 	var carriers []rendr.Carrier
 	for i, name := range []string{"u0", "u1"} {
-		carriers = append(carriers, dials[i].wrapDgram(udp.Carrier(name, "udp4", sock.LocalAddr().String(), udp.Options{})))
+		carriers = append(carriers, dials[i].wrapDgram(udp.Carrier(name, "udp4", sock.LocalAddr().String(), udpOpts())))
 	}
 	m := newMsPair(t, rendr.Config{}, nil, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromPacketConn(sock)}}, carriers)
 	dc, pc := m.openPacket(rendr.ModeRace)

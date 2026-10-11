@@ -212,7 +212,7 @@ func fuzzTrunk(dialer, mux, dg bool, ep *recEP, admits *[]uint32) (*Conn, *fuzzC
 	var fc *fuzzConn
 	var io *fakeIO
 	if dg {
-		io, _ = newFakeIOPair(1200)
+		io, _ = newFakeIOPair(nil, 1200)
 		c = dgConn(env, io, 1200, dialer)
 	} else {
 		fc = &fuzzConn{r: bytes.NewReader(nil)}

@@ -13,7 +13,7 @@ import (
 // stream Conn reports 0. Stats carries the carrier's kind, so Status never
 // infers it from the frame budget.
 func TestConnTransportLimitAndKind(t *testing.T) {
-	a, _ := newFakeIOPair(1200)
+	a, _ := newFakeIOPair(t, 1200)
 	c := dgConn(dgEnv(), a, 1000, true)
 	if got := c.TransportLimit(); got != 1200 {
 		t.Fatalf("TransportLimit %d after SetBudget(1000), want the transport's 1200", got)

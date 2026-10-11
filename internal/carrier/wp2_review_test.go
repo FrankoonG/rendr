@@ -124,7 +124,7 @@ var _ BatchIO = (*flowFake)(nil)
 // flowSide starts a passive carrier whose transport is a flowFake over
 // the first end of a link, with a raw peer on the other end.
 func flowSide(t *testing.T) (*dgSide, *rawPeer, *flowFake) {
-	ia, ib := newFakeIOPair(1200)
+	ia, ib := newFakeIOPair(t, 1200)
 	ff := &flowFake{fakeIO: ia, max: DefaultMaxBatch}
 	s := &dgSide{env: dgEnv(), io: ia, ep: &dEP{}, bell: &hBell{}}
 	s.c = dgConn(s.env, ff, 1200, false)
@@ -216,7 +216,7 @@ func TestDgramBatchRebindSame_L55(t *testing.T) {
 	for _, mode := range []string{"off", "depth", "flow"} {
 		t.Run(mode, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				ia, ib := newFakeIOPair(1200)
+				ia, ib := newFakeIOPair(t, 1200)
 				ia.rebind = true
 				var pio PacketIO = ia
 				prev := dgBatchOf
