@@ -35,6 +35,13 @@ func TestBatchWireIdentical(t *testing.T) {
 	run := func(mb int) (out [][]byte, calls, sent uint64) {
 		raw, _ := wp5Listen(t, "udp4")
 		defer raw.Close()
+		// The 200 DGRAMs (about 110 KiB) leave in one burst: a default
+		// receive buffer drops some while a -race reader lags (M5 I1's
+		// race lane, 132 of 200), and the row then waits for datagrams the
+		// kernel discarded. rendr's own sockets take 4 MiB (M2).
+		if err := raw.SetReadBuffer(4 << 20); err != nil {
+			t.Fatal(err)
+		}
 		du, _ := wp5Listen(t, "udp4")
 		o := NewOwnedUDPBatch(du, wp5AP(raw), wp5Flow, wp5MaxDatagram, mb)
 		env := wp2Env()
