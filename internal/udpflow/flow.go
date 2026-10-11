@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -27,10 +28,17 @@ var (
 	// the datagram's length (L42, PA-19).
 	errWriteCount = errors.New("rendr/udpflow: datagram write returned an invalid count")
 	// errTooLarge: a foreign conn refused a datagram as too large without
-	// telling the size it can send (Max 0: the MTU probe decides, M2-D25).
-	// One shared value, never modified.
+	// telling the size it can send, or rendr's own socket refused it (Max
+	// 0: the MTU probe decides, M2-D25). One shared value, never modified.
 	errTooLarge error = &wire.DatagramTooLargeError{}
+	// errNoResults: ReadDatagrams without room for a result.
+	errNoResults = errors.New("rendr/udpflow: ReadDatagrams without a result slot")
 )
+
+// testWake, if set by a test, sees every wake signal of a flow (wakeLocked,
+// whether or not its reader waits): the one-wake-per-touched-flow rows
+// count them (M5-D14). Unset in production.
+var testWake atomic.Pointer[func(f *Flow)]
 
 // isTooLarge reports whether err matches wire.ErrDatagramTooLarge.
 func isTooLarge(err error) bool { return errors.Is(err, wire.ErrDatagramTooLarge) }
@@ -51,9 +59,10 @@ type Flow struct {
 	mu         sync.Mutex
 	ring       []entry // the inbox: n entries from head, grown up to Limits.Inbox
 	head, n    int
-	cur        entry // the datagram the last ReadDatagram returned, until the next call or Release
-	reserveOut int   // control-reserve buffers in the inbox or in cur
-	limit      int   // the receive limit in rendr bytes (SetLimit, R1-6)
+	cur        entry   // the datagram the last ReadDatagram returned, until the next call or Release
+	held       []entry // the datagrams the last ReadDatagrams returned, until the next call or Release
+	reserveOut int     // control-reserve buffers in the inbox, cur or held
+	limit      int     // the receive limit in rendr bytes (SetLimit, R1-6)
 	peer       netip.AddrPort
 	peerAddr   *net.UDPAddr // the peer as a foreign conn's address value (nil on rendr's own socket)
 	cand       netip.AddrPort
@@ -132,7 +141,9 @@ func (f *Flow) unadmit() {
 }
 
 // push queues data (aliasing buf) from src; the inbox takes buf only on
-// pushOK. It never blocks (the demux never waits for a reader).
+// pushOK. It never blocks (the demux never waits for a reader) and never
+// wakes the reader: the demux wakes every flow it pushed to once after the
+// datagrams of one read (M5-D14).
 func (f *Flow) push(buf *carrier.Buf, data []byte, src netip.AddrPort, addr *net.UDPAddr, reserve bool) pushResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -183,14 +194,13 @@ func (f *Flow) roomLocked() bool {
 	return true
 }
 
-// enqueueLocked appends e (room checked) and wakes a waiting reader.
+// enqueueLocked appends e (room checked); the caller wakes the reader.
 func (f *Flow) enqueueLocked(e entry) {
 	f.ring[(f.head+f.n)%len(f.ring)] = e
 	f.n++
-	f.wakeLocked()
 }
 
-// wake wakes a waiting reader (the source died).
+// wake wakes a waiting reader (datagrams were queued, or the source died).
 func (f *Flow) wake() {
 	f.mu.Lock()
 	f.wakeLocked()
@@ -199,6 +209,9 @@ func (f *Flow) wake() {
 
 // wakeLocked signals the reader if it waits (cap-1 channel, coalescing).
 func (f *Flow) wakeLocked() {
+	if fn := testWake.Load(); fn != nil {
+		(*fn)(f)
+	}
 	if !f.waiting {
 		return
 	}
@@ -207,6 +220,16 @@ func (f *Flow) wakeLocked() {
 	case f.wakeCh <- struct{}{}:
 	default:
 	}
+}
+
+// releaseHeldLocked returns the buffers of the datagrams the reader holds:
+// the last ReadDatagram's and the last ReadDatagrams'.
+func (f *Flow) releaseHeldLocked() {
+	f.releaseLocked(&f.cur)
+	for i := range f.held {
+		f.releaseLocked(&f.held[i])
+	}
+	f.held = f.held[:0]
 }
 
 // releaseLocked returns e's buffer (and its reserve slot).
@@ -242,22 +265,34 @@ func (f *Flow) SetLimit(n int) {
 // (net.ErrClosed) or the source's end (an error matching net.ErrClosed).
 func (f *Flow) ReadDatagram(buf []byte) ([]byte, carrier.PeerKey, carrier.ReadEvent, error) {
 	f.mu.Lock()
-	f.releaseLocked(&f.cur)
+	if err := f.waitLocked(); err != nil {
+		f.mu.Unlock()
+		return nil, carrier.PeerKey{}, carrier.ReadOK, err
+	}
+	e, key, ev := f.popLocked()
+	if ev != carrier.ReadTruncated {
+		f.cur = e
+	}
+	f.mu.Unlock()
+	return e.data, key, ev, nil
+}
+
+// waitLocked returns the buffers the reader holds and waits until the inbox
+// holds a datagram (nil) or the read fails: Close (net.ErrClosed), the
+// source's end, or the read deadline (os.ErrDeadlineExceeded). f.mu is
+// held on entry and on return.
+func (f *Flow) waitLocked() error {
+	f.releaseHeldLocked()
 	for {
-		var err error
 		switch {
 		case f.closed:
-			err = net.ErrClosed
+			return net.ErrClosed
 		case f.src.killed.Load():
-			err = errSourceClosed
+			return errSourceClosed
 		case f.rdlExpired:
-			err = os.ErrDeadlineExceeded
+			return os.ErrDeadlineExceeded
 		case f.n > 0:
-			return f.popLocked()
-		}
-		if err != nil {
-			f.mu.Unlock()
-			return nil, carrier.PeerKey{}, carrier.ReadOK, err
+			return nil
 		}
 		f.waiting = true
 		f.mu.Unlock()
@@ -266,32 +301,33 @@ func (f *Flow) ReadDatagram(buf []byte) ([]byte, carrier.PeerKey, carrier.ReadEv
 	}
 }
 
-// popLocked hands out the inbox head and unlocks f.mu.
-func (f *Flow) popLocked() ([]byte, carrier.PeerKey, carrier.ReadEvent, error) {
-	e := f.ring[f.head]
+// popLocked takes the inbox head (f.n > 0): a datagram longer than the
+// receive limit is ReadTruncated (its buffer returned, e zero); one from
+// another source than the peer is ReadCandidate and becomes the latest
+// rebind candidate. The caller holds e's buffer.
+func (f *Flow) popLocked() (e entry, key carrier.PeerKey, ev carrier.ReadEvent) {
+	e = f.ring[f.head]
 	f.ring[f.head] = entry{}
 	f.head = (f.head + 1) % len(f.ring)
 	f.n--
-	key := carrier.PeerKey{AP: e.src}
+	key = carrier.PeerKey{AP: e.src}
 	if len(e.data) > f.limit {
 		f.releaseLocked(&e)
-		f.mu.Unlock()
-		return nil, key, carrier.ReadTruncated, nil
+		return e, key, carrier.ReadTruncated
 	}
-	f.cur = e
-	ev := carrier.ReadOK
+	ev = carrier.ReadOK
 	if e.src != f.peer {
 		f.cand, f.candAddr, f.hasCand = e.src, e.addr, true
 		ev = carrier.ReadCandidate
 	}
-	f.mu.Unlock()
-	return e.data, key, ev, nil
+	return e, key, ev
 }
 
-// Release implements carrier.PacketIO: returns the last inbox buffer.
+// Release implements carrier.PacketIO: returns the inbox buffers of the
+// last ReadDatagram or ReadDatagrams.
 func (f *Flow) Release() {
 	f.mu.Lock()
-	f.releaseLocked(&f.cur)
+	f.releaseHeldLocked()
 	f.mu.Unlock()
 }
 
@@ -416,12 +452,12 @@ func (f *Flow) SetWriteDeadline(t time.Time) error {
 
 // Close implements carrier.PacketIO: removes the flow (pointer compare),
 // releases its inbox (the queued buffers and the ring) and wakes its
-// reader; the socket stays open. The buffer of the datagram the reader
-// holds is returned by its next ReadDatagram or Release, never under it:
-// Close may run on another goroutine while the reader still uses that
-// datagram (PacketIO's reader half belongs to the reader), so the reader
-// must call Release (or ReadDatagram, which then fails) when it exits, or
-// the buffer stays charged to Env.Budget. Close is idempotent.
+// reader; the socket stays open. The buffers of the datagrams the reader
+// holds are returned by its next ReadDatagram, ReadDatagrams or Release,
+// never under it: Close may run on another goroutine while the reader
+// still uses them (PacketIO's reader half belongs to the reader), so the
+// reader must call Release (or a read, which then fails) when it exits,
+// or the buffers stay charged to Env.Budget. Close is idempotent.
 func (f *Flow) Close() error {
 	f.mu.Lock()
 	if f.closed {
