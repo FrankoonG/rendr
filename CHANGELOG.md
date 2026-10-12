@@ -19,8 +19,9 @@ rendr 2.0 is a ground-up rewrite. It breaks with rendr v0.x and v1 in every
 respect:
 
 - **Module path** `github.com/FrankoonG/rendr/v2` (and
-  `github.com/FrankoonG/rendr/quic/v2` for QUIC); the v0.x tags stay on
-  `main`'s history and keep working at their old path.
+  `github.com/FrankoonG/rendr/quic/v2` for QUIC). The old module path
+  `github.com/FrankoonG/rendr` has no release tags; its code stays on its
+  branches and is reachable by pseudo-version.
 - **API**: new; nothing of the v0.x or v1 API remains.
 - **Wire format**: version 2 (PREFACE magic `RND2`); it does not interoperate
   with v0.x or v1, whose handshakes are refused cleanly.
@@ -170,6 +171,10 @@ Measured on idle Linux virtual machines; the methods are in the README's
   optional PREFACE feature bits (an older peer ignores them) or a new minor
   version. A peer that needs a feature the other lacks is answered FEATURE,
   reported as `ErrVersion`.
+- The QUIC carriers' encapsulation is versioned by the ALPN `rendr/2-q1`
+  and frozen with the wire format: each DATAGRAM payload is a 4-byte
+  big-endian per-direction sequence number followed by one rendr datagram;
+  a QUIC peer offering another ALPN is refused.
 - Optional feature bits in 2.0.0: bit 0, rendr mux (shared carriers);
   bit 1, the end code of an ended session in a JOIN refusal.
 - A JOIN refusal (JOIN_ACK UNKNOWN_SESSION) carries the ended session's end
