@@ -193,7 +193,8 @@ func goldenVectors() []vector {
 	add(frameVec("ext_ff_flags00_handle1", Type(0xff), 0x00, 11, 1, extVal("x")))
 
 	vs = append(vs, goldenVectorsM2()...)
-	return append(vs, goldenVectorsM3()...)
+	vs = append(vs, goldenVectorsM3()...)
+	return append(vs, goldenVectorsM4()...)
 }
 
 // goldenVectorsM2 builds the vectors M2 adds (M2 design §A3.10), after
@@ -609,32 +610,42 @@ func TestGolden_L44(t *testing.T) {
 		"detach_short", "open_mode_4", "data_handle_0", "open_ack_capacity_listener_closed",
 		"rel_open_ack_capacity_listener_closed", "open_ack_capacity_mux_full", "open_ack_bad_request_duplicate_view",
 		"join_ack_mux_capacity_muxfull",
+		// M4 (design §A3.5).
+		"open_early", "open_early_packet", "open_flags_2",
+		// M4 WP13 B-1 (OptEndCode).
+		"preface_optendcode", "preface_ack_optendcode", "join_ack_unknown_session_endcode",
 	} {
 		if _, ok := enc[want]; !ok {
 			t.Errorf("golden file lacks %q", want)
 		}
 	}
-	// M1's and M2's vectors keep their positions and bytes (M3 design
-	// §A3: no existing encoding changes); the resent H1 is byte-identical
-	// to the first (PA-21).
-	if names[0] != "preface" || names[len(names)-1] != "join_ack_mux_capacity_muxfull" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
+	// M1's, M2's and M3's vectors keep their positions and bytes (M3
+	// design §A3, M4 design §A3: no existing encoding changes); the resent
+	// H1 is byte-identical to the first (PA-21).
+	if names[0] != "preface" || names[len(names)-1] != "join_ack_unknown_session_endcode" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
 		t.Errorf("golden order or H1 resend: first %q, last %q", names[0], names[len(names)-1])
 	}
-	m1, m12 := 0, 0
+	m1, m12, m123 := 0, 0, 0
 	for _, v := range vs {
 		if v.name == "dgram_empty" {
-			m1 = m12
+			m1 = m123
 		}
 		if v.name == "preface_optmux" {
+			m12 = m123
+		}
+		if v.name == "open_early" {
 			break
 		}
-		m12++
+		m123++
 	}
 	if m1 != 73-4 { // the M1 file: 73 lines, four of them comments
 		t.Errorf("%d vectors precede the M2 ones, want the 69 of M1", m1)
 	}
 	if m12 != 111-4 || vs[m12-1].name != "udp_h1_open" { // the M2 file: 111 lines, four of them comments
 		t.Errorf("%d vectors precede the M3 ones, want the 107 of M1 and M2 ending with udp_h1_open", m12)
+	}
+	if m123 != 135-4 || vs[m123-1].name != "join_ack_mux_capacity_muxfull" { // the M3 file: 135 lines, four of them comments
+		t.Errorf("%d vectors precede the M4 ones, want the 131 of M1–M3 ending with join_ack_mux_capacity_muxfull", m123)
 	}
 }
 

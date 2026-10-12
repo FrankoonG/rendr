@@ -144,6 +144,7 @@ func (s *Session) status() Status {
 	out.DeliveredBytes = st.delivered
 	out.RetransmittedBytes = st.retxBytes
 	out.DupBytes = st.dupBytes
+	out.EarlyBytes = st.earlyBytes
 	if s.p.Mode == ModeRace {
 		// The sender's extra copies (M3-D35): never counted as
 		// retransmissions or in the unique counters above.

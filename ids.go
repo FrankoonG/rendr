@@ -155,7 +155,7 @@ type State uint8
 
 // States.
 const (
-	StatePending State = 1 // passive: OPEN admitted, waiting for Confirm/Reject/AcceptTimeout
+	StatePending State = 1 // passive: OPEN admitted, waiting for Confirm/Reject/AcceptTimeout; or, for a dialer session returned by Dial with EarlyReturn, the peer has not answered yet
 	StateOpen    State = 2 // data flows; may be inside a no-path episode (SessionStatus.InNoPath)
 	StateClosing State = 3 // the application called Close; the session lingers to finish or reset
 	StateEnded   State = 4 // terminal; SessionStatus.Err is the end error (io.EOF after a clean finish)

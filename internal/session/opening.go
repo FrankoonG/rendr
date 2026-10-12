@@ -114,6 +114,25 @@ type dialer struct {
 
 	unsub   func()
 	release func()
+
+	// EarlyReturn (M4 design §A4; WP9a). deferred is set by Dial for an
+	// EarlyReturn session that has not started its opening; the first
+	// triggerOpen to clear it posts startOpen. started (actor) is set once
+	// the opening phase runs: at Dial for every other session, at startOpen
+	// (or a Close that finds the trigger's startOpen still on its way) for
+	// an EarlyReturn one; until then openBy is zero and no attempt starts.
+	// closeAt is when Close was called before the verdict (zero: not
+	// closed): Linger counts from it (earlyCloseLocked, M4-D12). early is
+	// the session's one early span [0, k0) (R1-2): fixed by the actor at
+	// the first OPEN attempt after the trigger, read-only afterwards,
+	// shared by every OPEN attempt (earlySpanLocked). closed is the
+	// session's s.closing, made by Dial for an EarlyReturn session and
+	// closed by Close and Abort: a trigger after either is a no-op.
+	deferred atomic.Bool
+	closed   <-chan struct{}
+	started  bool
+	closeAt  time.Time
+	early    earlySpan
 }
 
 // slot is one factory of the session's snapshot.
@@ -390,7 +409,9 @@ func (a *actor) dialActLocked(now time.Time) {
 	d := a.d
 	switch {
 	case !d.opened:
-		a.openingLocked(now)
+		if d.started { // an EarlyReturn session waits for its trigger (M4-D9)
+			a.openingLocked(now)
+		}
 	case a.doneWaitLocked():
 	case a.s.p.Mode.members(): // bond and race (M3-D29)
 		a.bondSlotsLocked(now)
@@ -443,7 +464,9 @@ func (a *actor) failOpeningLocked(now time.Time, err error) {
 		ch := d.result
 		a.answer(func() { ch <- err })
 	}
-	a.terminateLocked(now, err, nil, false)
+	// With EarlyReturn nobody waits for d.result: the outcome is the
+	// session's end, which the next Read and Write return (M4-D11).
+	a.earlyEndLocked(now, err)
 }
 
 // onWithdrawLocked: Dial's ctx ended first (its CAS to withdrawn won).
@@ -478,7 +501,11 @@ func (a *actor) startAttemptLocked(now time.Time, i int, kind wire.Type) {
 	sl.att = at
 	d.running++
 	a.dirty = true // Status shows the attempt as a joining carrier (L22)
-	go a.runAttempt(ctx, at, sl.f, payload)
+	var early *earlySpan
+	if kind == wire.TypeOpen {
+		early = a.earlySpanLocked() // the session's one early span (M4 R1-2; nil: none)
+	}
+	go a.runAttempt(ctx, at, sl.f, payload, early)
 }
 
 // runAttempt is a dial-attempt goroutine: Establish, Hooks.DialResult,
@@ -491,7 +518,14 @@ func (a *actor) startAttemptLocked(now time.Time, i int, kind wire.Type) {
 // conn itself, and this goroutine's deferred cleanup reports the attempt
 // as failed, so the slot's cadence, the attempt count and the abandoned
 // pool stay exact and the slot redials.
-func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, payload []byte) {
+//
+// sp is the session's early span for an OPEN attempt (M4, R1-2; nil for a
+// JOIN or a session without one): its bytes, copied out of the send
+// chunks by the first attempt that gets here (earlySpan.bytes, first thing,
+// so the chunk references are always dropped), are passed to a dial of the
+// attempt's own only (EstablishEarly, Pool.AttemptEarly).
+func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, payload []byte, sp *earlySpan) {
+	early := sp.bytes()
 	s := a.s
 	posted := false
 	defer func() {
@@ -523,9 +557,9 @@ func (a *actor) runAttempt(ctx context.Context, at *attempt, f carrier.Factory, 
 		if s.pk != nil {
 			dk = wire.TypeDgram
 		}
-		est, err = p.Attempt(ctx, f.Index, at.cid, at.kind, payload, check, inst, s.poolKey(), dk)
+		est, err = p.AttemptEarly(ctx, f.Index, at.cid, at.kind, payload, check, inst, s.poolKey(), dk, early)
 	} else {
-		est, err = carrier.Establish(ctx, s.env.Carrier, f, at.cid, at.kind, payload, check)
+		est, err = carrier.EstablishEarly(ctx, s.env.Carrier, f, at.cid, at.kind, payload, early, check)
 	}
 	posted = true
 	a.postResult(at, est, err)
@@ -884,13 +918,23 @@ func (a *actor) openOKLocked(now time.Time, i int, at *attempt, est *carrier.Est
 		s.peer = inst
 		s.bound.Store(true)
 		s.peerWindowLocked(window)
+		a.leavePendingLocked() // M4: every exit from StatePending
 		s.ctl.state = StateOpen
+		if s.st.closed {
+			// EarlyReturn: Close before the verdict (M4-D12); the linger
+			// keeps counting from that Close (st.closedAt).
+			s.ctl.state = StateClosing
+		}
 		ch := d.result
 		a.answer(func() { ch <- nil })
 		if s.p.Mode.members() {
 			a.chooseMembersLocked(now, i)
 		}
-		a.attachLocked(now, i, at, est)
+		l := a.attachLocked(now, i, at, est)
+		a.earlyVerdictLocked(now, l, est.Early)
+		if st := &s.st; st.wwaiting {
+			streamSignal(st.wwake) // a Write held by the early cap continues (M4-D10)
+		}
 		return
 	}
 	if inst != s.peer {
@@ -990,7 +1034,9 @@ func (a *actor) pktBadAnswerLocked(now time.Time, i int, at *attempt, est *carri
 }
 
 // joinRefusedLocked handles a non-OK JOIN_ACK from the bound instance
-// (§6.7): UNKNOWN_SESSION ends the session (ErrSessionLost, L19),
+// (§6.7): UNKNOWN_SESSION ends the session (ErrSessionLost, L19; with
+// the end code the passive's tombstone carried under wire.OptEndCode,
+// *AbortError{code, Remote} instead, as the lost RST would have, L47),
 // BAD_REQUEST with ErrProtocol, GOING_AWAY like a GOAWAY; CAPACITY backs
 // off. UNKNOWN_SESSION and GOING_AWAY end cleanly (io.EOF) once our DONE
 // was sent (D4, doneOr); BAD_REQUEST proves no peer gone and keeps its
@@ -1002,6 +1048,10 @@ func (a *actor) joinRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 	a.switchFailedLocked(now, i)
 	switch st {
 	case wire.StatusUnknownSession:
+		if est.EndCode != 0 {
+			a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortCode(est.EndCode), Remote: true}), nil, false)
+			return
+		}
 		a.terminateLocked(now, a.doneOr(fmt.Errorf("%w: JOIN_ACK UNKNOWN_SESSION", ErrSessionLost)), nil, false)
 	case wire.StatusBadRequest:
 		a.terminateLocked(now, fmt.Errorf("%w: JOIN_ACK BAD_REQUEST", ErrProtocol), nil, false)
@@ -1020,7 +1070,9 @@ func (a *actor) joinRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 // opening-race attempt that completed after the session opened on another
 // factory — is such a loser too: it never becomes a second member of its
 // fate group, nor a member beyond MaxCarriers (M3-D37, PA-31).
-func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Established) {
+//
+// It returns the new lane.
+func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Established) *lane {
 	s := a.s
 	d := a.d
 	ctl := &s.ctl
@@ -1068,4 +1120,5 @@ func (a *actor) attachLocked(now time.Time, i int, at *attempt, est *carrier.Est
 	est.Conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Gauge: a.laneGauge(est.Conn.Kind(), i)})
 	a.succeeded(i)
 	a.event(now, EventCarrierUp, l.id, 0, 0, carrier.CauseNone, nil)
+	return l
 }

@@ -32,6 +32,7 @@ func (s *Session) initStreamLocked() {
 	st.echoIn = s.p.FirstEpoch - 1
 	now := time.Now()
 	st.lastData, st.lastAdvance = now, now
+	st.idleOverride = -1 // no SetIdleTimeout yet (M4-D21)
 	st.order = make([]*lane, 0, 4)
 	// Deadline timers are created by the first Set*Deadline with a future
 	// time (§3.6); a zero deadline needs none.
@@ -56,11 +57,14 @@ func (s *Session) initStreamLocked() {
 // in that same or its first step, without a ring. A packet session
 // advertises no window: its OPEN carries 0, which Establish replaces by
 // each datagram attempt's cmtu offer (M2-D11), and its OPEN_ACK windows are
-// per carrier (laneWindowLocked).
+// per carrier (laneWindowLocked). A passive session that took an
+// OPEN(EARLY) advertises at least the early span, whatever the Budget
+// usage (M4-D6, earlyWindowLocked).
 func (s *Session) openWindowLocked() uint32 {
 	if s.pk != nil {
 		return 0
 	}
+	s.earlyWindowLocked()
 	w := min(s.raiseEdgeLocked(), math.MaxUint32)
 	s.st.lastWin = int64(w)
 	return uint32(w)

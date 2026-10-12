@@ -123,6 +123,13 @@ type lane struct {
 	goOwed    bool   // (S) a dialer lane on a view of a started MUX trunk: the go frame is not yet placed (M3-D8)
 	goStandIn bool   // (S) the go frame's unreliable stand-in was placed (m3 DGMUX, L40; placeStandInLocked)
 
+	// M4 (design §A5.1): early is set on the passive when this lane's own
+	// first frame was an OPEN with wire.OpenFlagEarly (NewPending,
+	// AttachOpen): DATA before the verdict is legal on it within
+	// wire.EarlyWindow (earlyDataLocked). Immutable once the lane is
+	// visible to its carrier.
+	early bool
+
 	// Packet lanes only (M2).
 	lastDgramAt  time.Time // (S) when this lane last placed a DGRAM (bond death counting, M2-D44)
 	capMarked    bool      // (S) its latest Fill left a queued datagram for want of capacity and marked the batch cap-blocked: the PONG that frees capacity wakes it (pktWakeCappedLocked)
@@ -211,6 +218,28 @@ type stream struct {
 	facts     uint32    // fact bits (fact*) not yet taken by the actor (takeFactsLocked)
 	lastData  time.Time // the IdleTimeout clock: the last application Write or Read commit or acknowledged delivery of our data (an sBase advance, B5)
 
+	// M4 (design §A2.3).
+	// abortReq is the application's Abort (M4-D20; Session.Abort, under
+	// mu): the RST the actor ends the session with (terminationLocked's
+	// case after the incoming RST). nil: none.
+	abortReq *wire.Rst
+	// idleOverride is SetIdleTimeout's per-session value (M4-D21): −1
+	// unset (initStreamLocked sets it), else the clamped IdleTimeout that
+	// replaces Params.IdleTimeout (0: off); the actor reads it through
+	// idleTimeout. Dial, NewPending and the test harnesses all run
+	// initStreamLocked; a bare &Session{} holds 0, an override that turns
+	// idle expiry off.
+	idleOverride time.Duration
+	// earlyBytes is SessionStatus.EarlyBytes (M4-D18, R1-2): the dialer
+	// stores the winning attempt's Established.Early at the verdict; the
+	// passive counts the new bytes accepted before its verdict. Frozen at
+	// the verdict.
+	earlyBytes uint64
+	// earlyOpen (passive): some adopted OPEN of this session carried
+	// wire.OpenFlagEarly; Confirm's window is then at least
+	// wire.EarlyWindow (openWindowLocked, M4-D6).
+	earlyOpen bool
+
 	// Counters (Status).
 	txBytes   uint64 // bytes committed by application Writes
 	rxBytes   uint64 // in-order bytes received
@@ -241,6 +270,18 @@ type control struct {
 
 	rst *wire.Rst // (A) RST to place on every live lane
 
+	// M4 (design §A5.4, R1-8): the pending context of a passive session.
+	// pendingDone is made by NewPending and closed exactly once when the
+	// session leaves StatePending for any reason (leavePendingLocked);
+	// pendingErr is then context.DeadlineExceeded when AcceptTimeout ended
+	// the pending phase, else context.Canceled (nil while pending);
+	// pendingHooks are the functions PendingAfterFunc registered, run once
+	// by leavePendingLocked after the session lock is released (a stopped
+	// one has f == nil). All three are read and written under mu.
+	pendingDone  chan struct{}
+	pendingErr   error
+	pendingHooks []*pendingHook
+
 	inNoPath     bool      // (A) inside a no-path episode (no live lane)
 	episodeStart time.Time // (A) death time of the last live lane
 	episodeGen   uint64    // (A) incremented per episode; expiry acts only if unchanged (L18)
@@ -252,6 +293,12 @@ type control struct {
 	migDeath, migQuality, migExplicit uint64 // (A) migration counters (§7.6)
 	rejoins, episodes                 uint64 // (A) Rejoins (dialer only), NoPathEpisodes
 }
+
+// pendingHook is one PendingAfterFunc registration (M4 R1-8): f runs once,
+// on the actor goroutine after the session lock is released, when the
+// session leaves StatePending; its stop function clears f under mu first
+// (and reports whether it did).
+type pendingHook struct{ f func() }
 
 // span is the half-open stream range [off, off+n).
 type span struct{ off, n uint64 }

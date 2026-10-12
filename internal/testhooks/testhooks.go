@@ -76,6 +76,11 @@ type Overrides struct {
 	// Counter preset (L14), equal in both Runtimes of a test.
 	FirstHandle uint32 // first handle a dialer allocates on a MUX trunk (1)
 
+	// M4 (m4-design §A2.3). MinIdleTimeout lowers the 10 s floor of
+	// Conn.SetIdleTimeout's clamp (the real-socket twins of the msess target
+	// tests); zero keeps 10 s.
+	MinIdleTimeout time.Duration
+
 	// Rand replaces the U[0,1) jitter source (redial backoff, salts are not
 	// affected). Nil keeps math/rand/v2.
 	Rand func() float64
@@ -156,6 +161,22 @@ type Hooks struct {
 	// It runs under the carrier's lock: it must not block or call into
 	// rendr.
 	PingTS func(carrier uint32, ts uint64) uint64
+
+	// M4 (m4-design §A2.3, R1-17).
+
+	// BeforeFirstFlight runs in a dial attempt right before the first
+	// flight of an OPEN carrying k early bytes (k ≥ 1: PREFACE ‖
+	// OPEN(EARLY) ‖ DATA) is written.
+	BeforeFirstFlight func(k int)
+	// BeforeEarlyRead runs on a passive carrier's reader before it reads
+	// the frame that follows an OPEN(EARLY), so a test can hold the reader
+	// while the verdict is decided.
+	BeforeEarlyRead func()
+	// Drained runs when a carrier's close drain (a refusal's WriteAndClose
+	// closer, a retirement drain) discarded n > 0 bytes of the peer's: the
+	// stimulus proof of the refusal-drain rows.
+	Drained func(n int)
+
 	// ClosePools runs in Runtime.Close right after its first snapshot of
 	// the Runtime's pools (step 1), with no lock held: a closed Peer's
 	// pool that registers again after it (a surviving session's redial

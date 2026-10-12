@@ -119,9 +119,14 @@ func refusalPayload(typ wire.Type, st wire.AckStatus, code uint32) []byte {
 
 // retireView is Retire on a view of a started MUX trunk (§A5.5): a live
 // view keeps its Fill until a call places nothing, then its DETACH(r)
-// follows (M2's CLOSE rule, per view); a view that carries no session
-// frames yet (opening, awaiting, attached-pending, pending, joining, held)
-// is abandoned at once. The view's end record becomes CauseRetired when
+// follows (M2's CLOSE rule, per view); so does a held passive view (OK
+// placed, no go frame yet) once the go frame ended its hold, so that its
+// session's last frames — the RST of a session that ended right after its
+// Confirm — reach the dialer (M4 checkpoint C-L; at the hold bound, drainMax
+// after the request, it is abandoned with its DETACH only when the go frame
+// never came); a view
+// that carries no session frames yet (opening, awaiting, attached-pending,
+// pending, joining) is abandoned at once. The view's end record becomes CauseRetired when
 // the DETACH exchange completes or at the DETACH bound.
 func (c *Conn) retireView(r wire.DetachReason) {
 	t := c.trunk
@@ -142,12 +147,39 @@ func (c *Conn) retireView(r wire.DetachReason) {
 			t.markWorkLocked()
 			t.readyLocked(c)
 		}
+	case c.state == viewHeld:
+		// Retired after the go frame (the hold's end readies it), or
+		// abandoned at the hold bound.
+		if !c.vx.retireQ.Load() {
+			c.vx.reason = r
+			c.vx.retireQ.Store(true)
+			t.markWorkLocked()
+			t.boundHeldRetireLocked(c)
+		}
 	default:
 		t.abandonLocked(c, r, &p)
 	}
 	t.mx.Unlock()
 	t.runPost(&p)
 	t.wakeWriter()
+}
+
+// boundHeldRetireLocked bounds the planned retirement of a held view (OK
+// placed, no go frame yet): a view still held drainMax after the request
+// — the dialer's go frame lost for good, or a dialer that never answers —
+// is abandoned, its DETACH only (R1-9), as its session's close bound would
+// (M4 checkpoint C-L).
+func (t *trunk) boundHeldRetireLocked(v *Conn) {
+	time.AfterFunc(drainMax, func() {
+		var p postList
+		t.mx.Lock()
+		if v.state == viewHeld && v.vx.retireQ.Load() {
+			t.abandonLocked(v, v.vx.reason, &p)
+		}
+		t.mx.Unlock()
+		t.runPost(&p)
+		t.wakeWriter()
+	})
 }
 
 // goAwayView is GoAway on a view of a started MUX trunk: GOAWAY once on the
@@ -547,40 +579,50 @@ func (t *trunk) withdrawResponseLocked(v *Conn) bool {
 	return true
 }
 
-// The tolerance ring: handles whose crossing frames are legal although no
+// The tolerance rings: handles whose crossing frames are legal although no
 // view holds them any more — a refused handle (the dialer's RST and DETACH
 // may cross the refusal) and a view retired at the DETACH bound (the
-// peer's frames and DETACH may still come). The ring holds MuxMaxViews
-// entries (the kind's): the oldest entry is overwritten.
+// peer's frames and DETACH may still come). Each kind has its own ring of
+// MuxMaxViews entries (the trunk kind's); a ring overwrites its oldest
+// entry. Most refused handles never see a crossing frame, so their entries
+// are never cleared: in one shared ring a burst of refusals pushed out a
+// retired view whose peer's DETACH was still to come, and that legal
+// DETACH killed the trunk (TestToleranceRingRefusalsKeepRetiredHandles).
 
 func (t *trunk) tolerateLocked(h uint32, all bool) {
-	n := t.maxViews()
-	if t.ms.tol == nil {
-		t.ms.tol = make([]tolEntry, n)
+	k := 0
+	if all {
+		k = 1
 	}
-	t.ms.tol[t.ms.tolHead] = tolEntry{h: h, all: all}
-	t.ms.tolHead = (t.ms.tolHead + 1) % n
+	n := t.maxViews()
+	if t.ms.tol[k] == nil {
+		t.ms.tol[k] = make([]tolEntry, n)
+	}
+	t.ms.tol[k][t.ms.tolHead[k]] = tolEntry{h: h, all: all}
+	t.ms.tolHead[k] = (t.ms.tolHead[k] + 1) % n
 }
 
 // toleratedLocked reports whether a frame of type typ for h is a tolerated
-// crossing frame: h is in the ring, and the entry covers every session
+// crossing frame: h is in a ring, and the entry covers every session
 // frame or typ is an RST, a response or the DETACH. With drop (the
 // handle's last frame, its DETACH) the entry leaves the ring.
 func (t *trunk) toleratedLocked(h uint32, typ wire.Type, drop bool) bool {
 	if h == 0 {
 		return false
 	}
-	for i, e := range t.ms.tol {
-		if e.h != h {
-			continue
+	for k := range t.ms.tol {
+		for i, e := range t.ms.tol[k] {
+			if e.h != h {
+				continue
+			}
+			if !e.all && typ != wire.TypeRst && typ != wire.TypeOpenAck && typ != wire.TypeJoinAck && typ != wire.TypeDetach {
+				return false
+			}
+			if drop {
+				t.ms.tol[k][i] = tolEntry{}
+			}
+			return true
 		}
-		if !e.all && typ != wire.TypeRst && typ != wire.TypeOpenAck && typ != wire.TypeJoinAck && typ != wire.TypeDetach {
-			return false
-		}
-		if drop {
-			t.ms.tol[i] = tolEntry{}
-		}
-		return true
 	}
 	return false
 }

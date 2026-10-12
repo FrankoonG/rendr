@@ -22,6 +22,12 @@ type reader struct {
 	// the bytes are processed first, the error ends the reader when more
 	// bytes are needed.
 	pending error
+	// drained counts, on a carrier whose first frame was an OPEN(EARLY)
+	// and only while Hooks.Drained is set, the DATA payload bytes read
+	// after the carrier's retirement began (the retirement drain: a
+	// refused session discards them); reported once when the reader exits
+	// (M4 R1-17).
+	drained int
 }
 
 // releaseBig releases the big-DATA buffer of a frame that is not handed over.
@@ -54,10 +60,18 @@ func (c *Conn) readLoop() {
 			rd.stage.Release()
 			rd.stage = nil
 		}
+		if h := c.env.Hooks; rd.drained > 0 && h != nil && h.Drained != nil {
+			h.Drained(rd.drained)
+		}
 		c.partDone(partReader)
 	}()
 	if rd.stage == nil {
 		rd.stage = c.env.Bufs.Get(BigData, c.env.stageBudget())
+	}
+	if c.opts.Early {
+		if h := c.env.Hooks; h != nil && h.BeforeEarlyRead != nil {
+			h.BeforeEarlyRead() // M4 R1-17: a test holds the reader before the early DATA
+		}
 	}
 	for c.readFrame(rd) {
 	}
@@ -219,12 +233,29 @@ func (c *Conn) frameArrived() time.Time {
 // first DATA after a PING wakes the writer, whose PING cadence becomes
 // PingBusy (P12).
 func (c *Conn) dataArrived(n int, now time.Time) {
+	if c.opts.Early {
+		c.countDrained(n)
+	}
 	c.rxBytes.Add(uint64(n))
 	if g := c.opts.Gauge; g != nil {
 		g.AddRx(n, now)
 	}
 	if !c.rxData.Load() && c.rxData.CompareAndSwap(false, true) {
 		c.wakeWriter()
+	}
+}
+
+// countDrained adds n DATA payload bytes to the reader's drained count
+// when Hooks.Drained is set and the retirement of the carrier's view 1
+// began (Retire or GoAway: a refused session ends) or the carrier died —
+// the stimulus proof of the refusal-drain rows (M4 R1-17: early DATA read
+// only after the refusal). Without the hook it does nothing.
+func (c *Conn) countDrained(n int) {
+	if h := c.env.Hooks; h == nil || h.Drained == nil {
+		return
+	}
+	if c.view1.retireCalled.Load() || c.death.Load() != nil {
+		c.rd.drained += n
 	}
 }
 

@@ -17,7 +17,7 @@ type Open struct {
 	SID      [16]byte    // chosen by the dialer from crypto/rand; all-zero is invalid (ErrReserved)
 	Kind     CarrierKind // session kind: 1 stream, 2 packet (M2)
 	Mode     uint8       // 1 selector, 2 bond, 3 race (ModeRace, M3; an M2 build answers it BAD_REQUEST CodeBadMode)
-	Flags    uint16      // OpenFlagEarly reserved until M4: all bits must be 0
+	Flags    uint16      // OpenFlagEarly on a stream OPEN only (M4); every other bit must be 0
 	RetainMs uint32      // the dialer's PassiveRetain in milliseconds
 	Window   uint32      // stream: the dialer's initial receive window (0 is legal: memory pressure); packet: the cmtu offer, 0 or MinFrameBudget..MaxDatagram
 	PMTU     uint16      // stream: 0; packet: the MaxPayload offer, MinPacketPayload..MaxPacketPayload
@@ -46,18 +46,22 @@ func PutOpen(dst []byte, o *Open) int {
 
 // ParseOpen decodes an OPEN payload. The explicit mlen must equal the
 // remaining bytes exactly; mlen > maxMeta returns ErrLength before the
-// metadata is touched. Kind must be 1 or 2, mode 1..MaxMode (ErrValue); flags
-// must be 0 and a stream session's PMTU 0 (ErrReserved); a packet session's
-// PMTU must lie in MinPacketPayload..MaxPacketPayload and its Window be 0
-// or in MinFrameBudget..MaxDatagram (ErrValue; M2 design §A3.5). Semantic
+// metadata is touched. Kind must be 1 or 2, mode 1..MaxMode (ErrValue);
+// flags must be a subset of OpenFlagEarly, OpenFlagEarly only on a stream
+// session (M4 design §A3.1, M4-D3), and a stream session's PMTU 0
+// (ErrReserved); a packet session's PMTU must lie in
+// MinPacketPayload..MaxPacketPayload and its Window be 0 or in
+// MinFrameBudget..MaxDatagram (ErrValue; M2 design §A3.5). Semantic
 // acceptance (the session kind on this carrier kind, a Window that fits the
-// carrier kind, a mode this build serves) is the admission's job.
+// carrier kind, a mode this build serves, EARLY only in a carrier's first
+// frame) is the admission's job.
 //
 // Check order: fixed part present (ErrShort), mlen > maxMeta (ErrLength),
 // mlen against the remaining bytes (ErrShort/ErrTrailing), zero SID
-// (ErrReserved), kind and mode (ErrValue), flags and a stream PMTU
-// (ErrReserved), a packet PMTU, then a packet Window (ErrValue). maxMeta is
-// clamped to [0, MaxMetadata]. An empty metadata decodes as nil.
+// (ErrReserved), kind and mode (ErrValue), a flag beyond OpenFlagEarly,
+// OpenFlagEarly on a packet session and a stream PMTU (ErrReserved), a
+// packet PMTU, then a packet Window (ErrValue). maxMeta is clamped to
+// [0, MaxMetadata]. An empty metadata decodes as nil.
 func ParseOpen(p []byte, maxMeta int) (Open, error) {
 	if len(p) < OpenFixedLen {
 		return Open{}, ErrShort
@@ -86,8 +90,10 @@ func ParseOpen(p []byte, maxMeta int) (Open, error) {
 		return Open{}, ErrValue
 	case o.Mode < 1 || o.Mode > MaxMode:
 		return Open{}, ErrValue
-	case o.Flags != 0:
+	case o.Flags&^OpenFlagEarly != 0:
 		return Open{}, ErrReserved
+	case o.Flags&OpenFlagEarly != 0 && o.Kind != KindStream:
+		return Open{}, ErrReserved // M4-D3: early data are stream bytes
 	case o.Kind == KindStream && o.PMTU != 0:
 		return Open{}, ErrReserved
 	case o.Kind == KindDatagram && (o.PMTU < MinPacketPayload || o.PMTU > MaxPacketPayload):
@@ -243,7 +249,9 @@ func ParseJoinAck(p []byte) (JoinAck, error) {
 // field, which a refusal leaves zero on a dedicated carrier: the code is
 // the field's low 32 bits, its high 32 bits stay zero. An OK JOIN_ACK is
 // unchanged. Handle 1's JOIN_ACK (the handshake's, any carrier) keeps
-// ParseJoinAck's rule.
+// ParseJoinAck's rule, except on a carrier that negotiated OptEndCode (M4):
+// there a JOIN_ACK(UNKNOWN_SESSION) carries the ended session's RST code
+// in the same layout (PutJoinAckMux, ParseJoinAckMux), 0 for none.
 
 // PutJoinAckMux writes a into dst as a view's JOIN_ACK on a MUX trunk and
 // returns JoinAckLen: PutJoinAck, with code in the RxNext field of a

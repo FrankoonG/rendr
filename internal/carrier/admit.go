@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"encoding/binary"
 	"errors"
 
 	"github.com/FrankoonG/rendr/v2/internal/wire"
@@ -12,7 +13,8 @@ import (
 
 // admitMux handles an OPEN or JOIN for a new handle h on a started passive
 // MUX trunk, on the reader (§A5.6): the handle becomes the largest seen;
-// the view cap (views plus queued answers), the payload decode, our GOAWAY,
+// the view cap (views plus queued answers), the payload decode, an EARLY
+// OPEN (BAD_REQUEST CodeBadValue, M4-D3), our GOAWAY,
 // a retiring trunk and a Runtime without passive mux are refused through
 // the refusal ring; otherwise a new view (pending for an OPEN, joining for
 // a JOIN; shim endpoint) is inserted under mx and, with mx released,
@@ -30,7 +32,10 @@ func (t *trunk) admitMux(h uint32, hdr wire.Header, p []byte) {
 	switch {
 	case full:
 		ans.Status, ans.Code = wire.StatusCapacity, wire.CodeMuxFull
-	case decodeFirst(hdr.Type, p) != nil:
+	case decodeFirst(hdr.Type, p) != nil, earlyOpen(hdr.Type, p):
+		// An EARLY OPEN belongs only in a carrier's first frame (M4-D3):
+		// on a live trunk it is refused like a malformed one, through the
+		// ring; the trunk and its other views live.
 		ans.Status, ans.Code = wire.StatusBadRequest, wire.CodeBadValue
 	case t.dg != nil && hdr.Type == wire.TypeOpen && p[16] == byte(wire.KindStream):
 		// A datagram trunk carries packet sessions only (M3-D24; a JOIN's
@@ -68,6 +73,12 @@ func decodeFirst(typ wire.Type, p []byte) error {
 	}
 	_, err := wire.ParseOpen(p, wire.MaxMetadata)
 	return err
+}
+
+// earlyOpen reports an OPEN payload that decoded with wire.OpenFlagEarly
+// (payload bytes 18–19; decodeFirst checked the layout first).
+func earlyOpen(typ wire.Type, p []byte) bool {
+	return typ == wire.TypeOpen && binary.BigEndian.Uint16(p[18:20])&wire.OpenFlagEarly != 0
 }
 
 // refuseMux queues the refusal a for handle h, a handle that never becomes
@@ -147,10 +158,19 @@ func (t *trunk) responsePlacedLocked(v *Conn, typ wire.Type, st wire.AckStatus, 
 		v.state = viewHeld
 		v.held.Store(true)
 		v.vx.fillOK.Store(false) // R1-1's ready set skips it until the go frame
-		if v.vx.retireQ.Load() || killed {
-			// Its session ended while the OK was due: held, it places its
+		if killed {
+			// Killed while the OK was due: held, it places its
 			// DETACH(ended) only (R1-9).
 			t.abandonLocked(v, wire.DetachEnded, p)
+		}
+		// A planned retirement requested while the OK was due (its session
+		// ended, with an RST to place) waits for the go frame: the hold
+		// ends there, the session's Fill places its last frames and the
+		// DETACH follows (retireDrainedLocked); without a go frame it is
+		// abandoned at the hold bound (boundHeldRetireLocked). M4
+		// checkpoint C-L.
+		if v.vx.retireQ.Load() && !killed {
+			t.boundHeldRetireLocked(v)
 		}
 	}
 }
@@ -161,7 +181,7 @@ func (t *trunk) responsePlacedLocked(v *Conn, typ wire.Type, st wire.AckStatus, 
 // canonical JOIN_ACK without it, the code is the view's, respCode). OK
 // makes the view attached-pending (the attempt returns it; it stays dark
 // until its session's Start); a refusal ends the handle (M3-D7) —
-// CodeListenerClosed marks the trunk unusable for OPENs (R1-10),
+// CAPACITY CodeListenerClosed marks the trunk unusable for OPENs (R1-10),
 // CodeMuxFull (OPEN or JOIN) full until a view leaves. A response that
 // crossed our DETACH (we abandoned the view) ends it when it is a refusal
 // and is ignored otherwise (the passive's DETACH follows). It returns the
@@ -201,7 +221,9 @@ func (t *trunk) onResponse(v *Conn, hdr wire.Header, p []byte) error {
 		if st == wire.StatusOK {
 			v.state = viewAttachedPending
 		} else {
-			if code == wire.CodeListenerClosed && v.vx.first == wire.TypeOpen {
+			// Only CAPACITY's code is a carrier code: REJECTED carries the
+			// application's own (an application may reject with 7).
+			if code == wire.CodeListenerClosed && st == wire.StatusCapacity && v.vx.first == wire.TypeOpen {
 				t.openFull = true
 			}
 			if code == wire.CodeMuxFull && st == wire.StatusCapacity {

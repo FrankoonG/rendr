@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -54,6 +55,18 @@ type Established struct {
 	// the session starts it (M3-D19); false for a dedicated carrier and for
 	// a view opened on a live trunk.
 	Fresh bool
+	// Early is the number of early DATA bytes (the session's early span
+	// [0, Early)) that followed the OPEN(EARLY) in this carrier's first
+	// flight (M4 design §A3.2): set only once the whole first flight was
+	// written; 0 for an attempt without early data, a JOIN, a PING, a
+	// partial first flight, a fast-path or coalesced view of the Pool.
+	// EstablishEarly fills it (M4 WP8); until then it is always 0.
+	Early int
+	// EndCode is the end code of a JOIN_ACK(UNKNOWN_SESSION) on a carrier
+	// that negotiated wire.OptEndCode: the RST code the ended session
+	// decided (0: none, or the form was not negotiated). Payload then
+	// holds the canonical JOIN_ACK (RxNext field zero) (WP13 B-1, L47).
+	EndCode uint32
 }
 
 // EstablishError describes a failed attempt. It wraps the underlying error.
@@ -195,8 +208,43 @@ func prefaceStatusName(s wire.PrefaceStatus) string {
 // PREFACE_ACK of this major also reports the passive's Instance (the
 // instance a GOING_AWAY names, design §6.6), with PrefaceOK false.
 func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type, payload []byte, check func(*wire.PrefaceAck) error) (*Established, error) {
+	return EstablishEarly(ctx, env, f, id, t, payload, nil, check)
+}
+
+// EstablishEarly is Establish with the session's early span (M4 design
+// §A3.2, M4-D4, R1-4): for a stream OPEN on a stream factory with a non-empty
+// early (at most wire.EarlyWindow bytes), the OPEN carries
+// wire.OpenFlagEarly — payload is the plain OPEN (flags 0) and
+// EstablishEarly sets the flag in its own copy, so the caller's payload
+// serves fast-path views unchanged — and one DATA frame (handle 1, offset
+// 0, fseq first + 1) with early follows it in the same first flight:
+// PREFACE ‖ OPEN(EARLY) ‖ DATA in one conn Write without DialEarly (L41);
+// with DialEarly the factory gets PREFACE ‖ OPEN(EARLY) as its first bytes
+// and the hello writer writes the DATA frame next, before the PREFACE_ACK
+// is awaited (awaitHello covers it). Established.Early reports len(early)
+// once the whole first flight was written, and the carrier's tx fseq then
+// continues at first + 2. Nothing else follows the first flight before
+// the response except a withdrawal RST(withdrawn), written only after the
+// whole first flight, at fseq first + 2 (first + 1 when no DATA frame was
+// sent: with DialEarly a withdrawal before the hello writer began the DATA
+// frame cancels that Write); after a partial first flight nothing follows
+// (L42). A failed or partial first flight is the stage "preface" transport
+// failure of Establish.
+//
+// early is ignored (Established.Early 0) for a JOIN, a PING, a packet
+// OPEN (EARLY is reserved there, M4-D3) and a datagram factory; more than wire.EarlyWindow bytes is a programming error
+// (panic). The caller keeps early unmodified until the call returns.
+// Hooks.BeforeFirstFlight(len(early)) runs right before an early first
+// flight is written (before the DialEarly factory call).
+func EstablishEarly(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type, payload, early []byte, check func(*wire.PrefaceAck) error) (*Established, error) {
 	if f.Kind == wire.KindDatagram {
 		return establishDatagram(ctx, env, f, id, t, payload, check)
+	}
+	if t != wire.TypeOpen || len(payload) < wire.OpenFixedLen || payload[16] != byte(wire.KindStream) {
+		early = nil // only a stream OPEN carries early data (M4-D3)
+	}
+	if len(early) > wire.EarlyWindow {
+		panic("rendr/carrier: EstablishEarly: early data beyond wire.EarlyWindow")
 	}
 	pingID := env.Presets.firstPingID()
 	var sb [8]byte
@@ -204,12 +252,30 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	salt := binary.LittleEndian.Uint64(sb[:])
 
 	opt := prefaceOpt(f, t)
-	hello := make([]byte, wire.PrefaceLen, wire.PrefaceLen+wire.FrameOverhead+max(len(payload), wire.PingFixedLen))
+	if t == wire.TypeJoin || opt&wire.OptMux != 0 {
+		// A stream JOIN carrier, and a MUX trunk offer (whose later views
+		// may JOIN), accept an end code in JOIN_ACK(UNKNOWN_SESSION)
+		// (WP13 B-1, L47).
+		opt |= wire.OptEndCode
+	}
+	size := wire.PrefaceLen + wire.FrameOverhead + max(len(payload), wire.PingFixedLen)
+	if len(early) > 0 {
+		size += wire.FrameOverhead + wire.DataPrefixLen + len(early)
+	}
+	hello := make([]byte, wire.PrefaceLen, size)
 	wire.PutPreface(hello, &wire.Preface{Minor: wire.Minor, Kind: wire.KindStream, Instance: env.Local, CarrierID: id, Opt: opt})
 	first := env.Presets.fseqFrom(hello)
 	switch t {
 	case wire.TypeOpen, wire.TypeJoin:
+		start := len(hello)
 		hello = wire.AppendFrame(hello, wire.Header{Type: t, Fseq: first, Handle: wire.SessionHandle}, payload)
+		if len(early) > 0 {
+			// The OPEN's flags (payload bytes 18–19) carry EARLY in this
+			// copy only; the frame's CRC is recomputed over it.
+			fp := hello[start+wire.HeaderLen : len(hello)-wire.TrailerLen]
+			binary.BigEndian.PutUint16(fp[18:20], binary.BigEndian.Uint16(fp[18:20])|wire.OpenFlagEarly)
+			wire.PutTrailer(hello[len(hello)-wire.TrailerLen:], wire.CRC(hello[start:len(hello)-wire.TrailerLen]))
+		}
 	case wire.TypePing:
 		if len(payload) != 0 {
 			panic("rendr/carrier: Establish: a PING first frame takes no payload")
@@ -219,6 +285,13 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 		hello = wire.AppendFrame(hello, wire.Header{Type: wire.TypePing, Fseq: first}, pp[:])
 	default:
 		panic("rendr/carrier: Establish: first frame must be OPEN, JOIN or PING")
+	}
+	// firstEnd ends PREFACE ‖ first frame: the DialEarly factory's bytes
+	// (a full slice expression, so a factory that appends to them cannot
+	// overwrite the DATA frame behind them).
+	firstEnd := len(hello)
+	if len(early) > 0 {
+		hello = appendEarlyData(hello, first+1, early)
 	}
 
 	// returned is set on every return path; a conn call that runs
@@ -232,9 +305,7 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 			return
 		}
 		if g != nil {
-			g.finish()
-			g.closeWith(nil, false)
-			g.join()
+			g.leave(false)
 		}
 		if env.IDs != nil {
 			env.IDs.Release(id)
@@ -263,13 +334,19 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	// Every factory call carries the DialInfo of its carrier (M2-D55,
 	// integration 1 D20); actx keeps bounding the attempt.
 	dctx := withDialInfo(actx, dialInfoFor(f, id, t, payload))
+	beforeFlight := func() {
+		if h := env.Hooks; h != nil && h.BeforeFirstFlight != nil && len(early) > 0 {
+			h.BeforeFirstFlight(len(early))
+		}
+	}
 	var nc net.Conn
 	var err error
 	if f.DialEarly != nil {
+		beforeFlight()
 		nc, err = GuardedDialEarly(dctx, env, func(ctx context.Context, first []byte) (net.Conn, error) {
 			dialStart()
 			return f.DialEarly(ctx, first)
-		}, hello)
+		}, hello[:firstEnd:firstEnd])
 	} else {
 		nc, err = GuardedDial(dctx, env, func(ctx context.Context) (net.Conn, error) {
 			dialStart()
@@ -284,9 +361,7 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	}
 
 	g = newHsGuard(ctx, env, nc, f.DialEarly != nil)
-	if t == wire.TypeOpen {
-		g.rst = withdrawFrame(first + 1)
-	}
+	g.rstOpen, g.first, g.early = t == wire.TypeOpen, first, len(early) > 0
 	stop := context.AfterFunc(actx, g.abort)
 	defer stop()
 	// failed leaves the conn (finish), closes it once (after RST(withdrawn)
@@ -294,17 +369,13 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	// joins the hello writer, and maps an I/O error caused by the abort to
 	// the context's outcome.
 	failed := func(stage string, cause Cause, prefaceOK bool, inst [16]byte, err error, rst bool) (*Established, error) {
-		if g.finish() { // aborted: ctx ended or the attempt deadline passed
+		if g.leave(rst) { // aborted: ctx ended or the attempt deadline passed
 			if ctx.Err() != nil {
 				cause, err = CauseLocalClose, fmt.Errorf("%w (%v)", context.Cause(ctx), err)
 			} else {
 				cause, err = CauseTransportError, fmt.Errorf("%w (%v)", errDialTimeout, err)
 			}
-		} else if rst {
-			g.closeWith(g.rst, false)
 		}
-		g.closeWith(nil, false)
-		g.join()
 		e := &EstablishError{Stage: stage, Cause: cause, PrefaceOK: prefaceOK, Err: err}
 		if prefaceOK {
 			e.Instance = inst
@@ -318,8 +389,14 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 		// overridden by it; every later abort unblocks the conn after it.
 		return failed("preface", CauseTransportError, false, [16]byte{}, errAttemptEnded, false)
 	}
-	if f.DialEarly == nil {
-		g.startHello(hello) // written while PREFACE_ACK is read (design §0.8 V1)
+	switch {
+	case f.DialEarly == nil:
+		beforeFlight()
+		g.startHello(hello, false) // written while PREFACE_ACK is read (design §0.8 V1)
+	case len(early) > 0:
+		// The factory sent PREFACE ‖ OPEN(EARLY); the DATA frame follows
+		// before the PREFACE_ACK is awaited (M4-D4).
+		g.startHello(hello[firstEnd:], true)
 	}
 
 	// PREFACE_ACK, checked in the canonical order (design §5.1).
@@ -359,13 +436,11 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 		if !errors.Is(perr, wire.ErrMajor) {
 			e.Instance = ack.Instance // a v2 answer: e.g. the instance a GOING_AWAY names
 		}
-		if g.finish() && ctx.Err() != nil {
+		// Closed first (leave), so a hello Write the passive will not read
+		// ends now: the typed answer never waits for the deadline (L44).
+		if g.leave(false) && ctx.Err() != nil {
 			e.Cause, e.Err = CauseLocalClose, context.Cause(ctx)
 		}
-		// Closed first, so a hello Write the passive will not read ends
-		// now: the typed answer never waits for the deadline (L44).
-		g.closeWith(nil, false)
-		g.join()
 		return fail(e)
 	}
 	if err := ackOptErr(opt, &ack); err != nil {
@@ -407,6 +482,13 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	if wire.CRCUpdate(wire.CRC(hb[:]), p) != wire.Trailer(rb[h.Len:]) {
 		return failed("response", CauseProtocolViolation, true, ack.Instance, fmt.Errorf("%v: %w", h.Type, wire.ErrCRC), false)
 	}
+	var endCode uint32
+	if h.Type == wire.TypeJoinAck && opt&ack.Opt&wire.OptEndCode != 0 {
+		var err error
+		if endCode, err = takeEndCode(p); err != nil {
+			return failed("response", CauseProtocolViolation, true, ack.Instance, fmt.Errorf("%v: %w", h.Type, err), false)
+		}
+	}
 	if err := validateResponse(h, p, pingID, salt); err != nil {
 		return failed("response", CauseProtocolViolation, true, ack.Instance, err, false)
 	}
@@ -418,12 +500,40 @@ func Establish(ctx context.Context, env *Env, f Factory, id uint32, t wire.Type,
 	c := newConn(env, nc, id, ack.Instance, f.Index, f.Name, true)
 	c.salt = salt
 	c.mux = muxed(opt, &ack)
+	c.endCode = opt&ack.Opt&wire.OptEndCode != 0
 	c.wr.fseq, c.rd.fseq = first+1, rfirst+1
+	if len(early) > 0 {
+		c.wr.fseq++ // the DATA frame of the first flight (awaitHello: written completely)
+	}
 	if t == wire.TypePing {
 		c.st.nextPingID = pingID + 1
 	}
 	returned = true
-	return &Established{Conn: c, Ack: ack, Resp: h, Payload: p, Fresh: c.mux}, nil
+	return &Established{Conn: c, Ack: ack, Resp: h, Payload: p, Fresh: c.mux, Early: len(early), EndCode: endCode}, nil
+}
+
+// EndCodes reports whether c's carrier negotiated wire.OptEndCode (WP13
+// B-1, L47): a JOIN_ACK(UNKNOWN_SESSION) answering a JOIN on any of its
+// views may carry the ended session's RST code. Immutable.
+func (c *Conn) EndCodes() bool { return c.trunk != nil && c.endCode }
+
+// takeEndCode reads the end code of JOIN_ACK payload p on a carrier that
+// negotiated wire.OptEndCode (WP13 B-1, L47): only an UNKNOWN_SESSION may
+// carry one, in its RxNext field's low 32 bits with the high 32 bits zero
+// (wire.ParseJoinAckMux's layout); every other status keeps the canonical
+// rule (ErrReserved). The field is then zeroed, so p is the canonical
+// JOIN_ACK that validateResponse and the session decode.
+func takeEndCode(p []byte) (uint32, error) {
+	a, code, err := wire.ParseJoinAckMux(p)
+	switch {
+	case err != nil:
+		return 0, err
+	case code != 0 && a.Status != wire.StatusUnknownSession:
+		return 0, wire.ErrReserved
+	case a.Status != wire.StatusOK:
+		clear(p[1:wire.JoinAckLen])
+	}
+	return code, nil
 }
 
 // prefaceOpt returns the optional feature bits of the dialer's PREFACE for
@@ -438,13 +548,16 @@ func prefaceOpt(f Factory, t wire.Type) uint32 {
 }
 
 // ackOptErr checks the optional bits of a PREFACE_ACK(OK) against the
-// PREFACE's opt (§A3.1): the passive echoes wire.OptMux only when the
-// PREFACE carried it, so an OptMux the dialer did not offer is a carrier
-// error (never a version error: it fails the attempt as a protocol
-// violation). Other optional bits are ignored.
+// PREFACE's opt (§A3.1): the passive echoes wire.OptMux and wire.OptEndCode
+// only when the PREFACE carried them, so such a bit the dialer did not
+// offer is a carrier error (never a version error: it fails the attempt as
+// a protocol violation). Other optional bits are ignored.
 func ackOptErr(opt uint32, ack *wire.PrefaceAck) error {
 	if ack.Opt&wire.OptMux != 0 && opt&wire.OptMux == 0 {
 		return errors.New("PREFACE_ACK echoes OptMux for a PREFACE without it")
+	}
+	if ack.Opt&wire.OptEndCode != 0 && opt&wire.OptEndCode == 0 {
+		return errors.New("PREFACE_ACK echoes OptEndCode for a PREFACE without it")
 	}
 	return nil
 }
@@ -502,7 +615,25 @@ func validateResponse(h wire.Header, p []byte, pingID uint32, salt uint64) error
 	return nil
 }
 
-// withdrawFrame encodes RST(withdrawn) with the dialer's second fseq.
+// appendEarlyData appends the first flight's DATA frame — handle 1, offset
+// 0, the bytes of early, fseq fseq — to dst without an intermediate copy of
+// early (M4-D4).
+func appendEarlyData(dst []byte, fseq uint32, early []byte) []byte {
+	start := len(dst)
+	n := wire.HeaderLen + wire.DataPrefixLen
+	dst = slices.Grow(dst, n+len(early)+wire.TrailerLen) // EstablishEarly sized it already
+	dst = dst[:start+n]
+	wire.PutHeader(dst[start:], &wire.Header{Type: wire.TypeData, Len: uint32(wire.DataPrefixLen + len(early)), Fseq: fseq, Handle: wire.SessionHandle})
+	wire.PutDataOffset(dst[start+wire.HeaderLen:], 0)
+	dst = append(dst, early...)
+	crc := wire.CRC(dst[start:])
+	dst = dst[:len(dst)+wire.TrailerLen]
+	wire.PutTrailer(dst[len(dst)-wire.TrailerLen:], crc)
+	return dst
+}
+
+// withdrawFrame encodes RST(withdrawn) with the given fseq: the dialer's
+// second, or its third after an early DATA frame (R1-4).
 func withdrawFrame(fseq uint32) []byte {
 	var p [wire.RstFixedLen]byte
 	wire.PutRst(p[:], &wire.Rst{Code: wire.RstWithdrawn})
@@ -529,13 +660,30 @@ var (
 // V1). The handshake waits for the writer (awaitHello) before anything
 // follows the first frame, and joins it (join) before it returns. left
 // tells a concurrent RST(withdrawn) that the handshake goroutine itself
-// left the conn; the writer is not waited for there, so the close that
-// follows a cut first frame also ends a Write that ignores its deadline.
+// left the conn; the RST's goroutine then also waits for the writer,
+// bounded by the same drainMax as its wait for left (pickWithdrawal), so
+// that it decides on the writer's final flags: a Write that delivered the
+// first flight but returns late is still followed by the RST (WP13 A-1).
+// That goroutine, not the handshake, then joins the writer (rstJoins), so
+// a withdrawal returns at once although a Write that ignores its deadline
+// is ended only by the close, drainMax later (no frame follows a cut first
+// flight). The withdrawal claims the close in the critical section in
+// which abort decides it (abortDecide), so a handshake that leaves on its
+// own after that decision (an OPEN_ACK from a racing Confirm) never closes
+// the conn without the RST.
+//
+// With early data (M4-D4) the first flight is PREFACE ‖ OPEN(EARLY) ‖
+// DATA: without DialEarly the hello writer writes it in one Write; with
+// DialEarly the factory wrote PREFACE ‖ OPEN and the hello writer writes
+// the DATA frame. The withdrawal RST follows only the whole first flight
+// (rstFrame, R1-4).
 type hsGuard struct {
 	env     *Env
 	nc      net.Conn
 	ctx     context.Context // the caller's context (its cause tells a withdrawal)
-	rst     []byte          // RST(withdrawn) for an OPEN; nil otherwise
+	rstOpen bool            // the first frame is an OPEN: a withdrawal RST(withdrawn) may follow it
+	first   uint32          // the first frame's fseq
+	early   bool            // a DATA frame (fseq first + 1) belongs to the first flight
 	left    chan struct{}   // closed by finish: the handshake goroutine makes no further conn call
 	closing chan struct{}   // closed when the close of the conn began (closeWith)
 	wdone   chan struct{}   // closed when the hello writer exited; nil without one (DialEarly)
@@ -544,32 +692,66 @@ type hsGuard struct {
 	mu           sync.Mutex
 	finished     bool  // the guarded phase ended: a later abort does nothing
 	aborted      bool  // abort ran before finish
-	firstWritten bool  // PREFACE ‖ first frame were written completely (DialEarly: by the factory)
+	firstWritten bool  // PREFACE ‖ first frame were written completely (DialEarly: by the factory); without DialEarly also the DATA frame
+	dataStarted  bool  // DialEarly: the hello writer began the DATA frame's Write
+	dataWritten  bool  // the DATA frame was written completely
+	dataCut      bool  // DialEarly: the DATA frame's Write never starts (a withdrawal RST took fseq first + 1)
 	wfinished    bool  // the hello writer's Write returned; werr is final
 	werr         error // the hello Write's error
 	wabandoned   bool  // the hello writer was counted in the abandoned-call pool
+	rstJoins     bool  // a concurrent withdrawal RST's goroutine joins the hello writer, not the handshake (pickWithdrawal)
 }
 
 func newHsGuard(ctx context.Context, env *Env, nc net.Conn, firstWritten bool) *hsGuard {
 	return &hsGuard{env: env, nc: nc, ctx: ctx, firstWritten: firstWritten, left: make(chan struct{}), closing: make(chan struct{})}
 }
 
-func (g *hsGuard) abort() {
+// abort is the attempt context's AfterFunc: the decision (abortDecide),
+// then the close it claimed.
+func (g *hsGuard) abort() { g.abortDecide()() }
+
+// abortDecide is abort's decision, in one critical section of g.mu: unless
+// the handshake already left the conn (finish), it marks the attempt
+// aborted, decides whether this is a withdrawal (an OPEN and the cause
+// ErrWithdrawn: the RST(withdrawn) may follow the first flight) and claims
+// the close of the conn (claimLocked). It returns the rest of the close,
+// to run outside the lock; a no-op when the handshake left first or the
+// close was claimed before (a failed hello Write). The claim is made under
+// the lock that finish takes, so a handshake that leaves after this
+// decision (finish reports aborted) never claims the close first: its
+// code-free closeWith loses to the withdrawal, which then still decides
+// the RST (pickWithdrawal). Releasing the lock unclaimed let an OPEN_ACK
+// that ended the response read on its own (a racing Confirm) close the
+// conn with no RST (WP13 review, L49;
+// TestWithdrawalClaimsCloseBeforeHandshakeLeaves_L49).
+func (g *hsGuard) abortDecide() (closeConn func()) {
 	g.mu.Lock()
 	if g.finished {
 		g.mu.Unlock()
-		return
+		return func() {}
 	}
 	g.aborted = true
-	withdraw := g.rst != nil && errors.Is(context.Cause(g.ctx), ErrWithdrawn)
+	withdraw := g.rstOpen && errors.Is(context.Cause(g.ctx), ErrWithdrawn)
+	won := g.claimLocked(withdraw)
 	g.mu.Unlock()
-	if withdraw {
-		// Whether the RST may follow is decided once the handshake left
-		// the conn: only after a first frame that was written completely.
-		g.closeWith(g.rst, true)
-		return
+	if !won {
+		return func() {}
 	}
-	g.closeWith(nil, false)
+	return func() { g.runClose(withdraw, withdraw) }
+}
+
+// leave is the handshake goroutine's exit after a failure: it leaves the
+// conn (finish), closes it once — after RST(withdrawn) when rst asks and no
+// abort came first (closeWith; rstFrame decides) — and joins the hello
+// writer. It reports whether abort ran first.
+func (g *hsGuard) leave(rst bool) (aborted bool) {
+	aborted = g.finish()
+	if !aborted && rst {
+		g.closeWith(true, false)
+	}
+	g.closeWith(false, false)
+	g.join()
+	return aborted
 }
 
 // finish ends the guarded phase — the handshake goroutine makes no further
@@ -592,11 +774,27 @@ func (g *hsGuard) isAborted() bool {
 	return g.aborted
 }
 
-// wroteFirst reports whether PREFACE ‖ first frame were written completely.
-func (g *hsGuard) wroteFirst() bool {
+// rstFrame returns the withdrawal RST that may follow the first flight,
+// or nil when nothing may (R1-4): no OPEN, or a first flight not written
+// completely — a partial frame is never followed (L42). Its fseq is
+// first + 2 after a DATA frame and first + 1 without one; with DialEarly a
+// DATA frame whose Write has not begun is cancelled here (dataCut), so the
+// RST takes fseq first + 1 and the DATA frame is never written.
+func (g *hsGuard) rstFrame() []byte {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.firstWritten
+	switch {
+	case !g.rstOpen || !g.firstWritten:
+		return nil
+	case !g.early:
+		return withdrawFrame(g.first + 1)
+	case g.dataWritten:
+		return withdrawFrame(g.first + 2)
+	case !g.dataStarted:
+		g.dataCut = true
+		return withdrawFrame(g.first + 1)
+	}
+	return nil // the DATA frame's Write is in progress or failed
 }
 
 // startHello writes hello on the hello writer, a guarded helper goroutine
@@ -605,8 +803,11 @@ func (g *hsGuard) wroteFirst() bool {
 // errors (writeFull, L42), and a failed Write closes the conn at once so
 // that the handshake's PREFACE_ACK read ends with it instead of waiting
 // for the deadline. The writer is joined by join; it is counted in the
-// abandoned-call pool only when join gave up on it.
-func (g *hsGuard) startHello(hello []byte) {
+// abandoned-call pool only when join gave up on it. hello is the whole
+// first flight, or with data set the DATA frame that follows a DialEarly
+// factory's PREFACE ‖ OPEN: that Write does not begin once the close of
+// the conn began or a withdrawal RST cancelled it (rstFrame).
+func (g *hsGuard) startHello(hello []byte, data bool) {
 	g.wdone = make(chan struct{})
 	go func() {
 		err := errHelloGoexit // kept when the Write unwinds with runtime.Goexit
@@ -615,6 +816,7 @@ func (g *hsGuard) startHello(hello []byte) {
 			g.wfinished, g.werr = true, err
 			if err == nil {
 				g.firstWritten = true
+				g.dataWritten = g.early
 			}
 			abandoned := g.wabandoned
 			g.mu.Unlock()
@@ -622,10 +824,20 @@ func (g *hsGuard) startHello(hello []byte) {
 				g.env.Abandon.Leave()
 			}
 			if err != nil {
-				g.closeWith(nil, false)
+				g.closeWith(false, false)
 			}
 			close(g.wdone) // last: whoever joins sees every effect of this goroutine
 		}()
+		if data {
+			g.mu.Lock()
+			cut := g.dataCut || g.closed.Load()
+			g.dataStarted = !cut
+			g.mu.Unlock()
+			if cut {
+				err = errAttemptEnded
+				return
+			}
+		}
 		err = writeFull(g.nc, hello)
 	}()
 }
@@ -646,10 +858,10 @@ func (g *hsGuard) helloFailed() error {
 // frame next (P18), and the attempt's deadline bounds the wait (abort). It
 // does not wait for the writer once the close of the conn began: it then
 // returns the Write's error, or errAttemptEnded, at once, and the handshake
-// leaves the conn (finish), so that a withdrawal's RST is decided — and a
-// cut first frame closed, which also ends a Write that ignores its deadline
-// — without waiting for this goroutine. Only the handshake goroutine calls
-// it.
+// leaves the conn (finish) and returns; a withdrawal's RST is decided on
+// the RST's own goroutine, which waits for the writer (bounded by
+// drainMax) and joins it (pickWithdrawal). Only the handshake goroutine
+// calls it.
 func (g *hsGuard) awaitHello() error {
 	if g.wdone == nil {
 		return nil // DialEarly: the factory sent PREFACE ‖ first frame
@@ -668,12 +880,25 @@ func (g *hsGuard) awaitHello() error {
 // join waits for the hello writer before the handshake returns. Its caller
 // left the conn (finish) and began its close (closeWith), which ends a
 // hello Write still in progress on a conn that honours its deadline or
-// Close: at once, or, after a withdrawal, as soon as the RST's goroutine
-// sees that the first frame is incomplete. Only a writer still inside a
-// Write that ignores both AbandonWait later is counted in the
-// abandoned-call pool, until its Write returns (L52). Only the handshake
+// Close. After a concurrent withdrawal the RST's goroutine joins the
+// writer instead (rstJoins, pickWithdrawal), after the close it begins
+// once it decided the RST, and join returns at once. Only the handshake
 // goroutine calls it.
 func (g *hsGuard) join() {
+	g.mu.Lock()
+	handed := g.rstJoins
+	g.mu.Unlock()
+	if !handed {
+		g.joinWriter()
+	}
+}
+
+// joinWriter waits for the hello writer, whose conn is closing. Only a
+// writer still inside a Write that ignores both AbandonWait later is
+// counted in the abandoned-call pool, until its Write returns (L52). Its
+// caller is the handshake goroutine (join) or, after a concurrent
+// withdrawal, the RST's goroutine (pickWithdrawal), never both.
+func (g *hsGuard) joinWriter() {
 	if g.wdone == nil {
 		return // DialEarly: no writer
 	}
@@ -700,25 +925,105 @@ func (g *hsGuard) join() {
 	}
 }
 
-// closeWith begins the close of the conn, once: with frame nil at once
-// (SetDeadline(now) and Close; CloseConn); otherwise after writing frame in
-// the L05 order (writeThenClose), but only when PREFACE ‖ first frame were
-// written completely — nothing may follow a partial first frame. concurrent
-// says that the handshake may still be inside a conn call (abort): the
-// frame then waits until the handshake goroutine left the conn (left), and
-// the first-frame condition is decided only then.
-func (g *hsGuard) closeWith(frame []byte, concurrent bool) {
-	if !g.closed.CompareAndSwap(false, true) {
-		return
+// closeWith begins the close of the conn, once: without rst at once
+// (SetDeadline(now) and Close; CloseConn); with rst after writing the
+// withdrawal RST in the L05 order (writeThenClose), but only when the
+// whole first flight was written (rstFrame) — nothing may follow a partial
+// frame. concurrent says that the handshake may still be inside a conn
+// call (abort, which claims the close inside its decision: abortDecide):
+// the RST's goroutine then waits until the handshake goroutine left the
+// conn and the hello writer returned, and rstFrame decides only then
+// (pickWithdrawal); that goroutine joins the writer (rstJoins, set with
+// the close's claim under the lock join reads it under: claimLocked).
+func (g *hsGuard) closeWith(rst, concurrent bool) {
+	g.mu.Lock()
+	won := g.claimLocked(rst && concurrent)
+	g.mu.Unlock()
+	if won {
+		g.runClose(rst, concurrent)
 	}
+}
+
+// claimLocked claims the close of the conn, once; g.mu is held. A
+// concurrent withdrawal that wins it (rstJoins) hands the join of the
+// hello writer to the RST's goroutine (pickWithdrawal).
+func (g *hsGuard) claimLocked(rstJoins bool) (won bool) {
+	won = g.closed.CompareAndSwap(false, true)
+	if won && rstJoins {
+		g.rstJoins = true
+	}
+	return won
+}
+
+// runClose begins the close that its caller claimed (claimLocked); see
+// closeWith.
+func (g *hsGuard) runClose(rst, concurrent bool) {
 	close(g.closing)
 	switch {
-	case frame != nil && concurrent:
-		writeThenClose(g.env, g.nc, frame, g.left, g.wroteFirst)
-	case frame != nil && g.wroteFirst():
-		writeThenClose(g.env, g.nc, frame, nil, nil)
+	case rst && concurrent:
+		writeThenClose(g.env, g.nc, nil, g.pickWithdrawal, g.joinAfterWithdrawal)
+	case rst:
+		if frame := g.rstFrame(); frame != nil {
+			writeThenClose(g.env, g.nc, frame, nil, nil)
+			return
+		}
+		CloseConn(g.env, g.nc)
 	default:
 		CloseConn(g.env, g.nc)
+	}
+}
+
+// pickWithdrawal is the pick of a concurrent withdrawal RST (closeWith),
+// run on the RST's goroutine while expired (drainMax after the close
+// began) has not fired. It waits until the handshake goroutine left the
+// conn (left) and then until the hello writer returned (wdone), so that
+// rstFrame decides on the writer's final flags: a Write that delivered the
+// first flight but had not returned when the close began is still followed
+// by the RST (WP13 A-1, L49), and a Write that honours the SetDeadline(now)
+// which already ran returns at once. It returns nil — no frame, and the
+// conn is closed at once — when expired fires first: a handshake still
+// inside a conn call (the close ends it, and the handshake then joins its
+// writer itself: rstJoins is cleared), or a hello Write that ignores its
+// deadline (the close ends it; best effort, L49).
+func (g *hsGuard) pickWithdrawal(expired <-chan time.Time) []byte {
+	timedOut := false
+	select {
+	case <-g.left:
+	case <-expired:
+		timedOut = true
+	}
+	g.mu.Lock()
+	if !g.finished {
+		g.rstJoins = false // the handshake has not reached join yet: it joins its writer
+	}
+	var wdone chan struct{}
+	if g.rstJoins {
+		wdone = g.wdone // set before finish, which this lock follows
+	}
+	own := g.rstJoins
+	g.mu.Unlock()
+	if timedOut || !own {
+		return nil
+	}
+	if wdone != nil {
+		select {
+		case <-wdone:
+		case <-expired:
+			return nil
+		}
+	}
+	return g.rstFrame()
+}
+
+// joinAfterWithdrawal joins the hello writer on a concurrent withdrawal
+// RST's goroutine after the close began, when that goroutine owns it
+// (rstJoins, pickWithdrawal).
+func (g *hsGuard) joinAfterWithdrawal() {
+	g.mu.Lock()
+	own := g.rstJoins
+	g.mu.Unlock()
+	if own {
+		g.joinWriter()
 	}
 }
 
@@ -730,19 +1035,22 @@ func (g *hsGuard) closeWith(frame []byte, concurrent bool) {
 // already sent (an OPEN_ACK racing a withdrawal), so the close never
 // answers unread bytes with a TCP reset that could discard the frame before
 // the passive read it (Windows drops buffered data on a reset).
-// When left is non-nil the handshake goroutine may still be inside a conn
+// When pick is non-nil the handshake goroutine may still be inside a conn
 // call: the goroutine first unblocks it with SetDeadline(now) — the
 // handshake's read and a hello Write in progress return at once on a conn
-// that honours deadlines — and waits until it left the conn, at most
-// drainMax, so that the drain never competes with it; ok, if non-nil, then
-// decides whether the frame may be written at all (the first frame was
-// written completely, so the hello writer's Write has returned), else the
-// conn is closed at once, which also ends a hello Write that ignores its
-// deadline. A handshake still inside its call after drainMax — a read that
-// ignores its deadline, or a conn whose deadline setters wait for the call
-// in progress (a websocket adapter that honours gorilla's one-reader rule;
-// design §0.14 B3) — gets no frame (it is best effort, L49): the conn is
-// closed at once, which ends the call on a conn that honours Close. The
+// that honours deadlines — and pick, given a timer that fires drainMax
+// later, waits until the handshake left the conn and the hello writer
+// returned (pickWithdrawal), so that the drain never competes with them;
+// it then supplies the frame, or nil when none may be written at all (the
+// first flight was not written completely: rstFrame), and the conn is
+// then closed at once. A handshake still inside its call, or a hello Write
+// still in progress, after drainMax — a call that ignores its deadline, or
+// a conn whose deadline setters wait for the call in progress (a websocket
+// adapter that honours gorilla's one-reader rule; design §0.14 B3) — gets
+// no frame (it is best effort, L49): the conn is closed then, which ends
+// the call on a conn that honours Close. after, if non-nil, runs last on
+// the goroutine, once the close began (it joins the hello writer: the
+// handshake left without waiting for it, pickWithdrawal). The
 // SetDeadline therefore runs on a goroutine of its own (closeOnce's
 // deadline step, goDeadline; the final close then calls Close only), which
 // such a conn holds until that close; the frame's write deadline is set
@@ -753,24 +1061,22 @@ func (g *hsGuard) closeWith(frame []byte, concurrent bool) {
 // ignores the write or the drain's read deadline and a peer that does not
 // read or close — its conn is closed exactly once as a last resort (design
 // §0.8 V2, closeOnce.last), which unblocks it on a conn that honours Close.
-func writeThenClose(env *Env, nc net.Conn, frame []byte, left <-chan struct{}, ok func() bool) {
+func writeThenClose(env *Env, nc net.Conn, frame []byte, pick func(expired <-chan time.Time) []byte, after func()) {
 	k := &closeOnce{nc: nc}
 	wait := env.Timing.withDefaults().AbandonWait
 	w := armWatch(env.Abandon, wait+3*drainMax, func() { k.last(env) })
 	go func() {
+		if after != nil {
+			defer after() // last: the close began and the watch ended
+		}
 		defer w.finish()
 		defer k.async(env) // exactly once, also on runtime.Goexit in a conn call (L51)
-		if left != nil {
+		if pick != nil {
 			set := k.goDeadline(env, wait+drainMax) // the close below comes drainMax after it at the latest
 			t := time.NewTimer(drainMax)
 			defer t.Stop()
-			select {
-			case <-left:
-			case <-t.C:
-				return // still inside a conn call: no frame; the close ends the call
-			}
-			if ok != nil && !ok() {
-				return
+			if frame = pick(t.C); frame == nil {
+				return // no frame may follow, or a call still in progress after drainMax: the close ends it
 			}
 			select {
 			case <-set: // the frame's write deadline follows SetDeadline(now)

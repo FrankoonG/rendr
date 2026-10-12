@@ -47,12 +47,13 @@ import (
 // Receive charge (D13, V3). st.oooCap is the size-class capacity held by inq
 // and ooq together: exactly the Budget charge of the session's receive
 // buffers. Out-of-order data takes a new buffer only while the charge stays
-// within recvLimit, 2·W; bytes that would need more are dropped and counted
-// in oooDropped (never a violation). In-order data inside the advertised
-// window is always taken; when it pushes the charge above 2·W, out-of-order
-// segments are shed, highest first and counted the same way (shedLocked).
-// So between Data calls the charge is at most 2·W whenever out-of-order data
-// is held; a session's Budget footprint adds one run per lane (D29), while
+// within recvLimit: 2·W, or earlyRecvLimit (2·EarlyWindow) while a passive
+// session is pending (early_recv.go); bytes that would need more are dropped
+// and counted in oooDropped (never a violation). In-order data inside the
+// advertised window is always taken; when it pushes the charge above
+// recvLimit, out-of-order segments are shed, highest first and counted the
+// same way (shedLocked). So between Data calls the charge is at most
+// recvLimit whenever out-of-order data is held; a session's Budget footprint adds one run per lane (D29), while
 // its carriers' reader stages are charged to the separate stage account
 // outside MaxBufferedBytes (§0.14 B2). With nothing held out of order the
 // charge is the in-order queue's alone, which nothing can shed: the window
@@ -84,8 +85,13 @@ func (s *Session) conflictErr() error {
 }
 
 // recvLimit is the cap on the receive charge that out-of-order data may
-// fill: 2·W (V3).
+// fill: 2·W (V3); while a passive session is pending, earlyRecvLimit, so
+// that sparse early DATA cannot make a session that nobody accepted yet
+// hold more than its early span allows (L48; early_recv.go).
 func (s *Session) recvLimit() int64 {
+	if s.pendingLocked() {
+		return earlyRecvLimit
+	}
 	return 2 * s.window()
 }
 
@@ -106,17 +112,27 @@ type rcall struct {
 	copied int // payload bytes copied (the call's own and the merged ones)
 }
 
-// dataLocked implements lane.Data under s.mu.
-func (s *Session) dataLocked(off uint64, p []byte, buf *carrier.Buf) error {
-	st := &s.st
-	if st.ended {
+// dataLocked implements lane.Data of lane l under s.mu (l: the lane whose
+// carrier delivered the frame, for M4's pre-verdict rule, lane.early). An
+// ended session discards the frame (also early DATA that arrives after a
+// refusal, M4-D8); a pending passive session takes it only as early data
+// (earlyDataLocked, M4-D5).
+func (s *Session) dataLocked(l *lane, off uint64, p []byte, buf *carrier.Buf) error {
+	if s.st.ended {
 		buf.Release()
 		return nil
 	}
 	if s.pendingLocked() {
-		buf.Release()
-		return errDataBeforeOpen
+		return s.earlyDataLocked(l, off, p, buf) // M4-D5
 	}
+	return s.recvDataLocked(off, p, buf)
+}
+
+// recvDataLocked is the receive path of one DATA frame inside the right
+// edge (the file comment): the checks, the comparison with held bytes, the
+// placement and the wakes.
+func (s *Session) recvDataLocked(off uint64, p []byte, buf *carrier.Buf) error {
+	st := &s.st
 	end := off + uint64(len(p))
 	switch {
 	case len(p) == 0 || end < off:

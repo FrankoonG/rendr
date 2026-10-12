@@ -469,13 +469,15 @@ func waitDone(t *testing.T, done <-chan struct{}, what string) {
 // TestPacketSmoke_CA is the in-memory half: DatagramLink and DatagramHub,
 // selector and bond, 60 virtual seconds each (30 under -race).
 func TestPacketSmoke_CA(t *testing.T) {
-	rate, duration := 10000, 60*time.Second
+	rate, back, duration := 10000, 1000, 60*time.Second
 	if loopbackRace {
 		// R1-23's first lever (R2-37), as TestPacketRaceSmoke_CR: the race
-		// lane runs 30 virtual seconds (two kills) at 1,000 datagrams per
-		// second, with the same criteria (the root package's Linux race
-		// time reached the 270-s lever line at I2).
-		rate, duration = 1000, 30*time.Second
+		// lane runs 30 virtual seconds (two kills) at 400 datagrams per
+		// second each way, with the same criteria (the root package's
+		// Linux race time reached the 270-s lever line at M3's I2; 1,000
+		// and 1,000 back until I3 of M4, when the race-unit passes
+		// exceeded 300 s).
+		rate, back, duration = 400, 400, 30*time.Second
 	}
 	for _, tr := range []struct {
 		name string
@@ -487,7 +489,7 @@ func TestPacketSmoke_CA(t *testing.T) {
 					n := tr.net()
 					defer n.close()
 					runSmoke(t, n, smokeRun{mode: mode, duration: duration, every: 10 * time.Second,
-						rate: rate, back: 1000, lossWin: 200 * time.Millisecond}, rendr.Config{})
+						rate: rate, back: back, lossWin: 200 * time.Millisecond}, rendr.Config{})
 				})
 			})
 		}
@@ -496,21 +498,23 @@ func TestPacketSmoke_CA(t *testing.T) {
 
 // TestPacketSmokeUDP_CA is the real-socket half over carrier/udp on
 // loopback: 10 real seconds with a kill every 2 s per mode (a shortened
-// timeline: the host runs no long real-time loads).
+// timeline: the host runs no long real-time loads); 6 s (two kills) under
+// the race detector (m3 R1-23's first lever, I3 of M4), with the same
+// criteria.
 func TestPacketSmokeUDP_CA(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-time smoke")
 	}
-	rate := 10000
+	rate, duration := 10000, 10*time.Second
 	if loopbackRace {
-		rate = 2000
+		rate, duration = 2000, 6*time.Second
 	}
 	pre, post := realLossWindows()
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		t.Run(mode.String(), func(t *testing.T) {
 			g0 := runtime.NumGoroutine()
 			n := smokeUDPNet(t)
-			runSmoke(t, n, smokeRun{mode: mode, duration: 10 * time.Second, every: 2 * time.Second,
+			runSmoke(t, n, smokeRun{mode: mode, duration: duration, every: 2 * time.Second,
 				rate: rate, back: 1000, lossWin: post, preWin: pre}, rendr.Config{})
 			deadline := time.Now().Add(5 * time.Second)
 			for runtime.NumGoroutine() > g0 && time.Now().Before(deadline) {

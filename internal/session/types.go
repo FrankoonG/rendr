@@ -40,7 +40,7 @@ type State uint8
 
 // States.
 const (
-	StatePending State = 1 // passive: OPEN admitted, waiting for Confirm/Reject/AcceptTimeout
+	StatePending State = 1 // passive: OPEN admitted, waiting for Confirm/Reject/AcceptTimeout; dialer: opening (a session returned by Dial with DialSpec.EarlyReturn before its verdict, M4-D19)
 	StateOpen    State = 2 // data flows (possibly inside a no-path episode)
 	StateClosing State = 3 // the application called Close; linger delivers the rest
 	StateEnded   State = 4 // terminal; Status().Err is the end error (io.EOF after a clean finish)
@@ -91,8 +91,14 @@ type EventSink interface{ Emit(ev Event) }
 type Verdict struct {
 	Opened bool           // the session reached StateOpen: tombstone answers UNKNOWN_SESSION
 	Status wire.AckStatus // never-opened sessions: REJECTED, CAPACITY or GOING_AWAY; a withdrawn one: UNKNOWN_SESSION
-	Code   uint32
-	Msg    string
+	// Code: a never-opened session's OPEN_ACK code; an opened one's RST
+	// code that this side decided (Abort, idle, linger, exhausted, ...; 0
+	// when it ended otherwise, e.g. by the peer's RST), which the
+	// tombstone puts in a JOIN_ACK(UNKNOWN_SESSION) on a carrier that
+	// negotiated wire.OptEndCode (WP13 B-1, L47). OpenAck ignores it for
+	// an opened session.
+	Code uint32
+	Msg  string
 }
 
 // OpenAck returns the OPEN_ACK that repeats this verdict.
@@ -155,6 +161,15 @@ type Params struct {
 	// Actors is the Runtime's gauge of running actor goroutines
 	// (rendr.Status.Actors, M3-D44); nil: not counted.
 	Actors *atomic.Int64
+
+	// EarlyDataMax (M4-D16; dialer, EarlyReturn sessions only) caps the
+	// early span: the bytes Write admits before the verdict and the first
+	// flight carries (0 … wire.EarlyWindow; 0: no early bytes).
+	EarlyDataMax int
+	// MinIdleTimeout is the floor of SetIdleTimeout's clamp (M4-D21): 0
+	// keeps 10 s (testhooks.MinIdleTimeout lowers it for real-socket
+	// tests).
+	MinIdleTimeout time.Duration
 }
 
 // PacketParams is the frozen configuration of a packet session (M2-D1),

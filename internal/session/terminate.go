@@ -39,9 +39,18 @@ import (
 // DONE were lost, or its Runtime closing) only says that the peer gave up
 // waiting for our DONE. Invariant 1 holds: the peer's FIN was delivered at
 // the contiguous point, where Read returns io.EOF anyway.
+//
+// A dialer still in its opening phase takes the pending branch (M4): no
+// rule below applies before the verdict; earlyCloseLocked runs the
+// deadline of a Close called before it (M4-D12; a no-op until M4's WP9a).
 func (a *actor) terminationLocked(now time.Time) {
 	s := a.s
 	st := &s.st
+	if a.d != nil && !a.d.opened {
+		a.earlyCloseLocked(now)
+		return
+	}
+	idle := a.idleTimeout()
 	linger := orDefault(s.p.Linger, defLinger)
 	idleBase := st.lastData
 	if a.openedAt.After(idleBase) {
@@ -52,6 +61,11 @@ func (a *actor) terminationLocked(now time.Time) {
 		// RST received: no RST is sent back (§4.7).
 		r := st.rstIn
 		a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortCode(r.Code), Msg: string(r.Msg), Remote: true}), nil, false)
+	case st.abortReq != nil:
+		// Conn.Abort (M4-D20): the application's RST; this side's calls
+		// return net.ErrClosed. A peer RST that arrived first wins (the
+		// case above): one end decision.
+		a.terminateLocked(now, net.ErrClosed, st.abortReq, false)
 	case st.exhausted:
 		// L14: exactly one RST(Exhausted); the Write already returned the error.
 		a.terminateLocked(now, errExhausted(), &wire.Rst{Code: wire.RstExhausted}, false)
@@ -68,7 +82,7 @@ func (a *actor) terminationLocked(now time.Time) {
 		a.terminateLocked(now, net.ErrClosed, &wire.Rst{Code: wire.RstClosed}, false)
 	case st.closed && !st.doneSent && !now.Before(st.closedAt.Add(linger)):
 		a.terminateLocked(now, net.ErrClosed, &wire.Rst{Code: wire.RstLinger}, false)
-	case s.p.IdleTimeout > 0 && !st.doneSent && !now.Before(idleBase.Add(s.p.IdleTimeout)):
+	case idle > 0 && !st.doneSent && !now.Before(idleBase.Add(idle)):
 		// After our DONE the exchange is complete and Linger bounds the
 		// wait for the peer's DONE (design §0.14 B4): not idleness.
 		a.terminateLocked(now, ErrIdleTimeout, &wire.Rst{Code: wire.RstIdle}, false)
@@ -78,10 +92,35 @@ func (a *actor) terminationLocked(now time.Time) {
 		} else if st.closed {
 			a.want(st.closedAt.Add(linger))
 		}
-		if s.p.IdleTimeout > 0 && !st.doneSent {
-			a.want(idleBase.Add(s.p.IdleTimeout))
+		if idle > 0 && !st.doneSent {
+			a.want(idleBase.Add(idle))
 		}
 	}
+}
+
+// EndCode returns the code of the RST this session decided once it ended
+// (Abort, idle, linger, exhausted, closed, going away), else 0: while it
+// has not ended, and when it ended without an RST of its own (the peer's
+// RST, a clean end, ErrNoPath). It is the Verdict.Code of an opened
+// session's tombstone, available while the session is still in the
+// table: a JOIN that Join answers UNKNOWN_SESSION because the session
+// ended (or whose adopt the exiting actor no longer takes) gets the same
+// end code as one that meets the tombstone (OptEndCode; WP13 B-1, L47).
+func (s *Session) EndCode() uint32 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.endCodeLocked()
+}
+
+// endCodeLocked is EndCode under s.mu. A passive session places an RST of
+// its own only once it was opened (terminationLocked; a pending one is
+// answered with an OPEN_ACK), and every RST code is at least 1, so 0
+// means none.
+func (s *Session) endCodeLocked() uint32 {
+	if s.ctl.state != StateEnded || s.ctl.rst == nil || s.st.rstIn != nil {
+		return 0
+	}
+	return s.ctl.rst.Code
 }
 
 // terminateLocked is the end procedure (§4.7): state Ended, the RST to
@@ -98,12 +137,19 @@ func (a *actor) terminateLocked(now time.Time, err error, rst *wire.Rst, goAway 
 	ctl := &s.ctl
 	a.ending = true
 	a.endErr = err
-	if a.opened {
-		a.verdict = Verdict{Opened: true}
+	if ctl.state == StatePending {
+		a.leavePendingLocked() // M4: every exit from StatePending
 	}
 	ctl.state = StateEnded
 	if rst != nil {
 		ctl.rst = rst
+	}
+	if a.opened {
+		// The RST this side decided (endCodeLocked): the tombstone answers
+		// a later JOIN with it (OptEndCode), so a dialer whose carriers all
+		// died before the RST reached it still ends with its code (WP13
+		// B-1, L47).
+		a.verdict = Verdict{Opened: true, Code: s.endCodeLocked()}
 	}
 	s.endLocked(err)
 	for _, l := range s.lanes {

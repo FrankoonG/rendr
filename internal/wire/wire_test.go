@@ -16,8 +16,9 @@ import (
 // PREFACE_ACK and frames, or several frames), "flow_header" (a bare valid
 // raw-UDP flow header) and "udp" (a flow header and valid rendr bytes); M3
 // decodes a JOIN_ACK on a later handle with the MUX parser when the
-// dedicated one refuses it (a coded view refusal). A single element is its
-// own decoder's, so the sets stay disjoint.
+// dedicated one refuses it (a coded view refusal); M4 (WP13 B-1) does so
+// for an UNKNOWN_SESSION on handle 1 too (an end code under OptEndCode).
+// A single element is its own decoder's, so the sets stay disjoint.
 func acceptors(b []byte) []string {
 	var out []string
 	if _, err := ParsePreface(b); err == nil {
@@ -28,8 +29,9 @@ func acceptors(b []byte) []string {
 	}
 	if f, n, err := DecodeFrame(b); err == nil && n == len(b) {
 		_, err := decodeTyped(f.Type, f.Payload)
-		if err != nil && f.Type == TypeJoinAck && f.Handle > SessionHandle {
-			// A view's JOIN_ACK on a MUX trunk may carry a refusal code.
+		if err != nil && f.Type == TypeJoinAck && (f.Handle > SessionHandle || len(f.Payload) > 0 && AckStatus(f.Payload[0]) == StatusUnknownSession) {
+			// A view's JOIN_ACK on a MUX trunk may carry a refusal code;
+			// an UNKNOWN_SESSION on handle 1 an end code (OptEndCode).
 			_, _, err = ParseJoinAckMux(f.Payload)
 		}
 		if err == nil {
@@ -578,7 +580,9 @@ func TestPayloadErrors_L44(t *testing.T) {
 		{"open mode 0", ErrValue, e(ParseOpen(open(1, 0, 0, 0, 0, ""), 100))},
 		{"open mode 4", ErrValue, e(ParseOpen(open(1, 4, 0, 0, 0, ""), 100))},
 		{"open mode 3 decodes", nil, e(ParseOpen(open(1, 3, 0, 0, 0, ""), 100))},
-		{"open early flag", ErrReserved, e(ParseOpen(open(1, 1, OpenFlagEarly, 0, 0, ""), 100))},
+		{"open early flag decodes (M4)", nil, e(ParseOpen(open(1, 1, OpenFlagEarly, 0, 0, ""), 100))},
+		{"open early flag on a packet OPEN", ErrReserved, e(ParseOpen(open(2, 1, OpenFlagEarly, 1200, 0, ""), 100))},
+		{"open flag bit 1", ErrReserved, e(ParseOpen(open(1, 1, 1<<1, 0, 0, ""), 100))},
 		{"open undefined flag", ErrReserved, e(ParseOpen(open(1, 1, 0x8000, 0, 0, ""), 100))},
 		{"open stream pmtu", ErrReserved, e(ParseOpen(open(1, 1, 0, 1200, 0, ""), 100))},
 		// M2 (§A8.7): a packet OPEN's window is its cmtu offer; 1 MiB is no

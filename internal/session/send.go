@@ -72,7 +72,7 @@ func (s *Session) writeRoundLocked(p []byte, dst *[maxRoundChunks]*carrier.Buf, 
 			return 0, 0, errDeadline
 		}
 		budgetBlocked := false
-		if room := s.sendRoomLocked(); room > 0 {
+		if room := s.earlyCapLocked(s.sendRoomLocked()); room > 0 {
 			k = min(int64(len(p)), room, maxRound)
 			if st.resEnd+uint64(k) > s.offsetLimit() {
 				st.exhausted = true

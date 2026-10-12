@@ -166,6 +166,7 @@ func (a *actor) onConfirmLocked(now time.Time, c *confirm) {
 	}
 	a.decided, a.opened = true, true
 	a.openedAt = now
+	a.leavePendingLocked() // M4: every exit from StatePending
 	ctl.state = StateOpen
 	win := s.openWindowLocked()
 	var sender *lane
@@ -250,6 +251,12 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	}
 	a.gen++
 	l := a.newLaneLocked(now, ad.conn, -1, a.gen, LaneJoining)
+	if ad.early {
+		// M4-D5: recorded before the carrier starts; earlyDataLocked
+		// (early_recv.go) reads it.
+		l.early = true
+		s.st.earlyOpen = true
+	}
 	a.unconfirmed = append(a.unconfirmed, l)
 	switch {
 	case ad.kind == adoptJoin:
@@ -257,7 +264,7 @@ func (a *actor) onAdoptLocked(now time.Time, ad *adopt) {
 	case ctl.state != StatePending:
 		l.first = firstFrame{t: wire.TypeOpenAck, openAck: wire.OpenAck{Status: wire.StatusOK, Window: s.laneWindowLocked(l)}}
 	}
-	ad.conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Hold: true})
+	ad.conn.Start(s.endpoint(l), &s.mb, carrier.StartOptions{Hold: true, Early: ad.early})
 	if ctl.state != StatePending {
 		a.episodeEndLocked(now)
 	}
@@ -275,13 +282,19 @@ func (s *Session) joinAckRxLocked(l *lane) uint64 {
 }
 
 // refuseAdopt answers an adopted carrier of an ended session and closes it:
-// JOIN_ACK(UNKNOWN_SESSION), or the session's verdict to a duplicate OPEN.
-// The carrier joins the exit join (§6.8).
+// JOIN_ACK(UNKNOWN_SESSION) — with an opened session's end code on a
+// carrier that negotiated wire.OptEndCode, as its tombstone would answer
+// (WP13 B-1, L47) — or the session's verdict to a duplicate OPEN. The
+// carrier joins the exit join (§6.8).
 func (a *actor) refuseAdopt(ad *adopt) {
 	defer a.dropConn(ad.conn)
 	if ad.kind == adoptJoin {
+		var code uint32
+		if a.verdict.Opened && ad.conn.EndCodes() {
+			code = a.verdict.Code
+		}
 		var p [wire.JoinAckLen]byte
-		n := wire.PutJoinAck(p[:], &wire.JoinAck{Status: wire.StatusUnknownSession})
+		n := wire.PutJoinAckMux(p[:], &wire.JoinAck{Status: wire.StatusUnknownSession}, code)
 		ad.conn.WriteAndClose(wire.TypeJoinAck, 0, ad.conn.Handle(), p[:n], time.Time{})
 		return
 	}
