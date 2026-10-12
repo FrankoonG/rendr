@@ -40,10 +40,10 @@ import (
 //     the open, before the first request; N = 16: after the last);
 //   - burst/afterN: the 16 requests written in one instant, the move after
 //     request N, so requests from both addresses wait in the flow's inbox
-//     together (a foreign conn moves one datagram per call; the batched
-//     read that meets a candidate among them is pinned by
-//     TestFlowReadDatagramsOrder, TestFlowReadDatagramsEndsAtCandidate_L55
-//     and TestDgramBatchRebindSame_L55/flow, which deliver its DGRAM);
+//     together (a foreign conn moves one datagram per call, so this row
+//     cannot reach a batched read that meets a candidate behind other
+//     results; that path's only guard against dropping the candidate is
+//     TestFlowReadDatagramsOrder in internal/udpflow);
 //   - double: two moves a millisecond apart, the second while the
 //     challenge to the first is in flight;
 //   - open: the move on the idle trunk right before the echo session's
@@ -70,7 +70,10 @@ import (
 //     nothing.
 //   - Replies (the accounting, m2 B1.0): the move costs only what the
 //     passive wrote to the old address — every lost reply was written no
-//     earlier than one one-way delay before the move and no later than the
+//     earlier than one one-way delay before the old mapping stopped
+//     forwarding (here the move, which kills the old mapping at once; at a
+//     real conntrack flush, the flush itself, before the dialer's next
+//     datagram reveals the new address) and no later than the
 //     commit (the passive's read of the challenge answer from the new
 //     address, after which it writes nothing to the old one); on the final
 //     counters after Done the loss is counted exactly in the passive's
@@ -84,14 +87,17 @@ import (
 // the passive wrote (passive Sent 15 = PeerReceived 15), so its reply
 // address was valid for every reply and no move was pending while it
 // echoed — and the request that a move would make a candidate is
-// delivered. The request was lost before it reached the passive's
-// process: in the network between the dialer's socket and B's.
+// delivered. The row passes on 575caff (the commit of the G6 run) and on
+// m5. So rendr did not lose the request: with every counter of both ends
+// at 0 it was lost outside the passive's process, most plausibly at the
+// NAT router's shaper queue; the run's sampling cannot place that drop.
 //
 // Mutants: a candidate's DGRAM frames skipped (dgFrames); a candidate
 // datagram handed to the rebind decision only; a candidate dropped by the
 // flow's one-datagram ReadDatagrams. Each fails gap/before0 … before15 and
 // burst (TestPacketNatRebind_L59 also catches them). A candidate dropped
-// from a batched ReadDatagrams after other results is TestFlowReadDatagramsOrder's.
+// from a batched ReadDatagrams after other results is caught only by
+// TestFlowReadDatagramsOrder (this row cannot reach that path).
 func TestPacketRebindDeliversCandidate_L59(t *testing.T) {
 	var cases []rlCase
 	for n := 0; n <= rlRequests; n++ {
