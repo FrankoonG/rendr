@@ -77,7 +77,7 @@ func TestQUICLateStreamOnDatagramCarrier_L48(t *testing.T) {
 
 	// A datagram carrier, handed over intact.
 	qc := dial()
-	if err := qc.SendDatagram([]byte("classify")); err != nil {
+	if err := qc.SendDatagram(framed(0, "classify")); err != nil {
 		t.Fatal(err)
 	}
 	d := f.packet(t)
@@ -123,13 +123,13 @@ func TestQUICLateStreamOnDatagramCarrier_L48(t *testing.T) {
 
 	// A second datagram carrier that opens no stream keeps working.
 	qc2 := dial()
-	if err := qc2.SendDatagram([]byte("second")); err != nil {
+	if err := qc2.SendDatagram(framed(0, "second")); err != nil {
 		t.Fatal(err)
 	}
 	d2 := f.packet(t)
 	t.Cleanup(func() { _ = d2.Close() })
 	read(d2, "second")
-	if err := qc2.SendDatagram([]byte("still")); err != nil {
+	if err := qc2.SendDatagram(framed(1, "still")); err != nil {
 		t.Fatal(err)
 	}
 	read(d2, "still")

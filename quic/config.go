@@ -20,13 +20,16 @@ const (
 	codeHandshakeTimeout                                 // neither a stream nor a DATAGRAM in time
 	codeRefused                                          // evicted by the admission bound
 	codeBadKind                                          // both kinds, or another ALPN
-	codeBudget                                           // DATAGRAM limit below DatagramBudget
+	codeBudget                                           // DATAGRAM limit below DatagramBudget and the sequence number
 	codeListenerClosed
+	codeMalformed // a DATAGRAM shorter than its sequence number
 )
 
 const (
-	ingressMax  = 2048 // datagrams in one ingress queue (L46)
-	ingressInit = 16   // its first ring; a drained ring above 4·ingressInit is released
+	seqLen       = 4    // the sequence number before each DATAGRAM's rendr datagram (KL-19)
+	quicRcvQueue = 128  // quic-go v0.63's DATAGRAM receive queue, pinned by TestQUICGoPinnedBehaviour
+	ingressMax   = 2048 // datagrams in one ingress queue (L46)
+	ingressInit  = 16   // its first ring; a drained ring above 4·ingressInit is released
 	// The egress queue (R1-9) holds egressAge of a 10-kpps flow of
 	// 1000-byte datagrams (R-F2: quic-go's window-limited phases after a
 	// congestion cut); WriteTo drops a head older than egressAge, so a
@@ -48,6 +51,7 @@ var (
 	errEvicted         = errors.New("rendr/quic: evicted by a newer connection")
 	errClassifyTimeout = errors.New("rendr/quic: neither a stream nor a DATAGRAM in time")
 	errListenerClosed  = errors.New("rendr/quic: listener closed")
+	errMalformed       = errors.New("rendr/quic: a DATAGRAM shorter than its sequence number")
 )
 
 // norm fills in the listener and queue defaults (non-positive: default).
