@@ -99,20 +99,20 @@ func dialStream(ctx context.Context, address string, tc *tls.Config, o *Options)
 }
 
 // dialDatagram opens a datagram carrier whose DATAGRAM limit, probed at
-// once, reaches DatagramBudget (L37).
+// once, carries DatagramBudget after the sequence number (L37, KL-19).
 func dialDatagram(ctx context.Context, address string, tc *tls.Config, o *Options) (net.PacketConn, net.Addr, error) {
 	w, err := dial(ctx, address, tc, o, true)
 	if err != nil {
 		return nil, nil, err
 	}
 	n, err := probeLimit(w.qc)
-	if err == nil && n < DatagramBudget {
-		err = fmt.Errorf("rendr/quic: DATAGRAM limit %d is below the %d-byte budget", n, DatagramBudget)
+	if err == nil && carrierLimit(n) < DatagramBudget {
+		err = fmt.Errorf("rendr/quic: DATAGRAM limit %d is below the %d-byte budget and its %d-byte sequence number", n, DatagramBudget, seqLen)
 	}
 	if err != nil {
 		w.close(codeBudget)
 		return nil, nil, err
 	}
-	d := newDgramConn(w.qc, nil, n, w.close, o, nil)
+	d := newDgramConn(w.qc, nil, carrierLimit(n), w.close, o, nil)
 	return d, d.peer, nil
 }

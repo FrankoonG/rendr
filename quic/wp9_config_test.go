@@ -102,7 +102,7 @@ func TestQUICConfigEnforced_L26(t *testing.T) {
 	}
 }
 
-// TestQUICALPN_L44: the ALPN is fixed to rendr/2 — any other NextProtos is
+// TestQUICALPN_L44: the ALPN is fixed to ALPN — any other NextProtos is
 // a constructor error, a client offering another protocol fails the QUIC
 // handshake before the Listener sees it, and a handshake that negotiated
 // another protocol anyway (a per-client tls.Config) is closed by the

@@ -179,7 +179,7 @@ never swaps the socket under it.
 |---|---|---|---|
 | plaintext TCP | `carrier/tcp` | stream | keepalive off, `TCP_NODELAY`; loopback only unless `Options.AllowNonLoopback`; vectored writes |
 | plaintext raw UDP | `carrier/udp` | datagram | a 9-byte flow header per datagram; one listening socket serves many carriers; don't-fragment; batched I/O on Linux amd64/arm64; loopback only unless `AllowNonLoopback` |
-| QUIC stream, QUIC DATAGRAM | `quic` (nested module) | stream, datagram | one QUIC connection per carrier; TLS required; ALPN `rendr/2` |
+| QUIC stream, QUIC DATAGRAM | `quic` (nested module) | stream, datagram | one QUIC connection per carrier; TLS required; ALPN `rendr/2-q1` |
 | the embedder's own | `rendr.StreamCarrier`, `rendr.DatagramCarrier`; passive `Listener.Handle`, `Listener.HandlePacket` | stream, datagram | any `net.Conn` or `net.PacketConn`, typically an L7 tunnel; `StreamCarrier.DialEarly` puts rendr's first bytes into the embedder's own open request |
 
 Stream sessions run on stream carriers only. Packet sessions prefer
@@ -775,8 +775,10 @@ limitation of 2.0.0 with its consequence.
   control (Reno, packet threshold 3, no undo of spurious loss detection, no
   option to change it) treats reordering as loss; on a path that reorders
   by 3 packets or more a constant-rate packet session loses datagrams.
-  quic-go also drops received DATAGRAM frames beyond 128 per connection
-  without a counter. Use `carrier/udp` or the QUIC stream carrier on
+  quic-go also drops received DATAGRAM frames beyond 128 per connection;
+  the carrier counts them in `Counters.IngressDrops` from the gaps in its
+  per-DATAGRAM sequence numbers (a network loss inside such an overflow
+  is counted there too). Use `carrier/udp` or the QUIC stream carrier on
   reordering paths.
 - **Synchronous-Write carriers at `GOMAXPROCS=1`.** A carrier conn whose
   `Write` returns only after the far end read the bytes (a `net.Pipe`-like

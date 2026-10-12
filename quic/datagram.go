@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"net"
 	"os"
@@ -36,14 +37,35 @@ func datagramLimit(qc *qgo.Conn) (int, error) {
 // probeLimit is the attach-time budget probe (a variable for tests).
 var probeLimit = datagramLimit
 
+// carrierLimit is the largest datagram rendr may write on a connection
+// whose DATAGRAM limit is n: the carrier's sequence number takes seqLen.
+func carrierLimit(n int) int { return n - seqLen }
+
+// polled is a cancelled context: ReceiveDatagram(polled) returns the head
+// of quic-go's receive queue, or an error when the queue is empty.
+var polled = func() context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return ctx
+}()
+
 // dgramConn is the DATAGRAM side of one QUIC connection as the
 // net.PacketConn of a rendr datagram carrier with exactly one peer:
 // ReadFrom always reports the same address value, WriteTo ignores its
 // address. A pump goroutine drains quic-go's receive queue, which drops
 // silently beyond 128 datagrams, into a bounded ingress queue that counts
-// its drops (L46). A sender goroutine drains a bounded egress queue into
-// SendDatagram, which blocks while quic-go holds 32 frames: rendr's writer
-// never waits for QUIC's congestion control (R1-9).
+// its drops (L46); what quic-go's queue dropped while the pump lagged is
+// counted from the gaps in the carrier's sequence numbers (KL-19, rxSeq).
+// A sender goroutine drains a bounded egress queue into SendDatagram,
+// which blocks while quic-go holds 32 frames: rendr's writer never waits
+// for QUIC's congestion control (R1-9).
+//
+// Wire (versioned by the ALPN): every DATAGRAM payload is a 4-byte
+// big-endian sequence number, then one datagram of rendr. Each direction
+// numbers the datagrams its sender handed to quic-go, from 0 and by one
+// (wrapping): one quic-go refused or the egress queue dropped takes no
+// number. A DATAGRAM shorter than the sequence number violates the
+// protocol and ends the connection (codeMalformed).
 type dgramConn struct {
 	qc      *qgo.Conn
 	peer    net.Addr // the value Dial returned or HandlePacket was given
@@ -53,13 +75,21 @@ type dgramConn struct {
 	max     atomic.Int64
 	in      ingress
 	out     egress
+	rx      rxSeq // the pump's (newDgramConn's before the pump starts)
 	pumped  chan struct{}
 	sent    chan struct{}
 	once    sync.Once
 	// exitHook, set by a test before it closes the conn, runs as the pump
 	// and the sender exit (the join test of Close).
 	exitHook func()
+	// hold, set by a test, stops the pump before its next receive until
+	// gate is closed or the connection ends: a stalled consumer.
+	hold atomic.Pointer[pumpHold]
 }
+
+// pumpHold is a test's hold on a pump: parked is signalled when the pump
+// stops at the hold, gate released.
+type pumpHold struct{ gate, parked chan struct{} }
 
 func newDgramConn(qc *qgo.Conn, first []byte, limit int, release func(qgo.ApplicationErrorCode), o *Options, ls *Counters) *dgramConn {
 	d := &dgramConn{qc: qc, peer: copyAddr(qc.RemoteAddr()), local: qc.LocalAddr(), release: release,
@@ -69,11 +99,11 @@ func newDgramConn(qc *qgo.Conn, first []byte, limit int, release func(qgo.Applic
 			d.sinks = append(d.sinks, c)
 		}
 	}
-	d.max.Store(int64(limit))
+	d.max.Store(int64(limit)) // carrierLimit of quic-go's limit
 	d.in.ring, d.in.max, d.in.wake = make([][]byte, ingressInit), o.DatagramQueueBytes, make(chan struct{}, 1)
 	d.out.max, d.out.wake = o.DatagramEgressBytes, make(chan struct{}, 1)
 	if first != nil {
-		d.in.push(first) // the datagram that classified the connection comes first
+		d.accept(first) // the datagram that classified the connection comes first
 	}
 	go d.pump()
 	go d.send()
@@ -106,29 +136,108 @@ func (d *dgramConn) exit(c chan struct{}) {
 	close(c)
 }
 
+// pump moves quic-go's received DATAGRAMs to the ingress queue. It takes
+// the queue's head without waiting while there is one, and tells rx when
+// it found the queue empty before it waits (KL-19).
 func (d *dgramConn) pump() {
 	defer d.exit(d.pumped)
+	ctx := d.qc.Context()
 	for {
-		b, err := d.qc.ReceiveDatagram(d.qc.Context())
+		if h := d.hold.Load(); h != nil {
+			signal(h.parked)
+			select {
+			case <-h.gate:
+			case <-ctx.Done():
+			}
+		}
+		b, err := d.qc.ReceiveDatagram(polled)
+		if err != nil { // the queue was empty (or the connection ended)
+			d.rx.empty()
+			b, err = d.qc.ReceiveDatagram(ctx)
+		}
 		if err != nil {
 			d.in.fail(d.cause(err), false) // reported after the queued datagrams (L01)
 			return
 		}
-		if !d.in.push(b) { // b moves to the queue: quic-go hands out a fresh slice
-			d.drops(false, 1)
+		if !d.accept(b) {
+			return
 		}
 	}
+}
+
+// accept takes one received DATAGRAM over: the gap its sequence number
+// shows is counted when quic-go's queue may have dropped it (rxSeq), and
+// the datagram moves to the ingress queue (quic-go hands out a fresh
+// slice), or is dropped and counted when that queue is full. A DATAGRAM
+// shorter than the sequence number fails the ingress queue after the
+// datagrams already queued and closes the connection (invariant 6).
+func (d *dgramConn) accept(b []byte) bool {
+	if len(b) < seqLen {
+		d.in.fail(errMalformed, false)
+		d.release(codeMalformed)
+		return false
+	}
+	if n := d.rx.take(binary.BigEndian.Uint32(b)); n > 0 {
+		d.drops(false, n)
+	}
+	if !d.in.push(b[seqLen:]) {
+		d.drops(false, 1)
+	}
+	return true
+}
+
+// rxSeq attributes the gaps in a direction's sequence numbers (KL-19).
+// quic-go drops a received DATAGRAM only while its receive queue holds
+// quicRcvQueue, every one of which arrived after the pump last found the
+// queue empty and is taken by the pump before the datagram that shows the
+// gap. So a gap shown while fewer than quicRcvQueue datagrams were taken
+// since the pump last found the queue empty - and none since a run that
+// reached quicRcvQueue - is no quic-go drop: the network lost or
+// reordered those datagrams, which no counter claims. Any other gap is
+// counted in IngressDrops: exactly quic-go's drops for in-order arrival,
+// with network losses and reordering inside such a lag counted too (they
+// cannot be told apart). A datagram behind the next expected one
+// (reordered) is delivered and counts nothing; the gap of a drop at the
+// end of a burst is counted when the next datagram arrives.
+type rxSeq struct {
+	next uint32 // the sequence number expected next
+	run  int    // datagrams taken since the pump last found quic-go's queue empty
+	lag  bool   // quic-go's queue may have been full since the last datagram taken
+}
+
+// empty records that the pump found quic-go's queue empty: a new run
+// starts, and lag stays for the next datagram, which shows the gap of a
+// drop at the end of the run.
+func (s *rxSeq) empty() { s.run = 0 }
+
+// take records the datagram numbered seq and returns the drops its gap
+// shows.
+func (s *rxSeq) take(seq uint32) uint64 {
+	var n uint64
+	if gap := int32(seq - s.next); gap >= 0 {
+		if s.lag {
+			n = uint64(gap)
+		}
+		s.next = seq + 1
+	}
+	s.run++
+	s.lag = s.run >= quicRcvQueue
+	return n
 }
 
 // send drains the egress queue, dropping a datagram older than egressAge;
 // an error is kept for the next WriteTo: once for a too-large datagram
 // (the budget shrinks), for good when the connection failed. At its exit
-// the datagrams still queued are discarded and counted.
+// the datagrams still queued are discarded and counted. Each datagram is
+// sent after its sequence number from one reused buffer (SendDatagram
+// copies it); a datagram quic-go accepted takes the next number.
 func (d *dgramConn) send() {
 	defer d.exit(d.sent)
 	defer d.discard()
 	q, done := &d.out, d.qc.Context().Done()
 	var cur []byte
+	var seq uint32
+	framed := make([]byte, seqLen, seqLen+int(d.max.Load())) // d.max only falls after attach
 	for {
 		q.mu.Lock()
 		q.give(cur) // the previous datagram's buffer: SendDatagram copied it, or it was dropped
@@ -154,15 +263,19 @@ func (d *dgramConn) send() {
 			d.drops(true, 1)
 			continue
 		}
-		err := d.qc.SendDatagram(cur) // copies cur
+		binary.BigEndian.PutUint32(framed, seq)
+		framed = append(framed[:seqLen], cur...)
+		err := d.qc.SendDatagram(framed) // copies framed
 		var tl *qgo.DatagramTooLargeError
 		switch {
 		case err == nil:
+			seq++
 		case errors.As(err, &tl):
-			if m := tl.MaxDatagramPayloadSize; m < d.max.Load() { // only the sender lowers it after attach
-				d.max.Store(m)
+			m := max(carrierLimit(int(tl.MaxDatagramPayloadSize)), 0)
+			if int64(m) < d.max.Load() { // only the sender lowers it after attach
+				d.max.Store(int64(m))
 			}
-			q.setErr(&rendr.DatagramTooLargeError{Max: int(tl.MaxDatagramPayloadSize)}, false)
+			q.setErr(&rendr.DatagramTooLargeError{Max: m}, false)
 			d.drops(true, 1)
 		default:
 			q.setErr(d.cause(err), true)

@@ -15,7 +15,8 @@
 //
 // Security: QUIC always encrypts, but encryption is not authentication. A
 // tls.Config is required and only what it verifies is authenticated; the
-// ALPN is fixed to "rendr/2" and verified after the handshake.
+// ALPN is fixed to "rendr/2-q1" and verified after the handshake; a peer
+// of an earlier encapsulation ("rendr/2") fails the handshake.
 //
 // Liveness belongs to rendr: keepalives are off, and the QUIC idle
 // timeout is at least MinIdleTimeout (default DefaultIdleTimeout) unless
@@ -24,14 +25,20 @@
 // is meant for tests only.
 //
 // Datagram budget: a DATAGRAM carrier's frame budget is the static
-// DatagramBudget (1152 bytes), valid at QUIC's minimum packet size; it is
-// checked at attach (an oversize probe) and only ever lowered when quic-go
-// refuses a datagram as too large. A packet session over it carries
-// application datagrams of up to 1127 bytes. One pump goroutine per
-// connection drains received DATAGRAMs into a bounded queue; one sender
-// goroutine drains a bounded egress queue into quic-go, so rendr's carrier
-// writer never blocks on QUIC's congestion control and a congested path
-// drops datagrams instead of stalling the carrier.
+// DatagramBudget (1152 bytes), valid at QUIC's minimum packet size after
+// the carrier's 4-byte sequence number; it is checked at attach (an
+// oversize probe) and only ever lowered when quic-go refuses a datagram as
+// too large. A packet session over it carries application datagrams of up
+// to 1127 bytes. One pump goroutine per connection drains received
+// DATAGRAMs into a bounded queue; one sender goroutine drains a bounded
+// egress queue into quic-go, so rendr's carrier writer never blocks on
+// QUIC's congestion control and a congested path drops datagrams instead
+// of stalling the carrier.
+//
+// Wire: every DATAGRAM payload is a 4-byte big-endian sequence number,
+// counting per direction the datagrams handed to quic-go from 0, followed
+// by one rendr datagram; the ALPN versions this format. A DATAGRAM shorter
+// than the sequence number ends the connection.
 //
 // Limitations of DATAGRAM carriers (quic-go v0.63): quic-go's congestion
 // control is Reno with a packet threshold of 3 and no undo of spurious loss
@@ -41,9 +48,11 @@
 // queue's 250-ms age limit (counted in Counters.EgressDrops). quic-go also
 // drops received DATAGRAM frames beyond 128 queued per connection without a
 // counter, so a receiving process that stalls for more than about 13 ms at
-// 10,000 datagrams a second loses datagrams no rendr counter sees. On
-// reordering paths, or where every loss must be accounted for, use the raw
-// UDP carrier (carrier/udp) or the QUIC stream carrier.
+// 10,000 datagrams a second loses datagrams; the carrier counts them in
+// Counters.IngressDrops from the gaps in its sequence numbers, when the
+// next datagram arrives (a loss in the network or a reordering during such
+// a stall is counted there too). On reordering paths use the raw UDP
+// carrier (carrier/udp) or the QUIC stream carrier.
 //
 // The package uses only rendr's public API: its conns are ordinary embedder
 // conns for rendr's core.
