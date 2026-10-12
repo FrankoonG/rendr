@@ -226,7 +226,8 @@ func TestQUICRxSeqAttribution(t *testing.T) {
 // counted from 0 - the full budget included - and a passive carrier
 // delivers what follows a peer's number; a DATAGRAM shorter than the
 // number ends the connection with codeMalformed after the datagrams before
-// it, as does a short first DATAGRAM.
+// it; a short first DATAGRAM ends it with codeMalformed before any carrier
+// is handed to rendr (counted in ListenerStats.BadKind).
 func TestQUICDatagramSeqWire_L37(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	t.Run("dialer sends", func(t *testing.T) {
@@ -307,14 +308,12 @@ func TestQUICDatagramSeqWire_L37(t *testing.T) {
 		if err := qc.SendDatagram([]byte{1}); err != nil {
 			t.Fatal(err)
 		}
-		d := f.packet(t)
-		t.Cleanup(func() { _ = d.Close() })
-		_ = d.SetReadDeadline(time.Now().Add(testEventuallyTime))
-		if _, _, err := d.ReadFrom(make([]byte, 64)); !errors.Is(err, errMalformed) {
-			t.Fatalf("ReadFrom returned %v, want errMalformed", err)
-		}
 		if code, remote := closeCode(t, qc); code != codeMalformed || !remote {
 			t.Errorf("closed with %d (remote %v), want codeMalformed", code, remote)
+		}
+		// The Listener counts BadKind before it closes the connection.
+		if s := l.Stats(); s.BadKind != 1 || s.Datagrams != 0 || len(f.packets) != 0 {
+			t.Errorf("a short first DATAGRAM: %+v, %d carriers handed; want BadKind 1 and none handed", s, len(f.packets))
 		}
 	})
 }
@@ -370,6 +369,35 @@ func TestQUICDatagramAcceptNoAlloc(t *testing.T) {
 	})
 	if allocs != 0 {
 		t.Errorf("%v allocations per datagram, want 0", allocs)
+	}
+}
+
+// TestQUICDatagramAcceptAfterCloseCountsNothing (KL-19): once the
+// carrier's ingress queue failed (Close, or the connection ended), the
+// DATAGRAMs the pump still drains from quic-go's queue are discarded and
+// counted nowhere, and the pump stops - even when rx lags and the next one
+// shows a gap. Stimulus: rx after a run of 128 (lag set), the queue
+// failed, a DATAGRAM 72 ahead. Integrity: accept reports the end, nothing
+// is counted or queued.
+func TestQUICDatagramAcceptAfterCloseCountsNothing(t *testing.T) {
+	c := &Counters{}
+	d := &dgramConn{sinks: []*Counters{c}}
+	d.in.ring, d.in.max, d.in.wake = make([][]byte, ingressInit), 1<<20, make(chan struct{}, 1)
+	for i := range uint32(quicRcvQueue) {
+		if !d.accept(framed(i, "x")) {
+			t.Fatal("accept failed")
+		}
+		_, _ = d.in.pop()
+	}
+	if !d.rx.lag {
+		t.Fatal("rx does not lag after a run of 128")
+	}
+	d.in.fail(net.ErrClosed, true)
+	if d.accept(framed(200, "x")) {
+		t.Error("accept after the ingress queue failed did not stop the pump")
+	}
+	if in, n := c.IngressDrops.Load(), d.in.n; in != 0 || n != 0 {
+		t.Errorf("after close: IngressDrops %d, %d queued; want 0 and 0", in, n)
 	}
 }
 

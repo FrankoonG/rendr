@@ -101,8 +101,11 @@ type Counters struct {
 	// queue while the carrier's pump lagged behind it (KL-19). The latter
 	// are counted from the gaps in the carrier's sequence numbers when the
 	// next datagram arrives: exactly for in-order arrival; a datagram the
-	// network lost or reordered while the pump lagged counts here too,
-	// one lost while the pump kept up counts nowhere (a transport loss).
+	// network lost or reordered while the pump lagged counts here too (a
+	// reordered one is still delivered, so delivered + IngressDrops can
+	// exceed what the peer sent: an upper bound, not an equality), one
+	// lost while the pump kept up counts nowhere (a transport loss).
+	// Nothing is counted once the carrier was closed.
 	IngressDrops atomic.Uint64
 	// EgressDrops: DATAGRAMs the egress queue dropped — one older than
 	// 250 ms (when its turn came, or when a newer one was queued), the
@@ -233,7 +236,7 @@ type ListenerStats struct {
 	Refused          uint64
 	Evicted          uint64 // pending connections evicted (oldest first)
 	ClassifyTimeouts uint64 // connections that neither opened a stream nor sent a DATAGRAM in time
-	BadKind          uint64 // connections that did both, or negotiated another ALPN
+	BadKind          uint64 // connections that did both, negotiated another ALPN, or sent a first DATAGRAM shorter than its sequence number
 	BudgetRefused    uint64 // datagram connections whose DATAGRAM limit could not carry DatagramBudget and the sequence number
 	Streams          uint64 // stream carriers handed to rendr
 	Datagrams        uint64 // datagram carriers handed to rendr

@@ -46,13 +46,19 @@
 // reorders by 3 packets or more the congestion window shrinks below the
 // path's rate, and a constant-rate flow loses datagrams to the egress
 // queue's 250-ms age limit (counted in Counters.EgressDrops). quic-go also
-// drops received DATAGRAM frames beyond 128 queued per connection without a
-// counter, so a receiving process that stalls for more than about 13 ms at
-// 10,000 datagrams a second loses datagrams; the carrier counts them in
-// Counters.IngressDrops from the gaps in its sequence numbers, when the
-// next datagram arrives (a loss in the network or a reordering during such
-// a stall is counted there too). On reordering paths use the raw UDP
-// carrier (carrier/udp) or the QUIC stream carrier.
+// drops received DATAGRAM frames beyond 128 queued per connection without
+// a signal, and the limit is fixed: when the carrier's pump does not run
+// while more than 128 DATAGRAMs arrive (12.8 ms at 10,000 datagrams a
+// second; a 45-datagram loss at that rate takes about 17 ms) the excess
+// is lost. rendr cannot prevent it - the pump never waits while datagrams
+// are queued, nor on rendr's consumer - so the carrier counts these drops
+// in Counters.IngressDrops from the gaps in its sequence numbers, when the
+// next datagram arrives (a loss in the network or a reordering during
+// such a lag is counted there too). quic-go's 256-packet queue of
+// unprocessed packets, which drops when its own connection goroutine
+// stalls, is not visible to the carrier: such a loss looks like a network
+// loss. On reordering paths use the raw UDP carrier (carrier/udp) or the
+// QUIC stream carrier.
 //
 // The package uses only rendr's public API: its conns are ordinary embedder
 // conns for rendr's core.

@@ -120,8 +120,9 @@ func (l *Listener) accept(h handoff, qc *qgo.Conn) {
 
 // classify waits at most HandshakeTimeout for the connection's first
 // client stream or DATAGRAM and hands the carrier to rendr. Both kinds,
-// neither, another ALPN, a DATAGRAM limit that cannot carry DatagramBudget
-// after the sequence number, eviction
+// neither, another ALPN, a first DATAGRAM shorter than its sequence
+// number, a DATAGRAM limit that cannot carry DatagramBudget after the
+// sequence number, eviction
 // and the Listener's close end the connection instead. Both kinds also
 // when the stream comes after the hand-over of a datagram carrier: see
 // watchLateStream.
@@ -177,6 +178,9 @@ func (l *Listener) classify(h handoff, w *waiter, ctx context.Context) {
 			return
 		}
 		l.bump(&l.stats.Streams)
+	case len(a.dg) < seqLen: // a first DATAGRAM shorter than its sequence number (invariant 6)
+		l.bump(&l.stats.BadKind)
+		rel(codeMalformed)
 	default:
 		n, err := probeLimit(qc)
 		if err != nil || carrierLimit(n) < DatagramBudget {

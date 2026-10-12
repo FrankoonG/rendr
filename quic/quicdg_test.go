@@ -95,9 +95,12 @@ func readSeqs(t *testing.T, r *dgramConn, n int) []int {
 	return seqs
 }
 
-// TestQUICDatagramPumpStallLossCounted_L46 (KL-19): quic-go keeps at most
-// 128 received DATAGRAMs per connection and drops beyond silently, so a
-// stalled pump would lose datagrams no counter sees. Stimulus: per
+// TestQUICDatagramPumpStallLossCounted_L46 (KL-19) is the accounting row:
+// quic-go keeps at most 128 received DATAGRAMs per connection and drops
+// beyond silently, so a stalled pump would lose datagrams no counter sees.
+// It proves the accounting path, not the production trigger (a stall of
+// the whole receiving process, which no in-process row reproduces; the
+// Linux pool's G3 QUIC rows are that evidence). Stimulus: per
 // direction, the receiving end's pump is held (a stalled consumer: a VM or
 // scheduler stall cannot be produced in process, a held pump is the same
 // burst after a pause) while the peer writes a burst of 1000-byte

@@ -775,10 +775,11 @@ limitation of 2.0.0 with its consequence.
   control (Reno, packet threshold 3, no undo of spurious loss detection, no
   option to change it) treats reordering as loss; on a path that reorders
   by 3 packets or more a constant-rate packet session loses datagrams.
-  quic-go also drops received DATAGRAM frames beyond 128 per connection;
-  the carrier counts them in `Counters.IngressDrops` from the gaps in its
-  per-DATAGRAM sequence numbers (a network loss inside such an overflow
-  is counted there too). Use `carrier/udp` or the QUIC stream carrier on
+  quic-go also drops received DATAGRAM frames beyond 128 per connection
+  (a fixed limit rendr cannot prevent from overflowing when the receiving
+  process stalls); the carrier counts them in `Counters.IngressDrops` from
+  the gaps in its per-DATAGRAM sequence numbers (a network loss inside
+  such an overflow is counted there too). Use `carrier/udp` or the QUIC stream carrier on
   reordering paths.
 - **Synchronous-Write carriers at `GOMAXPROCS=1`.** A carrier conn whose
   `Write` returns only after the far end read the bytes (a `net.Pipe`-like

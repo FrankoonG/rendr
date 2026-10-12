@@ -39,10 +39,20 @@ var probeLimit = datagramLimit
 
 // carrierLimit is the largest datagram rendr may write on a connection
 // whose DATAGRAM limit is n: the carrier's sequence number takes seqLen.
+//
+// quic-go's packer silently discards a queued DATAGRAM frame that does not
+// fit a packet without an ACK, and SendDatagram admits by an estimate that
+// never falls, while a path change resets the packet size to
+// InitialPacketSize. A DATAGRAM of at most DatagramBudget+seqLen bytes
+// fits a packet of that floor (1200 bytes, quicConfig) even with a 20-byte
+// connection ID, so a datagram within the carrier's MTU (DatagramBudget,
+// all rendr writes) is never discarded there; a larger one, admitted when
+// the probed limit was higher, could be after a path change.
 func carrierLimit(n int) int { return n - seqLen }
 
 // polled is a cancelled context: ReceiveDatagram(polled) returns the head
-// of quic-go's receive queue, or an error when the queue is empty.
+// of quic-go's receive queue, or an error when the queue is empty - the
+// pump's probe of an empty queue for rxSeq.
 var polled = func() context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -103,7 +113,7 @@ func newDgramConn(qc *qgo.Conn, first []byte, limit int, release func(qgo.Applic
 	d.in.ring, d.in.max, d.in.wake = make([][]byte, ingressInit), o.DatagramQueueBytes, make(chan struct{}, 1)
 	d.out.max, d.out.wake = o.DatagramEgressBytes, make(chan struct{}, 1)
 	if first != nil {
-		d.accept(first) // the datagram that classified the connection comes first
+		d.accept(first) // the datagram that classified the connection comes first (classify refused a short one)
 	}
 	go d.pump()
 	go d.send()
@@ -136,9 +146,12 @@ func (d *dgramConn) exit(c chan struct{}) {
 	close(c)
 }
 
-// pump moves quic-go's received DATAGRAMs to the ingress queue. It takes
-// the queue's head without waiting while there is one, and tells rx when
-// it found the queue empty before it waits (KL-19).
+// pump moves quic-go's received DATAGRAMs to the ingress queue. Like
+// quic-go's own ReceiveDatagram, it takes the queue's head without waiting
+// while there is one; it probes for an empty queue first (polled) only to
+// tell rx before it waits (KL-19). rendr cannot prevent quic-go's drops:
+// its 128-entry queue is fixed, and the pump never waits on rendr's
+// consumer (the ingress queue drops and counts instead).
 func (d *dgramConn) pump() {
 	defer d.exit(d.pumped)
 	ctx := d.qc.Context()
@@ -170,18 +183,25 @@ func (d *dgramConn) pump() {
 // the datagram moves to the ingress queue (quic-go hands out a fresh
 // slice), or is dropped and counted when that queue is full. A DATAGRAM
 // shorter than the sequence number fails the ingress queue after the
-// datagrams already queued and closes the connection (invariant 6).
+// datagrams already queued and closes the connection (invariant 6). Once
+// the ingress queue failed (Close, or the connection ended) the carrier
+// is over: nothing more is counted and the pump stops (false).
 func (d *dgramConn) accept(b []byte) bool {
 	if len(b) < seqLen {
 		d.in.fail(errMalformed, false)
 		d.release(codeMalformed)
 		return false
 	}
-	if n := d.rx.take(binary.BigEndian.Uint32(b)); n > 0 {
-		d.drops(false, n)
+	gap := d.rx.take(binary.BigEndian.Uint32(b))
+	full, closed := d.in.push(b[seqLen:])
+	if closed {
+		return false
 	}
-	if !d.in.push(b[seqLen:]) {
-		d.drops(false, 1)
+	if full {
+		gap++
+	}
+	if gap > 0 {
+		d.drops(false, gap)
 	}
 	return true
 }
@@ -489,15 +509,16 @@ type ingress struct {
 	wake           chan struct{} // one waiter re-checks; one that returns passes it on
 }
 
-// push queues b unless the queue is full (false: a drop) or failed.
-func (q *ingress) push(b []byte) bool {
+// push queues b unless the queue is full (full: a drop) or failed
+// (closed: discarded, not a drop).
+func (q *ingress) push(b []byte) (full, closed bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	switch {
 	case q.err != nil:
-		return true // closed: discarded, not a drop
+		return false, true
 	case q.n == ingressMax || q.bytes+len(b) > q.max:
-		return false
+		return true, false
 	case q.n == len(q.ring):
 		r := make([][]byte, 2*q.n)
 		for i := range q.n {
@@ -508,7 +529,7 @@ func (q *ingress) push(b []byte) bool {
 	q.ring[(q.head+q.n)%len(q.ring)] = b
 	q.n, q.bytes = q.n+1, q.bytes+len(b)
 	signal(q.wake)
-	return true
+	return false, false
 }
 
 func (q *ingress) fail(err error, discard bool) {

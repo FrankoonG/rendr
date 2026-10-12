@@ -188,13 +188,15 @@ QUIC and carriers:
   and a constant-rate packet session loses datagrams to the 250-ms egress
   age; use `carrier/udp` or the QUIC stream carrier on such paths.
 - quic-go drops received DATAGRAM frames beyond 128 per connection
-  without a signal: a receiving process stalled for more than about 13 ms
-  at 10,000 datagrams a second loses datagrams. The DATAGRAM carrier puts
+  without a signal, and rendr cannot prevent it: a receiving carrier whose
+  pump does not run while more than 128 DATAGRAMs arrive (12.8 ms at
+  10,000 datagrams a second) loses the excess. The DATAGRAM carrier puts
   a 4-byte sequence number before each datagram and counts these drops in
   `Counters.IngressDrops` from the gaps, when the next datagram arrives; a
   network loss or reordering inside such an overflow is counted there
-  too, and a network loss while the carrier kept up stays an uncounted
-  transport loss.
+  too (an upper bound), and a network loss while the carrier kept up, or
+  a drop by quic-go's 256-packet unprocessed-packet queue, stays an
+  uncounted transport loss.
 - A QUIC carrier costs about 7–8 goroutines (quic-go's own included), and
   QUIC's late stream close holds one goroutine per handed datagram
   connection.
