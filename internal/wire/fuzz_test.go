@@ -111,6 +111,8 @@ var refRules = map[byte]headerRule{
 	0x35: {0, true, 8, 8},        // RACK: cumAck · sack
 	// M3 (design §A3.4).
 	0x36: {0, true, 5, 5}, // DETACH: handle u32 · reason u8
+	// M5 (PA-86).
+	0x37: {0, true, 4, 4}, // DOWN: carrierID u32
 }
 
 // refHeaderErr is an independent statement of header checks (1)–(5).
@@ -205,6 +207,10 @@ func fuzzSeeds() [][]byte {
 		{0x36, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 1},                         // DETACH with handle 1 (carrier-level: 0)
 		{0x36, 0x01, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0},                      // DETACH with a flag
 		{0x36, 0, 0, 0, 6, 0, 0, 0, 1, 0, 0, 0, 0},                         // DETACH len 6
+		{0x37, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0},                         // DOWN header (M5)
+		{0x37, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 1},                         // DOWN with handle 1 (carrier-level: 0)
+		{0x37, 0x01, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0},                      // DOWN with a flag
+		{0x37, 0, 0, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0},                         // DOWN len 5
 		{0x12, 0, 0, 0, 7, 0, 0, 0, 1, 0, 0, 0, 1},                         // FIN short
 		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // short header
 	} {
@@ -498,11 +504,11 @@ func decodeChunked(b []byte, seed uint64) (frames []Frame, at int, err error) {
 // M2 fuzz targets (M2 design §A3.10).
 
 // refWrappable is an independent copy of the REL set: plan:356's nine
-// control frames, PACK (M2-D39) and DETACH (M3-D6).
+// control frames, PACK (M2-D39), DETACH (M3-D6) and DOWN (PA-86).
 var refWrappable = map[byte]bool{
 	0x01: true, 0x02: true, 0x03: true, 0x04: true, 0x12: true,
 	0x13: true, 0x14: true, 0x32: true, 0x33: true, 0x21: true,
-	0x36: true,
+	0x36: true, 0x37: true,
 }
 
 // refRelErr is an independent statement of ParseRel's check order (§A3.3):
@@ -834,6 +840,8 @@ func datagramSeeds() [][]byte {
 		bcat(g["refusal_version"], g["rack_zero"]),
 		// M3: a REL-wrapped DETACH in front of DGRAMs of two other handles.
 		bcat(g["rel_detach"], g["dgram_handle_3"], g["dgram_1000"]),
+		// M5: a REL-wrapped DOWN ahead of a REL{SCHED} and a DGRAM (PA-86).
+		bcat(g["rel_down"], g["rel_sched_n1"], g["dgram_handle_3"]),
 	)
 	for _, at := range []int{20, PrefaceLen + 3, len(g["h1_open"]) - 1} {
 		bad := bytes.Clone(g["h1_open"])

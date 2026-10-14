@@ -102,12 +102,14 @@ func TestPacketStreamLaneCapacity_L32(t *testing.T) {
 		death := time.Now()
 		// It dies of silence; or the passive found the silence first and its
 		// close reached the dialer's end (the fake link delivers a close
-		// through a stall), a transport_error after the passive's verdict.
+		// through a stall), a transport_error after the passive's verdict,
+		// or its DOWN on the other trunk of the pair did (PA-86: peer_down
+		// after the passive's verdict).
 		silent := func(c rendr.Cause) bool { return c == rendr.CausePingTimeout || c == rendr.CauseWriteStall }
 		if !silent(died.DeathCause) {
 			synctest.Wait() // the passive's CarrierDown reaches the log through its event worker
 			pev, ok := w.pev.downOf(sc.ID)
-			if died.DeathCause != rendr.CauseTransportError || !ok || !silent(pev.Cause) || pev.Time.After(death) {
+			if died.DeathCause != rendr.CauseTransportError && died.DeathCause != rendr.CausePeerDown || !ok || !silent(pev.Cause) || pev.Time.After(death) {
 				t.Fatalf("the stalled member died of %v (%q), want ping_timeout or write_stall (passive: %+v, %v)",
 					died.DeathCause, died.DeathDetail, pev, ok)
 			}

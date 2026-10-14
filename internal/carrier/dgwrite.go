@@ -46,6 +46,9 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 		room = 0 // nothing new follows our CLOSE
 	}
 	b.SetDatagram(int(dg.budget.Load()), room)
+	if c.mux && !w.held && !closing {
+		b.downs = &c.downs // a reliable session frame goes behind the pending DOWNs (PA-86)
+	}
 	h2 := dg.hs.repeatH2
 	dg.hs.repeatH2 = false
 	chal, cand, nonce := c.chalSendLocked(now)
@@ -64,9 +67,13 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 		if w.held && epFrames {
 			// The first response released the hold (R1-8); the first
 			// PING may follow it (the dialer keeps the response
-			// datagram's tail, R1-1).
+			// datagram's tail, R1-1), and so may a MUX trunk's pending
+			// DOWNs, behind the response in the REL order (PA-86).
 			w.held = false
 			dg.held.Store(false)
+			if c.mux {
+				c.downs.place(b)
+			}
 			if !retiring {
 				c.mu.Lock()
 				kill = c.dgPingLocked(w, b, now)
@@ -108,9 +115,10 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 // dgControlLocked appends the round's carrier control (§A5.8): the RACK
 // when one is due (latest state wins); in closing rounds only the REL
 // retransmission besides it; otherwise the PONG (its pad clamped to this
-// side's budget, M2-D24), the challenge PONG, the REL retransmission, a due
-// PING (never while held or retiring) and GOAWAY. kill reports a fourth
-// unanswered MTU probe.
+// side's budget, M2-D24), the challenge PONG, a MUX trunk's pending DOWNs
+// (never while held; PA-86: their RELs precede the round's session RELs),
+// the REL retransmission, a due PING (never while held or retiring) and
+// GOAWAY. kill reports a fourth unanswered MTU probe.
 func (c *Conn) dgControlLocked(w *writer, b *Batch, now time.Time, closing bool) (kill bool) {
 	dg := c.dg
 	st := &c.st
@@ -134,6 +142,9 @@ func (c *Conn) dgControlLocked(w *writer, b *Batch, now time.Time, closing bool)
 	}
 	if ch := &dg.chal; ch.pongDue && b.addPong(&ch.pong) {
 		ch.pongDue = false
+	}
+	if c.mux && !w.held {
+		c.downs.place(b)
 	}
 	c.dgRetxLocked(w, b, now)
 	if !st.retiring && !w.held {

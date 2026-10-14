@@ -30,7 +30,9 @@ import (
 // close; no reply datagram on the closed trunk after that instant (the
 // passive's Hooks.BeforeWrite; the close falls half a millisecond between
 // two requests' arrivals) and no DGRAM byte of the churn session there
-// from the next poll on, although that trunk lives on at the passive; the
+// from the next poll on, although that trunk lives on at the passive until
+// the dialer's DOWN for it, which arrives with the SCHED (PA-86: then it
+// ends there with peer_down); the
 // passive learned within one one-way delay (race, bond) or within the
 // failover view's JOIN round trip plus one one-way delay (selector); and
 // the dialer's direction loses nothing (a request whose write failed on
@@ -266,7 +268,16 @@ func muxCloseLossInFlight(t *testing.T, mode rendr.Mode) {
 	// Classification.
 	after, last := obs[learnIdx+1], obs[len(obs)-1]
 	if !last.pVictimLive {
-		t.Fatalf("premise: the closed trunk died on the passive within %v of the close", last.at.Sub(tClose))
+		// PA-86: the long session's u2 trunk is a second trunk of the pair,
+		// on which the dialer's DOWN for the closed trunk arrives one REL
+		// ahead of the SCHED (selector: ahead of the failover view's); it
+		// ends the passive's end (peer_down) by the instant the passive
+		// learns. Any other end before the observation's is the premise's
+		// failure.
+		if pd, ok := w.pev.sessionDown(pc.ID(), trunk.ID); !ok || pd.Cause != rendr.CausePeerDown || pd.Time.Before(tClose.Add(mclOneWay)) || pd.Time.After(tLearn) {
+			t.Fatalf("premise: the closed trunk died on the passive %v after the close (it must outlive the observation, or end by the dialer's DOWN when the passive learns: %+v, found %v)",
+				last.at.Sub(tClose), pd, ok)
+		}
 	}
 	if last.pTx != after.pTx {
 		t.Fatalf("(a): the passive placed %d DGRAM bytes of the churn session on trunk %d after it applied the SCHED that dropped it (%v after the close)",

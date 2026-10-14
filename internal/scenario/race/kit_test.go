@@ -606,7 +606,11 @@ func finish(t testing.TB, dc, pc *rendr.Conn) {
 // The test blackholes the link in BlackholeCloses mode, as an nft DROP:
 // the close of the end whose verdict comes first does not cross, so the
 // other end must reach a verdict of its own too — a transport_error there
-// would be the Link's close, not the end's detection.
+// would be the Link's close, not the end's detection. PA-86: that first
+// verdict's DOWN does cross, on the surviving member's trunk, so the other
+// end may instead end the carrier with peer_down when it arrives (after
+// the first end's ping_timeout or write_stall), as the first end's
+// detection reported to it.
 func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID, drop time.Time) {
 	t.Helper()
 	var evs [2]rendr.Event
@@ -617,10 +621,17 @@ func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID
 			return ok
 		})
 	}
+	silent := func(ev rendr.Event) bool {
+		return (ev.Cause == rendr.CausePingTimeout || ev.Cause == rendr.CauseWriteStall) && !ev.Time.Before(drop)
+	}
 	for i, c := range []*rendr.Conn{dc, pc} {
-		ev := evs[i]
-		if ev.Cause != rendr.CausePingTimeout && ev.Cause != rendr.CauseWriteStall || ev.Time.Before(drop) {
-			t.Errorf("the %s's death record of the dropped carrier %d at DROP %+v: %+v, want ping_timeout or write_stall after the DROP",
+		ev, other := evs[i], evs[1-i]
+		// PA-86: the end that detects the DROP first reports it with DOWN
+		// on the surviving member's trunk, and the other end then ends the
+		// carrier with peer_down at that DOWN's arrival, unless its own
+		// detection came first.
+		if !silent(ev) && !(ev.Cause == rendr.CausePeerDown && silent(other) && !ev.Time.Before(other.Time)) {
+			t.Errorf("the %s's death record of the dropped carrier %d at DROP %+v: %+v, want ping_timeout or write_stall after the DROP (or peer_down after the other end's)",
 				side(i), id, ev.Time.Sub(drop), ev)
 		}
 		if cs, ok := carrierOf(c.Status(), id); !ok || cs.State != rendr.CarrierDead || cs.DeathCause != ev.Cause {

@@ -139,6 +139,10 @@ type trunk struct {
 	viewDone  func(*Conn)      // dialer: the pool's view-count hook, called once per view at its Done (onViewDone)
 
 	ms muxState // the rest of the mux state (mux.go)
+
+	// downs are the DOWNs this MUX trunk's writer owes its peer for other
+	// trunks of the pair that died (PA-86, down.go); its own lock (a leaf).
+	downs downQueue
 }
 
 // viewState is a view's handle lifecycle state (M3 design §A5.4). Its

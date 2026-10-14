@@ -49,6 +49,13 @@ type Env struct {
 	// response as the view's first frame) or Conn.Refuse. nil: no passive
 	// mux (an OPEN or JOIN on a live trunk is then refused).
 	Admit func(v *Conn, h wire.Header, p []byte)
+
+	// Trunks is the Runtime's index of its established MUX trunks by pair
+	// (PA-86, down.go): the hook through which a dying trunk queues DOWN on
+	// the other trunks of its pair and a received DOWN finds the trunk it
+	// names. NewRuntime sets it; nil (component tests): no DOWN is sent, and
+	// one received names no trunk.
+	Trunks *TrunkSet
 }
 
 // stageBudget returns the account a carrier's reader stage is charged to

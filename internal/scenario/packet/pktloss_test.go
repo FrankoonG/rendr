@@ -72,8 +72,14 @@ import (
 //     the application; both ends finish cleanly and Runtime.Close leaves
 //     nothing.
 //
-// Because the passive cannot know earlier, rendr has nothing more to
-// count than PeerReceived already shows: the gap is the G6 judge's
+// PA-86 (F-7) lets the passive know at the same instant on a shared trunk
+// with another trunk of the pair (race, bond): the dialer's DOWN for the
+// closed trunk, one REL ahead of the SCHED, ends the passive's end
+// (peer_down), so the carrier no longer outlives the observation there;
+// the premise accepts that end in the instant the passive learns, and
+// every other criterion is unchanged. Because the passive cannot know
+// earlier than one one-way delay after the close, rendr has nothing more
+// to count than PeerReceived already shows: the gap is the G6 judge's
 // attribution of a loss on a carrier its own stimulus ended (its
 // no_other_error_class counts every incomplete packet churn echo, "k of
 // n replies", as error class other, and it has no row for the in-flight
@@ -270,7 +276,17 @@ func closeLossInFlight(t *testing.T, mode rendr.Mode) {
 	after := obs[learnIdx+1] // the next instant: everything of tLearn's instant is in it
 	last := obs[len(obs)-1]
 	if !last.pVictimLive {
-		t.Fatalf("premise: the closed carrier died on the passive within %v of the close (it must outlive the observation)", last.at.Sub(tClose))
+		// PA-86: race and bond hold a second trunk of the pair, on which the
+		// dialer's DOWN for the closed one arrives one REL ahead of the
+		// SCHED; it ends the passive's end (peer_down) in the instant the
+		// passive learns, so the passive also stops writing there by the
+		// trunk's death. Any other end before the observation's is the
+		// premise's failure (selector: no second trunk at the close, no
+		// DOWN — the carrier lives on at the passive until its ping_timeout).
+		if pd, ok := w.pev.downOf(vic.ID); !ok || pd.Cause != rendr.CausePeerDown || pd.Time.Before(tClose.Add(clOneWay)) || pd.Time.After(tLearn) {
+			t.Fatalf("premise: the closed carrier died on the passive %v after the close (it must outlive the observation, or end by the dialer's DOWN when the passive learns: %+v, found %v)",
+				last.at.Sub(tClose), pd, ok)
+		}
 	}
 	if last.pTx != after.pTx {
 		t.Fatalf("(a): the passive placed %d DGRAM bytes on carrier %d after it applied the SCHED that dropped it (%v after the close)",

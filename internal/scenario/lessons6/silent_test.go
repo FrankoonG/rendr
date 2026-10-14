@@ -113,8 +113,12 @@ func silentDrop(t *testing.T, mode rendr.Mode) {
 	}
 
 	// Each end declared the victim dead by itself, by a silence cause,
-	// within the bound.
+	// within the bound — or, on a shared carrier with another trunk of the
+	// pair (bond), the end whose peer declared it first ended it when that
+	// verdict's DOWN arrived (PA-86: peer_down, after the peer's verdict).
 	var died [2]time.Time
+	var causes [2]rendr.Cause
+	silent := func(c rendr.Cause) bool { return c == rendr.CausePingTimeout || c == rendr.CauseWriteStall }
 	for i, side := range []struct {
 		c   *rendr.PacketConn
 		evs *eventLog
@@ -124,7 +128,7 @@ func silentDrop(t *testing.T, mode rendr.Mode) {
 		if !ok || cs.State != rendr.CarrierDead {
 			t.Fatalf("%s: carrier %d is %+v (found %v), want dead", who, victim.ID, cs, ok)
 		}
-		if cs.DeathCause != rendr.CausePingTimeout && cs.DeathCause != rendr.CauseWriteStall {
+		if !silent(cs.DeathCause) && cs.DeathCause != rendr.CausePeerDown {
 			t.Fatalf("%s: carrier %d died of %v (%q), want ping_timeout or write_stall", who, victim.ID, cs.DeathCause, cs.DeathDetail)
 		}
 		ev, ok := side.evs.downOf(victim.ID)
@@ -134,8 +138,14 @@ func silentDrop(t *testing.T, mode rendr.Mode) {
 		if d := ev.Time.Sub(drop); d > 5*time.Second {
 			t.Fatalf("%s: carrier %d declared dead %v after the drop, want within 5 s", who, victim.ID, d)
 		}
-		died[i] = ev.Time
+		died[i], causes[i] = ev.Time, cs.DeathCause
 		t.Logf("%s: carrier %d (%s) dead +%v: %v %q", who, victim.ID, victim.Name, ev.Time.Sub(drop), cs.DeathCause, cs.DeathDetail)
+	}
+	for i, c := range causes {
+		if c == rendr.CausePeerDown && (!silent(causes[1-i]) || died[i].Before(died[1-i])) {
+			t.Fatalf("%s: carrier %d died of peer_down at +%v, but the other end's verdict is %v at +%v (a DOWN follows the peer's own verdict)",
+				[2]string{"dialer", "passive"}[i], victim.ID, died[i].Sub(drop), causes[1-i], died[1-i].Sub(drop))
+		}
 	}
 	if mode == rendr.ModeSelector {
 		if m := dc.Status().Migrations; m.Death != migr0.Death+1 || m.Quality != migr0.Quality {

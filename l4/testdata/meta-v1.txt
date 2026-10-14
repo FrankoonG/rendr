@@ -1,6 +1,8 @@
 # L4 metadata version 1 golden vectors (M4 design A3.5). Hand-written,
-# independent of the encoder; a change before v2.0.0 is deliberate and
-# recorded in the milestone report, after it needs a new version.
+# independent of the encoder. Before v2.0.0 a change is deliberate and
+# recorded in the milestone report. After v2.0.0 a frozen vector changes
+# only with a new wire minor version, an optional PREFACE feature bit, or a
+# new version of a versioned payload format such as L4 metadata.
 #
 #   ok  <name> <hex> <Request.Addr> <Request.App as hex, or ->
 #   bad <name> <hex or -> <code: BadRequest BadVersion BadCommand BadAddress>

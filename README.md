@@ -252,9 +252,15 @@ No migration is ever triggered by the application's own traffic pattern.
   passive has none and waits.
 - *Detection:* a carrier is declared dead by a transport error, a PING
   unanswered beyond the death deadline (`DeadMin`–`DeadMax`), a write stall
-  (`WriteStall`), a protocol violation or an instance mismatch. With no
-  usable carrier for `NoPathGrace` (15 s by default, counted from the death
-  of the last carrier) the session fails with `ErrNoPath`.
+  (`WriteStall`), a protocol violation, an instance mismatch or — on a
+  shared carrier — the peer's report that the carrier died at its end
+  (`peer_down`): when a shared carrier dies at one end for a reason the
+  other end cannot see, that end says so on the other shared carriers
+  between the same two instances, and the peer ends the carrier at once
+  instead of at its own death deadline, so every session on it moves within
+  one one-way delay. With no usable carrier for `NoPathGrace` (15 s by
+  default, counted from the death of the last carrier) the session fails
+  with `ErrNoPath`.
 
 ## Embedding contract and security model
 
@@ -860,12 +866,19 @@ limitation of 2.0.0 with its consequence.
 
 **Wire format.** Every carrier starts with a versioned PREFACE (magic
 `RND2`, major version 2, minor version, required and optional feature
-bits). The wire format is frozen at 2.0.0 and covered by golden vectors:
-later 2.x releases extend it only with optional feature bits, which an
-older peer ignores, or with a new minor version; a feature a peer must
-understand is a required bit, and a peer that lacks it answers FEATURE,
-which the dialer reports as `ErrVersion`. A handshake that does not start
-with the `RND2` magic (rendr v1's, for example) is refused cleanly.
+bits). Frames carry a type, a frame sequence number, a session handle and a
+CRC32C; on datagram carriers the control frames travel in a small reliable
+sublayer. On a shared carrier (rendr mux) further sessions open with OPEN
+or JOIN on the live carrier, the carrier-level DETACH ends one session's
+part, and the carrier-level DOWN reports that another shared carrier
+between the same two instances died at the sender's end. The wire format is
+frozen at 2.0.0 and covered by golden vectors: later 2.x releases change it
+only with a new minor version, an optional feature bit, which an older peer
+ignores, or a new version of a versioned payload format such as the L4
+metadata; a feature a peer must understand is a required bit, and a peer
+that lacks it answers FEATURE, which the dialer reports as `ErrVersion`. A
+handshake that does not start with the `RND2` magic (rendr v1's, for
+example) is refused cleanly.
 
 **API.** The module path is `github.com/FrankoonG/rendr/v2`. rendr 2.0 is
 a rewrite: it shares no API, wire format or module path with rendr v0.x or

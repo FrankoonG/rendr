@@ -75,7 +75,11 @@
 // uses a live carrier of its kind instead of dialling one, and a carrier
 // closes when its last session ends; there is no idle retention.
 // Sessions on one carrier share its head-of-line blocking and its fate: its
-// death migrates each of them, as it would a session of its own. On a
+// death migrates each of them, as it would a session of its own. A shared
+// carrier that dies at one end for a reason the other end cannot see (a
+// transport error, a PING timeout) is reported on the other shared
+// carriers between the two Runtimes, and the other end ends it at once
+// (CausePeerDown) instead of at its own death deadline. On a
 // carrier that was already live, the passive's first bytes for a session
 // leave about one round trip later than on a fresh carrier (the passive
 // waits for the dialer's first frame for that session). CheapSubflow

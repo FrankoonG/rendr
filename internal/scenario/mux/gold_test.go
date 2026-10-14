@@ -33,7 +33,8 @@ func verdict(c rendr.Cause) bool { return c == rendr.CausePingTimeout || c == re
 // records ping_timeout or write_stall; a rendrtest Link delivers a
 // carrier's close even while it is blackholed (the close crosses the
 // DROP, unlike an nft DROP), so the other end may record that close as
-// transport_error, but only at or after the first verdict.
+// transport_error, or the first end's DOWN on the other trunk of the pair
+// as peer_down (PA-86), but only at or after the first verdict.
 func droppedCause(t testing.TB, w *world, ps []pair, id rendr.CarrierID, drop time.Time) {
 	t.Helper()
 	var evs [2]rendr.Event
@@ -53,8 +54,8 @@ func droppedCause(t testing.TB, w *world, ps []pair, id rendr.CarrierID, drop ti
 	if !verdict(evs[first].Cause) {
 		t.Fatalf("the %s's death record of the dropped carrier %d (the first): %+v, want ping_timeout or write_stall", side(first), id, evs[first])
 	}
-	if o := evs[1-first]; !verdict(o.Cause) && (o.Cause != rendr.CauseTransportError || o.Time.Before(evs[first].Time)) {
-		t.Fatalf("the %s's death record of the dropped carrier %d: %+v, want ping_timeout or write_stall (or the first verdict's close)", side(1-first), id, o)
+	if o := evs[1-first]; !verdict(o.Cause) && (o.Cause != rendr.CauseTransportError && o.Cause != rendr.CausePeerDown || o.Time.Before(evs[first].Time)) {
+		t.Fatalf("the %s's death record of the dropped carrier %d: %+v, want ping_timeout or write_stall (or the first verdict's close or DOWN)", side(1-first), id, o)
 	}
 	for _, s := range ps {
 		for i, c := range []*rendr.Conn{s.d, s.p} {
