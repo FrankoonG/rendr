@@ -155,10 +155,12 @@ func (p *packetIO) Headroom() int { return 0 }
 // WriteDatagram implements PacketIO: one WriteTo of b to the original peer
 // value. A count outside [0, len(b)] or other than len(b) is an error that
 // is neither noise nor a size refusal (L42: the carrier dies, never
-// retried); a size error is a *wire.DatagramTooLargeError (the embedder's
-// own, with its Max, or Max 0 for EMSGSIZE); noise — EPERM included
-// (integration 1, D11) — is ErrNoise; the caller's deadline, an abort and
-// every other error are returned (write stall or death).
+// retried): a *countError, which matches ErrWriteCount, so the writer
+// hands the datagram, which may have left, back to no session. A size
+// error is a *wire.DatagramTooLargeError (the embedder's own, with its
+// Max, or Max 0 for EMSGSIZE); noise — EPERM included (integration 1,
+// D11) — is ErrNoise; the caller's deadline, an abort and every other
+// error are returned (write stall or death).
 func (p *packetIO) WriteDatagram(b []byte) error {
 	n, err := callWriteTo(p.pc, b, p.peer)
 	if n < 0 || n > len(b) {

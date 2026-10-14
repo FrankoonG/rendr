@@ -18,10 +18,12 @@ import (
 // gate is set, until the gate closes. With the gate set while the read is
 // parked holding its extras, that caller is the idle-release firing (the
 // reader goroutine calls Parks only when it takes its extras, arm), held
-// there with relMu before it decides to re-arm.
+// there with relMu before it decides to re-arm. dropGate, once set, holds
+// the next Drop until it closes: the reader taking its extras back, which
+// at its exit (endIdle) follows its critical section under relMu.
 type parkGateReader struct {
 	*fakeReader
-	gate atomic.Pointer[chan struct{}]
+	gate, dropGate atomic.Pointer[chan struct{}]
 }
 
 func (r *parkGateReader) Parks() uint64 {
@@ -29,6 +31,13 @@ func (r *parkGateReader) Parks() uint64 {
 		<-*g
 	}
 	return r.fakeReader.Parks()
+}
+
+func (r *parkGateReader) Drop() *udpsocket.Batch {
+	if g := r.dropGate.Swap(nil); g != nil {
+		<-*g
+	}
+	return r.fakeReader.Drop()
 }
 
 // parkGateSock is a fakeSock whose Source reads through a parkGateReader.
@@ -57,10 +66,22 @@ func (c *parkGateSock) newReader(release func(*udpsocket.Batch)) srcReader {
 //     relMu (a stray firing, up to a period after Done, keeps the reader and
 //     the Source reachable).
 //   - fired-at-exit: on the reader's state (hold, a park; no read loop) the
-//     timer fires while the exit's critical section holds relMu, and its
-//     firing runs once the exit set ended: it touches nothing — no Holding
-//     call, the extras untouched, no re-arm. Mutant: idleFire without the
-//     ended check.
+//     timer fires while the exit's critical section holds relMu (here
+//     held, and ended set, by the test as endIdle does: the firing is the
+//     timer's own goroutine, which waits for relMu), and runs once ended
+//     is set: it touches nothing — no Holding call, the extras untouched,
+//     no re-arm. Mutant: idleFire without the ended check.
+//   - late-firing: on the reader's state (hold, a park and the read's
+//     return; no read loop) the reader's own exit (endIdle) passes relMu
+//     and is held where it takes its extras back (parkGateReader's
+//     dropGate). A firing that reaches relMu only now — the timer's
+//     goroutine of a period that expired just before the exit's Stop,
+//     called here as that goroutine calls it — still finds the extras
+//     held and the read parked since the timer was armed, so without the
+//     exit's ended it would re-arm the timer behind the exit. It must
+//     return at ended: no Holding call, no release, no re-arm; nor may a
+//     firing once the exit returned. Mutants: endIdle without its
+//     ended = true; idleFire without the ended check.
 func TestSourceExitStopsIdleTimer(t *testing.T) {
 	t.Run("rearm-in-flight", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -140,6 +161,51 @@ func TestSourceExitStopsIdleTimer(t *testing.T) {
 			r.endIdle()
 			if u := buffered(env); u != 0 {
 				t.Fatalf("after the exit: BufferedBytes %d (%s)", u, heldBytes(env))
+			}
+		})
+	})
+	t.Run("late-firing", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			env := testEnv(1 << 30)
+			c := &parkGateSock{fakeSock: newFakeSock(32)}
+			s := newSeamSource(env, c.fakeSock, c, seamDgram, Limits{})
+			r := &reader{s: s}
+			r.startDepth()
+			rd := c.rd.Load()
+			r.hold() // the extras of a read at depth 32: the Batch, the timer armed
+			if rd == nil || !r.held || !r.armed.Load() {
+				t.Fatal("stimulus: no extras held, or the idle release not armed")
+			}
+			rd.park()   // the read parked holding them …
+			rd.unpark() // … and returned: the reader exits
+			gate := make(chan struct{})
+			var opened sync.Once
+			open := func() { opened.Do(func() { close(gate) }) }
+			defer open() // on a failure the exit ends with the bubble
+			rd.dropGate.Store(&gate)
+			exited := make(chan struct{})
+			go func() {
+				r.endIdle()
+				close(exited)
+			}()
+			synctest.Wait()
+			if rd.dropGate.Load() != nil || !rd.Held() {
+				t.Fatal("stimulus: the reader's exit did not pass relMu to take its extras back")
+			}
+			calls := rd.holdings.Load()
+			r.idleFire() // the late firing, after the exit's critical section
+			inWindow := rd.holdings.Load() - calls
+			rearmed := r.idleT.Stop()
+			open()
+			synctest.Wait()
+			<-exited
+			r.idleFire() // and one once the exit returned
+			if n := rd.holdings.Load() - calls; n != 0 || rearmed || r.idleT.Stop() || rd.releases.Load() != 0 {
+				t.Fatalf("a firing after the reader's exit took relMu: %d Holding calls (%d while the exit took its extras back), timer re-armed %v, %d releases; want it to return at ended, touching nothing and re-arming nothing",
+					n, inWindow, rearmed, rd.releases.Load())
+			}
+			if u := buffered(env); u != 0 || rd.Held() {
+				t.Fatalf("after the exit: BufferedBytes %d (%s), extras held %v", u, heldBytes(env), rd.Held())
 			}
 		})
 	})

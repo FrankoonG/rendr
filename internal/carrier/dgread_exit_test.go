@@ -18,12 +18,14 @@ import (
 // releasing), before the slots and the header's charge go back — until it
 // closes; parksGate holds the next parks call until it closes, which with
 // the read parked is the idle-release firing's (the reader calls parks
-// around its reads only); holdings counts the holding calls, which only a
-// firing makes.
+// around its reads only); reclaimGate holds the next reclaim until it
+// closes — the reader taking its extras back from the transport, which at
+// its exit (endDepth) follows its critical section under relMu; holdings
+// counts the holding calls, which only a firing makes.
 type gatedDepth struct {
 	*fakeBatch
-	relGate, parksGate atomic.Pointer[chan struct{}]
-	holdings           atomic.Int64
+	relGate, parksGate, reclaimGate atomic.Pointer[chan struct{}]
+	holdings                        atomic.Int64
 }
 
 func (g *gatedDepth) onRelease(f func(*ioHdr)) {
@@ -45,6 +47,13 @@ func (g *gatedDepth) parks() uint64 {
 func (g *gatedDepth) holding() bool {
 	g.holdings.Add(1)
 	return g.fakeBatch.holding()
+}
+
+func (g *gatedDepth) reclaim() bool {
+	if c := g.reclaimGate.Swap(nil); c != nil {
+		<-*c
+	}
+	return g.fakeBatch.reclaim()
 }
 
 var _ depthIO = (*gatedDepth)(nil)
@@ -81,6 +90,15 @@ func held32(t *testing.T, s *dgSide, base, sbase int64, what string) {
 	if b, st := s.env.Budget.Used()-base, s.env.Stages.Used()-sbase; b != 31*slotSize() || st != 32*hdrPerMsg {
 		t.Fatalf("%s: Budget %+d, Stages %+d; want the extras of depth 32 held (31 × %d, %d)", what, b, st, slotSize(), 32*hdrPerMsg)
 	}
+}
+
+// newGate returns a gate and its opener (once): a subtest defers the
+// opener as well, so that on a failure the goroutine the gate holds ends
+// with the bubble rather than deadlocking it, and the rows after it run.
+func newGate() (chan struct{}, func()) {
+	gate := make(chan struct{})
+	var once sync.Once
+	return gate, func() { once.Do(func() { close(gate) }) }
 }
 
 // TestDgramReaderExitWaitsForIdleRelease (R1-5 rule 3; B2-2): a burst of
@@ -201,15 +219,29 @@ func depthReader(t *testing.T) (rd *dgReader, g *gatedDepth, env *Env, base, sba
 //     the timer, and the exit stops it after that: no timer is armed once
 //     endDepth returned, and the extras and their charges are back.
 //     Mutant: endDepth stopping the timer before it takes relMu.
-//   - fired-at-exit: the timer fires while the exit holds relMu (its
-//     goroutine waits for it), and runs once the exit set ended: it
-//     touches nothing — no holding call, the extras untouched, no re-arm.
-//     Mutant: idleFire without the ended check.
+//   - fired-at-exit: the timer fires while the exit's critical section
+//     holds relMu (here held, and ended set, by the test as endDepth does:
+//     the firing is the timer's own goroutine, which waits for relMu), and
+//     runs once ended is set: it touches nothing — no holding call, the
+//     extras untouched, no re-arm. Mutant: idleFire without the ended
+//     check.
+//   - late-firing: the reader's own exit (endDepth) passes relMu and is
+//     held where it takes its extras back from the transport (gatedDepth's
+//     reclaimGate). A firing that reaches relMu only now — the timer's
+//     goroutine of a period that expired just before the exit's Stop,
+//     called here as that goroutine calls it — still finds the extras
+//     lent and the read parked since the timer was armed, so without the
+//     exit's ended it would re-arm the timer behind the exit (and touch
+//     the transport of a reader that is gone). It must return at ended:
+//     no holding call, no re-arm; nor may a firing once the exit returned.
+//     Mutants: endDepth without its ended = true; idleFire without the
+//     ended check.
 func TestDgramReaderExitStopsIdleTimer(t *testing.T) {
 	t.Run("rearm-in-flight", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			rd, g, env, base, sbase := depthReader(t)
-			gate := make(chan struct{})
+			gate, open := newGate()
+			defer open()
 			g.parksGate.Store(&gate)
 			time.Sleep(batchIdleRelease + time.Millisecond)
 			synctest.Wait()
@@ -228,7 +260,7 @@ func TestDgramReaderExitStopsIdleTimer(t *testing.T) {
 				t.Fatal("the reader's exit did not wait for the firing in progress (relMu)")
 			default:
 			}
-			close(gate)
+			open()
 			synctest.Wait()
 			<-exited
 			if rd.idleT.Stop() {
@@ -256,6 +288,39 @@ func TestDgramReaderExitStopsIdleTimer(t *testing.T) {
 			rd.endDepth()
 			if b, st := env.Budget.Used(), env.Stages.Used(); b != base || st != sbase {
 				t.Fatalf("after the exit: Budget %+d, Stages %+d; want the extras back", b-base, st-sbase)
+			}
+		})
+	})
+	t.Run("late-firing", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			rd, g, env, base, sbase := depthReader(t)
+			g.fakeBatch.state.Store(fbHeld) // the read returned: the reader took its extras back
+			gate, open := newGate()
+			defer open()
+			g.reclaimGate.Store(&gate)
+			exited := make(chan struct{})
+			go func() {
+				rd.endDepth()
+				close(exited)
+			}()
+			synctest.Wait()
+			if g.reclaimGate.Load() != nil || !g.fakeBatch.holding() {
+				t.Fatal("stimulus: the reader's exit did not pass relMu to take its extras back")
+			}
+			calls := g.holdings.Load()
+			rd.idleFire() // the late firing, after the exit's critical section
+			inWindow := g.holdings.Load() - calls
+			rearmed := rd.idleT.Stop()
+			open()
+			synctest.Wait()
+			<-exited
+			rd.idleFire() // and one once the exit returned
+			if n := g.holdings.Load() - calls; n != 0 || rearmed || rd.idleT.Stop() {
+				t.Fatalf("a firing after the reader's exit took relMu: %d holding calls (%d while the exit took its extras back), timer re-armed %v; want it to return at ended, touching nothing and re-arming nothing",
+					n, inWindow, rearmed)
+			}
+			if b, st := env.Budget.Used(), env.Stages.Used(); b != base || st != sbase || g.fakeBatch.holding() {
+				t.Fatalf("after the exit: Budget %+d, Stages %+d, holding %v; want the extras back", b-base, st-sbase, g.fakeBatch.holding())
 			}
 		})
 	})

@@ -170,17 +170,17 @@ func (tokenIO) MaxBatch() int        { return 1 }
 // it at any time, and a Batch in use is charged to Env.Stages — a
 // writer's for its call (writeBatch), the reader's while it holds its
 // extras (reader.hold). wpool holds the writers' call state (wbatch, a
-// Batch of MaxBatch messages), idle ones numbering at most the flows that
-// wrote at once; rpool the reader's Batch of min(MaxBatch, 32) messages,
-// the depth of its reads (R1-6): one is held while the Source reads, and
-// its idle release, a fall to depth 1, its exit or a refused Hold puts it
-// back (srcidle). The idle Batches of both pools are uncharged and
-// reclaimed by the garbage collector; until a collection their number is
-// bounded only by the pool's per-P caches. A regrow (reader.hold)
-// allocates a Batch only when its P's pool holds none — after a release
-// still in flight, whose Batch is not back yet, or when the reader runs
-// on another P than the one a Batch went back to — and steady-state reads
-// allocate nothing per datagram.
+// Batch of MaxBatch messages), one in use per flow writing at that moment;
+// rpool the reader's Batch of min(MaxBatch, 32) messages, the depth of its
+// reads (R1-6): one is held while the Source reads, and its idle release,
+// a fall to depth 1, its exit or a refused Hold puts it back (srcidle).
+// The idle Batches of both pools are uncharged and reclaimed by the
+// garbage collector; until a collection their number is bounded only by
+// the pools' per-P caches. A call or a regrow (reader.hold) allocates a
+// Batch only when its P's pool holds none — for the reader, after a
+// release still in flight, whose Batch is not back yet, or when it runs on
+// another P than the one a Batch went back to — and steady-state reads
+// and writes allocate nothing per datagram.
 func (s *Source) setIO(io sockIO) {
 	s.bio = io
 	mb := io.MaxBatch()
