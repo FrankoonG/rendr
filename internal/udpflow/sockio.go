@@ -32,9 +32,11 @@ const (
 // returns them (plan:774; M5 design R1-5 rule 3, the dialer reader's
 // period and mechanism, which srcidle applies to the passive Source): an
 // idle Source holds what it held at M4 — slot 0, uncharged — within
-// 2 × batchIdleRelease of its last datagram. internal/carrier's
-// batchIdleRelease has the same value. A Source takes it at NewSource;
-// tests lower it.
+// 2 × batchIdleRelease of its last datagram, or of its start if it never
+// read one. It is internal/carrier's batchIdleRelease, 1 s, which the
+// root package's TestIdlePacketListenerBufferedBytesZero_plan774 assumes;
+// TestBatchIdleReleaseShared in both packages pins the value. A Source
+// takes it at NewSource; tests lower it.
 var batchIdleRelease = time.Second
 
 // sockIO is how a Source moves datagrams on rendr's own socket: a
@@ -162,13 +164,17 @@ func (tokenIO) MaxBatch() int        { return 1 }
 // setIO makes io the Source's socket path (NewSource for rendr's own
 // socket; tests). It runs before Run.
 //
-// The writers' pool (wpool) is the one recorded exception to "every held
-// buffer is visible in BufferedBytes" (R1-5 rule 1, M5 design R3-28): an
-// idle wbatch resting in it is not charged. The garbage collector may
-// reclaim it at any time, a Batch in use is charged to Env.Stages for its
-// call (writeBatch) or, as the reader's extras, while the reader holds it
-// (reader.hold), and the idle ones number at most the flows that wrote at
-// once plus the one the reader's idle release returned.
+// The Source's two pools are the recorded exception to "every held buffer
+// is visible in BufferedBytes" (R1-5 rule 1, M5 design R3-28): an idle
+// Batch resting in one is not charged. The garbage collector may reclaim
+// it at any time, and a Batch in use is charged to Env.Stages — a
+// writer's for its call (writeBatch), the reader's while it holds its
+// extras (reader.hold). wpool holds the writers' call state (wbatch, a
+// Batch of MaxBatch messages), idle ones numbering at most the flows that
+// wrote at once; rpool the reader's Batch of min(MaxBatch, 32) messages,
+// the depth of its reads (R1-6), which its idle release, a fall to depth
+// 1, its exit or a refused Hold puts back (srcidle): two at most, one
+// while no idle release is in flight.
 func (s *Source) setIO(io sockIO) {
 	s.bio = io
 	mb := io.MaxBatch()
@@ -179,15 +185,15 @@ func (s *Source) setIO(io sockIO) {
 		}
 		return w
 	}
+	d := min(mb, srcMaxDepth)
+	s.rpool.New = func() any { return udpsocket.NewBatch(d) }
 }
 
 // wbatch is a flow writer's call state on the shared socket: the messages
 // of one WriteBatch and, for MaxBatch ≥ 2, the Batch. Writers take one
 // from the Source's pool per call and return it at the call's end, so an
 // idle flow holds none (R1-5 rule 2); a Batch in use is charged to
-// Env.Stages. The Source's reader takes one for the Batch of its extras
-// while it reads at depth D ≥ 2 and returns it at the idle release, so a
-// regrow allocates nothing (srcidle).
+// Env.Stages.
 type wbatch struct {
 	b     *udpsocket.Batch
 	ms    []udpsocket.Msg

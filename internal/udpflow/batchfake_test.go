@@ -206,15 +206,17 @@ const (
 // goroutine holds, drops, parks and unparks; the idle release takes parked
 // extras by one CAS on count and state, runs release and stores idle),
 // and b, the extras' Batch, owned per state. releases counts the idle
-// releases, lost the reads that woke to find their extras taken; a gate,
-// if set, holds an idle release between its CAS and its release function
-// until the gate closes (a release in flight).
+// releases, lost the reads that woke to find their extras taken, holdings
+// the Holding calls (only the idle-release timer makes them: a firing
+// makes one or two); a gate, if set, holds an idle release between its
+// CAS and its release function until the gate closes (a release in
+// flight).
 type fakeWord struct {
-	word           atomic.Uint64
-	b              *udpsocket.Batch
-	release        func(*udpsocket.Batch)
-	releases, lost atomic.Uint64
-	gate           atomic.Pointer[chan struct{}]
+	word                     atomic.Uint64
+	b                        *udpsocket.Batch
+	release                  func(*udpsocket.Batch)
+	releases, lost, holdings atomic.Uint64
+	gate                     atomic.Pointer[chan struct{}]
 }
 
 func (w *fakeWord) state() uint64 { return w.word.Load() & 3 }
@@ -279,6 +281,7 @@ func (w *fakeWord) Drop() *udpsocket.Batch {
 func (w *fakeWord) Parks() uint64 { return w.word.Load() >> 2 }
 
 func (w *fakeWord) Holding() bool {
+	w.holdings.Add(1)
 	s := w.state()
 	return s == fwHeld || s == fwParked
 }

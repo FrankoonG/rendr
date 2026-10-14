@@ -17,8 +17,9 @@ import (
 
 const (
 	// idleRelease is internal/udpflow's and internal/carrier's
-	// batchIdleRelease (unexported, 1 s): a batching reader returns its
-	// extras within 2 × idleRelease of its last datagram.
+	// batchIdleRelease (unexported, 1 s; each package's
+	// TestBatchIdleReleaseShared pins it there): a batching reader returns
+	// its extras within 2 × idleRelease of its last datagram.
 	idleRelease = time.Second
 	// idleSlack is this row's scheduling allowance on top of
 	// 2 × idleRelease (a real-socket row on a loaded host; the bound

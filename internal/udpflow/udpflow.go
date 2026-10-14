@@ -131,9 +131,11 @@ type Source struct {
 
 	// bio moves datagrams on pc when pc is exactly rendr's own listening
 	// socket (several per system call where it batches, M5-D10); nil for
-	// a foreign conn. wpool holds the flow writers' call state (wbatch).
+	// a foreign conn. wpool holds the flow writers' call state (wbatch),
+	// rpool the reader's Batch (reader.hold); setIO.
 	bio   sockIO
 	wpool sync.Pool
+	rpool sync.Pool
 	// idleRel is the idle release's period (batchIdleRelease at
 	// NewSource): the extras of a reader that stayed parked for a whole
 	// period go back (reader.idleFire).

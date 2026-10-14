@@ -35,25 +35,27 @@ type reader struct {
 	ms [srcMaxDepth]udpsocket.Msg
 	at [srcMaxDepth]uint8
 
-	// The extras of a read at depth D ≥ 2 — slots 1 … D−1 and the Batch
-	// of rw, a flow writer's call state taken from the Source's pool
-	// (s.wpool, so a regrow allocates nothing) and charged to Stages while
-	// held (rw.bytes; R1-5 rule 1) — and their idle release (plan:774; M5
-	// design R1-5 rule 3, which srcidle applies to the passive Source). The
-	// reads of rendr's own socket go through rd, the dialer reader's
-	// udpsocket.Reader, whose four-state word says who owns the extras:
-	// the reader goroutine while they are held (held mirrors rd.Held()
-	// after each read; the reader touches slots 1 … D−1 and rw only while
-	// held is true), nobody while its read is parked in the netpoller, and
-	// the idle-release timer (idleT, the period s.idleRel) once it took
-	// them by CAS from a read that stayed parked for a whole period; it
-	// returns them on its own goroutine (releaseIdle). The parked read
-	// then waits at depth 1 — it moves the next datagram into slot 0 — and
-	// the read after it is at D again; shed keeps depth 1 across reads
-	// that end in an error until a datagram arrives. An idle Source thus
-	// holds what it held at M4: slot 0, uncharged.
+	// The extras of a read at depth D ≥ 2 — slots 1 … D−1 and bt, a Batch
+	// of D messages taken from the Source's pool (s.rpool, so a regrow
+	// allocates nothing) and charged to Stages while held (btBytes, D ×
+	// batchMsgBytes; R1-5 rules 1 and 4) — and their idle release
+	// (plan:774; M5 design R1-5 rule 3, which srcidle applies to the
+	// passive Source). The reads of rendr's own socket go through rd, the
+	// dialer reader's udpsocket.Reader, whose four-state word says who owns
+	// the extras: the reader goroutine while they are held (held mirrors
+	// rd.Held() after each read; the reader touches slots 1 … D−1 and bt
+	// only while held is true), nobody while its read is parked (in the
+	// netpoller, or in a plain read), and the idle-release timer (idleT,
+	// the period s.idleRel) once it took them by CAS from a read that
+	// stayed parked for a whole period; it returns them on its own
+	// goroutine (releaseIdle). The parked read then waits at depth 1 — it
+	// moves the next datagram into slot 0 — and the read after it is at D
+	// again; shed keeps depth 1 across reads that end in an error until a
+	// datagram arrives. An idle Source thus holds what it held at M4: slot
+	// 0, uncharged.
 	rd      srcReader // nil: tokenIO (depth 1)
-	rw      *wbatch
+	bt      *udpsocket.Batch
+	btBytes int64
 	held    bool
 	shed    bool
 	idleT   *time.Timer   // armed while the extras are held (rd.Holding)
@@ -243,25 +245,26 @@ func (r *reader) fill(d int) int {
 	return k
 }
 
-// hold takes the extras for a read at depth D: a Batch from the Source's
-// pool (readDepth ≥ 2 means MaxBatch ≥ 2, so it holds MaxBatch ≥ D
-// messages), charged to Stages before rd holds it, and arms the idle
-// release; the slots 1 … D−1 follow in fill. rd refuses the Batch while
-// an idle release still returns the previous extras: the read stays at
-// depth 1.
+// hold takes the extras for a read at depth D: a Batch of D messages from
+// the Source's pool (rpool: the depth's class, R1-5 rules 1 and 4),
+// charged to Stages before rd holds it, and arms the idle release; the
+// slots 1 … D−1 follow in fill. rd refuses the Batch while an idle
+// release still returns the previous extras: the Batch goes back with its
+// charge and the read stays at depth 1.
 func (r *reader) hold() {
 	if r.rd == nil {
 		return // tokenIO: one datagram per call
 	}
 	s := r.s
-	w := s.wpool.Get().(*wbatch)
-	s.stages.Acquire(w.bytes)
-	if _, ok := r.rd.Hold(w.b); !ok {
-		s.stages.Release(w.bytes)
-		s.wpool.Put(w)
+	b := s.rpool.Get().(*udpsocket.Batch)
+	n := int64(b.Cap()) * batchMsgBytes
+	s.stages.Acquire(n)
+	if _, ok := r.rd.Hold(b); !ok {
+		s.stages.Release(n)
+		s.rpool.Put(b)
 		return
 	}
-	r.rw, r.held = w, true
+	r.bt, r.btBytes, r.held = b, n, true
 	r.arm()
 }
 
@@ -279,7 +282,7 @@ func (r *reader) dropExtras() {
 }
 
 // releaseExtras returns the extras: the slots 1 … D−1, each with its
-// Budget charge, and rw's Batch, with its Stages charge, to the Source's
+// Budget charge, and the Batch, with its Stages charge, to the Source's
 // pool. Their owner runs it: the reader goroutine after Drop, or the idle
 // release while rd is releasing them (releaseIdle).
 func (r *reader) releaseExtras() {
@@ -287,9 +290,9 @@ func (r *reader) releaseExtras() {
 		r.slot[i].Release()
 		r.slot[i] = nil
 	}
-	r.s.stages.Release(r.rw.bytes)
-	r.s.wpool.Put(r.rw)
-	r.rw = nil
+	r.s.stages.Release(r.btBytes)
+	r.s.rpool.Put(r.bt)
+	r.bt, r.btBytes = nil, 0
 }
 
 // releaseIdle is rd's release function: rd.TryRelease runs it on the
