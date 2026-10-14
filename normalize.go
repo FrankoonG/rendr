@@ -14,10 +14,13 @@ import (
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
-// Configuration defaults and clamp ranges (plan §4). The five fields whose
-// range includes zero (RetireGrace, Selector.Floor, Probe.DialWait,
-// Handshake.MaxMetadata, Handshake.EarlyDataMax) select zero with a
-// negative value; IdleTimeout is off (0) by default.
+// Configuration defaults and clamp ranges (plan §4). Six fields have a
+// range that includes zero, and a negative value selects zero in each (the
+// Config doc lists all six): the five zero-able fields (RetireGrace,
+// Selector.Floor, Probe.DialWait, Handshake.MaxMetadata,
+// Handshake.EarlyDataMax), whose zero is a setting of its own and is
+// selected silently, and IdleTimeout, whose zero is its default (off) and
+// whose negative value is recorded as a clamp (clampIdle).
 const (
 	defNoPathGrace, minNoPathGrace, maxNoPathGrace                = 15 * time.Second, 3 * time.Second, 300 * time.Second
 	defRejoinBackoffMax, minRejoinBackoffMax, maxRejoinBackoffMax = 4 * time.Second, 1 * time.Second, 8 * time.Second
@@ -144,13 +147,13 @@ type effective struct {
 }
 
 // normalize implements design §10.4 for a Runtime: (1) zero → default,
-// negative → zero for the four zero-able fields, clamp to the plan §4
-// range; (2) the cross-parameter constraints of plan §3.6 in their fixed
-// order; (5) the testhooks overrides when ov is non-nil (unclamped, not
-// recorded); (3) the derived parameter sets. It returns every adjustment of
-// steps 1–2 as "Field: old → new (reason)". It is a pure function: the same
-// input always yields the same effective value (Rand and Hooks are passed
-// through).
+// negative → zero for the five zero-able fields (and IdleTimeout,
+// recorded), clamp to the plan §4 range; (2) the cross-parameter
+// constraints of plan §3.6 in their fixed order; (5) the testhooks
+// overrides when ov is non-nil (unclamped, not recorded); (3) the derived
+// parameter sets. It returns every adjustment of steps 1–2 as "Field: old
+// → new (reason)". It is a pure function: the same input always yields the
+// same effective value (Rand and Hooks are passed through).
 func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 	var a adjuster
 	c := cfg
@@ -209,7 +212,7 @@ func normalize(cfg Config, ov *testhooks.Overrides) (effective, []string) {
 	// NoPathGrace/2 ≥ 1.5 s ≥ min RejoinBackoffMax; 2×Interval ≤ 60 s ≤ max
 	// Fresh), so step 1 never has to run again. The normalized Config is a
 	// fixed point when fed back as an input with each selected zero of the
-	// four zero-able fields written as a negative value: nothing changes or
+	// five zero-able fields written as a negative value: nothing changes or
 	// is recorded (TestConfigNormalizeIdempotent). Fed back unchanged, such
 	// a zero would select the default again, so an effective cfg is never
 	// re-normalized.

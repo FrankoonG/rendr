@@ -78,11 +78,12 @@ func newFront(dial func(context.Context, string) (*rendr.Conn, error), logf func
 	return &front{dial: dial, logf: logf, timeout: handshakeTimeout, slots: make(chan struct{}, maxHandshakes)}
 }
 
-// serve accepts from ln until ctx is done or ln fails for good, handles
-// each connection on its own goroutine and returns after every one ended:
-// nil after ctx ended it, else Accept's error. Temporary Accept errors
-// (EMFILE) back off 5 ms → 100 ms. Cancelling ctx closes ln, ends running
-// handshakes at once and resets forwarded connections.
+// serve accepts from ln until ctx is done or ln is closed, handles each
+// connection on its own goroutine and returns after every one ended: nil
+// after ctx ended it, else Accept's net.ErrClosed. Every other Accept error
+// (EMFILE, for example; a TCP listener fails for good only once closed) is
+// retried after a backoff of 5 ms → 100 ms. Cancelling ctx closes ln, ends
+// running handshakes at once and resets forwarded connections.
 func (f *front) serve(ctx context.Context, ln net.Listener) error {
 	defer f.wg.Wait()
 	defer ln.Close()
