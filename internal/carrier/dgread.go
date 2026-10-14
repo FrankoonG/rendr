@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/v2/internal/sched"
 	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
@@ -663,6 +664,7 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 				continue
 			}
 			dg.rwin.Jump(f.Fseq)
+			dg.jumpAt = time.Time{} // the claim is proven (dgJumpPingLocked)
 		default:
 			c.dgDropped(1)
 			continue
@@ -695,15 +697,18 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 // nonce salt ^ id, its record in the ring; L23) or to the rebind challenge
 // in flight (id 0, its nonce, from its candidate; M2-D27). A PONG to an
 // answered PING proves nothing: the fseq window compares in serial
-// arithmetic, so a datagram of this direction replayed 2^31 to 2^32−1024
-// frames later reads a window or more ahead, and its old PONG would move
-// the window behind every genuine frame (m3 W2). The sender jumps that far after an outage cost a window of
-// frames, and the PONG to the PING the outage left outstanding, retried at
-// the RTO, or asked for by dgJumpClaim, arrives within a round trip of its
-// end. A datagram of another carrier direction or session, whose fseqs
-// start elsewhere (§0.13 A6), lands ahead about half the time, but its
-// PONGs answer another salt or another challenge: it never moves the
-// window (m3 FSEQJUMP; §A9.1, R1-35).
+// arithmetic, so a datagram of this direction replayed 2^31 to
+// 2^32 − wire.FseqWindowBits frames later reads a window or more ahead,
+// and its old PONG would move the window behind every genuine frame (m3
+// W2). The sender jumps that far after an outage cost a window of frames,
+// and the PONG to the PING the outage left outstanding (retried at the
+// RTO: dgPingDueLocked) or to one that dgJumpClaim asked for (at once,
+// then at the round trip's pace: dgJumpPingLocked) arrives within a round
+// trip after the outage, or after the path stops losing those PINGs. A
+// datagram of another carrier direction or session, whose fseqs start
+// elsewhere (§0.13 A6), lands ahead about half the time, but its PONGs
+// answer another salt or another challenge: it never moves the window (m3
+// FSEQJUMP; §A9.1, R1-35).
 func (c *Conn) dgJumpProof(f *wire.Frame, rest []byte, src PeerKey, now time.Time) bool {
 	if c.dgProves(f.Type, f.Payload, src, now) {
 		return true
@@ -748,8 +753,8 @@ func (c *Conn) dgProves(t wire.Type, p []byte, src PeerKey, now time.Time) bool 
 // free challenge-PONG slot, any other in a free PONG slot, so a frame of
 // another carrier never displaces a genuine answer, and a PONG of ours
 // that answers another carrier's PING matches nothing at the peer — and a
-// PING of ours is asked for, at most one per RTO, whose PONG proves the
-// jump. Nothing else of the frame is applied.
+// PING of ours whose PONG proves the jump is asked for when the claim
+// says so (dgJumpPingLocked). Nothing else of the frame is applied.
 func (c *Conn) dgJumpClaim(f *wire.Frame, now time.Time) {
 	var p wire.Ping
 	ping := false
@@ -773,8 +778,7 @@ func (c *Conn) dgJumpClaim(f *wire.Frame, now time.Time) {
 		st.pong, st.pongDue = p, true
 		wake = true
 	}
-	if dg.jumpPing.IsZero() || now.Sub(dg.jumpPing) >= c.relRTOLocked() {
-		dg.jumpPing = now
+	if c.dgJumpPingLocked(now) {
 		st.pingReq = true
 		wake = true
 	}
@@ -782,6 +786,72 @@ func (c *Conn) dgJumpClaim(f *wire.Frame, now time.Time) {
 	if wake {
 		c.wakeWriter()
 	}
+}
+
+// dgJumpPingLocked reports whether the unproven forward jump of a frame
+// read at now asks for a PING of the carrier, whose PONG proves it (m5
+// PA-85, amending m3 FSEQJUMP's "at most one per RTO"); the reader calls
+// it with Conn.mu held. A claim begins with the first such frame since the
+// window last took a jump, or since a ping timeout D (the death deadline)
+// without one, and asks at once; a later frame of the claim asks again
+// once dgJumpEveryLocked has passed since the last request — the smoothed
+// RTT unless the claim is foreign or the PING ring runs short, so a lost
+// PING or PONG costs a round trip, not an RTO.
+func (c *Conn) dgJumpPingLocked(now time.Time) bool {
+	dg, st := c.dg, &c.st
+	d := sched.DeathDeadline(st.srtt, st.inflight(), st.rate, c.tm.DeadMin, c.tm.DeadMax)
+	prev := dg.jumpLast
+	dg.jumpLast = now
+	if dg.jumpAt.IsZero() || now.Sub(prev) >= d {
+		dg.jumpAt = now // a new claim: ask at once
+	} else if now.Sub(dg.jumpPing) < c.dgJumpEveryLocked(d, now) {
+		return false
+	}
+	dg.jumpPing = now
+	return true
+}
+
+// dgJumpEveryLocked is the spacing at now of a jump claim's PING requests
+// (dgJumpPingLocked) for a ping timeout d. It is the smoothed RTT, at
+// least minRateSample (never more often than a PING may judge an
+// interval), and longer in two cases:
+//
+//   - The claim is foreign: it began d ago or more, and the carrier still
+//     accepted a frame within the last RTO and round trip (the answers to
+//     PINGs an RTO apart arrive that often). A genuine jump is proven
+//     within a ping timeout or its carrier dies, and a carrier that still
+//     accepts frames has its own direction in the window, so the claimed
+//     frames are another carrier direction's or session's: they ask at M3's
+//     pace, once per RTO, and never draw a PING per round trip for longer
+//     than d. A carrier that has accepted nothing for that long — its own
+//     direction jumped too, perhaps after a foreign claim began, or its
+//     PINGs go unanswered — asks at the round trip's pace again, until the
+//     proof, an answer in the window, or its death a ping timeout after its
+//     oldest unanswered PING.
+//   - pingCadenceMax PINGs are outstanding (a long loss of the PINGs or
+//     their PONGs): at least the time left to the carrier's death deadline
+//     (its oldest unanswered PING's) over the records still free, so the
+//     rest of the ring is spread evenly over that time. A ring that
+//     requests filled while the reverse path lost them would leave no PING
+//     to prove the jump once the path is back (a full ring encodes none),
+//     and the carrier would die of ping_timeout with its path working.
+func (c *Conn) dgJumpEveryLocked(d time.Duration, now time.Time) time.Duration {
+	st := &c.st
+	every := max(st.srtt, minRateSample)
+	if now.Sub(c.dg.jumpAt) >= d {
+		rto := c.relRTOLocked()
+		if last := c.lastRx.Load(); last != 0 && c.dgSince(now)-last < int64(rto+st.srtt) {
+			every = max(every, rto)
+		}
+	}
+	if free := pingRingSize - st.n; st.n >= pingCadenceMax && free > 0 {
+		_, at, _ := c.deathDueLocked(now)
+		if at.IsZero() {
+			at = now.Add(d)
+		}
+		every = max(every, at.Sub(now)/time.Duration(free))
+	}
+	return every
 }
 
 // chalAnswer is what one frame did to the rebind challenge (dgDispatch).

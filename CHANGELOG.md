@@ -236,12 +236,19 @@ Raw-UDP admission and NAT:
   is not seen by that attempt; the next attempt opens a fresh flow.
 - A holder of a raw-UDP flow ID who can inject window-valid frames can
   start and redirect a rebind challenge; authentication is the defence.
-- A genuine frame-sequence jump of 1,024 frames or more on a datagram
-  carrier loses the frames that arrive before the jump is proven (at most
-  about rate × (2 RTT + 10 ms) per direction); sessionless probe carriers
-  cannot prove a jump; a foreign frame landing less than 1,024 frames ahead
-  is still accepted (about 2^-22 per frame); a foreign replay from a new
-  address can draw rate-limited challenge PINGs.
+- A genuine frame-sequence jump of 8,192 frames or more on a datagram
+  carrier (about as many frames lost in a row: 82 ms at 100,000 datagrams
+  a second) loses the frames that arrive before the jump is proven (at most
+  about rate × (2 RTT + 10 ms) per direction, plus a round trip, at least
+  5 ms, for each proof PING lost while fewer than 16 PINGs are outstanding;
+  past that the carrier spreads its free PING records over the time left
+  to its ping timeout); sessionless probe carriers cannot prove a jump; a
+  foreign frame landing less than 8,192 frames ahead is still accepted
+  (about 2^-19 per frame); foreign frames a window ahead draw one PING per
+  round trip (at least 5 ms apart) for up to a ping timeout, then one per
+  retransmission timeout while the carrier still receives its own frames;
+  a foreign replay from a new address can draw rate-limited challenge
+  PINGs.
 - On a Peer that mixes datagram budgets with a black hole between 537 bytes
   and the larger budget, the MTU probe can flap; and on Linux a
   `SOCK_DESTROY` of an idle listening raw-UDP socket stops its source.
