@@ -19,9 +19,17 @@ type Status struct {
 	// FromPacketConn source keeps for its socket (one datagram buffer per
 	// source, at most 64 KiB) holds no data while it waits and is not
 	// counted; a datagram read into it counts once it is queued for a
-	// flow. So it is 0 with no session and no carrier, also while
-	// Listeners with FromPacketConn sources are open (plan:774), and
-	// after Runtime.Close, except for buffers still held by calls stuck in
+	// flow. A udp.Listen socket that reads several datagrams per call
+	// (Linux amd64 and arm64, udp.Options.MaxBatch ≥ 2) also holds up to
+	// min(MaxBatch, 32) − 1 more read buffers of its MaxDatagram class and
+	// message headers of about 184 bytes per MaxBatch while datagrams
+	// arrive, all counted; once its read has waited one to two seconds
+	// without a datagram it returns them, and it reads one datagram per
+	// call until the next one arrives (a datagram carrier's reader does the
+	// same with its own extra buffers). So it is 0 with no session and no
+	// carrier, also while Listeners with FromPacketConn sources are open —
+	// from two seconds after their last datagram (plan:774) — and after
+	// Runtime.Close, except for buffers still held by calls stuck in
 	// embedder code (Abandoned).
 	BufferedBytes int64
 

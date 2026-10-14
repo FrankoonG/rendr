@@ -276,10 +276,13 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 // idleCharge is what rs's Source holds while it waits with nothing queued
-// (its slot 0 is uncharged, R-C3-2): nothing on a plain socket; on a
-// socket in ModeBatch at depth D ≥ 2 (Linux amd64/arm64) its extra slots
-// 1 … D−1 on the Budget — none where the Budget refuses every buffer — and
-// its Batch in Stages (M5 design R1-4 rule 2, R1-5 rule 4, R3-24).
+// between datagrams (its slot 0 is uncharged, R-C3-2): nothing on a plain
+// socket; on a socket in ModeBatch at depth D ≥ 2 (Linux amd64/arm64) its
+// extra slots 1 … D−1 on the Budget — none where the Budget refuses every
+// buffer — and its Batch in Stages (M5 design R1-4 rule 2, R1-5, R3-24),
+// until its read stayed parked for a whole batchIdleRelease: the idle
+// release then returns them, and it holds nothing (srcidle;
+// TestFlowOwnedSocketIdleRelease_plan774).
 func (rs *realSource) idleCharge(maxDatagram int, budgetRefuses bool) (budget, stages int64) {
 	d := rs.s.readDepth()
 	if d < 2 {
@@ -303,8 +306,12 @@ func (rs *realSource) idleCharge(maxDatagram int, budgetRefuses bool) (budget, s
 // nothing stays charged beyond the idle charge. When the flow's inbox is
 // full, the read buffer the Budget took (TryCharge) is returned uncharged
 // for the next read: after the overflow and the drain, the idle source
-// again holds exactly its idle charge.
+// again holds exactly its idle charge. The row pins the charges between
+// datagrams, so its sources keep their extras for an hour of parked reads
+// (batchIdleRelease): a stalled host cannot let the idle release return
+// them mid-row; the release itself has its own rows (srcidle).
 func TestFlowOwnedSocketCharge(t *testing.T) {
+	idlePeriod(t, time.Hour)
 	t.Run("budget", func(t *testing.T) {
 		rs := newRealSource(t, 1232)
 		used := func() int64 { return rs.env.Budget.Used() + rs.env.Stages.Used() }

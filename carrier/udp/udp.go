@@ -114,6 +114,16 @@ type Options struct {
 // the routing table chooses, not necessarily the address a datagram
 // arrived at (rendr does not use IP_PKTINFO). Bind a specific address on a
 // multi-homed host.
+//
+// Where the socket reads several datagrams per call (Linux amd64 and
+// arm64, Options.MaxBatch ≥ 2), its source holds up to
+// min(MaxBatch, 32) − 1 read buffers beyond its first, and their message
+// headers, while datagrams arrive, counted in rendr.Status.BufferedBytes.
+// Once its read has waited one to two seconds without a datagram it
+// returns them and reads one datagram per call until the next arrives;
+// the first read buffer holds no data while it waits and is not counted,
+// so an idle listening socket adds nothing to BufferedBytes, with or
+// without sessions.
 func Listen(network, address string, o Options) (net.PacketConn, error) {
 	return listen(context.Background(), network, address, o)
 }
