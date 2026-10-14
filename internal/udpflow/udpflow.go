@@ -6,14 +6,14 @@
 //
 // One goroutine per Source reads the socket and routes each datagram by its
 // flow ID into that flow's bounded inbox (tail drop when full or when the
-// Budget refuses the buffer, counted): on rendr's own listening socket a
-// flow queues datagram buffers up to the socket's read buffer in bytes
-// (carrier/udp's Options.ReadBuffer), on any other conn up to Limits.Inbox
-// datagrams (M5 work item inboxtime, F-6). rendr's own listening socket is
-// read up to min(MaxBatch, 32) datagrams per system call where it batches
-// (recvmmsg on Linux amd64/arm64) and written by the flows several per call
-// (sendmmsg); every flow that received datagrams of a read is woken once
-// after the read (M5-D13, M5-D14). A datagram of an unknown flow
+// Budget refuses the buffer, counted): a flow queues up to Limits.Inbox
+// datagrams, and on rendr's own listening socket also as many as fit the
+// socket's read buffer in bytes of datagram buffers (carrier/udp's
+// Options.ReadBuffer; M5 work item inboxtime, F-6). rendr's own listening
+// socket is read up to min(MaxBatch, 32) datagrams per system call where it
+// batches (recvmmsg on Linux amd64/arm64) and written by the flows several
+// per call (sendmmsg); every flow that received datagrams of a read is
+// woken once after the read (M5-D13, M5-D14). A datagram of an unknown flow
 // creates a flow only when its rendr bytes are a complete valid first
 // datagram H1 (a PREFACE of kind datagram and exactly one first frame whose
 // header and CRC verify): before that nothing is allocated (plan:324).
@@ -53,7 +53,7 @@ import (
 const (
 	DefaultPerSource     = 32   // admitting OPEN flows per source IP address
 	DefaultPerSourceJoin = 32   // admitting JOIN and probe flows per source IP address (R1-21)
-	DefaultInbox         = 512  // datagrams queued per flow of a conn without a recorded read buffer (Limits.Inbox)
+	DefaultInbox         = 512  // datagrams a flow may always queue (Limits.Inbox; rendr's own listening socket may queue more)
 	DefaultTombstones    = 4096 // removed flow IDs remembered per source (oldest forgotten first; R1-11)
 	MaxFlowsCap          = 65536
 )
@@ -77,9 +77,10 @@ const (
 	// flow holds it (R3-28), and gives each back with its charge as soon as
 	// its reader has drained it; with its inbox empty it is back on its first
 	// block. The entries' storage thus follows the queue, which is bounded
-	// in bytes or datagrams (Flow.roomLocked), with no allocation per
-	// datagram in steady state (the pool), and the queued datagrams' buffers
-	// are charged to Env.Budget.
+	// in datagrams and, on rendr's own listening socket, also in bytes
+	// (Flow.roomLocked), with no allocation per datagram in steady state
+	// (the pool), and the queued datagrams' buffers are charged to
+	// Env.Budget.
 	minRing = 8
 	// blockLen is the entries of one pooled inbox block (about 5 KiB).
 	blockLen = 64
@@ -111,13 +112,15 @@ type Limits struct {
 	// PerSourceJoin bounds admitting flows per source IP address whose H1
 	// carries a JOIN or a probe PING (R1-21): an OPEN flood never uses it.
 	PerSourceJoin int
-	// Inbox bounds the datagrams queued per flow of a Source whose socket
-	// records no read buffer: an embedder's conn (M2-D59; rendr cannot see
-	// its buffering, L57) or a token built without one (tests). On rendr's
-	// own listening socket a flow is bounded in bytes by the socket's read
-	// buffer instead (Source.setReadBuffer). Either way the queued buffers
-	// are charged to Env.Budget with TryAcquire: a refusal drops the
-	// datagram.
+	// Inbox is the datagrams a flow may always queue (M2-D59). It bounds
+	// the flows of a Source whose socket records no read buffer — an
+	// embedder's conn (rendr cannot see its buffering, L57) or a token
+	// built without one (tests) — and is the floor of the flows on rendr's
+	// own listening socket, which may also queue while the buffers they
+	// hold are below the socket's read buffer (Source.setReadBuffer): the
+	// read buffer only raises M2's bound, also where a large MaxDatagram's
+	// read slots are of a large class. Either way the queued buffers are
+	// charged to Env.Budget with TryAcquire: a refusal drops the datagram.
 	Inbox int
 	// TombstoneTTL is how long a removed flow's ID stays refused:
 	// max(Handshake.Timeout, DialTimeout) + 2 s, the longest a correct
@@ -161,9 +164,10 @@ type Source struct {
 	firstCseq uint32           // the REL cseq of a valid H1 (Presets.FirstCseq or wire.FirstCseq)
 	firstFseq uint32           // Presets.FirstFseq (0: an H1's first frame carries its PREFACE's fseq)
 
-	// inboxBytes bounds each flow's inbox in bytes of queued datagram
-	// buffers (setReadBuffer: rendr's own listening socket's read buffer);
-	// 0 bounds it by Limits.Inbox datagrams. Set before Run.
+	// inboxBytes lets each flow's inbox queue, beyond Limits.Inbox
+	// datagrams, while its datagram buffers come to fewer bytes
+	// (setReadBuffer: rendr's own listening socket's read buffer); 0 leaves
+	// the datagram bound alone. Set before Run.
 	inboxBytes int64
 	// bpool holds the inbox blocks of blockLen entries the flows take
 	// beyond their first (takeBlock). A block in a flow's inbox is charged
@@ -257,10 +261,17 @@ func NewSource(env *carrier.Env, pc net.PacketConn, lim Limits) *Source {
 // F-6): a flow whose reader lags never drops while the buffers it holds
 // are below the read buffer the embedder sized (A6.3: at least 50 ms of the
 // peak packet rate), where the fixed 512 datagrams held 5 ms at 100 kpps.
-// The bound is at least one read of the socket — srcMaxDepth datagrams of
-// its read slots' class — so the datagrams one read routes to a drained
-// flow always fit before its one wake (M5-D14, §A4.5). n ≤ 0 keeps the
-// datagram bound, Limits.Inbox. It runs before Run, after maxDgram is set.
+// The byte bound is the flow's own, and it only adds room: a flow also
+// queues while it holds fewer than Limits.Inbox datagrams (Flow.roomLocked),
+// which matters where the read slots' class is large (a MaxDatagram above
+// about 4 KiB at the 4-MiB default). Each queued datagram counts its
+// buffer's class, on the direct path the read slot's (MaxDatagram + 1)
+// whatever its length. The byte bound is at least one read of the socket —
+// srcMaxDepth datagrams of the read slots' class — so the datagrams one
+// read routes to a drained flow always fit before its one wake (M5-D14,
+// §A4.5) even under a Limits.Inbox below one read (a test hook). n ≤ 0
+// leaves the datagram bound alone. It runs before Run, after maxDgram is
+// set.
 func (s *Source) setReadBuffer(n int) {
 	if n <= 0 {
 		s.inboxBytes = 0

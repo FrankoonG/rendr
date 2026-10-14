@@ -62,7 +62,9 @@ type Flow struct {
 	// blocks — the flow's own first block (base, minRing entries) and then
 	// pooled blocks of blockLen entries, each charged to the stage account
 	// while linked (takeBlock) — holding qBytes of datagram buffers (their
-	// class capacities, roomLocked's byte bound). base is nil once closed.
+	// class capacities, roomLocked's byte bound). A dequeued entry is
+	// cleared, so a drained block, the first one or one back in the pool,
+	// references no buffer, data or address. base is nil once closed.
 	head, tail *block
 	hi, ti, n  int
 	qBytes     int64
@@ -243,16 +245,16 @@ func (f *Flow) pushReserve(rb []byte, src netip.AddrPort, addr *net.UDPAddr) pus
 	return pushOK
 }
 
-// roomLocked reports whether the inbox can take one more datagram: on
-// rendr's own listening socket while the buffers it holds are below the
-// Source's byte bound (the socket's read buffer, setReadBuffer), else while
-// it holds fewer than Limits.Inbox datagrams (M2-D59). Its storage grows a
-// block at a time (enqueueLocked).
+// roomLocked reports whether the inbox can take one more datagram: while
+// it holds fewer than Limits.Inbox datagrams (M2-D59, on every conn), and
+// on rendr's own listening socket also while the buffers it holds are below
+// the Source's byte bound (the socket's read buffer, setReadBuffer; 0 on
+// any other conn). The read buffer thus only ever raises M2's bound: a
+// large MaxDatagram, whose read slots are of a large class, never holds
+// fewer datagrams than M2 did. Both bounds are the flow's own. Its storage
+// grows a block at a time (enqueueLocked).
 func (f *Flow) roomLocked() bool {
-	if b := f.src.inboxBytes; b > 0 {
-		return f.qBytes < b
-	}
-	return f.n < f.src.lim.Inbox
+	return f.n < f.src.lim.Inbox || f.qBytes < f.src.inboxBytes
 }
 
 // enqueueLocked appends e (room checked): a full last block is followed
@@ -271,9 +273,12 @@ func (f *Flow) enqueueLocked(e entry) {
 }
 
 // dequeueLocked takes the oldest entry (f.n > 0); the caller holds its
-// buffer. A pooled block the reader has drained goes back to the pool with
-// its charge at once (putBlock), and an empty inbox is back on the flow's
-// first block, so an idle flow holds that block only.
+// buffer. Its slot is cleared: a drained block keeps no reference to a
+// buffer the caller may release (and another flow reuse), to its data or to
+// a foreign address — the pool hands the block to any flow of the Source.
+// A pooled block the reader has drained goes back to the pool with its
+// charge at once (putBlock), and an empty inbox is back on the flow's first
+// block, so an idle flow holds that block only.
 func (f *Flow) dequeueLocked() entry {
 	b := f.head
 	e := b.e[f.hi]

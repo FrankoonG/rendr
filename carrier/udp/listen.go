@@ -98,8 +98,9 @@ func listen(ctx context.Context, network, address string, o Options) (net.Packet
 			return nil, err
 		}
 	}
-	// The token records the read buffer asked for: package udpflow bounds
-	// each flow's inbox by it (M5 work item inboxtime, F-6).
+	// The token records the read buffer asked for: package udpflow lets
+	// each flow's inbox queue up to it in bytes, beyond M2's 512 datagrams
+	// (M5 work item inboxtime, F-6).
 	return carrier.NewOwnedUDPListenSocket(u, maxDatagram, o.MaxBatch, rbuf), nil
 }
 

@@ -610,8 +610,8 @@ func NewOwnedUDPSocketBatch(u *net.UDPConn, maxDatagram, maxBatch int) *OwnedUDP
 // NewOwnedUDPListenSocket is NewOwnedUDPSocketBatch for carrier/udp's
 // Listen, which also records the read buffer size it asked the kernel for
 // (Options.ReadBuffer, or its default for 0; a negative size records
-// none): package udpflow bounds each flow's inbox by it (ReadBuffer; M5
-// work item inboxtime, F-6).
+// none): package udpflow lets each flow's inbox queue up to it in bytes,
+// beyond its datagram bound (ReadBuffer; M5 work item inboxtime, F-6).
 func NewOwnedUDPListenSocket(u *net.UDPConn, maxDatagram, maxBatch, readBuffer int) *OwnedUDPSocket {
 	s := NewOwnedUDPSocketBatch(u, maxDatagram, maxBatch)
 	s.readBuf = max(readBuffer, 0)
@@ -623,9 +623,10 @@ func (s *OwnedUDPSocket) MaxDatagram() int { return s.limit }
 
 // ReadBuffer returns the read buffer size carrier/udp's Listen asked the
 // kernel for when it opened the socket — the size the embedder configured,
-// not what the kernel granted (Linux caps an unprivileged request at
-// rmem_max and reports twice the size it grants) — or 0 for a token built
-// without one (NewOwnedUDPSocket, NewOwnedUDPSocketBatch).
+// not what the kernel reports (Linux caps an unprivileged request at
+// rmem_max, doubles it for its bookkeeping overhead and reports the doubled
+// value) — or 0 for a token built without one (NewOwnedUDPSocket,
+// NewOwnedUDPSocketBatch).
 func (s *OwnedUDPSocket) ReadBuffer() int { return s.readBuf }
 
 // MaxBatch returns the socket's normalised Options.MaxBatch (1 … 64).

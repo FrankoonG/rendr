@@ -6,15 +6,20 @@ package udpflow
 // datagrams — 5 ms at 100 kpps — with a clean kernel path and a 16-MiB
 // read buffer). On rendr's own listening socket a flow queues datagram
 // buffers while their bytes are below the socket's read buffer (never
-// fewer than one read's 32 datagrams); its entry storage grows by pooled
-// blocks charged to Stages and shrinks as its reader drains them, so an
-// idle flow holds its first block only; every queued datagram stays
-// charged to the Budget, so MaxBufferedBytes bounds them all. Seam
-// sources inside synctest bubbles and real tokens, on every OS; the
-// real-socket row through carrier/udp's Listen is carrier/udp's
-// TestFlowInboxHoldsTwentyMillisAt100kpps_L40.
+// fewer than one read's 32 datagrams), and always while it holds fewer
+// than Limits.Inbox (M2's 512, so a large MaxDatagram's slot class never
+// holds fewer than M2 did); both bounds are the flow's own. Its entry
+// storage grows by pooled blocks charged to Stages and shrinks as its
+// reader drains them, so an idle flow holds its first block only, and a
+// drained block references nothing; every queued datagram stays charged
+// to the Budget, so MaxBufferedBytes bounds them all. Seam sources inside
+// synctest bubbles and real tokens, on every OS; the real-socket rows
+// through carrier/udp's Listen are carrier/udp's
+// TestFlowInboxHoldsTwentyMillisAt100kpps_L40 and
+// TestListenJumboInboxKeepsM2Bound_L40.
 
 import (
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -112,47 +117,100 @@ func readFirst(t *testing.T, f *Flow) {
 const heldSlice = 32 * entrySize
 
 // idleInbox fails unless f's inbox is empty and back on its first block,
-// with nothing counted against its bound.
+// with nothing counted against its bound and every entry of the first block
+// cleared (cleanBlock).
 func idleInbox(t *testing.T, f *Flow, what string) {
 	t.Helper()
 	f.mu.Lock()
 	entries, pooled, queued := inboxStorageLocked(f)
 	onBase, qb := f.head == f.base && f.tail == f.base && f.hi == 0 && f.ti == 0, f.qBytes
+	dirty := -1
+	if f.base != nil {
+		dirty = cleanBlock(f.base)
+	}
 	f.mu.Unlock()
 	if !onBase || entries != minRing || pooled != 0 || queued != 0 || qb != 0 {
 		t.Fatalf("%s: inbox on its first block %v, %d entries in %d pooled blocks, %d queued, %d bytes counted; want the first block alone, empty",
 			what, onBase, entries, pooled, queued, qb)
 	}
+	if dirty >= 0 {
+		t.Fatalf("%s: the drained first block is not clear at %d of its %d entries (an entry still set, or at %d a stale link); want every dequeued entry cleared",
+			what, dirty, minRing, minRing)
+	}
+}
+
+// pooledBlocksLocked returns the pooled blocks linked into f's inbox, in
+// order (f.mu held).
+func pooledBlocksLocked(f *Flow) []*block {
+	var bs []*block
+	for b := f.head; b != nil; b = b.next {
+		if b != f.base {
+			bs = append(bs, b)
+		}
+	}
+	return bs
+}
+
+// cleanBlock returns the index of b's first entry that still references a
+// buffer, data, a source or a foreign address — or is marked reserve — and
+// -1 when every entry is cleared and b links no further block (len(b.e):
+// only a stale link).
+func cleanBlock(b *block) int {
+	for i := range b.e {
+		if e := &b.e[i]; e.buf != nil || e.data != nil || e.src != (netip.AddrPort{}) || e.addr != nil || e.reserve {
+			return i
+		}
+	}
+	if b.next != nil {
+		return len(b.e)
+	}
+	return -1
+}
+
+// pooledClean fails unless every block of bs — pooled blocks a flow linked
+// and has drained, back in its Source's pool — is cleared (cleanBlock):
+// the pool hands them to any flow of the Source, so a stale entry would pin
+// a released buffer, which another flow may already reuse, and its address.
+func pooledClean(t *testing.T, bs []*block, what string) {
+	t.Helper()
+	for i, b := range bs {
+		if j := cleanBlock(b); j >= 0 {
+			t.Fatalf("%s: drained pooled block %d of %d: entry %d (of %d) not cleared, or a stale link", what, i, len(bs), j, len(b.e))
+		}
+	}
 }
 
 // TestFlowInboxReadBufferBound_L58 (F-6; L58's drop rule at the new bound;
 // L16): a flow of a socket whose read buffer is rb holds datagrams while
-// the buffers it holds are below rb — here 101 datagrams of the read
-// slots' class, rb = 100 slots + 1 byte — and tail-drops the rest of a
-// burst of 160, counted in Stats and Env.Dgram (InboxDrops); the demux
-// goes on. While they are queued, every held datagram is charged to the
-// Budget (exactly 101 slots beyond the reader's extras) and the inbox's
-// pooled blocks to Stages, once each (exactly pooledFor(101) blocks); its
-// reader then gets all 101 in order, and the drained inbox is back on its
-// first block with both accounts at their baselines (the storage shrinks).
-// A second burst meets the same bound (the count of held bytes is exact),
+// the buffers it holds are below rb — here 601 datagrams of the read
+// slots' class, rb = 600 slots + 1 byte, above M2's 512 (production
+// Limits) — and tail-drops the rest of a burst of 700, counted in Stats
+// and Env.Dgram (InboxDrops); the demux goes on. While they are queued,
+// every held datagram is charged to the Budget (exactly 601 slots beyond
+// the reader's extras) and the inbox's pooled blocks to Stages, once each
+// (exactly pooledFor(601) blocks); its reader then gets all 601 in order,
+// and the drained inbox is back on its first block with both accounts at
+// their baselines (the storage shrinks) and every drained block cleared. A
+// second burst meets the same bound (the count of held bytes is exact),
 // and Close with a full inbox returns every charge once. Mutants: the bound
-// back at 512 datagrams (160 queued, no drop); a held datagram uncharged
-// (the Budget short by a slot per uncharged one); a block charged twice;
-// blocks never returned (Stages above its baseline after the drain); the
-// held bytes not counted down (the second burst is refused early).
+// back at 512 datagrams (512 queued); a held datagram uncharged (the
+// Budget short by a slot per uncharged one); a block charged twice; blocks
+// never returned (Stages above its baseline after the drain); the held
+// bytes not counted down (bytes still counted after the drain); a dequeued
+// entry not cleared (a drained block still references its datagram).
 func TestFlowInboxReadBufferBound_L58(t *testing.T) {
 	idlePeriod(t, time.Hour) // the reader keeps its extras: the charges below are exact
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
 		slot := slotBytes(env, seamDgram)
-		const keep, sent = 101, 160
-		rb := (keep-1)*slot + 1 // the 101st datagram still finds the held bytes below the bound
+		const keep, sent = 601, 700
+		rb := (keep-1)*slot + 1 // the 601st datagram still finds the held bytes below the bound
 		c := newFakeSock(32)
 		h := newFHarnessRB(t, env, Limits{}, c, seamDgram, int(rb))
 		defer h.shutdown()
-		if h.s.inboxBytes != rb {
-			t.Fatalf("the Source's byte bound %d, want the read buffer %d (above one read's %d)", h.s.inboxBytes, rb, srcMaxDepth*slot)
+		if h.s.inboxBytes != rb || h.s.lim.Inbox >= keep {
+			t.Fatalf("premise: the Source's byte bound %d, want the read buffer %d (above one read's %d), with Limits.Inbox %d below the %d it holds",
+				h.s.inboxBytes, rb, srcMaxDepth*slot, h.s.lim.Inbox, keep)
 		}
 		from := apOf(2, 1000)
 		c.queue(from, h1(1, wire.TypeOpen, 1))
@@ -177,6 +235,7 @@ func TestFlowInboxReadBufferBound_L58(t *testing.T) {
 			f.mu.Lock()
 			entries, pooled, queued := inboxStorageLocked(f)
 			qb := f.qBytes
+			linked := pooledBlocksLocked(f)
 			f.mu.Unlock()
 			drops := uint64((round + 1) * (sent - keep))
 			if queued != keep || qb != keep*slot || st.InboxDrops != drops || env.Dgram.InboxDrops.Load() != drops {
@@ -193,6 +252,7 @@ func TestFlowInboxReadBufferBound_L58(t *testing.T) {
 			}
 			drainSeq(t, f, 2, keep)
 			idleInbox(t, f, "after the drain")
+			pooledClean(t, linked, "after the drain")
 			if b, s := env.Budget.Used(), env.Stages.Used(); b != b0 || s != s0 {
 				t.Fatalf("burst %d drained: Budget %d, Stages %d; want the baselines %d and %d", round, b, s, b0, s0)
 			}
@@ -200,12 +260,19 @@ func TestFlowInboxReadBufferBound_L58(t *testing.T) {
 
 		queueSeq(c, from, 1, 2, sent)
 		synctest.Wait()
+		f.mu.Lock()
+		linked := pooledBlocksLocked(f)
+		f.mu.Unlock()
+		if len(linked) != pooledFor(keep) {
+			t.Fatalf("before Close: %d pooled blocks linked, want %d", len(linked), pooledFor(keep))
+		}
 		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
 		if b, s := env.Budget.Used(), env.Stages.Used(); b != hb || s != hs {
 			t.Fatalf("Close with a full inbox: Budget %d, Stages %d; want the reader's extras %d and %d (every charge of the flow returned once)", b, s, hb, hs)
 		}
+		pooledClean(t, linked, "after Close")
 	})
 }
 
@@ -213,15 +280,18 @@ func TestFlowInboxReadBufferBound_L58(t *testing.T) {
 // (here 1 byte), a flow's inbox holds one read of the socket — 32
 // datagrams of the read slots' class — so the datagrams one read routes to
 // a flow whose reader has drained it always reach it before its one wake.
-// A second read of 32 finds the inbox full and drops all of them. Mutant:
-// the bound not raised to one read (one datagram queued, 31 dropped).
+// M2's datagram floor (Limits.Inbox, 512) already holds one read; the byte
+// floor keeps the rule under a Limits.Inbox below one read, as a test hook
+// can set (here 8). A second read of 32 finds the inbox full and drops all
+// of them. Mutant: the byte bound not raised to one read (8 datagrams
+// queued, 24 dropped).
 func TestFlowInboxFloorOneRead_L54(t *testing.T) {
 	idlePeriod(t, time.Hour)
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
 		slot := slotBytes(env, seamDgram)
 		c := newFakeSock(32)
-		h := newFHarnessRB(t, env, Limits{}, c, seamDgram, 1)
+		h := newFHarnessRB(t, env, Limits{Inbox: 8}, c, seamDgram, 1)
 		defer h.shutdown()
 		if want := int64(srcMaxDepth) * slot; h.s.inboxBytes != want {
 			t.Fatalf("the byte bound for a 1-byte read buffer: %d, want one read, %d", h.s.inboxBytes, want)
@@ -248,6 +318,119 @@ func TestFlowInboxFloorOneRead_L54(t *testing.T) {
 		}
 		drainSeq(t, f, 2, srcMaxDepth)
 		idleInbox(t, f, "after the drain")
+	})
+}
+
+// TestFlowInboxNeverBelowM2Bound_L58 (F-6: the read buffer only ever
+// raises the bound; M2-D59; L58): every queued datagram counts its read
+// slot's class whatever its length, so where the class is large the byte
+// bound alone would hold fewer than M2's 512 datagrams — at the 4-MiB
+// default 509 at a MaxDatagram of 4,200 (class 8,256 B), 256 at 9,000
+// (16,448 B) and 64 at 65,507 (65,600 B), and at A6.3's 16 MiB still 256
+// at 65,507 — where every flow of a udp.Listen socket held 512 before
+// inboxtime. A lagging flow there still takes 512 of a burst of 600, each
+// charged at its slot's class, and drops the other 88 (L58); its reader
+// gets all 512 in order and the drained inbox holds nothing. Mutant: the
+// datagram floor dropped on rendr's own socket (509, 256, 64 and 256
+// queued).
+func TestFlowInboxNeverBelowM2Bound_L58(t *testing.T) {
+	idlePeriod(t, time.Hour)
+	for _, r := range []struct{ maxDatagram, rb int }{
+		{4200, 4 << 20}, {9000, 4 << 20}, {65507, 4 << 20}, {65507, 16 << 20},
+	} {
+		t.Run(fmt.Sprintf("MaxDatagram%d-rb%dMiB", r.maxDatagram, r.rb>>20), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				const sent = 600
+				env := testEnv(1 << 30)
+				slot := slotBytes(env, r.maxDatagram)
+				if byBytes := (int64(r.rb) + slot - 1) / slot; byBytes >= DefaultInbox {
+					t.Fatalf("premise: the byte bound holds %d datagrams of class %d, want fewer than %d", byBytes, slot, DefaultInbox)
+				}
+				c := newFakeSock(32)
+				h := newFHarnessRB(t, env, Limits{}, c, r.maxDatagram, r.rb)
+				defer h.shutdown()
+				from := apOf(2, 1000)
+				c.queue(from, h1(1, wire.TypeOpen, 1))
+				synctest.Wait()
+				f := h.flows()[0]
+				readOne(t, f, time.Second)
+				f.Admitted()
+				synctest.Wait()
+				b0 := env.Budget.Used() // the reader's extras
+				queueSeq(c, from, 1, 2, sent)
+				synctest.Wait()
+				f.mu.Lock()
+				queued := f.n
+				f.mu.Unlock()
+				drops := uint64(sent - DefaultInbox)
+				if st := h.s.Stats(); queued != DefaultInbox || st.InboxDrops != drops || env.Dgram.InboxDrops.Load() != drops {
+					t.Fatalf("a lagging flow, slot class %d B, read buffer %d: %d of %d queued, InboxDrops %d (Env %d); want %d queued (M2's bound) and %d drops",
+						slot, r.rb, queued, sent, st.InboxDrops, env.Dgram.InboxDrops.Load(), DefaultInbox, drops)
+				}
+				if b := env.Budget.Used(); b != b0+DefaultInbox*slot {
+					t.Fatalf("Budget %d, want the extras %d + %d queued × %d B", b, b0, DefaultInbox, slot)
+				}
+				drainSeq(t, f, 2, DefaultInbox)
+				idleInbox(t, f, "after the drain")
+				if b := env.Budget.Used(); b != b0 {
+					t.Fatalf("drained: Budget %d, want the extras %d", b, b0)
+				}
+			})
+		})
+	}
+}
+
+// TestFlowInboxBoundPerFlow_L58 (F-6: "a flow never drops while the bytes
+// it holds are below" the read buffer — each flow's own bytes): two
+// lagging flows of one Source whose read buffer holds 601 datagrams (600
+// slots + 1 byte, above M2's 512) each take 601 of a burst of 700 and drop
+// 99, wherever the other flow's inbox stands; their readers then get every
+// queued datagram in order. Mutant: the byte bound applied to the Source's
+// total (the second flow gets only its 512-datagram floor).
+func TestFlowInboxBoundPerFlow_L58(t *testing.T) {
+	idlePeriod(t, time.Hour)
+	synctest.Test(t, func(t *testing.T) {
+		env := testEnv(1 << 30)
+		slot := slotBytes(env, seamDgram)
+		const keep, sent = 601, 700
+		c := newFakeSock(32)
+		h := newFHarnessRB(t, env, Limits{}, c, seamDgram, int((keep-1)*slot+1))
+		defer h.shutdown()
+		a, b := apOf(2, 1000), apOf(3, 1000)
+		c.queue(a, h1(1, wire.TypeOpen, 1))
+		c.queue(b, h1(2, wire.TypeOpen, 1))
+		synctest.Wait()
+		fs := h.flows()
+		if len(fs) != 2 {
+			t.Fatalf("%d flows admitted, want 2", len(fs))
+		}
+		for _, f := range fs {
+			readOne(t, f, time.Second)
+			f.Admitted()
+		}
+		synctest.Wait()
+		b0 := env.Budget.Used()
+		queueSeq(c, a, 1, 2, sent) // the first flow fills first: one read moves 32 of one source
+		queueSeq(c, b, 2, 2, sent)
+		synctest.Wait()
+		for _, f := range fs {
+			f.mu.Lock()
+			queued, qb := f.n, f.qBytes
+			f.mu.Unlock()
+			if queued != keep || qb != keep*slot {
+				t.Errorf("flow %d: %d queued (%d bytes counted), want %d (%d bytes): the bound is each flow's own", f.ID(), queued, qb, keep, keep*slot)
+			}
+		}
+		if st := h.s.Stats(); st.InboxDrops != 2*(sent-keep) {
+			t.Fatalf("InboxDrops %d, want %d (%d of each flow's burst)", st.InboxDrops, 2*(sent-keep), sent-keep)
+		}
+		if u := env.Budget.Used(); u != b0+2*keep*slot {
+			t.Fatalf("Budget %d, want the extras %d + 2 × %d queued × %d B", u, b0, keep, slot)
+		}
+		for _, f := range fs {
+			drainSeq(t, f, 2, keep)
+			idleInbox(t, f, fmt.Sprintf("flow %d after the drain", f.ID()))
+		}
 	})
 }
 

@@ -44,9 +44,12 @@ func TestFlowCloseDropsRing_W4L2(t *testing.T) {
 		f.mu.Lock()
 		grown, blocks, queued := inboxStorageLocked(f)
 		f.mu.Unlock()
-		if grown < DefaultInbox || queued != DefaultInbox || env.Budget.Used() == 0 || env.Stages.Used() != int64(blocks)*blockBytes {
-			t.Fatalf("the burst: storage %d entries in %d pooled blocks, queued %d, Budget %d, Stages %d; want %d queued, charged, and the blocks' %d B each in Stages",
-				grown, blocks, queued, env.Budget.Used(), env.Stages.Used(), DefaultInbox, blockBytes)
+		// Exactly the first block and pooledFor(512) = 8 pooled ones, each
+		// charged once: 8 + 8 × 64 = 520 entries for 512 datagrams.
+		wantBlocks := pooledFor(DefaultInbox)
+		if blocks != wantBlocks || grown != minRing+wantBlocks*blockLen || queued != DefaultInbox || env.Budget.Used() == 0 || env.Stages.Used() != int64(wantBlocks)*blockBytes {
+			t.Fatalf("the burst: storage %d entries in %d pooled blocks, queued %d, Budget %d, Stages %d; want %d queued, charged, in %d entries of %d pooled blocks of %d B each in Stages",
+				grown, blocks, queued, env.Budget.Used(), env.Stages.Used(), DefaultInbox, minRing+wantBlocks*blockLen, wantBlocks, blockBytes)
 		}
 
 		if err := f.Close(); err != nil {
