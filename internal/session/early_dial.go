@@ -40,10 +40,11 @@ import (
 // instead (never triggered and nothing reserved: a local end). Read
 // and CloseWrite call it first; Write calls it right after a
 // round's bytes were committed, so the first attempt's early span
-// includes them (R1-15), and earlyCapLocked calls it when the cap holds a
-// Write back. It never blocks and takes only the mailbox's leaf lock, so
-// callers may hold s.mu. A no-op for every other session (one immutable
-// field compare on the passive, one atomic load on an opened dialer).
+// includes them (R1-15), and a Write of no bytes once its checks passed;
+// earlyCapLocked calls it when the cap holds a Write back. It never
+// blocks and takes only the mailbox's leaf lock, so callers may hold
+// s.mu. A no-op for every other session (one immutable field compare on
+// the passive, one atomic load on an opened dialer).
 func (s *Session) triggerOpen() {
 	if s.p.Role != RoleDialer {
 		return
