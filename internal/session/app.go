@@ -157,6 +157,11 @@ func (s *Session) write(p []byte, poll **time.Timer) (int, error) {
 			err = st.endErr
 		case deadlinePassed(&st.wdl):
 			err = errDeadline
+		default:
+			// EarlyReturn: a Write that succeeds opens the session, also
+			// one of no bytes: it admits min(len(p), EarlyDataMax) = 0
+			// bytes, then triggers (M4-D9, §A4.1; K21).
+			s.triggerOpen()
 		}
 		s.mu.Unlock()
 		return 0, err

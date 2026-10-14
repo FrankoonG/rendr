@@ -67,14 +67,22 @@ func (e hookPanic) Error() string {
 type Server struct {
 	// Dial opens the target. nil: a net.Dialer's DialContext on "tcp" and
 	// r.Addr. It should honour ctx; a call still running one second after
-	// its budget is abandoned and answered CodeTimeout, and the conn it
-	// returns later is closed. Return an error wrapping ErrDenied to refuse
-	// by policy (CodeNotAllowed). A panic is answered CodeDialFailed. ctx
-	// bounds the dial only; it is cancelled after the dial returns, and the
-	// returned conn must not depend on it. At most 192 calls run at
-	// once, abandoned ones included. A conn the Server closes on the hook's
-	// behalf (returned with an error, or late) is closed under recover; a
-	// conn the Server forwards must not panic.
+	// its budget is abandoned, and the conn it returns later is closed. The
+	// abandoned call is answered CodeTimeout, unless the pending session's
+	// AcceptTimeout came first, as it does whenever the budget ends less
+	// than one second before it (always when the budget is AcceptTimeout
+	// minus 250 ms, for example with a DialTimeout at or above
+	// AcceptTimeout): the Listener has then refused the session (the dialer
+	// gets ErrCapacity) and the Server sends nothing (ServerStatus.Lost).
+	// Return an error wrapping ErrDenied to refuse by policy
+	// (CodeNotAllowed). A panic is answered CodeDialFailed. ctx bounds the
+	// dial only; it is cancelled after the dial returns, and the returned
+	// conn must not depend on it. At most 192 calls run at once, abandoned
+	// ones included. A conn the Server closes on the hook's behalf
+	// (returned with an error, or late) is closed under recover; a conn
+	// returned without an error belongs to the Server, which forwards it
+	// (or resets it, when the session was decided while it dialled), and
+	// must not panic.
 	Dial func(ctx context.Context, r Request) (net.Conn, error)
 	// DialTimeout bounds one target dial (0: DefaultDialTimeout; clamped to
 	// 0.5–30 s) and never runs past the pending session's AcceptTimeout
@@ -197,7 +205,11 @@ func (s *Server) connect(ctx context.Context, p *rendr.PendingConn, r Request) n
 		return nil
 	}
 	dctx, cancel := context.WithDeadline(ctx, deadline)
-	stop := context.AfterFunc(pctx, cancel) // the pending context has an AfterFunc method: no goroutine (R1-8)
+	// The pending context has an AfterFunc method, so no goroutine waits on
+	// it while the dial runs (R1-8); if the pending phase ends first, the
+	// context package runs cancel on a goroutine of its own, as it runs
+	// every AfterFunc function.
+	stop := context.AfterFunc(pctx, cancel)
 	s.dialing.Add(1)
 	var t net.Conn
 	var err error
