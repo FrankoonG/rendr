@@ -104,7 +104,7 @@ const (
 	ControlFloor = 300
 
 	// FseqWindowBits is the anti-replay window of a datagram carrier
-	// direction (plan:332 as amended by m5 PA-85): 8,192 frames, a 1-KiB
+	// direction (plan:333 as amended by m5 PA-85): 8,192 frames, a 1-KiB
 	// bitmap per carrier and direction. It covers the frames legitimately
 	// in flight at the design maximum (L39): 82 ms at 100,000 frames per
 	// second, four times the about 2,000 in flight over a 20-ms round

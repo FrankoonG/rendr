@@ -11,11 +11,12 @@ import (
 )
 
 // The pace of the PINGs that prove a forward jump (m5 PA-85, amending m3
-// FSEQJUMP's "at most one per RTO"; plan:332, L43): dgJumpPingLocked asks
+// FSEQJUMP's "at most one per RTO"; plan:333, L43): dgJumpPingLocked asks
 // for one when a claim begins, then once per smoothed RTT (at least
-// minRateSample) for at most the ping timeout, at M3's RTO pace after it,
-// and at least an RTO and D/16 apart while the cadence's share of the PING
-// ring is outstanding.
+// minRateSample); at M3's RTO pace once the claim is a ping timeout old
+// while the carrier still accepts frames (a foreign claim); and, while the
+// cadence's share of the PING ring is outstanding, with the free records
+// spread evenly over the time left to the carrier's death deadline.
 
 // fjRTT gives the carrier a smoothed RTT of rtt: every PING it wrote since
 // its start is answered rtt after it was read, so its first RTT sample is
@@ -161,19 +162,20 @@ type fjAnswer struct {
 // TestDatagramJumpProofBounded_L43: a jump claim asks for PINGs at the
 // round trip's pace for no longer than the ping timeout (the death
 // deadline D, 3 s here) since it began (m5 PA-85): a genuine jump is proven
-// by then or its carrier is dead, so a longer claim is another carrier
+// by then or its carrier is dead, so a longer claim on a carrier that
+// still accepts frames of its own direction is another carrier
 // direction's frames, which from then on ask at M3's pace (once per RTO)
 // and never draw a PING per round trip for as long as they come. The
 // carrier's srtt is 20 ms and its RTO 200 ms; its peer answers every PING
-// 20 ms after it was written (the carrier lives and its genuine direction
-// is in order), while frames of another direction (fseqs 2^20 ahead)
-// arrive every millisecond for 2·D + 100 ms. PASS: in the claim's first
-// D − 50 ms the carrier writes at least a PING per two round trips; from
-// D + 50 ms to 2·D its PINGs go an RTO apart (to a millisecond more);
-// every foreign frame is dropped and counted; after a pause of D + 100 ms
-// without one, foreign frames for 100 ms begin a new claim: a PING at the
-// first of them and a round trip apart after it (five in the 100 ms); the
-// carrier lives.
+// 20 ms after it was written (the carrier lives and accepts its genuine
+// direction's PONGs, in order), while frames of another direction (fseqs
+// 2^20 ahead) arrive every millisecond for 2·D + 100 ms. PASS: in the
+// claim's first D − 50 ms the carrier writes at least a PING per two round
+// trips; from D + 50 ms to 2·D its PINGs go an RTO apart (to a millisecond
+// more); every foreign frame is dropped and counted; after a pause of
+// D + 100 ms without one, foreign frames for 100 ms begin a new claim: a
+// PING at the first of them and a round trip apart after it (five in the
+// 100 ms); the carrier lives.
 func TestDatagramJumpProofBounded_L43(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const rtt = 20 * time.Millisecond
@@ -268,28 +270,37 @@ func TestDatagramJumpProofBounded_L43(t *testing.T) {
 
 // TestDatagramJumpProofRingShare_L43: round-trip-paced proof PINGs stop
 // short of filling the PING ring (m5 PA-85): once the cadence's share of
-// the ring (pingCadenceMax) is outstanding, the requests go an RTO (M3's
-// pace) and D/16 apart (D the ping timeout), so the other 16 records last
-// the whole claim and a PING still goes out when a reverse path that lost
-// them comes back (a full ring encodes none: the carrier would die of
-// ping_timeout with its path back). The carrier's srtt is 20 ms and its
-// RTO 200 ms; the peer's direction jumps by a window and 5000 frames and
-// sends a DGRAM per step while every PING of the carrier is lost: for 1 s
-// with the default D of 3 s (D/16 below the RTO), and for 8 s with DeadMin
-// and DeadMax 10 s (D/16 = 625 ms; at the RTO alone the ring would be full
-// after 3.5 s). PASS: the first pingCadenceMax PINGs go a round trip apart
-// (20 ms to a step more), the later ones max(RTO, D/16) apart (to a step
-// more); the ring is never full; after the loss the first PING the carrier
-// writes is answered at once and its PONG proves the jump within
-// max(RTO, D/16) and two steps; the carrier lives.
+// the ring (pingCadenceMax) is outstanding, the requests spread the free
+// records evenly over the time left to the carrier's death deadline (its
+// oldest unanswered PING's), never closer than a round trip, so a PING
+// still goes out when a reverse path that lost them comes back before the
+// death (a full ring encodes none: the carrier would die of ping_timeout
+// with its path back), and no RTO paces them. The peer's direction jumps by
+// a window and 5000 frames and sends a DGRAM per step while every PING of
+// the carrier is lost: with an srtt of 20 ms and an RTO of 200 ms for 1 s
+// at the default D of 3 s (the later PINGs about 159 ms apart: at the
+// round trip's pace the ring would be full after 640 ms) and for 8 s with
+// DeadMin and DeadMax 10 s (about 571 ms apart), and with an srtt of
+// 150 ms (RTO 450 ms) for 2.8 s at the default D (the ring holds a PING
+// per round trip until the death: they stay a round trip apart, never an
+// RTO). PASS: the first pingCadenceMax PINGs go a round trip apart (to a
+// step more); each later one follows the one before it, at t, by
+// max(srtt, (A − t)/(f + 1)) to a step more, where A is the death deadline
+// of the first PING (its time plus D) and f the records still free
+// (pingRingSize less the PINGs before it); the ring is never full; after
+// the loss the first PING the carrier writes is answered at once and its
+// PONG proves the jump within the next such spacing and two steps; the
+// carrier lives.
 func TestDatagramJumpProofRingShare_L43(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
+		rtt        time.Duration
 		dead, loss time.Duration // DeadMin = DeadMax (0: the default), the PINGs' loss
 		step       time.Duration
 	}{
-		{"default", 0, time.Second, time.Millisecond},
-		{"deadmin10s", 10 * time.Second, 8 * time.Second, 2 * time.Millisecond},
+		{"default", 20 * time.Millisecond, 0, time.Second, time.Millisecond},
+		{"deadmin10s", 20 * time.Millisecond, 10 * time.Second, 8 * time.Second, 2 * time.Millisecond},
+		{"rtt150", 150 * time.Millisecond, 0, 2800 * time.Millisecond, 5 * time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -300,11 +311,10 @@ func TestDatagramJumpProofRingShare_L43(t *testing.T) {
 				})
 				s.start(StartOptions{})
 				synctest.Wait()
-				srtt, rto := fjRTT(t, s, p, 20*time.Millisecond)
+				srtt, rto := fjRTT(t, s, p, tc.rtt)
 				s.c.mu.Lock()
 				dl := sched.DeathDeadline(s.c.st.srtt, s.c.st.inflight(), s.c.st.rate, s.c.tm.DeadMin, s.c.tm.DeadMax)
 				s.c.mu.Unlock()
-				every := max(rto, dl/(pingRingSize-pingCadenceMax))
 				p.fseq += fjOutage
 				start := time.Now()
 				seq := uint64(10)
@@ -323,17 +333,25 @@ func TestDatagramJumpProofRingShare_L43(t *testing.T) {
 				if full {
 					t.Fatalf("the PING ring was full while the PINGs were lost")
 				}
-				for k := 1; k < len(at); k++ {
-					g, lo := at[k]-at[k-1], srtt
-					if k >= pingCadenceMax {
-						lo = every
+				// spacing is the least gap after a PING at from with k PINGs
+				// outstanding: a round trip, and once the cadence's share is
+				// outstanding the free records spread to the death deadline.
+				death := at[0] + dl
+				spacing := func(from time.Duration, k int) time.Duration {
+					if k < pingCadenceMax {
+						return srtt
 					}
+					return max(srtt, (death-from)/time.Duration(pingRingSize-k+1))
+				}
+				for k := 1; k < len(at); k++ {
+					g, lo := at[k]-at[k-1], spacing(at[k-1], k)
 					if g < lo || g > lo+tc.step {
 						t.Fatalf("PINGs at %v: %v between PINGs %d and %d, want %v to a step more", at, g, k-1, k, lo)
 					}
 				}
 				// The reverse path is back: the first PING the carrier writes
 				// is answered at once, and its PONG proves the jump.
+				every := spacing(at[len(at)-1], len(at))
 				end := time.Now()
 				var proved bool
 				for !proved && time.Since(end) < every+2*tc.step {
@@ -357,4 +375,156 @@ func TestDatagramJumpProofRingShare_L43(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestDatagramJumpProofForeignThenGenuine_L43: a claim that frames of
+// another direction kept going for longer than a ping timeout asks at M3's
+// pace only while the carrier still accepts frames of its own direction;
+// when its own direction jumps too, the carrier accepts nothing more, and
+// from an RTO and a round trip after the last frame it accepted its PINGs
+// go a round trip apart again, so a lost proof costs a round trip, not an
+// RTO, inside a foreign claim as well (m5 PA-85: the proving PING is never
+// left to the RTO cadence). The carrier's srtt is 20 ms and its RTO 200 ms
+// (D 3 s); frames of another direction (fseqs 2^20 ahead) arrive every
+// millisecond throughout. For D + 700 ms the peer answers each PING in
+// order, alternately 20 and 30 ms after it was written (a jitter below a
+// round trip); then the peer's direction jumps by a window and 5000
+// frames, its DGRAMs arrive every millisecond, and the answers still due
+// and every PING of the carrier are lost until eight round trips after S,
+// the time an RTO and a round trip after the last answer the carrier
+// accepted; then the peer answers the newest PING in a jumped datagram.
+// PASS: from D + 50 ms to the jump the PINGs go an RTO apart (to a
+// millisecond more: the claim is foreign, and the jitter does not
+// interrupt the carrier's evidence); the first PING at or after S comes
+// within a round trip and a millisecond of it, the later ones a round trip
+// apart (to a millisecond more), at least six; fewer than pingCadenceMax
+// PINGs are outstanding at the end of the loss (the ring's share plays no
+// part); the PONG in the jumped datagram proves the jump (its DGRAM is
+// delivered); every foreign and unproven jumped frame is dropped and
+// counted; the carrier lives.
+func TestDatagramJumpProofForeignThenGenuine_L43(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		s, p := rawPair(t, 1200, true)
+		s.start(StartOptions{})
+		synctest.Wait()
+		_, rto := fjRTT(t, s, p, 20*time.Millisecond)
+		s.c.mu.Lock()
+		dl := sched.DeathDeadline(s.c.st.srtt, s.c.st.inflight(), s.c.st.rate, s.c.tm.DeadMin, s.c.tm.DeadMax)
+		s.c.mu.Unlock()
+		foreign := &rawPeer{io: p.io, fseq: p.fseq + 1<<20}
+		d0 := s.c.Stats().Dropped
+		start := time.Now()
+		var (
+			at         []time.Duration // when the carrier wrote each PING
+			newest     wire.Ping
+			due        []fjAnswer
+			answers    int           // answers the peer scheduled
+			lastAnswer time.Duration // when the peer last sent an answer in order
+			jumped     bool          // the peer's direction jumped: its frames are ahead
+			drops      int           // frames sent that the carrier must drop
+		)
+		// step sends the answers due and a foreign DGRAM (and a jumped one
+		// once the peer's direction jumped), then schedules an answer to
+		// every PING the carrier wrote, alternately 20 and 30 ms late,
+		// until the jump.
+		step := func() {
+			now := time.Now()
+			k := 0
+			for _, a := range due {
+				if a.at.After(now) {
+					due[k] = a
+					k++
+					continue
+				}
+				p.send(pingFrame(wire.TypePong, a.p))
+				lastAnswer = time.Since(start)
+			}
+			due = due[:k]
+			foreign.send(dgramFrame(uint64(1000+drops), 100))
+			drops++
+			if jumped {
+				p.send(dgramFrame(uint64(1000+drops), 100))
+				drops++
+			}
+			synctest.Wait()
+			_, pings := fjPings(p.read(), false)
+			for _, pg := range pings {
+				at = append(at, time.Since(start))
+				newest = pg
+				if !jumped {
+					delay := 20 * time.Millisecond
+					if answers%2 == 1 {
+						delay += 10 * time.Millisecond
+					}
+					answers++
+					due = append(due, fjAnswer{at: time.Now().Add(delay), p: pg})
+				}
+			}
+		}
+		run := func(d time.Duration) {
+			for from := time.Now(); time.Since(from) < d; {
+				step()
+				time.Sleep(time.Millisecond)
+			}
+		}
+		run(dl + 700*time.Millisecond)
+		// The peer's direction jumps: the answers still due are lost, with
+		// everything else it sends until the proof.
+		jump := time.Since(start)
+		p.fseq += fjOutage
+		due, jumped = nil, true
+		s.c.mu.Lock()
+		srtt, rtoNow := s.c.st.srtt, s.c.relRTOLocked()
+		s.c.mu.Unlock()
+		if rtoNow != rto {
+			t.Fatalf("stimulus: the RTO moved from %v to %v with the answers' jitter", rto, rtoNow)
+		}
+		sw := lastAnswer + rto + srtt // S: the carrier's evidence of its own direction runs out
+		run(sw + 8*srtt - time.Since(start))
+		s.c.mu.Lock()
+		n := s.c.st.n
+		s.c.mu.Unlock()
+		var foreignPINGs, after []time.Duration
+		for _, a := range at {
+			switch {
+			case a >= sw:
+				after = append(after, a)
+			case a >= dl+50*time.Millisecond && a < jump:
+				foreignPINGs = append(foreignPINGs, a)
+			}
+		}
+		t.Logf("D %v, srtt %v, RTO %v: PINGs of the foreign claim from D + 50 ms at %v; the jump at %v, the last answer at %v, S at %v; PINGs from S at %v; %d outstanding",
+			dl, srtt, rto, foreignPINGs, jump, lastAnswer, sw, after, n)
+		if len(foreignPINGs) < 3 {
+			t.Fatalf("stimulus: PINGs %v of the foreign claim after its ping timeout, want three or more", foreignPINGs)
+		}
+		for k := 1; k < len(foreignPINGs); k++ {
+			if g := foreignPINGs[k] - foreignPINGs[k-1]; g < rto || g > rto+time.Millisecond {
+				t.Fatalf("PINGs %v of the foreign claim: %v between two, want the RTO %v to 1 ms more", foreignPINGs, g, rto)
+			}
+		}
+		if n >= pingCadenceMax {
+			t.Fatalf("stimulus: %d PINGs outstanding after the loss: the ring's share plays a part", n)
+		}
+		if len(after) < 6 || after[0] > sw+srtt+time.Millisecond {
+			t.Fatalf("PINGs from S (%v) at %v: want the first within a round trip (%v) and a millisecond, and at least six", sw, after, srtt)
+		}
+		for k := 1; k < len(after); k++ {
+			if g := after[k] - after[k-1]; g < srtt || g > srtt+time.Millisecond {
+				t.Fatalf("PINGs from S (%v) at %v: %v between two, want srtt %v to 1 ms more", sw, after, g, srtt)
+			}
+		}
+		// The proof: the newest PING's PONG in a jumped datagram.
+		p.send(dgramFrame(9999, 100), pingFrame(wire.TypePong, newest))
+		synctest.Wait()
+		if got := fjDelivered(s.ep); !slices.Equal(got, []uint64{9999}) {
+			t.Fatalf("delivered %v, want [9999]: the PONG to the newest PING did not prove the jump", got)
+		}
+		if d := s.c.Stats().Dropped - d0; d != uint64(drops) {
+			t.Fatalf("dropped %d frames of %d foreign and unproven jumped DGRAMs", d, drops)
+		}
+		if dead, cause, detail, _ := s.c.Death(); dead {
+			t.Fatalf("carrier died: %v %q", cause, detail)
+		}
+	})
 }

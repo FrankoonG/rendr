@@ -674,12 +674,13 @@ func (c *Conn) dgFrames(data []byte, src PeerKey, ev ReadEvent, now time.Time) b
 // and its old PONG would move the window behind every genuine frame (m3
 // W2). The sender jumps that far after an outage cost a window of frames,
 // and the PONG to the PING the outage left outstanding (retried at the
-// RTO) or to one that dgJumpClaim asked for (at once, then once per round
-// trip: dgJumpPingLocked) arrives within a round trip after the outage, or
-// after the path stops losing those PINGs. A datagram of another carrier
-// direction or session, whose fseqs start elsewhere (§0.13 A6), lands
-// ahead about half the time, but its PONGs answer another salt or another
-// challenge: it never moves the window (m3 FSEQJUMP; §A9.1, R1-35).
+// RTO: dgPingDueLocked) or to one that dgJumpClaim asked for (at once,
+// then at the round trip's pace: dgJumpPingLocked) arrives within a round
+// trip after the outage, or after the path stops losing those PINGs. A
+// datagram of another carrier direction or session, whose fseqs start
+// elsewhere (§0.13 A6), lands ahead about half the time, but its PONGs
+// answer another salt or another challenge: it never moves the window (m3
+// FSEQJUMP; §A9.1, R1-35).
 func (c *Conn) dgJumpProof(f *wire.Frame, rest []byte, src PeerKey, now time.Time) bool {
 	if c.dgProves(f.Type, f.Payload, src, now) {
 		return true
@@ -765,14 +766,9 @@ func (c *Conn) dgJumpClaim(f *wire.Frame, now time.Time) {
 // it with Conn.mu held. A claim begins with the first such frame since the
 // window last took a jump, or since a ping timeout D (the death deadline)
 // without one, and asks at once; a later frame of the claim asks again
-// once dgJumpEveryLocked passed since the last request — the smoothed RTT,
-// so a lost PING or PONG costs a round trip, not an RTO. Once D passed
-// since the claim began, a genuine jump is proven or its carrier is dead
-// (the PINGs it asked for went unanswered until the proof), so its frames
-// are another carrier direction's or session's: from then on they ask at
-// M3's pace, once per RTO, for as long as they keep coming without a pause
-// of D. They never draw a PING per round trip for longer than D, and a
-// genuine jump among them is proven at M3's pace, as before.
+// once dgJumpEveryLocked has passed since the last request — the smoothed
+// RTT unless the claim is foreign or the PING ring runs short, so a lost
+// PING or PONG costs a round trip, not an RTO.
 func (c *Conn) dgJumpPingLocked(now time.Time) bool {
 	dg, st := c.dg, &c.st
 	d := sched.DeathDeadline(st.srtt, st.inflight(), st.rate, c.tm.DeadMin, c.tm.DeadMax)
@@ -780,32 +776,52 @@ func (c *Conn) dgJumpPingLocked(now time.Time) bool {
 	dg.jumpLast = now
 	if dg.jumpAt.IsZero() || now.Sub(prev) >= d {
 		dg.jumpAt = now // a new claim: ask at once
-	} else if now.Sub(dg.jumpPing) < c.dgJumpEveryLocked(d, now.Sub(dg.jumpAt) >= d) {
+	} else if now.Sub(dg.jumpPing) < c.dgJumpEveryLocked(d, now) {
 		return false
 	}
 	dg.jumpPing = now
 	return true
 }
 
-// dgJumpEveryLocked is the spacing of a jump claim's PING requests
-// (dgJumpPingLocked) for a ping timeout d: the smoothed RTT, at least
-// minRateSample (never more often than a PING may judge an interval); at
-// least the RTO once the claim is spent (it began d ago or more: M3's
-// pace). Once pingCadenceMax PINGs are outstanding (a long loss of the
-// PINGs or their PONGs), the requests go at least an RTO and
-// d/(pingRingSize − pingCadenceMax) apart, so the rest of the ring lasts
-// the whole claim: a ring that requests filled while the reverse path lost
-// them would leave no PING to prove the jump once the path is back (a full
-// ring encodes none), and the carrier would die of ping_timeout with its
-// path working.
-func (c *Conn) dgJumpEveryLocked(d time.Duration, spent bool) time.Duration {
+// dgJumpEveryLocked is the spacing at now of a jump claim's PING requests
+// (dgJumpPingLocked) for a ping timeout d. It is the smoothed RTT, at
+// least minRateSample (never more often than a PING may judge an
+// interval), and longer in two cases:
+//
+//   - The claim is foreign: it began d ago or more, and the carrier still
+//     accepted a frame within the last RTO and round trip (the answers to
+//     PINGs an RTO apart arrive that often). A genuine jump is proven
+//     within a ping timeout or its carrier dies, and a carrier that still
+//     accepts frames has its own direction in the window, so the claimed
+//     frames are another carrier direction's or session's: they ask at M3's
+//     pace, once per RTO, and never draw a PING per round trip for longer
+//     than d. A carrier that has accepted nothing for that long — its own
+//     direction jumped too, perhaps after a foreign claim began, or its
+//     PINGs go unanswered — asks at the round trip's pace again, until the
+//     proof, an answer in the window, or its death a ping timeout after its
+//     oldest unanswered PING.
+//   - pingCadenceMax PINGs are outstanding (a long loss of the PINGs or
+//     their PONGs): at least the time left to the carrier's death deadline
+//     (its oldest unanswered PING's) over the records still free, so the
+//     rest of the ring is spread evenly over that time. A ring that
+//     requests filled while the reverse path lost them would leave no PING
+//     to prove the jump once the path is back (a full ring encodes none),
+//     and the carrier would die of ping_timeout with its path working.
+func (c *Conn) dgJumpEveryLocked(d time.Duration, now time.Time) time.Duration {
 	st := &c.st
 	every := max(st.srtt, minRateSample)
-	if spent || st.n >= pingCadenceMax {
-		every = max(every, c.relRTOLocked())
+	if now.Sub(c.dg.jumpAt) >= d {
+		rto := c.relRTOLocked()
+		if last := c.lastRx.Load(); last != 0 && c.dgSince(now)-last < int64(rto+st.srtt) {
+			every = max(every, rto)
+		}
 	}
-	if st.n >= pingCadenceMax {
-		every = max(every, d/(pingRingSize-pingCadenceMax))
+	if free := pingRingSize - st.n; st.n >= pingCadenceMax && free > 0 {
+		_, at, _ := c.deathDueLocked(now)
+		if at.IsZero() {
+			at = now.Add(d)
+		}
+		every = max(every, at.Sub(now)/time.Duration(free))
 	}
 	return every
 }

@@ -26,7 +26,7 @@ const (
 )
 
 // FseqWindow is the anti-replay window of one datagram-carrier direction
-// (plan:332, m5 PA-85): FseqWindowBits frames in u32 serial arithmetic
+// (plan:333, m5 PA-85): FseqWindowBits frames in u32 serial arithmetic
 // (L14), FseqWindowBits/8 bytes of bitmap. The width covers the frames in
 // flight at the design maximum (L39), so a burst loss of fewer frames
 // moves the window like any other loss.

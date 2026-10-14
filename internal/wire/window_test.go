@@ -220,7 +220,7 @@ func lapGaps(width, start uint64, accept func(uint64) WindowVerdict) string {
 	return ""
 }
 
-// TestFseqWindow_L43_L14: the datagram fseq window (M2-D13, plan:332; its
+// TestFseqWindow_L43_L14: the datagram fseq window (M2-D13, plan:333; its
 // width W = FseqWindowBits, m5 PA-85, TestFseqWindowCoversInFlight_L39) —
 // Init makes everything before the first fseq "seen"; a reordered fseq
 // inside the W-frame window is accepted once (not strict +1), a repeated
@@ -392,7 +392,7 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 
 // TestFseqWindowCoversInFlight_L39: the datagram replay window covers the
 // frames in flight at the design maximum (L39; m5 PA-85, amending
-// plan:332's 1,024): 8,192 frames, 82 ms at G3-100k's 100,000 frames per
+// plan:333's 1,024): 8,192 frames, 82 ms at G3-100k's 100,000 frames per
 // second, whose 20-ms round trip holds about 2,000 (M5-D27). A frame 8,191
 // ahead of the newest — 8,190 lost before it — moves the window like any
 // loss: it is new, the lost frames are new once when they arrive late and

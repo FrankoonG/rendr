@@ -13,7 +13,7 @@ import (
 )
 
 // The datagram replay window at the M5 rate (m5 F-5, PA-85 amending
-// plan:332; L39, L43). C-P found that M3's 1,024-frame window spans 10 ms
+// plan:333; L39, L43). C-P found that M3's 1,024-frame window spans 10 ms
 // at G3-100k's 100 kpps, less than the about 2,000 frames in flight over
 // its 20-ms round trip, and that the PING proving a jump of a window or
 // more was repeated only at the RTO: a burst loss of 1,024 frames made the
@@ -21,7 +21,7 @@ import (
 // or more. These are C-P's failing-first rows, beside
 // TestPacketFseqJumpRecovery_L43.
 
-// m3Window is M3's datagram replay window (plan:332 before PA-85): a
+// m3Window is M3's datagram replay window (plan:333 before PA-85): a
 // consecutive loss of more frames was a forward jump the receiver had to
 // prove.
 const m3Window = 1024
