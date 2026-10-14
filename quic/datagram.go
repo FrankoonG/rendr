@@ -216,11 +216,10 @@ func (d *dgramConn) accept(b []byte) bool {
 // drop: the network lost or reordered those datagrams, which no counter
 // claims. Any other gap, one shown during an overflow (lag: quic-go's
 // queue may have been full), is counted in IngressDrops: a network loss
-// and a quic-go drop leave the same gap. A
-// datagram behind the next expected one (reordered) is delivered, counts
-// nothing and leaves any lag to the datagram that shows the gap; the gap
-// of a drop at the end of a burst is counted when the next datagram
-// arrives.
+// and a quic-go drop leave the same gap. A datagram behind the next
+// expected one (reordered) is delivered, counts nothing and leaves any lag
+// to the datagram that shows the gap; the gap of a drop at the end of a
+// burst is counted when the next datagram arrives.
 //
 // What the count means, in the words of Counters.IngressDrops and the
 // README (one text): When DATAGRAMs arrive in order that count is exact,

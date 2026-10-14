@@ -666,10 +666,12 @@ session and socket of a Runtime with up to 10,000 sessions.
 
 Batched system calls make arrivals burstier: the datagrams one call moves
 reach the receiving session together. Size `Packet.Queue` for these bursts
-at the peak rate, not for the average rate. (At 80,000 datagrams a second,
-a receiver with the default 1 MiB `Packet.Queue` dropped about one
-datagram in 7,000 from its receive queue, counted in `DropRecvQueue`, with
-batching on, and none with batching off.)
+at the peak rate, not for the average rate. (On the path of the
+packet-rate figures under [Performance](#performance), with 1,000-byte
+datagrams on a 2.0 development build: at 80,000 datagrams a second, a
+receiver with the default 1 MiB `Packet.Queue` dropped about one datagram
+in 7,000 from its receive queue, counted in `DropRecvQueue`, with batching
+on, and none with batching off.)
 
 rendr 2.0.0 uses no UDP segmentation or receive offloads (GSO, GRO).
 
@@ -678,7 +680,9 @@ rendr 2.0.0 uses no UDP segmentation or receive offloads (GSO, GRO).
 Every figure below names its method; none comes from the Windows
 development host. The authoritative figures are measured on idle Linux
 virtual machines of the private test pool, with every other workload
-stopped.
+stopped. Each case ran twice at the release gate; a figure comes from the
+less favourable run (the lower rate or share, the longer time or gap)
+unless its sentence counts the runs.
 
 **Stream throughput (BENCH-E2E-1).** One process hosts both ends with
 `GOMAXPROCS(8)`; exactly one carrier, a loopback TCP connection; the sender
@@ -689,7 +693,7 @@ transfers per run. Implementations run alternately in pairs, and the result
 is the median of the per-pair ratios; the A/A noise band is the spread of
 rendr-against-rendr pairs.
 
-<!-- FIGURE: BENCH-E2E-1 median of per-pair ratios, rendr 2.0.0 / rendr v0.3.0 and rendr 2.0.0 / raw TCP, with the A/A noise band, the pair count and the date; method: BENCH-E2E-1 as described, at least 5 alternating pairs per comparison on an idle Linux VM; source case: G7 (BENCH-E2E-1) at the M5 gate -->
+<!-- FIGURE: BENCH-E2E-1 median of per-pair ratios, rendr 2.0.0 / rendr v0.3.0 and rendr 2.0.0 / raw TCP, with the A/A noise band, the pair count and the date; method: BENCH-E2E-1 as described, at least 5 alternating pairs per comparison on an idle Linux VM; aggregation: of the gate's 2 G7 runs (step 3), the one with the lower rendr 2.0.0 / v0.3.0 median, every token from that run; source case: G7 (BENCH-E2E-1) at the M5 gate -->
 On BENCH-E2E-1, rendr 2.0.0 reaches {ratio-v030} × the throughput of rendr
 v0.3.0 and {ratio-raw} × that of a raw TCP connection over the same
 loopback path (median of per-pair ratios over {pairs} alternating pairs,
@@ -707,7 +711,7 @@ stops after two failed steps. "A → B" is the dialer sending on its own
 socket to the passive's listening socket; "B → A" the passive sending
 through its listening socket to the dialer.
 
-<!-- FIGURE: packet-rate ceiling per direction (A → B, B → A) with MaxBatch default (32) and MaxBatch 1, plus the raw-UDP reference ceiling, the CPU microseconds per datagram per direction and role (A, B; the role process's CPU time divided by the datagrams it sent and received, at the default arm's ceiling step of that direction), and the date; method: the ramp described above on an idle Linux VM; source case: perf/pps-ceiling at the M5 gate -->
+<!-- FIGURE: packet-rate ceiling per direction (A → B, B → A) with MaxBatch default (32) and MaxBatch 1, plus the raw-UDP reference ceiling, the CPU microseconds per datagram per direction and role (A, B; the role process's CPU time divided by the datagrams it sent and received, at the default arm's ceiling step of that direction), and the date; method: the ramp described above on an idle Linux VM; aggregation: of the gate's 2 runs, per direction the one with the lower default-arm ceiling (on a tie, the one with the higher CPU microseconds per datagram summed over A and B), every token of that direction from that run; source case: perf/pps-ceiling at the M5 gate -->
 The packet-rate ceiling is {ceiling-ab} datagrams a second from A to B and
 {ceiling-ba} from B to A with the default `MaxBatch` ({ceiling-ab-1} and
 {ceiling-ba-1} with `MaxBatch` 1; raw UDP on the same path: {raw-ab} and
@@ -725,7 +729,7 @@ duplicate datagram, losses only within 200 ms of a switching event, and
 every arrival gap caused by a switch under 200 ms. Sessions use the sizing
 of [Datagram I/O](#datagram-io-and-batching).
 
-<!-- FIGURE: G3 at 100 kpps, A → B: the delivered fraction per mode (selector, bond, race), and over the three modes the longest switch gap and the losses outside the event windows, and the date; method: G3 as described, 2 runs per mode; source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
+<!-- FIGURE: G3 at 100 kpps, A → B: the delivered fraction per mode (selector, bond, race), and over the three modes the longest switch gap and the losses outside the event windows, and the date; method: G3 as described, 2 runs per mode; aggregation: per mode the lower delivered fraction of its 2 runs, and over the 6 runs the longest switch gap and the largest count of losses outside the event windows; source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
 At 100,000 datagrams a second, selector, bond and race sessions delivered
 {g3-sel}, {g3-bond} and {g3-race} of the datagrams sent, with the longest
 switch gap {g3-gap} ms and {g3-out} losses outside the event windows
@@ -737,7 +741,7 @@ three independent links between two virtual machines (50, 100 and
 link; steady goodput (the first 2 s excluded) is compared with the sum of
 the links' calibrated raw rates.
 
-<!-- FIGURE: G8 3-path steady goodput as a fraction of the summed calibrated link rates, the SHA-256 match (the runs whose received 2 GiB matched the sender's SHA-256), the longest zero-delivery gap, and the date; method: G8 as described, 2 runs; source case: gold/G8-3path at the M5 gate -->
+<!-- FIGURE: G8 3-path steady goodput as a fraction of the summed calibrated link rates, the SHA-256 match (the runs whose received 2 GiB matched the sender's SHA-256), the longest zero-delivery gap, and the date; method: G8 as described, 2 runs; aggregation: the lower fraction and the longest gap of the 2 runs; source case: gold/G8-3path at the M5 gate -->
 A three-path bond reached {g8-ratio} of the summed link rates (criterion:
 at least 85 %), with the longest zero-delivery gap {g8-gap} ms; the 2 GiB
 received matched the sender's SHA-256 in {g8-sha} of 2 runs ({date}).
@@ -747,7 +751,7 @@ received matched the sender's SHA-256 in {g8-sha} of 2 runs ({date}).
 takes about three round trips; a stream transfer is in flight when every
 packet of the active path is silently dropped.
 
-<!-- FIGURE: G4-dialcost recovery from the DROP to the first new byte at the receiver, split into detection, dial, JOIN and first byte, and the date; method: G4-dialcost as described, 2 runs; source case: gold/G4-dialcost at the M5 gate -->
+<!-- FIGURE: G4-dialcost recovery from the DROP to the first new byte at the receiver, split into detection, dial, JOIN and first byte, and the date; method: G4-dialcost as described, 2 runs; aggregation: of the 2 runs, the one with the longer recovery, its split from the same run; source case: gold/G4-dialcost at the M5 gate -->
 Recovery took {g4dc-total} s from the drop to the first new byte
 (detection {g4dc-detect} s, dial {g4dc-dial} s, JOIN and first byte
 {g4dc-join} s; criterion: at most 5 s; {date}).

@@ -61,10 +61,11 @@
 // the full queue dropped after a later one was queued is missed, and once
 // the queue has drained, a late datagram numbered above every one received
 // hides the overflow's drops numbered above it). quic-go's 256-packet
-// queue of unprocessed packets, which drops when its own connection
-// goroutine stalls, is not visible to the carrier: such a drop looks like
-// a loss in the network. On reordering paths use the raw UDP carrier
-// (carrier/udp) or the QUIC stream carrier.
+// queue of unprocessed packets drops when its own connection goroutine
+// stalls. The carrier cannot tell such a drop from a loss in the network:
+// it counts during an overflow, as a network loss does, and not
+// otherwise. On reordering paths use the raw UDP carrier (carrier/udp) or
+// the QUIC stream carrier.
 //
 // The package uses only rendr's public API: its conns are ordinary embedder
 // conns for rendr's core.

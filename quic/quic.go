@@ -109,8 +109,9 @@ type Counters struct {
 	// datagram the full queue dropped after a later one was queued is
 	// missed, and once the queue has drained, a late datagram numbered
 	// above every one received hides the overflow's drops numbered above
-	// it). A drop by quic-go's 256-packet queue of unprocessed packets is
-	// not visible to the carrier: it looks like a loss in the network. A
+	// it). The carrier cannot tell a drop by quic-go's 256-packet queue of
+	// unprocessed packets from a loss in the network: such a drop counts
+	// during an overflow, as a network loss does, and not otherwise. A
 	// datagram lost while the carrier keeps up is not counted (a transport
 	// loss). Nothing is counted once the carrier was closed.
 	IngressDrops atomic.Uint64
