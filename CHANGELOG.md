@@ -148,28 +148,30 @@ Testing:
 
 ### Performance
 
-Measured on idle Linux virtual machines; the methods are in the README's
-"Performance" section.
+Measured on idle Linux virtual machines, each figure from the less
+favourable of the release gate's two runs; the methods are in the
+README's "Performance" section.
 
-<!-- FIGURE: BENCH-E2E-1 ratios rendr 2.0.0 / v0.3.0 and rendr 2.0.0 / raw TCP (median of per-pair ratios, pair count, A/A noise band); source case: G7 (BENCH-E2E-1) at the M5 gate -->
+<!-- FIGURE: BENCH-E2E-1 ratios rendr 2.0.0 / v0.3.0 and rendr 2.0.0 / raw TCP (median of per-pair ratios, pair count, A/A noise band); aggregation as README's BENCH-E2E-1 spec (the G7 run with the lower rendr 2.0.0 / v0.3.0 median, every token from that run); source case: G7 (BENCH-E2E-1) at the M5 gate -->
 - Stream throughput (BENCH-E2E-1, one loopback TCP carrier, 1-GiB
-  transfers, alternating pairs): {ratio-v030} × rendr v0.3.0 and
+  transfers, {pairs} alternating pairs): {ratio-v030} × rendr v0.3.0 and
   {ratio-raw} × raw TCP (A/A noise band {noise} %).
 
-<!-- FIGURE: packet-rate ceiling per direction with MaxBatch default and 1, relative to the raw-UDP reference on the same path; source case: perf/pps-ceiling at the M5 gate -->
+<!-- FIGURE: packet-rate ceiling per direction with MaxBatch default and 1, and the default arm's ceilings relative to the raw-UDP reference on the same path (the default-arm ceiling divided by the raw-UDP reference ceiling of the same run); aggregation as README's packet-rate spec (per direction the run with the lower default-arm ceiling, every token of that direction from that run); source case: perf/pps-ceiling at the M5 gate -->
 - Packet rate (1,000-byte datagrams, one `carrier/udp` carrier, a 12-s
   step ramp per direction; a step passes when 99 % of its datagrams
   arrive and 98 % were sent; capped at the raw-UDP reference): a ceiling
   of {ceiling-ab} datagrams a second from dialer to passive and
-  {ceiling-ba} back, {raw-share-ab} and {raw-share-ba} of raw UDP on the
-  same path.
+  {ceiling-ba} back with the default `MaxBatch`, {raw-share-ab} and
+  {raw-share-ba} of raw UDP on the same path ({ceiling-ab-1} and
+  {ceiling-ba-1} with `MaxBatch` 1).
 
-<!-- FIGURE: G3 at 100 kpps per mode: delivered fraction and worst switch gap; source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
+<!-- FIGURE: G3 at 100 kpps: the delivered fraction per mode and the longest switch gap over the three modes; aggregation as README's G3 spec (per mode the lower delivered fraction of its 2 runs, the longest switch gap of the 6 runs); source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
 - 100,000 datagrams a second across ten switching events (G3): selector,
   bond and race delivered {g3-sel}, {g3-bond} and {g3-race} of the
   datagrams sent; the longest switch gap was {g3-gap} ms.
 
-<!-- FIGURE: G8 3-path bond goodput as a fraction of the summed calibrated link rates; source case: gold/G8-3path at the M5 gate -->
+<!-- FIGURE: G8 3-path bond goodput as a fraction of the summed calibrated link rates; aggregation as README's G8 spec (the lower of the 2 runs); source case: gold/G8-3path at the M5 gate -->
 - Bond aggregation over three independent links between two machines
   (G8): {g8-ratio} of the summed link rates.
 
@@ -210,20 +212,24 @@ QUIC and carriers:
   and a constant-rate packet session loses datagrams to the 250-ms egress
   age; use `carrier/udp` or the QUIC stream carrier on such paths.
 - quic-go drops received DATAGRAM frames beyond 128 per connection
-  without a signal, and rendr cannot prevent it: a receiving carrier whose
-  pump does not run while more than 128 DATAGRAMs arrive (12.8 ms at
-  10,000 datagrams a second) loses the excess. The DATAGRAM carrier puts
-  a 4-byte sequence number before each datagram and counts these drops in
-  `Counters.IngressDrops` from the gaps, when the next datagram arrives.
-  When DATAGRAMs arrive in order the count is exact, except that a network
-  loss or a drop by quic-go's 256-packet unprocessed-packet queue during
-  such an overflow counts too; while the carrier keeps up, either stays an
-  uncounted transport loss. On a path that reorders the count is no bound:
-  it can be too high (a datagram reordered during an overflow counts and
-  is still delivered) or too low (a late datagram the full queue dropped
+  without a signal (a fixed limit rendr cannot prevent from overflowing
+  when the receiving process stalls): a receiving carrier whose pump does
+  not run while more than 128 DATAGRAMs arrive (12.8 ms at 10,000
+  datagrams a second) loses the excess. The DATAGRAM carrier puts a 4-byte
+  sequence number before each datagram and counts them in
+  `Counters.IngressDrops` from the gaps in its per-DATAGRAM sequence
+  numbers, when the next datagram arrives. When DATAGRAMs arrive in order
+  that count is exact, except that a datagram lost in the network during
+  such an overflow counts too. On a path that reorders it is no bound: it
+  can be too high (a datagram reordered during an overflow counts and is
+  still delivered) or too low (a late datagram the full queue dropped
   after a later one was queued is missed, and once the queue has drained,
   a late datagram numbered above every one received hides the overflow's
-  drops numbered above it).
+  drops numbered above it). The carrier cannot tell a drop by quic-go's
+  256-packet queue of unprocessed packets from a loss in the network: such
+  a drop counts during an overflow, as a network loss does, and not
+  otherwise. A datagram lost while the carrier keeps up is not counted (a
+  transport loss).
 - A QUIC carrier costs about 7–8 goroutines (quic-go's own included), and
   QUIC's late stream close holds one goroutine per handed datagram
   connection.
@@ -283,6 +289,21 @@ Packet sessions:
   OPEN_ACK or its first frame for the session is lost, the passive is held
   for one control retransmission timeout and datagrams it wrote right after
   `Confirm` can age out (about 1–2 % of such openings at 1 % loss).
+- Packet sessions never retransmit, so the datagrams in flight on a
+  carrier that dies, and those written to it before the writer learns that
+  the other end closed or lost it, are lost. They show in the writer's
+  `Sent` − `PeerReceived` (as far as the peer has reported; during traffic
+  it also holds the datagrams still in flight), and the writer moves to
+  its other carriers once it learns of the death: by its own detection, by
+  the dialer's route update, or by the peer's DOWN on a shared carrier. A
+  datagram a dying datagram carrier was given but never wrote is placed
+  again on a live carrier while younger than `Packet.MaxAge` from its
+  `WriteTo`, or counted in a send-side `Drop*` counter (in a race session,
+  once no other member's copy of it is left). The datagrams of a write
+  whose count the carrier's conn misreported are not placed again, nor are
+  those of a failed write on a stream carrier, which a packet session
+  falls back to: either write may have sent part of them, so they count as
+  lost in flight (`Sent` − `PeerReceived`).
 - A shared datagram carrier whose reliable control window (eight frames)
   is already full when another shared carrier of the pair dies sends its
   DOWN only after the oldest of them is acknowledged: the peer then moves
@@ -305,9 +326,6 @@ Packet sessions:
   dead carrier's path is the longer one, less than the difference of the
   two paths' one-way delays before it. They count in the sender's `Sent` −
   `PeerReceived`, as any datagram lost in flight on a dead carrier.
-<!-- CHECK at C-B: the M4 C3 packet-loss gap below (escalated; a failing-first row was proposed); drop or reword it if M5 fixed it -->
-- Replies a packet session sends on a carrier that a stimulus has just
-  ended can be lost with no loss counter moving on either end.
 
 Scheduling and estimation:
 
@@ -317,37 +335,36 @@ Scheduling and estimation:
   50 ms of the slow member (in-process race scenarios: up to about 2 s for
   a 128 KiB/s member at 20 ms).
 - Race ACK copies add one frame per extra member per acknowledgement.
-<!-- CHECK at C-B: the estimator items below (two-way bulk overestimate, small-buffer residuals) are M5 performance items; update them from the gate's figures -->
 - Under two-way bulk on deep bottlenecks the rate estimate runs 1–3 × high,
   so in-flight caps grow to about 6.5 × (BDP + buffer) and round trips
-  settle at 0.5–1.03 s on 20-ms links; an interactive session sharing a
-  carrier with bulk sessions waits about cap / rate (in-process scenarios
-  at 4 MiB/s and 20 ms: echo P99 237 ms).
-- Estimator residuals: with socket or link buffers below one 256-KiB batch
-  a PONG waits behind the peer's write (0.41–0.63 of the link at 1 MiB/s);
-  one way, with blocking writes below a rate of one batch / (minRTT +
-  2 × PingBusy + 100 ms) (256 KiB / 220 ms ≈ 1.14 MiB/s at a 20-ms minRTT
-  with the default PingBusy), a flow reaches about 0.6–0.8 of the link;
-  two-way bulk over buffers shallower than a batch at 1.5–2 MiB/s with a
-  30–40 ms RTT can still leave one direction
-  below 85 % of the link in some interleavings; low rates with deep
+  settle at 0.5–1.03 s on 20-ms links; where bulk both ways fills a buffer
+  so that writes block, up to one more 256-KiB batch stands in the queue.
+  An interactive session sharing a carrier with bulk sessions waits about
+  cap / rate (in-process scenarios at 4 MiB/s and 20 ms: echo P99 about
+  230 ms).
+- Estimator residuals (in-process scenarios): with 64-KiB socket or link
+  buffers and bulk both ways, a PONG waits behind the peer's write and one
+  direction carries less than 0.85 of the link at 1–2 MiB/s (down to about
+  0.6 at a 20-ms RTT); two-way bulk over buffers shallower than a 256-KiB
+  batch, below about 2 MiB/s or at a 30–40 ms RTT, can still leave one
+  direction below 85 % of the link in some interleavings (about 4 % of
+  runs with random stalls over 1.5–3 MiB/s, 96–192 KiB and 10–40 ms, most
+  of them at 1.5–2 MiB/s with a 30–40 ms RTT); one way, with blocking
+  writes below a rate of one batch / (minRTT + 2 × PingBusy + 100 ms)
+  (256 KiB / 220 ms ≈ 1.14 MiB/s at a 20-ms minRTT with the default
+  PingBusy), a flow reaches about 0.6–0.8 of the link; low rates with deep
   buffers vary between 0.62 and 0.98 of the link per run; a one-way flow
-  at 1 MiB/s and 100 ms reaches about 0.8 of the link;
-  a peer clock drift of 0.2–0.5 % at 2 MiB/s exceeds the latency bound by
-  up to 25 % (in-process scenarios).
+  at 1 MiB/s and 100 ms reaches about 0.8 of the link; a peer clock drift
+  of 0.2–0.5 % at 2 MiB/s exceeds the latency bound by up to 25 %.
 - A shared carrier that is write-blocked is not used for new sessions, so
   a session that opens during a short stall pays a fresh dial.
 - When no JOIN waits, OPEN waiters still dial beside a slow OPEN claimant,
   so a carrier kill can draw more than one opening dial per factory.
 - Each carrier attempt in flight holds one session goroutine that no Status
   field counts.
-<!-- CHECK at C-B: the throughput items below were M5 P0 questions; replace them with the gate's findings -->
 - In one process with two long-lived Runtimes, single-session throughput
   dropped about 8 % after a burst of 64 sessions and stayed there (cause
   not found; in-process loopback benchmark).
-- Single-stream throughput and CPU per GiB moved by about 3 % and 5 %
-  between two 2.0 development milestones (paired BENCH-E2E-1 runs); not
-  explained.
 
 Sessions and L4:
 

@@ -97,21 +97,23 @@ type Options struct {
 // kernel socket's: rendr counted the datagram as sent.
 type Counters struct {
 	// IngressDrops: received DATAGRAMs dropped before rendr read them —
-	// by a full ingress queue (L46), or by quic-go's own 128-entry receive
-	// queue while the carrier's pump lagged behind it (KL-19). The latter
-	// are counted from the gaps in the carrier's sequence numbers when the
-	// next datagram arrives. When DATAGRAMs arrive in order that count is
-	// exact, except that a datagram lost in the network (or in quic-go's
-	// 256-packet queue of unprocessed packets) while the pump lagged counts
-	// too, so on a path that keeps order but loses datagrams it is an upper
-	// bound. On a path that reorders it is no bound: it can be too high (a
-	// datagram reordered while the pump lagged counts too and is still
-	// delivered) or too low (a late datagram quic-go's full queue dropped
-	// after a later one was queued is missed, and once the queue has
-	// drained, a late datagram numbered above every one the carrier
-	// received hides the drops numbered above it). A datagram lost while
-	// the pump kept up counts nowhere (a transport loss). Nothing is
-	// counted once the carrier was closed.
+	// by a full ingress queue (L46), or by quic-go, which drops received
+	// DATAGRAM frames beyond 128 per connection (a fixed limit rendr cannot
+	// prevent from overflowing when the receiving process stalls; KL-19).
+	// The carrier counts the latter from the gaps in its per-DATAGRAM
+	// sequence numbers, when the next datagram arrives. When DATAGRAMs
+	// arrive in order that count is exact, except that a datagram lost in
+	// the network during such an overflow counts too. On a path that
+	// reorders it is no bound: it can be too high (a datagram reordered
+	// during an overflow counts and is still delivered) or too low (a late
+	// datagram the full queue dropped after a later one was queued is
+	// missed, and once the queue has drained, a late datagram numbered
+	// above every one received hides the overflow's drops numbered above
+	// it). The carrier cannot tell a drop by quic-go's 256-packet queue of
+	// unprocessed packets from a loss in the network: such a drop counts
+	// during an overflow, as a network loss does, and not otherwise. A
+	// datagram lost while the carrier keeps up is not counted (a transport
+	// loss). Nothing is counted once the carrier was closed.
 	IngressDrops atomic.Uint64
 	// EgressDrops: DATAGRAMs the egress queue dropped — one older than
 	// 250 ms (when its turn came, or when a newer one was queued), the

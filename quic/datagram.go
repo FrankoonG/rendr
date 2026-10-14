@@ -214,22 +214,25 @@ func (d *dgramConn) accept(b []byte) bool {
 // quicRcvQueue datagrams were taken since the pump last found the queue
 // empty - and none since a run that reached quicRcvQueue - is no quic-go
 // drop: the network lost or reordered those datagrams, which no counter
-// claims. Any other gap is counted in IngressDrops: for in-order arrival
-// every quic-go drop, and a network loss inside such a lag too (the two
-// cannot be told apart), so the count is exact when the network loses
-// none during a lag and an upper bound otherwise. A datagram behind the
-// next expected one (reordered) is delivered, counts nothing and leaves
-// any lag to the datagram that shows the gap; the gap of a drop at the
-// end of a burst is counted when the next datagram arrives.
+// claims. Any other gap, one shown during an overflow (lag: quic-go's
+// queue may have been full), is counted in IngressDrops: a network loss
+// and a quic-go drop leave the same gap. A datagram behind the next
+// expected one (reordered) is delivered, counts nothing and leaves any lag
+// to the datagram that shows the gap; the gap of a drop at the end of a
+// burst is counted when the next datagram arrives.
 //
-// When DATAGRAMs are reordered the count is no bound, and O(1) state
-// cannot tell the cases apart. A datagram reordered inside a lag is
-// counted too and still delivered (an over-count). A drop is missed when
-// the datagram that shows its gap was taken before the lag began (a late
-// datagram the full queue dropped after a later one was queued), or when
-// a late datagram at or above the next expected number arrives after the
-// drain: its own gap is counted, it ends the lag, and the drops numbered
-// above it count nothing (under-counts).
+// What the count means, in the words of Counters.IngressDrops and the
+// README (one text): When DATAGRAMs arrive in order that count is exact,
+// except that a datagram lost in the network during such an overflow
+// counts too. On a path that reorders it is no bound: it can be too high
+// (a datagram reordered during an overflow counts and is still delivered)
+// or too low (a late datagram the full queue dropped after a later one
+// was queued is missed, and once the queue has drained, a late datagram
+// numbered above every one received hides the overflow's drops numbered
+// above it). O(1) state cannot tell the reordered cases apart: in the
+// first under-count the datagram that shows the drop's gap was taken
+// before the lag began; in the second, the late datagram's own gap is
+// counted, it ends the lag, and the drops numbered above it count nothing.
 type rxSeq struct {
 	next uint32 // the sequence number expected next
 	run  int    // datagrams taken since the pump last found quic-go's queue empty
