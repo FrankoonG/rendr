@@ -85,15 +85,18 @@ type DialOptions struct {
 	// on both sides and Done is closed. Close keeps its meaning: what was
 	// written is delivered once the peer accepts, within Linger; Abort
 	// withdraws. A Close before the first Write, Read or CloseWrite sends
-	// nothing. The cold-start wait for probe samples is skipped. PeerInstance
-	// and RemoteAddr report the zero InstanceID until the peer accepted. A
-	// session that opens on a carrier it shares with other sessions (rendr
-	// mux) sends its bytes after the answer, which costs the same as early
-	// data on a carrier of its own. Do not use it when the peer's answer must
-	// precede your first byte (a SOCKS5 reply, for example). Write before you
-	// Read: a Read that comes first opens the session without early bytes.
-	// DialPacket refuses it with ErrProtocol. SessionStatus.EarlyBytes
-	// reports how many bytes travelled as early data.
+	// nothing; neither does an idle limit (Config.IdleTimeout,
+	// Conn.SetIdleTimeout) that expires before them, counted from Dial: the
+	// session then ends with ErrIdleTimeout. The cold-start wait for probe
+	// samples is skipped. PeerInstance and RemoteAddr report the zero
+	// InstanceID until the peer accepted. A session that opens on a carrier
+	// it shares with other sessions (rendr mux) sends its bytes after the
+	// answer, which costs the same as early data on a carrier of its own. Do
+	// not use it when the peer's answer must precede your first byte (a
+	// SOCKS5 reply, for example). Write before you Read: a Read that comes
+	// first opens the session without early bytes. DialPacket refuses it
+	// with ErrProtocol. SessionStatus.EarlyBytes reports how many bytes
+	// travelled as early data.
 	EarlyReturn bool
 }
 

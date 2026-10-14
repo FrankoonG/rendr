@@ -148,6 +148,39 @@ func (a *actor) earlyCloseLocked(now time.Time) {
 	a.want(by)
 }
 
+// earlyIdleLocked is terminationLocked's IdleTimeout rule for a dialer
+// session that Dial returned with EarlyReturn and that is still deferred:
+// no Write, Read or CloseWrite triggered it (K21; plan:277, plan:385). The
+// application holds it, so it is idle like any other session: its clock is
+// st.lastData, which Dial set and which nothing moves before the trigger,
+// under the session's IdleTimeout (a.idleTimeout: SetIdleTimeout's override
+// included, the clock never restarted). At expiry it claims
+// dialer.deferred, as earlyCloseLocked does, and ends the session locally
+// with ErrIdleTimeout: no attempt ever ran, so nothing was sent and nothing
+// is (no OPEN, no RST); the end releases the session's MaxSessions unit
+// (Registry.Ended) and its health hold, and EventSessionEnd reports it. A
+// Write that holds a reservation is activity, not idleness: its commit
+// triggers the opening, so the rule leaves the session to it. A trigger
+// that claimed deferred first (a Read or CloseWrite racing the deadline)
+// opens the session instead, whose opening phase is bounded by Grace as
+// any dialer's (§4.7: an opening phase is not idleness of the open
+// session).
+func (a *actor) earlyIdleLocked(now time.Time) {
+	d, s := a.d, a.s
+	st := &s.st
+	idle := a.idleTimeout()
+	if a.ending || idle <= 0 || !d.deferred.Load() || st.resEnd != s.p.FirstOffset {
+		return
+	}
+	if at := st.lastData.Add(idle); now.Before(at) {
+		a.want(at)
+		return
+	}
+	if d.deferred.CompareAndSwap(true, false) {
+		a.earlyEndLocked(now, ErrIdleTimeout)
+	}
+}
+
 // onStartOpenLocked handles startOpen: the deferred opening starts — the
 // opening race and cadence that Dial runs (dialActLocked, in this step),
 // openBy = now + Grace. The early span is fixed by the first OPEN attempt
@@ -163,8 +196,9 @@ func (a *actor) onStartOpenLocked(now time.Time) {
 }
 
 // earlyEndLocked ends an EarlyReturn session before its verdict (a Close
-// or Abort, the Linger after a Close) with err: the end procedure
-// withdraws every attempt. failOpeningLocked emits the event the same way.
+// or Abort, the Linger after a Close, the IdleTimeout of a session never
+// triggered) with err: the end procedure withdraws every attempt.
+// failOpeningLocked emits the event the same way.
 func (a *actor) earlyEndLocked(now time.Time, err error) {
 	if a.ending {
 		return
