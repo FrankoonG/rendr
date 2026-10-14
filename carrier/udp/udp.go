@@ -116,15 +116,16 @@ type Options struct {
 // multi-homed host.
 //
 // Where the socket reads several datagrams per call (Linux amd64 and
-// arm64, Options.MaxBatch ≥ 2), its source holds up to
-// min(MaxBatch, 32) − 1 read buffers beyond its first, and a message
-// header per read buffer, from its first read on and while datagrams
-// arrive, counted in rendr.Status.BufferedBytes. Once its read has waited
-// one to two seconds without a datagram it returns them and reads one
-// datagram per call until the next arrives; the first read buffer holds
-// no data while it waits and is not counted, so a listening socket adds
-// nothing to BufferedBytes from two seconds after its last datagram, or
-// after it began to read if none arrived, with or without sessions.
+// arm64, Options.MaxBatch other than 1: the default 0 selects 32), its
+// source holds up to min(MaxBatch, 32) − 1 read buffers beyond its first,
+// and a message header per read buffer, from its first read on and while
+// datagrams arrive, counted in rendr.Status.BufferedBytes. Once its read
+// has waited one to two seconds without a datagram it returns them and
+// reads one datagram per call until the next arrives; the first read
+// buffer holds no data while it waits and is not counted, so a listening
+// socket adds nothing to BufferedBytes from two seconds after its last
+// datagram, or after it began to read if none arrived, with or without
+// sessions.
 func Listen(network, address string, o Options) (net.PacketConn, error) {
 	return listen(context.Background(), network, address, o)
 }
