@@ -38,13 +38,15 @@ same change as the vectors:
 // TestWireGoldenFrozen is the wire freeze (m5 R4): testdata/frozen.sha256
 // lists the SHA-256 of every golden vector file of the root module, and a
 // vector that changes, appears or disappears without the list changing
-// fails it. A golden vector file is every file under a testdata directory
-// of the module except the fuzz corpora (testdata/fuzz, seeds that grow
-// without a wire change) and the list itself; the walk covers what the
-// module's zip carries (Go's rules: no "." or "_" directories, no nested
-// module, no directory the root .gitignore anchors such as /docs/). The
-// list is in sha256sum's format, so `sha256sum -c` checks it from the
-// module root.
+// fails it. A golden vector file is every file in a testdata tree of the
+// module except the fuzz corpora (testdata/fuzz, seeds that grow without a
+// wire change) and the list itself. The walk leaves out what the module's
+// zip leaves out (a nested module, a version-control directory) and the
+// directories the root .gitignore anchors, such as /docs/, which the zip
+// never sees; it looks for testdata trees only outside directories whose
+// names start with "." or "_" (the go command ignores those, the zip does
+// not), and inside a testdata tree every file counts. The list is in
+// sha256sum's format, so `sha256sum -c` checks it from the module root.
 func TestWireGoldenFrozen(t *testing.T) {
 	root, err := moduleRoot(frozenModule)
 	if err != nil {
@@ -124,6 +126,10 @@ func anchoredDirs(root string) map[string]bool {
 	return out
 }
 
+// vcsDirs are the version-control directories a module zip leaves out at
+// any depth (golang.org/x/mod/zip).
+var vcsDirs = map[string]bool{".bzr": true, ".git": true, ".hg": true, ".svn": true}
+
 // goldenHashes walks the module at root and returns the SHA-256 of every
 // golden vector file by its slash path relative to root; self (the list)
 // is left out.
@@ -144,8 +150,8 @@ func goldenHashes(root, self string) (map[string]string, error) {
 				return nil
 			}
 			name := d.Name()
-			if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") || skip[rel] ||
-				(name == "fuzz" && path.Base(path.Dir(rel)) == "testdata") {
+			if vcsDirs[name] || skip[rel] || (name == "fuzz" && path.Base(path.Dir(rel)) == "testdata") ||
+				(!inTestdata(rel) && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_"))) {
 				return filepath.SkipDir
 			}
 			if _, err := os.Stat(filepath.Join(p, "go.mod")); err == nil {
@@ -243,11 +249,13 @@ func frozenDiff(want, got map[string]string) string {
 }
 
 // TestWireGoldenFrozenSelf checks the guard's own parts on a synthetic
-// module: the walk finds testdata files at any depth and leaves out fuzz
-// corpora, the list itself, "." and "_" directories, nested modules,
-// .gitignore-anchored directories and files outside testdata; the diff
-// reports a changed, an added and a removed file; the list format round
-// trips and refuses malformed and repeated lines.
+// module: the walk finds testdata files at any depth, inside "." and "_"
+// directories of a testdata tree too, and leaves out fuzz corpora, the
+// list itself, version-control directories, "." and "_" directories above
+// a testdata tree, nested modules, .gitignore-anchored directories and
+// files outside testdata; the diff reports a changed, an added and a
+// removed file; the list format round trips and refuses malformed and
+// repeated lines.
 func TestWireGoldenFrozenSelf(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
@@ -255,6 +263,9 @@ func TestWireGoldenFrozenSelf(t *testing.T) {
 		".gitignore":                "/docs/\nbin/\n",
 		"a/testdata/v.txt":          "v",
 		"a/testdata/sub/deep.bin":   "d",
+		"a/testdata/_v/a.txt":       "underscore inside",
+		"a/testdata/.v/a.txt":       "dot inside",
+		"a/testdata/.git/HEAD":      "vcs",
 		"a/testdata/frozen.sha256":  "self",
 		"a/testdata/fuzz/F/seed":    "fuzz",
 		"a/notes.txt":               "not a vector",
@@ -283,7 +294,7 @@ func TestWireGoldenFrozenSelf(t *testing.T) {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
-	if want := "a/testdata/sub/deep.bin a/testdata/v.txt b/c/testdata/x/testdata.y"; strings.Join(paths, " ") != want {
+	if want := "a/testdata/.v/a.txt a/testdata/_v/a.txt a/testdata/sub/deep.bin a/testdata/v.txt b/c/testdata/x/testdata.y"; strings.Join(paths, " ") != want {
 		t.Errorf("walk found %q, want %q", paths, want)
 	}
 	if sum := sha256.Sum256([]byte("v")); got["a/testdata/v.txt"] != hex.EncodeToString(sum[:]) {

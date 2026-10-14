@@ -26,8 +26,10 @@ var (
 	// challenge is lost — never the carrier.
 	errNotCandidate = fmt.Errorf("%w: not the flow's latest rebind candidate", carrier.ErrNoRebind)
 	// errWriteCount: a foreign conn's WriteTo reported another count than
-	// the datagram's length (L42, PA-19).
-	errWriteCount = errors.New("rendr/udpflow: datagram write returned an invalid count")
+	// the datagram's length (L42, PA-19). It wraps carrier.ErrWriteCount:
+	// the passive carrier's writer then hands back none of the datagrams
+	// that call was given — the conn may have sent them.
+	errWriteCount = fmt.Errorf("%w (a foreign conn's WriteTo)", carrier.ErrWriteCount)
 	// errTooLarge: a foreign conn refused a datagram as too large without
 	// telling the size it can send, or rendr's own socket refused it (Max
 	// 0: the MTU probe decides, M2-D25). One shared value, never modified.

@@ -3,22 +3,24 @@ package carrier
 import (
 	"testing"
 	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 )
 
 // defaultIdleRelease is batchIdleRelease as the package set it, before any
 // test lowered it (setIdleRelease).
 var defaultIdleRelease = batchIdleRelease
 
-// TestBatchIdleReleaseShared (M5 work item srcidle): the dialer reader's
-// idle release has the passive Source's period — internal/udpflow's
-// batchIdleRelease, which that package's TestBatchIdleReleaseShared pins —
-// and the root package's TestIdlePacketListenerBufferedBytesZero_plan774
-// bounds its waits by 2 × that period (its idleRelease): all three are
-// 1 s (M5 design R1-5 rule 3). A change of one fails here or there until
-// the three agree again.
+// TestBatchIdleReleaseShared (M5 work item srcidle; one shared period):
+// the dialer reader's idle release takes the shared
+// udpsocket.IdleRelease — the passive Source's period too, which
+// internal/udpflow's TestBatchIdleReleaseShared pins there — and that is
+// 1 s (M5 design R1-5 rule 3), by which the root package's
+// TestIdlePacketListenerBufferedBytesZero_plan774 bounds its waits. A
+// reader given another default, or a shared value that moved, fails here.
 func TestBatchIdleReleaseShared(t *testing.T) {
-	if defaultIdleRelease != time.Second {
-		t.Fatalf("batchIdleRelease %v: internal/udpflow's batchIdleRelease and the root package's idleRelease are 1 s; change the three together",
-			defaultIdleRelease)
+	if defaultIdleRelease != udpsocket.IdleRelease || udpsocket.IdleRelease != time.Second {
+		t.Fatalf("batchIdleRelease %v, udpsocket.IdleRelease %v: the dialer reader takes the shared idle-release period, 1 s (R1-5 rule 3)",
+			defaultIdleRelease, udpsocket.IdleRelease)
 	}
 }

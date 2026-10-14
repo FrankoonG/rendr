@@ -2,10 +2,12 @@ package carrier
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/sched"
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -184,10 +186,12 @@ func (c *Conn) dgPingLocked(w *writer, b *Batch, now time.Time) (kill bool) {
 // carrier (an invalid count included: never retried, L42), and so does a
 // death record found before a write: nothing more is written, and the
 // DGRAMs of the datagrams no write carried go back to their sessions
-// after the death (dgReturnUnsent; none after an invalid count). The PING is
-// committed when the write that carried it returns (L23); the rest of the
-// commit follows under Conn.mu: the REL timer per R1-2, the CLOSE and the
-// retirement checks (R1-4).
+// after the death (dgReturnUnsent). After an invalid count none of the
+// datagrams the misreporting call was given goes back — which of them
+// left is unknown — but the round's later ones, which no call was given,
+// do. The PING is committed when the write that carried it returns (L23);
+// the rest of the commit follows under Conn.mu: the REL timer per R1-2,
+// the CLOSE and the retirement checks (R1-4).
 func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, cand PeerKey, nonce uint64) bool {
 	dg := c.dg
 	io := dg.io
@@ -252,7 +256,7 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 				break
 			}
 			err := io.WriteDatagram(d)
-			c.dgOutcome(w, b, &rs, i, end, err, now, time.Now())
+			c.dgOutcome(w, b, &rs, i, end, end, err, now, time.Now()) // the call carried this datagram alone
 			i = end
 		}
 	}
@@ -329,8 +333,12 @@ func (c *Conn) dgWriteFailed(fatal error) {
 // one. It does so after the carrier's death record is set, so the session
 // places them again on a live carrier (or counts them where its queue
 // would): a datagram rendr knows never left is neither lost uncounted nor
-// sent twice. A round whose write returned an invalid count (L42) hands
-// nothing back: which datagrams left is unknown.
+// sent twice. A write that returned an invalid count (L42: an error
+// matching ErrWriteCount or udpsocket.ErrInvalidCount, or a batched count
+// of a shape it cannot have) is the exception: which of the datagrams that
+// call was given left is unknown — a transport that misreports its count
+// may have sent them — so none of them goes back, while the round's
+// datagrams after that call, which no call was given, do.
 type DgramReturner interface {
 	// Unsent hands back the DGRAM of session seq seq: p aliases buf.B and
 	// the reference on buf moves to the endpoint (kept or released). It is
@@ -342,9 +350,9 @@ type DgramReturner interface {
 // dgReturnUnsent hands the DGRAMs of the round's sealed frames [from,
 // b.Len()) back to their views' endpoints (DgramReturner), each with a
 // reference of its own on its chunk, before ReleaseRefs drops the batch's
-// (from < 0: nothing, which datagrams left is unknown). A DGRAM without a
-// chunk (component tests), of a handle no view holds any more, or of an
-// endpoint that takes nothing back is dropped as before.
+// (from < 0: nothing). A DGRAM without a chunk (component tests), of a
+// handle no view holds any more, or of an endpoint that takes nothing back
+// is dropped as before.
 func (c *Conn) dgReturnUnsent(b *Batch, from int) {
 	if from < 0 {
 		return
@@ -372,6 +380,24 @@ func (c *Conn) dgReturnUnsent(b *Batch, from int) {
 // nothing more is written on it.
 var errWriteDead = errors.New("rendr/carrier: carrier died during the write round")
 
+// ErrWriteCount is the identity of an invalid write count (L42, PA-19): a
+// datagram write that reported another count than the datagram's length,
+// or a batched write whose count has a shape it cannot have. errors.Is
+// matches it for every such error of the datagram transports — the
+// embedder adapter's (a *countError of a WriteTo), rendr's own sockets'
+// (errUDPWriteCount), a batched write's (errBatchCount) and udpflow's
+// foreign-conn writes — and the batch calls' own udpsocket.ErrInvalidCount
+// stands beside it (isWriteCount). The carrier dies, and the writer hands
+// back none of the datagrams the misreporting call was given: the count
+// lied, so they may have left (dgOutcome, DgramReturner).
+var ErrWriteCount = errors.New("rendr/carrier: datagram write returned an invalid count")
+
+// isWriteCount reports whether err is an invalid write count (L42):
+// ErrWriteCount, or udpsocket.ErrInvalidCount from a batch call.
+func isWriteCount(err error) bool {
+	return errors.Is(err, ErrWriteCount) || errors.Is(err, udpsocket.ErrInvalidCount)
+}
+
 // dgRound is what a round's datagram writes build up for its commit.
 type dgRound struct {
 	budget      int       // the send budget the round packs under (lowered by a refusal)
@@ -380,7 +406,7 @@ type dgRound struct {
 	pinged      bool      // the round's PING left: PingCommitted is reported
 	pingT       time.Time // its commit time
 	fatal       error     // the error that ends the carrier
-	unsent      int       // with fatal: the first sealed frame no write carried (-1: none, or unknown; dgReturnUnsent)
+	unsent      int       // with fatal: the first sealed frame whose DGRAM goes back (dgReturnUnsent; -1: none)
 }
 
 // dgOutcome applies the result err of the write of the datagram of sealed
@@ -388,10 +414,14 @@ type dgRound struct {
 // it carried is committed at ret, written or lost to noise (L23);
 // written — counted, the DGRAM's bytes and the RACK mark; too large —
 // Refused, the PING record goes, the budget shrinks (M2-D25); noise —
-// Dropped; else the error ends the carrier. It reports whether the budget
-// changed: the datagrams packed after this one under the old budget are
-// then packed again.
-func (c *Conn) dgOutcome(w *writer, b *Batch, rs *dgRound, i, end int, err error, now, ret time.Time) (shrank bool) {
+// Dropped; else the error ends the carrier: this datagram and the round's
+// rest never left — unless err is an invalid count (isWriteCount, L42):
+// then which of the datagrams of the call that carried this one left is
+// unknown, and only those after that call, from callEnd (the first sealed
+// frame after it: its flush's end, or end for a call of this datagram
+// alone), go back. It reports whether the budget changed: the datagrams
+// packed after this one under the old budget are then packed again.
+func (c *Conn) dgOutcome(w *writer, b *Batch, rs *dgRound, i, end, callEnd int, err error, now, ret time.Time) (shrank bool) {
 	dg := c.dg
 	n, hasDgram := b.datagramDgram(end)
 	ping := w.ping && w.pingAt >= i && w.pingAt < end
@@ -435,6 +465,13 @@ func (c *Conn) dgOutcome(w *writer, b *Batch, rs *dgRound, i, end int, err error
 		return rs.budget != before
 	case errors.Is(err, ErrNoise):
 		c.dgDropped(1) // this datagram is lost; the carrier lives
+	case isWriteCount(err):
+		// L42: the call that carried this datagram misreported its count —
+		// a transport that sent a datagram and returned (len+1, nil) or
+		// (0, nil), a sendmmsg count beyond its call — so its datagrams may
+		// have left, and one handed back would be sent twice. Those after
+		// the call were given to no call.
+		rs.fatal, rs.unsent = err, callEnd
 	default:
 		rs.fatal, rs.unsent = err, i // this datagram and the round's rest never left
 	}
@@ -462,9 +499,13 @@ const dgArenaSize = 64 << 10
 // flush goes on with ds[n+1:] — lost to noise (the flush goes on with
 // ds[n+1:]) or fatal (the round's unsent datagrams are never written:
 // dgReturnUnsent hands their DGRAMs back). A death record found before a
-// call is fatal for that call's datagrams. A count outside [0, len], a short count without an error, or a full count
-// with one, is fatal (L42). Counters move only for the written indexes, at
-// the call's return (L55).
+// call is fatal for that call's datagrams. A count outside [0, len], a
+// short count without an error, or a full count with one, is fatal
+// (errBatchCount, L42), and so is an invalid count the transport reports
+// as ds[n]'s error (isWriteCount): which of the call's datagrams left is
+// unknown, so none of ds[n:] goes back — only the datagrams of the flushes
+// after it, which no call was given. Counters move only for the written
+// indexes, at the call's return (L55).
 func (c *Conn) dgWriteFlushes(w *writer, b *Batch, rs *dgRound, now time.Time) {
 	if b.Len() == 0 {
 		return
@@ -508,13 +549,14 @@ func (c *Conn) dgWriteFlushes(w *writer, b *Batch, rs *dgRound, now time.Time) {
 			ret := time.Now()
 			if k < 0 || k > nd-sent || (err == nil) != (k == nd-sent) {
 				// Out of range, short without an error, or an error for a
-				// datagram past the last (L42): which datagrams left is
-				// unknown, so none is handed back.
-				rs.fatal, rs.unsent = errBatchCount, -1
+				// datagram past the last (L42): which of the call's
+				// datagrams left is unknown, so none of them is handed
+				// back; the flushes after it were given to no call.
+				rs.fatal, rs.unsent = errBatchCount, ends[nd-1]
 				break
 			}
 			for j := sent; j < sent+k; j++ {
-				c.dgOutcome(w, b, rs, dgStart(first, ends[:], j), ends[j], nil, now, ret)
+				c.dgOutcome(w, b, rs, dgStart(first, ends[:], j), ends[j], ends[nd-1], nil, now, ret)
 			}
 			sent += k
 			if err == nil {
@@ -522,7 +564,7 @@ func (c *Conn) dgWriteFlushes(w *writer, b *Batch, rs *dgRound, now time.Time) {
 			}
 			j := sent
 			sent++
-			if c.dgOutcome(w, b, rs, dgStart(first, ends[:], j), ends[j], err, now, ret) && sent < nd {
+			if c.dgOutcome(w, b, rs, dgStart(first, ends[:], j), ends[j], ends[nd-1], err, now, ret) && sent < nd {
 				i = ends[j] // packed under the old budget: pack the rest again
 				break
 			}
@@ -544,8 +586,8 @@ func dgStart(first int, ends []int, j int) int {
 
 // errBatchCount: a batched write reported a count outside the datagrams it
 // was given, fewer without an error, or all of them with an error (L42:
-// the carrier dies, never retried).
-var errBatchCount = errors.New("rendr/carrier: batched datagram write returned an invalid count")
+// the carrier dies, never retried). It matches ErrWriteCount.
+var errBatchCount = fmt.Errorf("%w (a batched write's count of a shape it cannot have)", ErrWriteCount)
 
 // errBudgetFloor: a refusal lowered the budget below wire.ControlFloor.
 var errBudgetFloor = errors.New("datagram budget below the control floor")

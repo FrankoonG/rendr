@@ -3,6 +3,8 @@ package quic
 import (
 	"bytes"
 	"encoding/binary"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,6 +75,47 @@ func writeTraced(t *testing.T, w *dgramConn, ft *frameTracer, from, to int) {
 			eventually(t, "the receiver's quic-go handled the group", func() bool { return ft.rcvDatagrams.Load() == base+int64(i+1) })
 		}
 	}
+}
+
+// rawSendTraced has the raw quic-go conn qc send each payload as one
+// DATAGRAM, in groups of 32, and waits after each group until the
+// receiver's quic-go (traced by ft) handled them: queued, or dropped by
+// its receive queue. Every DATAGRAM sent before must have been handled.
+func rawSendTraced(t *testing.T, qc *qgo.Conn, ft *frameTracer, payloads ...[]byte) {
+	t.Helper()
+	base := ft.rcvDatagrams.Load()
+	for i, p := range payloads {
+		if err := qc.SendDatagram(p); err != nil {
+			t.Fatal(err)
+		}
+		if i%32 == 31 || i == len(payloads)-1 {
+			eventually(t, "the receiver's quic-go handled the group", func() bool { return ft.rcvDatagrams.Load() == base+int64(i+1) })
+		}
+	}
+}
+
+// pumpWaits reports whether a carrier's pump waits in quic-go's
+// ReceiveDatagram for the next DATAGRAM: it found quic-go's queue empty
+// (rxSeq.empty ran) and parked. The polled probe never parks, and a held
+// pump parks outside ReceiveDatagram. It reads every goroutine's stack,
+// so the test must run one datagram carrier.
+func pumpWaits() bool {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		head, _, _ := strings.Cut(g, "\n")
+		if strings.Contains(head, "[select") && strings.Contains(g, ".(*dgramConn).pump(") && strings.Contains(g, ".ReceiveDatagram(") {
+			return true
+		}
+	}
+	return false
 }
 
 // readSeqs reads n datagrams from r and returns their seqDatagram indices,

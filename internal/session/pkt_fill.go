@@ -15,9 +15,10 @@ import (
 // (≤ 64 DGRAMs: the batch's frame limit). Steps 1–4 are the stream's
 // (fillControlLocked: the passive's first response, RST, the dialer's
 // SCHED, and on the duty lane the PACK, fillPackLocked); then, on a data
-// lane, the DGRAMs and the FIN once nothing is queued. On a datagram batch
-// the reliable frames (first response, RST, SCHED, FIN, a reliable PACK)
-// are REL frames (the batch's datagram mode).
+// lane, the DGRAMs and the FIN once nothing is queued and no returned DGRAM
+// waits (pkt_unsent.go; L40). On a datagram batch the reliable frames
+// (first response, RST, SCHED, FIN, a reliable PACK) are REL frames (the
+// batch's datagram mode).
 func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 	if l.state == LaneDead {
 		return // C1: never place anything on a lane the actor declared dead
@@ -36,7 +37,7 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 		if s.p.Mode == ModeRace {
 			due = s.racePktFinDueLocked(l, b.Now().Sub(pk.base).Nanoseconds()) // once per member (M3-D30)
 		} else {
-			due = st.fin.requested && !st.fin.acked && st.fin.lane == nil && pk.tx.n == 0 && pk.txBig.n == 0
+			due = st.fin.requested && !st.fin.acked && st.fin.lane == nil && pk.tx.n == 0 && pk.txBig.n == 0 && pk.redoN() == 0
 		}
 		if due {
 			if !pk.finPlaced {
@@ -156,9 +157,9 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 			if !b.AddDgram(l.Handle(), pk.nextSeq, body, buf) {
 				return placed // the batch is full: the writer self-continues
 			}
+			s.pktPlacedLocked(l, dg, pk.nextSeq, at, d.wide, 0)
 			q.pop().ext.Release() // the batch holds its own reference
 			pk.nextSeq++
-			pk.ctr.Sent++
 			left -= int64(n)
 			placed = true
 		}
@@ -183,7 +184,7 @@ func (s *Session) pktAgeQueueLocked(q *pring, nowNs int64, noData bool) {
 	for q.n > 0 && nowNs-q.front().at > maxAge {
 		at := q.front().at
 		if q.evict() == 0 {
-			continue // a race datagram another lane placed: it was sent
+			continue // a race datagram a placement of which may have left: it was sent
 		}
 		if noData || at < noPathEnd {
 			pk.ctr.DropNoPath++
@@ -197,6 +198,22 @@ func (s *Session) pktAgeQueueLocked(q *pring, nowNs int64, noData bool) {
 func (s *Session) pktHasDataLaneLocked() bool {
 	for _, l := range s.st.order {
 		if l.data && l.state != LaneDead {
+			return true
+		}
+	}
+	return false
+}
+
+// pktCarriableLocked reports whether a live data lane could carry an n-byte
+// datagram at all, now or once it can write: a stream data lane, or a
+// datagram one whose DgramMax is at least n (M2-D45; the wake policy's
+// "ever", pktOtherCarrierLocked).
+func (s *Session) pktCarriableLocked(n int) bool {
+	for _, l := range s.st.order {
+		if !l.data || l.state == LaneDead {
+			continue
+		}
+		if pp, dg := pktDgramLane(l); !dg || pp.DgramMax() >= n {
 			return true
 		}
 	}

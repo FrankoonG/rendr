@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -77,6 +78,19 @@ type dgReader struct {
 	relGen    atomic.Uint64  // the generation the latest idle release returned (after it completed)
 	relHdrGen atomic.Uint64  // the generation of the header releaseHdr returned (the timer's goroutine; published as relGen)
 	woke      atomic.Bool    // the idle release set the read deadline to wake the reader
+	// relMu (one slot, made by startDepth) orders a firing of idleT
+	// against the reader's exit (endDepth), as the passive Source's reader
+	// does (internal/udpflow): a firing holds it for its whole run, and
+	// endDepth takes it, sets ended and stops idleT before the extras go
+	// back, so the reader's partDone — and the carrier's Done — follows a
+	// release in flight (every charge is back) and no firing re-arms the
+	// timer after the exit. A channel rather than a sync.Mutex, so that a
+	// reader waiting for a release in flight is durably blocked in a
+	// synctest bubble (TestDgramReaderExitWaitsForIdleRelease). ended
+	// (under relMu): the reader exited; a firing releases and re-arms
+	// nothing.
+	relMu chan struct{}
+	ended bool
 }
 
 // depthIO is a dialer socket's side of the adaptive receive depth (M5
@@ -120,9 +134,9 @@ type depthIO interface {
 }
 
 // batchIdleRelease is how long a dialer reader may stay parked with its
-// extras before the idle release returns them (R1-5, M5-D61). Tests lower
-// it.
-var batchIdleRelease = time.Second
+// extras before the idle release returns them (R1-5, M5-D61): the shared
+// udpsocket.IdleRelease, the passive Source's period too. Tests lower it.
+var batchIdleRelease = udpsocket.IdleRelease
 
 // flowReadDepth bounds the results one ReadDatagrams call of a flow
 // returns (a flow drains its inbox: no system call, one lock per call;
@@ -293,6 +307,7 @@ func (rd *dgReader) startDepth(c *Conn, d depthIO) {
 		rd.refused = &s.ChargeRefused
 	}
 	d.onRelease(rd.releaseHdr)
+	rd.relMu = make(chan struct{}, 1)
 	rd.idleT = time.AfterFunc(time.Hour, rd.idleFire)
 	rd.idleT.Stop()
 }
@@ -469,14 +484,21 @@ func (rd *dgReader) collect() {
 	}
 }
 
-// endDepth returns the reader's extras when it exits: held ones are taken
-// back from the transport; a stale header whose release still runs is
-// left to the garbage collector.
+// endDepth ends the idle release and returns the reader's extras when it
+// exits: a firing in progress completes first — a release in flight
+// returns its slots and its header's charge before the reader's partDone
+// — and none releases or re-arms after it (relMu, ended: the Stop under
+// relMu cancels a re-arm by the firing that held it); held extras are
+// taken back from the transport, and a stale header, whose release has
+// completed by then, goes back to its pool.
 func (rd *dgReader) endDepth() {
 	if rd.dio == nil {
 		return
 	}
+	rd.relMu <- struct{}{}
+	rd.ended = true
 	rd.idleT.Stop()
+	<-rd.relMu
 	if rd.hdr != nil {
 		rd.shrink(1)
 	}
@@ -499,8 +521,14 @@ func (rd *dgReader) arm() {
 // now, so the header returns to its pool at once (its message array stays
 // referenced by the parked read until it returns). A busy reader costs one
 // O(1) firing per period; the timer touches no traffic (a resource
-// release, not a liveness trigger: invariant 7).
+// release, not a liveness trigger: invariant 7). relMu orders a firing
+// before the reader's exit (endDepth).
 func (rd *dgReader) idleFire() {
+	rd.relMu <- struct{}{}
+	defer func() { <-rd.relMu }()
+	if rd.ended {
+		return
+	}
 	d := rd.dio
 	if d.holding() {
 		seq := d.parks()
