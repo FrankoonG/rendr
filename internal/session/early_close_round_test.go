@@ -18,13 +18,17 @@ import (
 // reservation completes below it"), and a Write that reports n > 0 bytes
 // must see exactly those n bytes delivered: the opening starts, the passive
 // reads them and then io.EOF within Linger. A Write that returns
-// (0, net.ErrClosed) is acceptable too. Never (n > 0) with no factory call.
+// (0, net.ErrClosed) is acceptable too, except in close-settled. Never
+// (n > 0) with no factory call.
 //
 // Rows:
 //   - close: the hook only closes; the Write commits right after it;
 //   - close-settled: the hook waits for the actor's step before the copy,
 //     so the opening starts while the round is still uncommitted (the early
-//     span excludes it; it is sent after the verdict, below the FIN);
+//     span excludes it; it is sent after the verdict, below the FIN). The
+//     actor decided before the commit, so the outcome is fixed (F20): the
+//     Write returns (len, nil), the factory is called and the passive reads
+//     every byte, then io.EOF;
 //   - close-cap: a Write larger than EarlyDataMax; the Close lands in its
 //     first (capped) round, the next round returns net.ErrClosed;
 //   - max0: EarlyDataMax 0, the first Write waits for the verdict, so the
@@ -101,6 +105,12 @@ func TestEarlyCloseDuringFirstWriteDelivers_L03(t *testing.T) {
 				}
 				if r.err != nil && !errors.Is(r.err, net.ErrClosed) {
 					t.Fatalf("Write = (%d, %v), want nil or net.ErrClosed", r.n, r.err)
+				}
+				if tc.settle && (r.n != len(msg) || r.err != nil) {
+					// The opening started before the copy (the hook waited for
+					// the actor's step): the round is committed below the FIN
+					// and delivered after the verdict (F20).
+					t.Fatalf("Write = (%d, %v), want (%d, nil): the round reserved before the Close is delivered after the verdict", r.n, r.err, len(msg))
 				}
 
 				if tc.abort || tc.empty {
