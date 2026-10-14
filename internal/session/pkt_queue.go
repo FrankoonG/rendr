@@ -210,8 +210,9 @@ func (q *pring) evict() int {
 // headPlaced reports whether a placement of the head descriptor may have
 // left (race only: its seq is fixed and not every placement of it was
 // handed back by a dying carrier, pkt_unsent.go; q.n > 0). One whose every
-// placement came back counts as never placed: it leaves the queue counted
-// as a drop.
+// placement came back counts as never placed: evict counts it as a drop
+// (the race head step may move it to the redo list instead,
+// raceHeadLocked).
 func (q *pring) headPlaced() bool {
 	return q.seq != nil && q.seq[q.head] != 0 && q.cellAt(q.cell[q.head]).pc > 0
 }

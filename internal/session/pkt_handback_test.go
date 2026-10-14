@@ -395,19 +395,33 @@ func TestPacketUnsentAgeOrder_L40(t *testing.T) {
 // reads the datagram before io.EOF with no DropLate (the old rule placed
 // the FIN first: the peer delivered io.EOF at its straggler bound and
 // counted the datagram late). selector, and race (the only datagram member
-// placed it, so the redo list holds it). after-peer-fin: a DGRAM handed
-// back after the peer's FIN is DropQueue at once (PA-6: nothing queued is
-// worth sending) and does not hold our FIN. Mutants: the FIN without the
-// redo check (selector; race); a hand-back after the peer's FIN kept.
+// placed it, so the redo list holds it). race-ring: the ring keeps the
+// returned datagram for a member behind it (finAfterReturnedRing).
+// race-too-large, race-too-large-dying: a returned datagram no live member
+// can carry does not hold our FIN (finAfterTooLarge). after-peer-fin: a
+// DGRAM handed back after a peer FIN that came before ours was requested
+// is DropQueue at once (PA-6: nothing queued is worth sending) and does
+// not hold our FIN; after-our-fin: one handed back after the peer's FIN
+// that answered ours is placed again (finAfterOursReturned). Mutants: the
+// FIN without the redo check (selector; race); the race FIN without the
+// ring's returned-datagram check (race-ring); a fully returned head moved
+// to the redo list though no live member can carry it (race-too-large); a
+// hand-back after the peer's FIN kept (after-peer-fin); a hand-back after
+// any peer FIN dropped (after-our-fin).
 func TestPacketFinAfterReturned_L40(t *testing.T) {
 	for _, tc := range []struct {
-		name    string
-		mode    Mode
-		peerFin bool
-	}{{"selector", ModeSelector, false}, {"race", ModeRace, false}, {"after-peer-fin", ModeSelector, true}} {
-		t.Run(tc.name, func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) { finAfterReturned(t, tc.mode, tc.peerFin) })
-		})
+		name string
+		run  func(t *testing.T)
+	}{
+		{"selector", func(t *testing.T) { finAfterReturned(t, ModeSelector, false) }},
+		{"race", func(t *testing.T) { finAfterReturned(t, ModeRace, false) }},
+		{"after-peer-fin", func(t *testing.T) { finAfterReturned(t, ModeSelector, true) }},
+		{"race-ring", finAfterReturnedRing},
+		{"race-too-large", func(t *testing.T) { finAfterTooLarge(t, false) }},
+		{"race-too-large-dying", func(t *testing.T) { finAfterTooLarge(t, true) }},
+		{"after-our-fin", finAfterOursReturned},
+	} {
+		t.Run(tc.name, func(t *testing.T) { synctest.Test(t, tc.run) })
 	}
 }
 
@@ -496,6 +510,236 @@ func finAfterReturned(t *testing.T, mode Mode, peerFin bool) {
 	}
 	if c := dpCtr(b); c.DropLate != 0 || c.Received != 1 {
 		t.Fatalf("the peer's counters %+v: the returned datagram arrived after its FIN", c)
+	}
+	dpEnd(a, io.EOF)
+	dpEnd(b, io.EOF)
+}
+
+// hbDrain runs l's Fill until it appends nothing (as dpIdle) and returns
+// every frame placed meanwhile.
+func hbDrain(l *lane) []dpFrame {
+	var out []dpFrame
+	for range 64 {
+		b := dpFill(l, time.Now())
+		fs := dpFrames(b)
+		b.ReleaseRefs()
+		if len(fs) == 0 {
+			return out
+		}
+		out = append(out, fs...)
+	}
+	panic("hbDrain: the lane never went idle")
+}
+
+// finAfterReturnedRing (race-ring; M5 review, second wave; L40): race with
+// mixed budgets. l1 (1400) placed the datagram, l3 (600) skipped it as too
+// large and is at the queue's end, and l2 (1400) is behind it and
+// write-blocked, so when l1's writer hands it back — before l1's death
+// step, as in production — the ring keeps it for l2 (pkt_unsent.go). After
+// Close l3 places no FIN while it waits (the old rule placed it: l3 had
+// passed every queued datagram and this one had its seq). Once l2's write
+// returns, l2 places the datagram and then our FIN, and the peer reads it
+// before io.EOF with no DropLate.
+func finAfterReturnedRing(t *testing.T) {
+	p := dpNewPair(dpOpt{mode: ModeRace, maxAge: time.Second}, dpOpt{mode: ModeRace}, true, true, true)
+	rcPktRace(p.a.s)
+	rcPktRace(p.b.s)
+	a, b := p.a.s, p.b.s
+	for _, sd := range []*dpSide{&p.a, &p.b} {
+		for _, l := range sd.ls {
+			l.c = &carrier.Conn{}
+		}
+	}
+	l1, l2, l3 := p.a.ls[0], p.a.ls[1], p.a.ls[2]
+	p.a.ps[2].set(func(f *dpPort) { f.budget = 600 })
+	a.mu.Lock()
+	a.pktRecomputeLocked()
+	a.mu.Unlock()
+	for _, l := range p.a.ls {
+		dpIdle(l)
+	}
+	p.a.ps[1].set(func(f *dpPort) { f.blocked = true })
+	dpWrite(t, a, 1, 1000)
+	b1 := dpFill(l1, time.Now())
+	if seqs, _ := rcDgrams(b1); len(seqs) != 1 {
+		t.Fatalf("premise: l1 placed %v, want the datagram", seqs)
+	}
+	if seqs, _ := rcDgrams(dpFill(l3, time.Now())); len(seqs) != 0 {
+		t.Fatalf("premise: l3 placed %v, want none (too large for its budget)", seqs)
+	}
+	if _, n := rcTx(a); n != 1 {
+		t.Fatalf("premise: %d queued, want 1 (l2 is behind it)", n)
+	}
+	dpReturn(l1, b1)
+	dpKill(a, l1)
+	dpKill(b, p.b.ls[0])
+	dpClose(a)
+	b3 := dpFill(l3, time.Now())
+	if fs := dpFrames(b3); dpCount(fs, wire.TypeFin) != 0 {
+		t.Fatalf("l3 placed %v: our FIN must wait for the returned datagram the ring keeps for l2", fs)
+	}
+	if err := dpDeliver(b3, p.b.ls[2], 2, nil); err != nil {
+		t.Fatal(err)
+	}
+	b3.ReleaseRefs()
+	time.Sleep(100 * time.Millisecond) // beyond the peer's EOF straggler bound (50 ms)
+	b.mu.Lock()
+	b.pktPeerFinCheckLocked(time.Now())
+	b.mu.Unlock()
+	p.a.ps[1].set(func(f *dpPort) { f.blocked = false })
+	b2 := dpFill(l2, time.Now())
+	var order []dpFrame
+	for _, f := range dpFrames(b2) {
+		if f.typ == wire.TypeDgram || f.typ == wire.TypeFin {
+			order = append(order, f)
+		}
+	}
+	if len(order) != 2 || order[0].typ != wire.TypeDgram || order[0].seq != 0 || order[1].typ != wire.TypeFin || order[1].fin != 1 {
+		t.Fatalf("once its write returned l2 placed %v, want DGRAM(0) then FIN(1)", order)
+	}
+	if err := dpDeliver(b2, p.b.ls[1], 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	b2.ReleaseRefs()
+	got := dpReadEOF(t, b)
+	if len(got) != 1 || dpID(got[0]) != 1 {
+		t.Fatalf("the peer read %d datagrams before io.EOF, want the returned one", len(got))
+	}
+	if c := dpCtr(b); c.DropLate != 0 || c.Received != 1 {
+		t.Fatalf("the peer's counters %+v: the returned datagram arrived after its FIN", c)
+	}
+	if c := dpCtr(a); c.Sent != 1 || hbDrops(c) != 0 {
+		t.Fatalf("the sender's counters %+v, want Sent 1 and no drop", c)
+	}
+	dpEnd(a, io.EOF)
+	dpEnd(b, io.EOF)
+}
+
+// finAfterTooLarge (race-too-large, race-too-large-dying; M5 review,
+// second wave; M2-D45, L40): race, l1 (1400) placed a 1000-byte datagram
+// and its writer hands it back; l3 (600), the only other member, is behind
+// it and can never carry it. Once l1's death step ran no live member can
+// carry it: l3's Fill after Close counts it DropTooLarge and places our FIN
+// in the same batch (it neither waits in the redo list nor holds the FIN).
+// dying: l3 drains before l1's death step — l1 may still count as a member
+// that can carry it, so it may wait and our FIN with it — and then the
+// death step wakes l3 for whatever is still due: our FIN goes out once and
+// the datagram is counted DropTooLarge once.
+func finAfterTooLarge(t *testing.T, dying bool) {
+	s := dpSession(dpOpt{mode: ModeRace, maxAge: time.Second})
+	l1 := hbRaceLane(s, 1)
+	l3 := hbRaceLane(s, 3)
+	p3 := l3.port.(*dpPort)
+	p3.set(func(f *dpPort) { f.budget = 600 })
+	s.mu.Lock()
+	s.pktRecomputeLocked()
+	s.mu.Unlock()
+	dpIdle(l1)
+	dpIdle(l3)
+	dpWrite(t, s, 1, 1000)
+	b1 := dpFill(l1, time.Now())
+	if seqs, _ := rcDgrams(b1); len(seqs) != 1 {
+		t.Fatalf("premise: l1 placed %v, want the datagram", seqs)
+	}
+	if _, n := rcTx(s); n != 1 {
+		t.Fatalf("premise: %d queued, want 1 (l3 is behind it)", n)
+	}
+	dpReturn(l1, b1)
+	if !dying {
+		dpKill(s, l1)
+		dpClose(s)
+		fs := dpFrames(dpFill(l3, time.Now()))
+		if dpCount(fs, wire.TypeFin) != 1 || dpCount(fs, wire.TypeDgram) != 0 {
+			t.Fatalf("l3's Fill after Close placed %v: want our FIN at once, the datagram no live member can carry counted", fs)
+		}
+		if c := hbIdentity(t, s, 1, "after l3's Fill"); c.DropTooLarge != 1 || c.Sent != 0 || hbDrops(c) != 1 {
+			t.Fatalf("%+v: want the datagram DropTooLarge", c)
+		}
+		dpEnd(s, io.EOF)
+		return
+	}
+	dpClose(s)
+	fs := hbDrain(l3)
+	w0 := p3.wakeCount()
+	dpKill(s, l1)
+	if dpCount(fs, wire.TypeFin) == 0 && p3.wakeCount() == w0 {
+		t.Fatalf("l3 placed %v before l1's death step, and the death step did not wake it for our FIN", fs)
+	}
+	fs = append(fs, hbDrain(l3)...)
+	if dpCount(fs, wire.TypeFin) != 1 || dpCount(fs, wire.TypeDgram) != 0 {
+		t.Fatalf("l3 placed %v by l1's death step: want our FIN once and no DGRAM", fs)
+	}
+	if c := hbIdentity(t, s, 1, "after l1's death step"); c.DropTooLarge != 1 || c.Sent != 0 || hbDrops(c) != 1 {
+		t.Fatalf("%+v: want the datagram DropTooLarge", c)
+	}
+	dpEnd(s, io.EOF)
+}
+
+// finAfterOursReturned (after-our-fin; M5 review, second wave; PA-6, L39,
+// L40): bond, and we close first. Our last datagram is in l1's round, in
+// flight, when our FIN goes out on l2; the peer answers with its FIN at
+// once (PA-6 at the peer) and still waits for seq 0, which is below our
+// final seq. Then l1's round fails and hands seq 0 back. The peer's FIN
+// came after ours was requested, so the send queue was not released and
+// the returned DGRAM follows it: placed again on l2 and read by the peer
+// before io.EOF, with no drop counted (the first wave counted it
+// DropQueue: the peer never got it).
+func finAfterOursReturned(t *testing.T) {
+	p := dpNewPair(dpOpt{mode: ModeBond, maxAge: time.Second}, dpOpt{mode: ModeBond}, true, true)
+	a, b := p.a.s, p.b.s
+	for _, sd := range []*dpSide{&p.a, &p.b} {
+		for _, l := range sd.ls {
+			l.c = &carrier.Conn{}
+			dpIdle(l)
+		}
+	}
+	a1, a2, b2 := p.a.ls[0], p.a.ls[1], p.b.ls[1]
+	dpWrite(t, a, 1, 100)
+	r1 := dpFill(a1, time.Now()) // the round in flight on l1
+	if seqs, _ := rcDgrams(r1); len(seqs) != 1 {
+		t.Fatalf("premise: l1 placed %v, want the datagram", seqs)
+	}
+	p.a.ps[0].b = carrier.NewBatch(0) // keep r1: a later Fill of l1 gets a fresh batch
+	dpClose(a)
+	f2 := dpFill(a2, time.Now())
+	if dpCount(dpFrames(f2), wire.TypeFin) != 1 {
+		t.Fatalf("premise: our FIN on l2: %v", dpFrames(f2))
+	}
+	if err := dpDeliver(f2, b2, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	f2.ReleaseRefs()
+	g2 := dpFill(b2, time.Now())
+	if dpCount(dpFrames(g2), wire.TypeFin) != 1 {
+		t.Fatalf("premise: the peer's FIN follows ours at once: %v", dpFrames(g2))
+	}
+	if err := dpDeliver(g2, a2, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	g2.ReleaseRefs()
+	dpReturn(a1, r1) // l1's round fails now, before l1's death step
+	dpKill(a, a1)
+	dpKill(b, p.b.ls[0])
+	if c := dpCtr(a); hbDrops(c) != 0 {
+		t.Fatalf("returned after the peer's FIN that answered ours: %+v: the peer still waits for it, want no drop", c)
+	}
+	h2 := dpFill(a2, time.Now())
+	if got := hbDgrams(dpFrames(h2)); len(got) != 1 || got[0].seq != 0 || dpID(got[0].body) != 1 {
+		t.Fatalf("l2 placed %v, want the returned seq 0 again", got)
+	}
+	if err := dpDeliver(h2, b2, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	h2.ReleaseRefs()
+	got := dpReadEOF(t, b)
+	if len(got) != 1 || dpID(got[0]) != 1 {
+		t.Fatalf("the peer read %d datagrams before io.EOF, want the returned one", len(got))
+	}
+	if c := dpCtr(a); c.Sent != 1 || hbDrops(c) != 0 {
+		t.Fatalf("the sender's counters %+v, want Sent 1 and no drop", c)
+	}
+	if c := dpCtr(b); c.Received != 1 || c.DropLate != 0 {
+		t.Fatalf("the peer's counters %+v, want the datagram received in time", c)
 	}
 	dpEnd(a, io.EOF)
 	dpEnd(b, io.EOF)

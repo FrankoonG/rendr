@@ -204,6 +204,22 @@ func (s *Session) pktHasDataLaneLocked() bool {
 	return false
 }
 
+// pktCarriableLocked reports whether a live data lane could carry an n-byte
+// datagram at all, now or once it can write: a stream data lane, or a
+// datagram one whose DgramMax is at least n (M2-D45; the wake policy's
+// "ever", pktOtherCarrierLocked).
+func (s *Session) pktCarriableLocked(n int) bool {
+	for _, l := range s.st.order {
+		if !l.data || l.state == LaneDead {
+			continue
+		}
+		if pp, dg := pktDgramLane(l); !dg || pp.DgramMax() >= n {
+			return true
+		}
+	}
+	return false
+}
+
 // pktOtherCarrierLocked reports whether a live data lane other than l
 // (nil: any) can carry an n-byte datagram and wakes it (M2-D45). Datagram
 // lanes come first, as in the wake walk (§A5.2): a datagram that fits a

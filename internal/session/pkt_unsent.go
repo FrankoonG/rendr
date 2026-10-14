@@ -30,10 +30,12 @@ import (
 // the latest no-path episode ended, or ages while no data lane exists),
 // DropTooLarge when no live lane can carry it (M2-D45; a wide one waits
 // for a member that can carry it at all), DropQueue when the redo list is
-// full, the session ended or the peer's FIN arrived (PA-6: nothing queued
-// is worth sending). Sent counts it again at the re-placement, so Sent −
-// PeerReceived covers only the datagrams a transport accepted, and the
-// send-side identity holds.
+// full, the session ended, or the peer's FIN came before ours was
+// requested (PA-6 released the send queues: nothing queued is worth
+// sending; a FIN that answers ours releases nothing, and the returned
+// DGRAM follows the queue). Sent counts it again at the re-placement, so
+// Sent − PeerReceived covers only the datagrams a transport accepted, and
+// the send-side identity holds.
 //
 // Race: a datagram's placements are counted in its cell (pcell, taken at
 // its first placement): pc, the placements not handed back. A placement
@@ -41,17 +43,24 @@ import (
 // pc. While pc stays above 0, another placement left or is in a round that
 // may still hand it back, and the returned copy only leaves Race.Copies.
 // At 0 the datagram leaves Sent: while its descriptor is queued the ring
-// keeps it (a member whose cursor has not passed it places it again, or
-// the head counts it as never placed); otherwise it joins the redo list as
-// above. So Sent counts the datagrams with a placement that may have left
-// and Race.Copies the other such placements: exact for hand-backs (the
-// carriers' refusals stay attributed by raceRefused, an upper bound). A
-// dead lane's record keeps its cells for the maxDying latest deaths, since
-// the last round of its carrier may still come back.
+// keeps it, and a member whose cursor has not passed it places it again;
+// once no live member's cursor is behind it, the head moves it to the redo
+// list while a live member can carry it — the placing members may still
+// be live, their death steps not run — and otherwise counts it as never
+// placed (DropTooLarge, or DropAge or DropNoPath once aged;
+// raceHeadLocked). One whose descriptor had left the ring joins the redo
+// list as above; there a member leaves a head it cannot carry to another
+// and goes on with its own cursor. So Sent counts the datagrams with a
+// placement that may have left and Race.Copies the other such placements:
+// exact for hand-backs (the carriers' refusals stay attributed by
+// raceRefused, an upper bound). A dead lane's record keeps its cells for
+// the maxDying latest deaths, since the last round of its carrier may
+// still come back.
 //
 // At-most-once holds: a returned datagram never left, and its seq is still
 // delivered once by the receiver's dedup window if a transport lied. The
-// FIN waits for the redo list as for the queue (L40; M2 design §A5.6).
+// FIN waits for the redo list as for the queue, and in race for a queued
+// datagram whose every placement came back (L40; M2 design §A5.6).
 
 // maxRedo bounds the redo list: a dying carrier returns at most one
 // round's DGRAMs (≤ MaxBatchFrames), and a few carriers may die together.
@@ -219,7 +228,7 @@ func (p *plane) Unsent(c *carrier.Conn, seq uint64, d []byte, buf *carrier.Buf) 
 // pktUnsentLocked takes back the DGRAM of seq seq that lane l's carrier
 // placed and never wrote (buf's reference moves here).
 func (s *Session) pktUnsentLocked(l *lane, seq uint64, d []byte, buf *carrier.Buf) {
-	pk, st := s.pk, &s.st
+	pk := s.pk
 	r := predo{seq: seq, body: d, buf: buf, at: time.Since(pk.base).Nanoseconds()}
 	if e := l.recFind(seq); e != nil {
 		r.at, r.wide, r.cell = e.at, e.wide, e.cell
@@ -244,20 +253,30 @@ func (s *Session) pktUnsentLocked(l *lane, seq uint64, d []byte, buf *carrier.Bu
 	if pk.ctr.Sent > 0 {
 		pk.ctr.Sent-- // no placement of it left: counted again when it is placed again
 	}
-	switch {
-	case queued:
+	if queued {
 		// Its descriptor is still queued: the ring keeps it. A member
 		// whose cursor has not passed it places it again, or the head
-		// counts it as never placed.
+		// moves it to the redo list or counts it (raceHeadLocked).
 		r.release(&pk.tx)
-	case st.ended || st.peerFinSet || pk.redoN() >= maxRedo:
-		r.release(&pk.tx)
-		pk.ctr.DropQueue++
+	} else if !s.pktRedoLocked(r) {
 		return
-	default:
-		pk.redoPush(r)
 	}
 	s.pktWakeLocked(time.Now())
+}
+
+// pktRedoLocked puts returned DGRAM r on the redo list and reports true, or
+// counts it DropQueue (its references released) when nothing queued is
+// worth sending any more — the session ended, or the peer's FIN came before
+// ours was requested (PA-6) — or the list is full.
+func (s *Session) pktRedoLocked(r predo) bool {
+	pk := s.pk
+	if s.st.ended || pk.peerFirst || pk.redoN() >= maxRedo {
+		r.release(&pk.tx)
+		pk.ctr.DropQueue++
+		return false
+	}
+	pk.redoPush(r)
+	return true
 }
 
 // pktLaneGoneLocked is the packet part of the death step of lane l
@@ -325,7 +344,10 @@ func (pk *packet) redoPop() predo {
 // place it now, or for a wide one that can carry it at all, else
 // DropTooLarge), beyond a stream lane's capacity left (the batch is marked
 // cap-blocked). It reports whether it placed one and whether l's Fill must
-// stop (a full batch, the capacity, or another lane takes the head).
+// stop: a full batch, the capacity, or — selector and bond, where nothing
+// overtakes the head — another lane takes the head. A race member that
+// leaves the head to another goes on with its own cursor (every member
+// places every datagram from its own: M3-D32).
 func (s *Session) placeRedoLocked(l *lane, b *carrier.Batch, dg bool, left *int64) (placed, stop bool) {
 	pk := s.pk
 	if pk.redoN() == 0 {
@@ -349,7 +371,7 @@ func (s *Session) placeRedoLocked(l *lane, b *carrier.Batch, dg bool, left *int6
 		}
 		if dg && n > b.DgramRoom() {
 			if s.pktOtherCarrierLocked(l, n, r.wide) {
-				return placed, true
+				return placed, s.p.Mode != ModeRace
 			}
 			pk.redoPop().release(&pk.tx)
 			pk.ctr.DropTooLarge++
@@ -390,8 +412,9 @@ func (s *Session) pktRedoAgeLocked(nowNs int64) time.Time {
 	return time.Time{}
 }
 
-// pktRedoReleaseLocked drops the redo list at the session's end or at the
-// peer's FIN (nothing queued is worth sending): DropQueue each.
+// pktRedoReleaseLocked drops the redo list at the session's end or at a
+// peer FIN that came before ours was requested (PA-6: nothing queued is
+// worth sending): DropQueue each.
 func (s *Session) pktRedoReleaseLocked() {
 	pk := s.pk
 	for pk.redoN() > 0 {
