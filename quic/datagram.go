@@ -214,20 +214,22 @@ func (d *dgramConn) accept(b []byte) bool {
 // quicRcvQueue datagrams were taken since the pump last found the queue
 // empty - and none since a run that reached quicRcvQueue - is no quic-go
 // drop: the network lost or reordered those datagrams, which no counter
-// claims. Any other gap is counted in IngressDrops: exactly quic-go's
-// drops for in-order arrival. A datagram behind the next expected one
-// (reordered) is delivered, counts nothing and leaves any lag to the
-// datagram that shows the gap; the gap of a drop at the end of a burst is
-// counted when the next datagram arrives.
+// claims. Any other gap is counted in IngressDrops: for in-order arrival
+// every quic-go drop, and a network loss inside such a lag too (the two
+// cannot be told apart), so the count is exact when the network loses
+// none during a lag and an upper bound otherwise. A datagram behind the
+// next expected one (reordered) is delivered, counts nothing and leaves
+// any lag to the datagram that shows the gap; the gap of a drop at the
+// end of a burst is counted when the next datagram arrives.
 //
 // When DATAGRAMs are reordered the count is no bound, and O(1) state
-// cannot tell the cases apart. A network loss or reordering inside a lag
-// is counted too (an over-count). A drop is missed when the datagram that
-// shows its gap was taken before the lag began (a late datagram the full
-// queue dropped after its successor had arrived), or when a late datagram
-// carrying the next expected number arrives after the drain: it ends the
-// lag, and the gap of the drops after it shows at the next datagram
-// (under-counts).
+// cannot tell the cases apart. A datagram reordered inside a lag is
+// counted too and still delivered (an over-count). A drop is missed when
+// the datagram that shows its gap was taken before the lag began (a late
+// datagram the full queue dropped after a later one was queued), or when
+// a late datagram at or above the next expected number arrives after the
+// drain: its own gap is counted, it ends the lag, and the drops numbered
+// above it count nothing (under-counts).
 type rxSeq struct {
 	next uint32 // the sequence number expected next
 	run  int    // datagrams taken since the pump last found quic-go's queue empty

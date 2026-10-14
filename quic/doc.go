@@ -53,15 +53,18 @@
 // is lost. rendr cannot prevent it - the pump never waits while datagrams
 // are queued, nor on rendr's consumer - so the carrier counts these drops
 // in Counters.IngressDrops from the gaps in its sequence numbers, when the
-// next datagram arrives: exactly when DATAGRAMs arrive in order. On a path
-// that reorders the count can be too high (a loss in the network or a
-// reordering during such a lag is counted too) or too low (a drop whose
-// gap was shown before the lag, or shows only after a reordered datagram),
-// so there it is no bound. quic-go's 256-packet queue of
-// unprocessed packets, which drops when its own connection goroutine
-// stalls, is not visible to the carrier: such a loss looks like a network
-// loss. On reordering paths use the raw UDP carrier (carrier/udp) or the
-// QUIC stream carrier.
+// next datagram arrives. When DATAGRAMs arrive in order the count is
+// exact, except that a loss in the network during such a lag is counted
+// too (an upper bound on a path that loses datagrams). On a path that
+// reorders it is no bound: it can be too high (a datagram reordered during
+// such a lag is counted and still delivered) or too low (a late datagram
+// quic-go's full queue dropped after a later one was queued is missed,
+// and once the queue has drained, a late datagram numbered above every
+// one the carrier received hides the drops numbered above it). quic-go's
+// 256-packet queue of unprocessed packets, which drops when its own
+// connection goroutine stalls, is not visible to the carrier: such a loss
+// looks like a network loss. On reordering paths use the raw UDP carrier
+// (carrier/udp) or the QUIC stream carrier.
 //
 // The package uses only rendr's public API: its conns are ordinary embedder
 // conns for rendr's core.

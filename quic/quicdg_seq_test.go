@@ -331,11 +331,13 @@ func TestQUICDatagramEgressDropTakesNoSeq(t *testing.T) {
 // last found it empty, or the first datagram after such a run - and in
 // uint32 serial arithmetic; a reordered datagram counts nothing, counts
 // toward the run (it never starts a lag on a short run) and leaves the lag
-// to the datagram that shows the gap, also after the drain. The
-// two limitation rows pin the documented under-count on a reordering path
-// (Counters.IngressDrops): a drop whose gap a datagram showed before the
-// lag, and drops whose gap shows only after a late datagram carrying the
-// next expected number ended the lag, count nothing.
+// to the datagram that shows the gap, also after the drain. Rows also pin
+// the documented inexact counts (Counters.IngressDrops): in order, a
+// network loss inside a lag counts too (an upper bound); on a reordering
+// path (the limitation rows), a drop whose gap a datagram showed before
+// the lag counts nothing, and a late datagram at or above the next
+// expected number that arrives after the drain ends the lag, so the drops
+// numbered above it count nothing.
 func TestQUICRxSeqAttribution(t *testing.T) {
 	const e = -1 // the pump found quic-go's queue empty
 	run := func(from, n int) []int {
@@ -364,6 +366,9 @@ func TestQUICRxSeqAttribution(t *testing.T) {
 		{"gap after 127 since empty", 0, cat([]int{e}, run(0, 127), []int{200}), 0},
 		{"gap after 128 since empty", 0, cat([]int{e}, run(0, 128), []int{200}), 72},
 		{"gap after the run and an empty queue", 0, cat([]int{e}, run(0, 128), []int{e, 200}), 72},
+		// In order, quic-go dropped nothing and the network lost 128: the
+		// loss counts like a drop (an upper bound).
+		{"network loss inside a lag counts", 0, cat([]int{e}, run(0, 128), []int{e, 129}), 1},
 		{"lag ends with the next datagram", 0, cat([]int{e}, run(0, 128), []int{e, 128, e, 300}), 0},
 		{"gaps all through a long run", 0, cat([]int{e}, run(0, 128), []int{130, 140}), 11},
 		{"reordered inside a lag", 0, cat([]int{e}, run(0, 128), []int{130, 129, 131}), 2},
@@ -378,6 +383,10 @@ func TestQUICRxSeqAttribution(t *testing.T) {
 		// quic-go dropped 129 and 130; 128, delayed, arrives after the
 		// drain as the next expected number and ends the lag.
 		{"limitation: next expected after the drain", 0, cat([]int{e}, run(0, 128), []int{e, 128, 131}), 0},
+		// quic-go dropped 128, 130 and 131; 129, delayed, arrives after
+		// the drain above the next expected number: its own gap (128)
+		// counts, and it ends the lag, so 130 and 131 count nothing.
+		{"limitation: late datagram above next after the drain", 0, cat([]int{e}, run(0, 128), []int{e, 129, 132}), 1},
 		{"serial wrap", 0xffffff00, cat([]int{e}, run(0xffffff00-(1<<32), 128), []int{5}), 133},
 	} {
 		s := rxSeq{next: c.next}
@@ -591,7 +600,7 @@ func TestQUICDatagramSeqBudget_L37(t *testing.T) {
 
 // TestQUICDatagramAcceptNoAlloc: taking a received DATAGRAM over - the
 // sequence check and the move to the ingress queue - and reading it
-// allocate nothing in steady state.
+// allocate nothing in steady state (asserted in the non-race lane, §A10.3).
 func TestQUICDatagramAcceptNoAlloc(t *testing.T) {
 	d := &dgramConn{sinks: []*Counters{{}}}
 	d.in.ring, d.in.max, d.in.wake = make([][]byte, ingressInit), 1<<20, make(chan struct{}, 1)
@@ -607,7 +616,7 @@ func TestQUICDatagramAcceptNoAlloc(t *testing.T) {
 			t.Fatalf("pop: %q, %v", got, err)
 		}
 	})
-	if allocs != 0 {
+	if !raceEnabled && allocs != 0 {
 		t.Errorf("%v allocations per datagram, want 0", allocs)
 	}
 }
@@ -615,7 +624,8 @@ func TestQUICDatagramAcceptNoAlloc(t *testing.T) {
 // TestQUICDatagramSendNoAlloc: one step of the send loop - framing a
 // datagram after its sequence number, handing it to quic-go (a stub here)
 // and classifying the result - allocates nothing, so a sent datagram costs
-// rendr no allocation in steady state (quic-go's own copy aside).
+// rendr no allocation in steady state (quic-go's own copy aside; asserted
+// in the non-race lane, §A10.3).
 // Integrity: each accepted datagram goes out framed after the next number;
 // one refused as too large, or failed otherwise, takes none and is
 // reported (the refusal with quic-go's limit).
@@ -636,7 +646,7 @@ func TestQUICDatagramSendNoAlloc(t *testing.T) {
 			t.Fatalf("step: %v, %v", tl, err)
 		}
 	})
-	if allocs != 0 {
+	if !raceEnabled && allocs != 0 {
 		t.Errorf("%v allocations per sent datagram, want 0", allocs)
 	}
 	const steps = 1001 // AllocsPerRun's warm-up run and 1000
