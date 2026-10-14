@@ -198,14 +198,15 @@ QUIC and carriers:
   10,000 datagrams a second) loses the excess. The DATAGRAM carrier puts
   a 4-byte sequence number before each datagram and counts these drops in
   `Counters.IngressDrops` from the gaps, when the next datagram arrives.
-  The count is exact when DATAGRAMs arrive in order (a network loss inside
-  such an overflow is counted there too). On a path that reorders it is
-  no bound: it can be too high (a datagram reordered during an overflow is
-  counted and still delivered) and too low (a late datagram that quic-go's
-  full queue dropped after a later one had already shown its gap, or drops
-  whose gap shows only after a reordered datagram). A network loss while
-  the carrier kept up, or a drop by quic-go's 256-packet unprocessed-packet
-  queue, stays an uncounted transport loss.
+  When DATAGRAMs arrive in order the count is exact, except that a network
+  loss or a drop by quic-go's 256-packet unprocessed-packet queue during
+  such an overflow counts too; while the carrier keeps up, either stays an
+  uncounted transport loss. On a path that reorders the count is no bound:
+  it can be too high (a datagram reordered during an overflow counts and
+  is still delivered) or too low (a late datagram the full queue dropped
+  after a later one was queued is missed, and once the queue has drained,
+  a late datagram numbered above every one received hides the overflow's
+  drops numbered above it).
 - A QUIC carrier costs about 7–8 goroutines (quic-go's own included), and
   QUIC's late stream close holds one goroutine per handed datagram
   connection.

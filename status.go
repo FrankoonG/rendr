@@ -67,9 +67,9 @@ type DatagramStatus struct {
 	Sources    int    // live FromPacketConn sources
 	Flows      int    // live raw-UDP flows, admitting ones included (bounded, see FromPacketConn)
 	Admitting  int    // flows counted against their source IP address's quotas (≤ 32 OPEN and ≤ 32 JOIN or probe flows per address): from the first datagram until a positive verdict was written for them, their dialer answered an OPEN's address check, or their removal; a source that answers the check is bounded by AcceptBacklog, MaxSessions and Flows instead (see FromPacketConn)
-	Dropped    uint64 // datagrams and frames dropped: malformed, unknown flow, foreign source, duplicate or out-of-window frames, quota, truncated
+	Dropped    uint64 // datagrams and frames dropped: malformed, unknown flow, foreign source, duplicate or out-of-window frames, quota, truncated, a received DGRAM MaxBufferedBytes refused, or a send lost to a transient error
 	Truncated  uint64 // of Dropped: truncated or oversize datagrams
-	InboxDrops uint64 // datagrams a full flow inbox dropped
+	InboxDrops uint64 // datagrams a raw-UDP flow dropped because its inbox was full or MaxBufferedBytes refused them
 	ReadErrors uint64 // transient read errors (ICMP class), backed off and ignored
 	Rebinds    uint64 // raw-UDP flows whose reply address moved after a nonce check
 
@@ -165,7 +165,7 @@ type SessionStatus struct {
 // TxBytes count every copy.
 type RaceCounters struct {
 	CopyBytes uint64 // stream sender: payload bytes placed by a lane below another lane's cursor (extra copies)
-	Copies    uint64 // packet sender: extra placements of datagrams another lane already placed, less the carriers' refusals and the copies a dying carrier handed back unwritten
+	Copies    uint64 // packet sender: extra placements of datagrams another lane already placed, less the carriers' refusals and the copies a dying carrier handed back unwritten (so, like PacketCounters.Sent, it can decrease between two snapshots)
 }
 
 // PacketCounters count the datagrams of one packet session on this side.
@@ -173,15 +173,19 @@ type RaceCounters struct {
 // still queued is in none of them, nor is one a dying carrier handed back
 // unwritten while it waits to be placed again; nothing is queued after the
 // end): a datagram a carrier refused as too large counts in DropTooLarge,
-// not in Sent. A datagram that was sent and not received was lost with a
-// carrier, dropped by the network, or counted in the peer's receive-side
-// drops.
+// not in Sent. A datagram that was sent and not received was lost in
+// flight (dropped by the network, or with a carrier that died), dropped by
+// a carrier of either side or by the peer's raw-UDP flow (counted in
+// Status.Datagram and, for a carrier, in its CarrierStatus.Dropped, or in
+// a QUIC carrier's Counters; not here), or counted in the peer's DropLate.
+// Sent − PeerReceived counts them as far as the peer has reported; during
+// traffic it also holds the datagrams still in flight.
 type PacketCounters struct {
-	Sent          uint64 // handed to a carrier, not refused by it and not handed back unwritten by a carrier that died (such a datagram leaves Sent until it is placed again, or is counted in a drop counter, so Sent can decrease between two snapshots)
+	Sent          uint64 // handed to a carrier, not refused by it and not handed back unwritten by a carrier that died; a refused datagram leaves Sent for DropTooLarge, and a handed-back one leaves it until it is placed again or counted in a drop counter, so Sent can decrease between two snapshots
 	Received      uint64 // accepted from carriers (distinct)
 	Duplicates    uint64 // received again inside the dedup window (the 16,384 datagrams behind the newest received), also after ReadFrom returned io.EOF; in a race session the members' copies of a datagram while they arrive inside the window (copies beyond it count in DropLate)
-	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
-	DropAge       uint64 // send side: not handed to a carrier within Packet.MaxAge of its WriteTo while one existed, also one a dying carrier handed back unwritten that was not placed again within MaxAge of its WriteTo
+	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, still queued or waiting to be placed again at the end or at the peer's FIN, or handed back unwritten by a dying carrier after either or while too many waited
+	DropAge       uint64 // send side: not handed to a carrier, or not placed again after a dying carrier handed it back unwritten, within Packet.MaxAge of its WriteTo while one existed
 	DropTooLarge  uint64 // send side: no live carrier could carry it, a carrier refused it as too large, or a budget shrink left it on a member too small for it while every member that can carry it was write-blocked or at its capacity
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no carrier
 	DropRecvQueue uint64 // receive side: evicted from a full receive queue (the application did not read)
@@ -208,7 +212,7 @@ type MigrationCounts struct {
 // RxBytes, RetxBytes and Frames count this session's traffic only; the
 // estimator (SRTT, MinRTT, Rate, Inflight, Cap) and the datagram fields
 // (MTU, Dropped, Retransmits, Rebinds) are the carrier's, the same for
-// every session on it — a datagram the carrier drops belongs to no
+// every session on it — a datagram the carrier drops is not counted per
 // session — and a dead row keeps the values it had when the session left
 // the carrier.
 type CarrierStatus struct {
@@ -233,7 +237,7 @@ type CarrierStatus struct {
 
 	// Datagram carriers (zero on stream carriers).
 	MTU         int    // current frame budget: bytes of rendr frames per datagram
-	Dropped     uint64 // datagrams and frames this carrier dropped (truncated, malformed, duplicate, out of window, foreign)
+	Dropped     uint64 // datagrams and frames this carrier dropped (truncated, malformed, duplicate, out of window, foreign, a received DGRAM MaxBufferedBytes refused, a send lost to a transient error)
 	Retransmits uint64 // reliable control retransmissions (first datagram included)
 	Rebinds     uint64 // reply-address moves (passive raw-UDP flows)
 
