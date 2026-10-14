@@ -1,6 +1,7 @@
 package mux
 
 import (
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -68,21 +69,44 @@ import (
 // in 3. With both parts: 0
 // failures in 2,371 host -race runs of shallow (the worst direction
 // 0.910), and no sweep cell below 0.910.
+//
+// Lanes (bulkLinks): shallow-late6ms runs only outside -race; the race
+// lane runs deep and shallow with the same bound.
 func TestMuxBulkBothWaysKeepsTheLink(t *testing.T) {
-	for _, c := range []struct {
-		name   string
-		rate   float64
-		buffer int
-		late   time.Duration // the A → B sender starts this much after the B → A sender
-	}{
-		{"deep", 4 << 20, 0, 0},
-		{"shallow", 2 << 20, (2 << 20) / 16, 0},
-		{"shallow-late6ms", 2 << 20, (2 << 20) / 16, 6 * time.Millisecond},
-	} {
+	for _, c := range bulkLinks() {
 		t.Run(c.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) { bulkBothWays(t, c.rate, c.buffer, c.late) })
 		})
 	}
+}
+
+// bulkLink is one Link of TestMuxBulkBothWaysKeepsTheLink.
+type bulkLink struct {
+	name   string
+	rate   float64
+	buffer int
+	late   time.Duration // the A → B sender starts this much after the B → A sender
+}
+
+// bulkLinks returns the Links TestMuxBulkBothWaysKeepsTheLink runs in this
+// lane. The non-race unit and sweep lanes run all three. Under -race
+// shallow-late6ms is left out and deep and shallow run (racebudget:
+// m5-design R4-22's lever, applied by the C-P round 2 decision when the
+// Linux race-unit passes took 289–292 s of their 300-s budget). The row's
+// bound is the same in every lane; shallow-late6ms's check of the write
+// lag is a non-race one, as it fails without the write lag in nearly every
+// run without -race. TestRaceLaneSubtests checks the list against the
+// binary's build.
+func bulkLinks() []bulkLink {
+	links := []bulkLink{
+		{"deep", 4 << 20, 0, 0},
+		{"shallow", 2 << 20, (2 << 20) / 16, 0},
+		{"shallow-late6ms", 2 << 20, (2 << 20) / 16, 6 * time.Millisecond},
+	}
+	if raceEnabled {
+		links = slices.DeleteFunc(links, func(l bulkLink) bool { return l.name == "shallow-late6ms" })
+	}
+	return links
 }
 
 func bulkBothWays(t *testing.T, rate float64, buffer int, late time.Duration) {

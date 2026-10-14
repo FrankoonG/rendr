@@ -1,6 +1,7 @@
 package packet
 
 import (
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -38,18 +39,67 @@ import (
 // jump at once and lost nothing after the heal); integrity, NonBlockingWrite,
 // the attribution of every loss to the link and a clean end with io.EOF.
 // The post-heal loss is logged for the pool follow-up.
+//
+// Lanes (fseqJumpCases): the non-race lanes run all four subtests; under
+// -race a fixed two of them cover each of the row's rules once, with the
+// same bounds.
 func TestPacketFseqJumpRecovery_L43(t *testing.T) {
+	for _, c := range fseqJumpCases() {
+		t.Run(c.name(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { fseqJumpRecovery(t, c.mode, c.both) })
+		})
+	}
+}
+
+// fseqJumpCase is one subtest of TestPacketFseqJumpRecovery_L43: the
+// session's mode, and whether both directions are blackholed (both) or
+// B → A alone (down).
+type fseqJumpCase struct {
+	mode rendr.Mode
+	both bool
+}
+
+func (c fseqJumpCase) name() string {
+	if c.both {
+		return c.mode.String() + "/both"
+	}
+	return c.mode.String() + "/down"
+}
+
+// fseqJumpCases returns the subtests TestPacketFseqJumpRecovery_L43 runs in
+// this lane. The non-race unit and sweep lanes run all four: selector and
+// bond, each down and both. Under -race (racebudget: the C-P round 2
+// decision applies the 21:50 lever as a fixed subset, every bound
+// unchanged) selector/both and bond/down run, and between them they cover
+// each of the row's rules once:
+//   - selector (selector/both): the jumped carrier is the selector's
+//     active carrier, and the session keeps it;
+//   - bond (bond/down): the jumped carrier is the bond's only member, and
+//     the session keeps it;
+//   - down (bond/down): one direction jumps; the dialer's proof PING
+//     crosses the open direction inside the passive's window, and the
+//     PONG in the first frames after the heal proves the jump;
+//   - both (selector/both): both directions jump at the full rate, so the
+//     passive's window jumps too, and each side's proof PING arrives in a
+//     frame a window ahead of the peer's window, which drops the frame and
+//     answers the PING from it (dgJumpClaim).
+//
+// A selector's one-way jump also runs under -race, with its first proof
+// PING lost, in TestPacketFseqJumpProofLost_L43. TestRaceLaneSubtests
+// checks the list against the binary's build.
+func fseqJumpCases() []fseqJumpCase {
+	var cs []fseqJumpCase
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		for _, both := range []bool{false, true} {
-			name := mode.String() + "/down"
-			if both {
-				name = mode.String() + "/both"
-			}
-			t.Run(name, func(t *testing.T) {
-				synctest.Test(t, func(t *testing.T) { fseqJumpRecovery(t, mode, both) })
-			})
+			cs = append(cs, fseqJumpCase{mode, both})
 		}
 	}
+	if raceEnabled {
+		cs = slices.DeleteFunc(cs, func(c fseqJumpCase) bool {
+			return c.name() != "selector/both" && c.name() != "bond/down"
+		})
+	}
+	return cs
 }
 
 func fseqJumpRecovery(t *testing.T, mode rendr.Mode, both bool) {
