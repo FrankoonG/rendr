@@ -361,7 +361,11 @@ func TestSourceIdleReleaseRace(t *testing.T) {
 // regrow after it allocate nothing — the parked read's extras go back to
 // the Source's pools (the Batch to s.rpool, the slots to DBufs), the read
 // moves its datagram into slot 0, and the read after it at depth 32 takes
-// them from those pools again.
+// them from those pools again. The row relies on one P: AllocsPerRun runs
+// its cycles with GOMAXPROCS 1, and the release here completes before the
+// regrow, so the Batch it puts back rests in that P's pool. With several
+// Ps, or a release still in flight, a regrow may allocate one (setIO);
+// steady-state reads never do (TestSourceBatchStepZeroAllocs_L54).
 func TestSourceIdleRegrowZeroAllocs(t *testing.T) {
 	env := testEnv(1 << 30)
 	hb, hs := srcHold(env)
@@ -758,16 +762,16 @@ func TestSourceIdleReleaseProductionReader(t *testing.T) {
 // test lowered it (idlePeriod).
 var defaultIdleRelease = batchIdleRelease
 
-// TestBatchIdleReleaseShared (srcidle review): the Source's idle release
-// has the dialer reader's period — internal/carrier's batchIdleRelease,
-// which that package's TestBatchIdleReleaseShared pins — and the root
-// package's TestIdlePacketListenerBufferedBytesZero_plan774 bounds its
-// waits by 2 × that period (its idleRelease): all three are 1 s (M5
-// design R1-5 rule 3). A change of one fails here or there until the
-// three agree again.
+// TestBatchIdleReleaseShared (srcidle review; one shared period): the
+// Source's idle release takes the shared udpsocket.IdleRelease — the
+// dialer reader's period too, which internal/carrier's
+// TestBatchIdleReleaseShared pins there — and that is 1 s (M5 design R1-5
+// rule 3), by which the root package's
+// TestIdlePacketListenerBufferedBytesZero_plan774 bounds its waits. A
+// Source given another default, or a shared value that moved, fails here.
 func TestBatchIdleReleaseShared(t *testing.T) {
-	if defaultIdleRelease != time.Second {
-		t.Fatalf("batchIdleRelease %v: internal/carrier's batchIdleRelease and the root package's idleRelease are 1 s; change the three together",
-			defaultIdleRelease)
+	if defaultIdleRelease != udpsocket.IdleRelease || udpsocket.IdleRelease != time.Second {
+		t.Fatalf("batchIdleRelease %v, udpsocket.IdleRelease %v: the Source takes the shared idle-release period, 1 s (R1-5 rule 3)",
+			defaultIdleRelease, udpsocket.IdleRelease)
 	}
 }

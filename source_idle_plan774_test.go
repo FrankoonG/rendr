@@ -8,6 +8,7 @@ import (
 
 	"github.com/FrankoonG/rendr/v2"
 	"github.com/FrankoonG/rendr/v2/carrier/udp"
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
@@ -16,11 +17,13 @@ import (
 // decision amends them): real loopback sockets, outside synctest bubbles.
 
 const (
-	// idleRelease is internal/udpflow's and internal/carrier's
-	// batchIdleRelease (unexported, 1 s; each package's
-	// TestBatchIdleReleaseShared pins it there): a batching reader returns
-	// its extras within 2 × idleRelease of its last datagram.
-	idleRelease = time.Second
+	// idleRelease is the readers' shared idle-release period,
+	// udpsocket.IdleRelease (1 s): internal/udpflow's and
+	// internal/carrier's batchIdleRelease take it as their default, and
+	// each package's TestBatchIdleReleaseShared pins it there. A batching
+	// reader returns its extras within 2 × idleRelease of its last
+	// datagram.
+	idleRelease = udpsocket.IdleRelease
 	// idleSlack is this row's scheduling allowance on top of
 	// 2 × idleRelease (a real-socket row on a loaded host; the bound
 	// itself is proved exactly by internal/udpflow's

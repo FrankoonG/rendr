@@ -465,6 +465,13 @@ func (e *countError) Error() string {
 	return fmt.Sprintf("rendr: conn %s returned invalid count %d (buffer %d)", e.op, e.n, e.max)
 }
 
+// Is matches ErrWriteCount for the count of a write (Write, WriteTo): a
+// datagram writer then hands back none of the datagrams the call was
+// given, which may have left (L42; dgOutcome).
+func (e *countError) Is(target error) bool {
+	return target == ErrWriteCount && (e.op == "Write" || e.op == "WriteTo")
+}
+
 // errZeroRead and errZeroWrite: a Read or Write that returned (0, nil) is a
 // transport error (L01, L42): a reliable stream that makes no progress and
 // reports no error is broken.
