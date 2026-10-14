@@ -92,8 +92,10 @@ type DialSpec struct {
 // session with that error instead (Read and Write return it, Done closes,
 // EventSessionEnd carries it). Before the verdict Write admits at most
 // Params.EarlyDataMax bytes in all; a Close keeps its linger meaning and
-// an Abort withdraws (early_dial.go). ctx is not used after the return. A
-// packet session with EarlyReturn fails at once with ErrProtocol.
+// an Abort withdraws (early_dial.go). A session never triggered ends with
+// ErrIdleTimeout once its IdleTimeout passed since Dial, sending nothing
+// (K21). ctx is not used after the return. A packet session with
+// EarlyReturn fails at once with ErrProtocol.
 //
 // A packet session (Params.Kind == wire.KindDatagram, M2 design §A5.4,
 // §A5.12) sends OPEN with its MaxPayload offer (Params.Packet.MaxPayload)
@@ -173,9 +175,15 @@ func dial(ctx context.Context, env *Env, spec DialSpec, h healthSource) (*Sessio
 	}
 	if spec.EarlyReturn {
 		// M4-D9: no attempt before the trigger; the actor runs at the
-		// first ring (a trigger's startOpen, Close, a health snapshot).
+		// first ring (a trigger's startOpen, Close, a health snapshot,
+		// SetIdleTimeout). With an IdleTimeout it runs one step now, which
+		// arms the idle deadline of a session that is never used (K21,
+		// earlyIdleLocked), and parks.
 		d.deferred.Store(true)
 		s.mb.actor.Store(a)
+		if p.IdleTimeout > 0 {
+			a.kick()
+		}
 		return s, nil
 	}
 	d.started = true

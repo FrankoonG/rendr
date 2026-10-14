@@ -1059,7 +1059,7 @@ func TestCodecZeroAllocs_L41_L44(t *testing.T) {
 			sinkVerdict = fw.Accept(fseq)
 			sinkVerdict = fw.Accept(fseq - 1)
 			sinkVerdict = fw.Accept(fseq - 1)
-			sinkVerdict = fw.Accept(fseq - 2000)
+			sinkVerdict = fw.Accept(fseq - 2*FseqWindowBits) // late
 		},
 		"SeqWindow": func() {
 			seq += 2

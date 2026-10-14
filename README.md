@@ -411,7 +411,9 @@ _, err = conn.Read(buf)          // a refusal or ErrNoPath arrives here instead 
 - `Dial` returns after its local checks, before any network I/O and
   without the cold-start wait for probe samples. The session opens with
   its first `Write`, `Read` or `CloseWrite`; a `Close` before any of them
-  sends nothing.
+  sends nothing. An idle limit (`Config.IdleTimeout`, `Conn.SetIdleTimeout`,
+  `l4.Dial`'s 10 minutes) counts from `Dial`: a session that is never used
+  ends with `ErrIdleTimeout` and sends nothing either.
 - The first bytes written, up to `Handshake.EarlyDataMax` (64 KiB; 0–64 KiB),
   leave in the same carrier write as the OPEN when the session dials a
   carrier of its own, so the first answer arrives about one round trip

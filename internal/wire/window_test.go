@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"testing"
+	"unsafe"
 )
 
 // fseqModel is a map model of FseqWindow's specification (M2 design
@@ -33,8 +34,9 @@ func (m *fseqModel) accept(f uint32) WindowVerdict {
 		if f-m.top >= FseqWindowBits {
 			return WindowAhead
 		}
-		// Forget what leaves the window: the d numbers from top − 1023 on
-		// (so a number seen one lap of 2^32 ago is never taken for seen).
+		// Forget what leaves the window: the d numbers from
+		// top − (FseqWindowBits − 1) on (so a number seen one lap of 2^32
+		// ago is never taken for seen).
 		for v := m.top - (FseqWindowBits - 1); v != f-(FseqWindowBits-1); v++ {
 			delete(m.seen, v)
 		}
@@ -218,11 +220,12 @@ func lapGaps(width, start uint64, accept func(uint64) WindowVerdict) string {
 	return ""
 }
 
-// TestFseqWindow_L43_L14: the datagram fseq window (M2-D13, plan:333) —
+// TestFseqWindow_L43_L14: the datagram fseq window (M2-D13, plan:333; its
+// width W = FseqWindowBits, m5 PA-85, TestFseqWindowCoversInFlight_L39) —
 // Init makes everything before the first fseq "seen"; a reordered fseq
-// inside the 1024-frame window is accepted once (not strict +1), a repeated
-// one is a duplicate, one 1024 or more behind the newest is late; one 1024
-// or more ahead is reported and moves nothing (m3 FSEQJUMP: a frame of
+// inside the W-frame window is accepted once (not strict +1), a repeated
+// one is a duplicate, one W or more behind the newest is late; one W or
+// more ahead is reported and moves nothing (m3 FSEQJUMP: a frame of
 // another carrier direction never black-holes this one), and Jump takes it
 // and clears the window; u32 serial arithmetic across 2^32 (L14:
 // a preset near the limit wraps and keeps accepting); after a full lap,
@@ -231,6 +234,7 @@ func lapGaps(width, start uint64, accept func(uint64) WindowVerdict) string {
 // random reordering, duplication, loss and jumps, and in a phase without
 // jumps that laps the ring many times; no allocation.
 func TestFseqWindow_L43_L14(t *testing.T) {
+	const W = FseqWindowBits
 	var w FseqWindow
 	expect := func(f uint32, want WindowVerdict) {
 		t.Helper()
@@ -238,12 +242,12 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 			t.Fatalf("Accept(%#x) = %d, want %d", f, got, want)
 		}
 	}
-	// Init: the 1024 fseqs before first are seen, older ones late.
+	// Init: the W fseqs before first are seen, older ones late.
 	first := uint32(100)
 	w.Init(first)
 	expect(first-1, WindowDuplicate)
-	expect(first-1-1023, WindowDuplicate) // wraps below 0: serial arithmetic
-	expect(first-1-1024, WindowLate)
+	expect(first-1-(W-1), WindowDuplicate) // wraps below 0: serial arithmetic
+	expect(first-1-W, WindowLate)
 	expect(first, WindowNew)
 	expect(first, WindowDuplicate)
 	// Loss and reordering: a gap is skipped, the late arrival is new once.
@@ -254,39 +258,39 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 	for f := uint32(103); f < 110; f++ {
 		expect(f, WindowNew)
 	}
-	// The window edge: 1023 behind the newest is inside, 1024 late.
+	// The window edge: W − 1 behind the newest is inside, W late.
 	top := uint32(110)
-	expect(top-1023, WindowDuplicate) // before first: seen since Init
-	expect(top-1024, WindowLate)
-	// A jump of exactly 1023 keeps one old bit; 1024 or more clears all.
-	expect(top+1023, WindowNew)
+	expect(top-(W-1), WindowDuplicate) // before first: seen since Init
+	expect(top-W, WindowLate)
+	// A move of exactly W − 1 keeps one old bit; W or more clears all.
+	expect(top+(W-1), WindowNew)
 	expect(top, WindowDuplicate)
-	expect(top+1, WindowNew) // passed over by the jump: new
+	expect(top+1, WindowNew) // passed over by the move: new
 	expect(top-1, WindowLate)
-	top += 1023
-	for _, jump := range []uint32{1024, 1025, 4096, 1 << 20, 1<<31 - 1} {
+	top += W - 1
+	for _, jump := range []uint32{W, W + 1, 4 * W, 1 << 20, 1<<31 - 1} {
 		// Ahead: nothing moves — the window still holds its newest and its
 		// far edge, and the next in order is new.
 		expect(top+jump, WindowAhead)
 		expect(top+jump, WindowAhead)
 		expect(top, WindowDuplicate)
-		expect(top-1024, WindowLate)
+		expect(top-W, WindowLate)
 		top++
 		expect(top, WindowNew)
 		// Jump takes it: only the newest is seen.
 		top += jump - 1
 		w.Jump(top)
 		expect(top, WindowDuplicate)
-		expect(top-1, WindowNew)    // inside the new window, never seen
-		expect(top-1023, WindowNew) // the far edge, cleared by the jump
-		expect(top-1023, WindowDuplicate)
-		expect(top-1024, WindowLate)
+		expect(top-1, WindowNew)     // inside the new window, never seen
+		expect(top-(W-1), WindowNew) // the far edge, cleared by the jump
+		expect(top-(W-1), WindowDuplicate)
+		expect(top-W, WindowLate)
 	}
 	// 2^31 ahead is not newer in serial arithmetic: late, never a jump.
 	expect(top+1<<31, WindowLate)
 	expect(top, WindowDuplicate)
-	// A move inside one window is taken bit by bit: 1023 ahead is new.
-	expect(top+1023, WindowNew)
+	// A move inside one window is taken bit by bit: W − 1 ahead is new.
+	expect(top+(W-1), WindowNew)
 
 	// L14: an fseq preset at the u32 limit keeps working across the wrap.
 	w.Init(0xfffffffe)
@@ -317,7 +321,8 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 
 	// Against the map model: random reordering, duplication, loss and
 	// jumps, from several starts (also across the wrap); then without jumps,
-	// so the window laps its ring more than 20 times.
+	// so the window laps its ring more than 20 times (20 · W steps: about
+	// 1.4 forward per step).
 	rng := rand.New(rand.NewPCG(43, 14))
 	for _, first := range []uint32{1, 0xfffffc00, 0x7fffffff, 0xfffffffe} {
 		for _, jumps := range []bool{true, false} {
@@ -325,7 +330,11 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 			m := newFseqModel(first)
 			counts := [4]int{}
 			taken := 0
-			for range 20000 {
+			steps := 20000
+			if !jumps {
+				steps = max(steps, 20*W)
+			}
+			for range steps {
 				d, arbitrary := randDelta(rng, FseqWindowBits, jumps)
 				f := m.top + uint32(d)
 				if arbitrary {
@@ -366,7 +375,7 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 		sinkVerdict = w.Accept(f)
 		sinkVerdict = w.Accept(f - 1)
 		sinkVerdict = w.Accept(f - 1)
-		sinkVerdict = w.Accept(f - 5000)
+		sinkVerdict = w.Accept(f - 2*W) // late
 	}); a != 0 && !raceEnabled {
 		t.Errorf("FseqWindow.Accept: %v allocs", a)
 	}
@@ -378,6 +387,53 @@ func TestFseqWindow_L43_L14(t *testing.T) {
 		}
 	}); grew && !raceEnabled {
 		t.Errorf("FseqWindow allocated while accepting 400,000 fseqs")
+	}
+}
+
+// TestFseqWindowCoversInFlight_L39: the datagram replay window covers the
+// frames in flight at the design maximum (L39; m5 PA-85, amending
+// plan:333's 1,024): 8,192 frames, 82 ms at G3-100k's 100,000 frames per
+// second, whose 20-ms round trip holds about 2,000 (M5-D27). A frame 8,191
+// ahead of the newest — 8,190 lost before it — moves the window like any
+// loss: it is new, the lost frames are new once when they arrive late and
+// the newest before the loss is still inside, a duplicate. A frame 8,192
+// or more ahead is a forward jump the caller must prove (WindowAhead). The
+// window's bitmap is 1 KiB per carrier direction.
+func TestFseqWindowCoversInFlight_L39(t *testing.T) {
+	const window = 8192 // PA-85
+	if inFlight := 100000 * 20 / 1000; window < 4*inFlight {
+		t.Fatalf("a %d-frame window holds less than four round trips of %d frames in flight", window, inFlight)
+	}
+	var w FseqWindow
+	for _, first := range []uint32{1000, 0xffffff00} { // also across the wrap (L14)
+		w.Init(first)
+		if got := w.Accept(first); got != WindowNew {
+			t.Fatalf("Accept(first %#x) = %d", first, got)
+		}
+		if got := w.Accept(first + window - 1); got != WindowNew {
+			t.Fatalf("a frame %d ahead (%d lost before it): Accept = %d, want new: the window must cover the loss", window-1, window-2, got)
+		}
+		for _, f := range []uint32{first + 1, first + window/2, first + window - 2} {
+			if got := w.Accept(f); got != WindowNew {
+				t.Fatalf("a lost frame %#x arriving late: Accept = %d, want new", f, got)
+			}
+		}
+		if got := w.Accept(first); got != WindowDuplicate {
+			t.Fatalf("the newest before the loss, %#x: Accept = %d, want duplicate (inside the window)", first, got)
+		}
+		top := first + window - 1
+		if got := w.Accept(top + window); got != WindowAhead {
+			t.Fatalf("a frame %d ahead: Accept = %d, want ahead (a jump to prove)", window, got)
+		}
+		if got := w.Accept(top + window - 1); got != WindowNew {
+			t.Fatalf("a frame %d ahead: Accept = %d, want new", window-1, got)
+		}
+	}
+	if n := unsafe.Sizeof(w.bits); n != window/8 {
+		t.Fatalf("the window's bitmap is %d bytes, want %d", n, window/8)
+	}
+	if n := unsafe.Sizeof(w); n > window/8+8 {
+		t.Fatalf("the window is %d bytes, want at most %d", n, window/8+8)
 	}
 }
 
