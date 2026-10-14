@@ -95,12 +95,20 @@ func frozenModuleRoot(mod string) (string, error) {
 	}
 }
 
-// frozenHashes walks the module at root as its zip would carry it (no "."
-// or "_" directory, no nested module) and returns the SHA-256 of every
-// file under a testdata directory, fuzz corpora and self excepted, by its
-// slash path relative to root.
+// frozenVCSDirs are the version-control directories a module zip leaves
+// out at any depth (golang.org/x/mod/zip).
+var frozenVCSDirs = map[string]bool{".bzr": true, ".git": true, ".hg": true, ".svn": true}
+
+// frozenHashes walks the module at root and returns the SHA-256 of every
+// file in a testdata tree, fuzz corpora (testdata/fuzz) and self excepted,
+// by its slash path relative to root. It leaves out what the module's zip
+// leaves out (a nested module, a version-control directory) and looks for
+// testdata trees only outside directories whose names start with "." or
+// "_" (the go command ignores those, the zip does not); inside a testdata
+// tree every file counts.
 func frozenHashes(root, self string) (map[string]string, error) {
 	out := map[string]string{}
+	inTestdata := func(rel string) bool { return strings.Contains("/"+path.Dir(rel)+"/", "/testdata/") }
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -115,8 +123,8 @@ func frozenHashes(root, self string) (map[string]string, error) {
 				return nil
 			}
 			name := d.Name()
-			if strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") ||
-				(name == "fuzz" && path.Base(path.Dir(rel)) == "testdata") {
+			if frozenVCSDirs[name] || (name == "fuzz" && path.Base(path.Dir(rel)) == "testdata") ||
+				(!inTestdata(rel) && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_"))) {
 				return filepath.SkipDir
 			}
 			if _, err := os.Stat(filepath.Join(p, "go.mod")); err == nil {
@@ -124,7 +132,7 @@ func frozenHashes(root, self string) (map[string]string, error) {
 			}
 			return nil
 		}
-		if !d.Type().IsRegular() || rel == self || !strings.Contains("/"+path.Dir(rel)+"/", "/testdata/") {
+		if !d.Type().IsRegular() || rel == self || !inTestdata(rel) {
 			return nil
 		}
 		b, err := os.ReadFile(p)
@@ -203,17 +211,21 @@ func frozenDiff(want, got map[string]string) string {
 }
 
 // TestQUICGoldenFrozenSelf checks the guard's own parts on a synthetic
-// module: the walk finds testdata files at any depth and leaves out fuzz
-// corpora, the list itself, "." and "_" directories, nested modules and
-// files outside testdata; the diff reports a changed, an added and a
-// removed file; the list format round trips and refuses malformed and
-// repeated lines.
+// module: the walk finds testdata files at any depth, inside "." and "_"
+// directories of a testdata tree too, and leaves out fuzz corpora, the
+// list itself, version-control directories, "." and "_" directories above
+// a testdata tree, nested modules and files outside testdata; the diff
+// reports a changed, an added and a removed file; the list format round
+// trips and refuses malformed and repeated lines.
 func TestQUICGoldenFrozenSelf(t *testing.T) {
 	root := t.TempDir()
 	files := map[string]string{
 		"go.mod":                    "module example.com/m\n",
 		"a/testdata/v.txt":          "v",
 		"a/testdata/sub/deep.bin":   "d",
+		"a/testdata/_v/a.txt":       "underscore inside",
+		"a/testdata/.v/a.txt":       "dot inside",
+		"a/testdata/.git/HEAD":      "vcs",
 		"a/testdata/frozen.sha256":  "self",
 		"a/testdata/fuzz/F/seed":    "fuzz",
 		"a/notes.txt":               "not a vector",
@@ -241,7 +253,7 @@ func TestQUICGoldenFrozenSelf(t *testing.T) {
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
-	if want := "a/testdata/sub/deep.bin a/testdata/v.txt b/c/testdata/x/testdata.y"; strings.Join(paths, " ") != want {
+	if want := "a/testdata/.v/a.txt a/testdata/_v/a.txt a/testdata/sub/deep.bin a/testdata/v.txt b/c/testdata/x/testdata.y"; strings.Join(paths, " ") != want {
 		t.Errorf("walk found %q, want %q", paths, want)
 	}
 	if sum := sha256.Sum256([]byte("v")); got["a/testdata/v.txt"] != hex.EncodeToString(sum[:]) {
