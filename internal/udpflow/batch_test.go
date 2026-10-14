@@ -299,8 +299,10 @@ func TestSourceMaxBatchOne(t *testing.T) {
 			if len(got) != 41 || slices.ContainsFunc(offered, func(n int) bool { return n != 1 }) {
 				t.Fatalf("41 queued datagrams: reads offered %v, moved %v; want one per call", offered, got)
 			}
-			if u := buffered(env); u != 41*slotBytes(env, seamDgram) {
-				t.Fatalf("%d bytes buffered: depth 1 holds no extras", u)
+			// The 41 queued datagrams and, since inboxtime, the inbox's one
+			// pooled block beyond its first 8 entries (Stages, R3-28).
+			if u, want := buffered(env), 41*slotBytes(env, seamDgram)+int64(pooledFor(41))*blockBytes; u != want {
+				t.Fatalf("%d bytes buffered, want %d: depth 1 holds no extras", u, want)
 			}
 		})
 	})

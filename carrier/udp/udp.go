@@ -92,6 +92,21 @@ type Options struct {
 	// ReadBuffer and WriteBuffer size the socket buffers, best effort: 0
 	// selects 4 MiB and 1 MiB (on Linux raised past rmem_max/wmem_max with
 	// the FORCE options when the process may).
+	//
+	// A Listen socket's ReadBuffer also bounds what each carrier it serves
+	// may queue in rendr: the datagrams that arrived for the carrier and
+	// were not delivered yet, each held in a rendr buffer of at most the
+	// socket's MaxDatagram size class (2,112 bytes at the default
+	// MaxDatagram), up to ReadBuffer bytes of such buffers per carrier and
+	// never fewer than the 32 datagrams one read of the socket returns. The
+	// queue thus follows the socket buffer the embedder sized: a carrier
+	// whose reader falls behind loses nothing while its queue holds less
+	// (the default 4 MiB holds about 20 ms at 100,000 datagrams a second).
+	// Queued datagrams count in rendr.Status.BufferedBytes and stay within
+	// Config.MaxBufferedBytes; one that finds its carrier's queue full, or
+	// the budget used up, is dropped and counted in
+	// rendr.Status.Datagram.InboxDrops. Any other net.PacketConn given to
+	// rendr.FromPacketConn queues at most 512 datagrams per carrier.
 	ReadBuffer, WriteBuffer int
 	// MaxBatch is the most datagrams one send or receive system call moves
 	// on Linux amd64/arm64 (sendmmsg, recvmmsg): 0 or a negative value
@@ -114,6 +129,14 @@ type Options struct {
 // the routing table chooses, not necessarily the address a datagram
 // arrived at (rendr does not use IP_PKTINFO). Bind a specific address on a
 // multi-homed host.
+//
+// Each carrier the socket serves queues the datagrams its reader has not
+// taken yet, up to Options.ReadBuffer bytes of datagram buffers and at
+// least 32 datagrams: the per-carrier queue follows the read buffer, so
+// size it for the longest pause of a carrier's reader as well as for the
+// socket (see Options.ReadBuffer). The queued datagrams, and the queue's
+// entries beyond its first 8, count in rendr.Status.BufferedBytes while
+// they are held.
 //
 // Where the socket reads several datagrams per call (Linux amd64 and
 // arm64, Options.MaxBatch ≥ 2), its source holds up to

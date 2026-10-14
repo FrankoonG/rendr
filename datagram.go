@@ -86,8 +86,11 @@ func (packetSource) isSource() {}
 // counted, and nothing is allocated for it. Flows are bounded: at most 32
 // admitting flows per source IP address for OPENs and 32 for JOINs and
 // probes, and MaxSessions × MaxCarriersPerSession + Sessionless.Total +
-// Handshake.MaxConcurrent flows in all (at most 65,536); every flow's
-// inbox holds at most 512 datagrams (see Status.Datagram). A flow is
+// Handshake.MaxConcurrent flows in all (at most 65,536); a flow's inbox
+// holds the datagrams its reader has not taken yet, up to the socket's read
+// buffer in bytes for a socket from carrier/udp's Listen (see its
+// Options.ReadBuffer) and at most 512 datagrams for any other
+// net.PacketConn (see Status.Datagram). A flow is
 // admitting from its first datagram until a positive verdict was written
 // for it or, for an OPEN, until its dialer answered the address check of
 // the passive's first answer, which proves that the source receives the
