@@ -168,8 +168,25 @@ func misreportedOnce(t *testing.T, mode rendr.Mode, alone bool) {
 	}
 
 	// Once: every request reached the passive once, none was sent twice.
-	if r := echo.reads.Load(); r != clRequests || ds.Sent != clRequests || ds.PeerReceived != clRequests || drops(&ds) != 0 {
-		t.Fatalf("a request was lost: the passive read %d of %d; dialer %+v", r, clRequests, ds)
+	// PA-86 (bond): the victim's death sends DOWN on u2 in the instant the
+	// misreported datagram left on the victim; both cross one one-way
+	// delay, and in virtual time they arrive in the same instant, so the
+	// DOWN may end the passive's end of the victim before that datagram is
+	// read: a datagram in flight on a dead carrier (L39), lost and counted
+	// in the dialer's Sent − PeerReceived. Only that datagram — the request
+	// written at the stimulus — may be missing, never another, and never a
+	// duplicate.
+	stimSeq := uint64(at.Sub(start) / clGap)
+	var missing []uint64
+	for seq := range uint64(clRequests) {
+		if _, read := echo.echoedAt(seq); !read {
+			missing = append(missing, seq)
+		}
+	}
+	excused := mode == rendr.ModeBond && len(missing) == 1 && missing[0] == stimSeq
+	if r := echo.reads.Load(); len(missing) != 0 && !excused || uint64(r) != ds.PeerReceived || ds.Sent != clRequests ||
+		ds.Sent-ds.PeerReceived != uint64(len(missing)) || drops(&ds) != 0 {
+		t.Fatalf("a request was lost: the passive read %d of %d (missing %v; the misreported request %d); dialer %+v", r, clRequests, missing, stimSeq, ds)
 	}
 	if res := echo.v.Result(); ps.Duplicates != 0 || res.Duplicates+res.Corrupt+res.BadSize != 0 {
 		t.Fatalf("the passive counted %d duplicates (integrity %+v): the misreported datagram, which left, was sent again", ps.Duplicates, res)

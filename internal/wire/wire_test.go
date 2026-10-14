@@ -817,19 +817,20 @@ func TestParseHeaderRules_L44(t *testing.T) {
 			}
 		}
 	}
-	if accepted != 18+128 {
-		t.Fatalf("%d type bytes accepted, want 18 core (13 of M1, 4 of M2, DETACH of M3) + 128 extension", accepted)
+	if accepted != 19+128 {
+		t.Fatalf("%d type bytes accepted, want 19 core (13 of M1, 4 of M2, DETACH of M3, DOWN of M5) + 128 extension", accepted)
 	}
 	// Unassigned core types — 0x52 ('R') never — are ErrType. The M2 types
 	// 0x20, 0x21, 0x34 and 0x35 are known since M2 (§A8.7), DETACH 0x36
-	// since M3 (M3 design §A3.4); all are swept above.
-	for _, ty := range []byte{0x00, 0x05, 0x15, 0x22, 0x37, 0x7f, 'R'} {
+	// since M3 (M3 design §A3.4), DOWN 0x37 since M5 (PA-86); all are
+	// swept above.
+	for _, ty := range []byte{0x00, 0x05, 0x15, 0x22, 0x38, 0x7f, 'R'} {
 		if _, err := ParseHeader(hdr(ty, 0, 9, 1)); !errors.Is(err, ErrType) {
 			t.Errorf("type %#x: %v, want ErrType", ty, err)
 		}
 	}
-	for _, ty := range []Type{TypeDgram, TypePack, TypeRel, TypeRack, TypeDetach} {
-		if !ty.Known() || ty.Extension() || ty.CarrierLevel() != (ty == TypeRel || ty == TypeRack || ty == TypeDetach) {
+	for _, ty := range []Type{TypeDgram, TypePack, TypeRel, TypeRack, TypeDetach, TypeDown} {
+		if !ty.Known() || ty.Extension() || ty.CarrierLevel() != (ty == TypeRel || ty == TypeRack || ty == TypeDetach || ty == TypeDown) {
 			t.Errorf("%v: known %v, carrier level %v", ty, ty.Known(), ty.CarrierLevel())
 		}
 	}
@@ -1044,8 +1045,9 @@ func TestCodecZeroAllocs_L41_L44(t *testing.T) {
 		"PutRack":       func() { sinkN = PutRack(dst, &rk) },
 		"PutFlowHeader": func() { PutFlowHeader(dst, gFlow) },
 		"PutDetach":     func() { sinkN = PutDetach(dst, &Detach{Handle: 0xffffffff, Reason: DetachRetired}) },
+		"PutDown":       func() { sinkN = PutDown(dst, 0xffffffff) },
 		"helpers": func() {
-			sinkBool = Wrappable(TypePack) || Wrappable(TypeDetach) || IsPreface(dst[:PrefaceLen])
+			sinkBool = Wrappable(TypePack) || Wrappable(TypeDetach) || Wrappable(TypeDown) || IsPreface(dst[:PrefaceLen])
 			sinkU32 = EchoOpt(0xffffffff)
 			sinkBool, sinkErr = MuxNegotiated(0, OptMux)
 			sinkU32 = PacketWindow(1127, 1152)
@@ -1210,7 +1212,8 @@ func TestTypeStrings(t *testing.T) {
 		TypePing: "PING", TypePong: "PONG", TypeClose: "CLOSE", TypeGoAway: "GOAWAY",
 		0x20: "DGRAM", 0x21: "PACK", 0x34: "REL", 0x35: "RACK", // M2 (§A8.7)
 		0x36: "DETACH", // M3 (M3 design §A3.4)
-		0x22: "0x22", 0x37: "0x37", 0x52: "0x52", 0x80: "0x80", 0xff: "0xff", 0x00: "0x00",
+		0x37: "DOWN",   // M5 (PA-86)
+		0x22: "0x22", 0x38: "0x38", 0x52: "0x52", 0x80: "0x80", 0xff: "0xff", 0x00: "0x00",
 	}
 	for ty, s := range want {
 		if got := ty.String(); got != s {

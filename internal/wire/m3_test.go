@@ -274,9 +274,9 @@ func TestModeRaceParse_L44(t *testing.T) {
 // TestSessionHandleRule_L14: a session frame carries any handle but 0 —
 // 0 is ErrHandle, every other value up to 2^32−1 parses (L14: no wrap or
 // sign trouble at the top of the space) — for every session type, bare and
-// REL-wrapped; carrier-level frames (DETACH included) keep handle 0, bare
-// and REL-wrapped (M3 design §A3.2, M3-D4). SessionHandle stays 1, the
-// first handle of every carrier.
+// REL-wrapped; carrier-level frames (DETACH and M5's DOWN included) keep
+// handle 0, bare and REL-wrapped (M3 design §A3.2, M3-D4). SessionHandle
+// stays 1, the first handle of every carrier.
 func TestSessionHandleRule_L14(t *testing.T) {
 	if SessionHandle != 1 {
 		t.Fatalf("SessionHandle %d", SessionHandle)
@@ -318,8 +318,8 @@ func TestSessionHandleRule_L14(t *testing.T) {
 			}
 		}
 	}
-	if session != 11 || carrier != 7 {
-		t.Fatalf("%d session and %d carrier-level core types, want 11 and 7", session, carrier)
+	if session != 11 || carrier != 8 { // DOWN (PA-86) is the eighth carrier-level type
+		t.Fatalf("%d session and %d carrier-level core types, want 11 and 8", session, carrier)
 	}
 	// The golden vectors with handles 2, 7, 3 and 2^32−1 decode with them;
 	// handle 0 on DATA is a header rejection.

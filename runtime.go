@@ -146,6 +146,10 @@ func newRuntime(cfg Config, ov *testhooks.Overrides) (*Runtime, error) {
 		// A closed Peer's pool that dials again for a surviving session is
 		// tracked again (Status.Mux, Runtime.Close's join; WP16 API-1).
 		PoolLive: rt.addPool,
+		// The established MUX trunks of both roles by peer pair: a trunk's
+		// death is reported with DOWN on the others, and the peer's DOWN
+		// ends the trunk it names (PA-86, cause peer_down).
+		Trunks: carrier.NewTrunkSet(),
 	}
 	rt.eff.params.Actors = &rt.actors // every session's Params counts its running actor (M3-D44)
 	rt.gateFn = rt.gate

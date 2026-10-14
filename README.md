@@ -252,7 +252,14 @@ No migration is ever triggered by the application's own traffic pattern.
   passive has none and waits.
 - *Detection:* a carrier is declared dead by a transport error, a PING
   unanswered beyond the death deadline (`DeadMin`–`DeadMax`), a write stall
-  (`WriteStall`), a protocol violation or an instance mismatch. With no
+  (`WriteStall`), a protocol violation, an instance mismatch or — on a
+  shared carrier — the peer's report that the carrier died at its end
+  (`peer_down`): when a shared carrier dies at one end for a reason the
+  other end cannot see, that end says so on its other shared carriers to
+  the same peer instance that were dialled in the same direction, and the
+  peer ends the carrier when the report arrives instead of at its own death
+  deadline, so the sessions on it move about one one-way delay after the
+  death ([`CHANGELOG.md`](CHANGELOG.md) lists the exceptions). With no
   usable carrier for `NoPathGrace` (15 s by default, counted from the death
   of the last carrier) the session fails with `ErrNoPath`.
 
@@ -268,7 +275,12 @@ transport layer meant to run inside the embedder's own protocol:
   an authenticated L7 tunnel, ...).
 - A rendr `InstanceID` identifies a running instance for routing only. It is
   random but travels in clear on the wire: it is not a secret, **not an
-  identity**, and proves nothing.
+  identity**, and proves nothing. A peer that claims an instance and holds
+  one shared carrier to a passive can therefore also end that instance's
+  other shared carriers at the passive (the carrier-level DOWN names them by
+  small sequential IDs; their sessions migrate as after any carrier death),
+  so a passive that serves dialers which do not trust each other must bind
+  each instance to an authenticated identity in its own layer.
 - The built-in TCP and UDP carriers (`carrier/tcp`, `carrier/udp`) are
   plaintext. Their listeners and dialers accept only loopback addresses
   unless `Options.AllowNonLoopback` is set; enable that only on a trusted
@@ -862,9 +874,16 @@ limitation of 2.0.0 with its consequence.
 
 **Wire format.** Every carrier starts with a versioned PREFACE (magic
 `RND2`, major version 2, minor version, required and optional feature
-bits). The wire format is frozen at 2.0.0 and covered by golden vectors:
-later 2.x releases extend it only with optional feature bits, which an
-older peer ignores, or with a new minor version; a feature a peer must
+bits). Frames carry a type, a frame sequence number, a session handle and a
+CRC32C; on datagram carriers the control frames travel in a small reliable
+sublayer. On a shared carrier (rendr mux) further sessions open with OPEN
+or JOIN on the live carrier, the carrier-level DETACH ends one session's
+part, and the carrier-level DOWN reports that another shared carrier
+between the same two instances, dialled in the same direction, died at the
+sender's end. The wire format is frozen at 2.0.0 and covered by golden
+vectors: later 2.x releases change it only with a new minor version, an
+optional feature bit, which an older peer ignores, or a new version of a
+versioned payload format such as the L4 metadata; a feature a peer must
 understand is a required bit, and a peer that lacks it answers FEATURE,
 which the dialer reports as `ErrVersion`. A handshake that does not start
 with the `RND2` magic (rendr v1's, for example) is refused cleanly.

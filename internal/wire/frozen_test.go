@@ -20,19 +20,22 @@ import (
 // refreeze rewrites testdata/frozen.sha256 from the golden vector files in
 // the tree. It is separate from -update on purpose: regenerating a vector
 // never refreezes the list in the same command.
-var refreeze = flag.Bool("refreeze", false, "rewrite testdata/frozen.sha256 from the golden vector files (a new wire minor or an optional feature bit only)")
+var refreeze = flag.Bool("refreeze", false, "rewrite testdata/frozen.sha256 from the golden vector files (after v2.0.0: a new wire minor version, an optional PREFACE feature bit or a new version of a versioned payload format only)")
 
 const (
 	frozenPath   = "testdata/frozen.sha256"
 	frozenModule = "github.com/FrankoonG/rendr/v2"
 )
 
-// frozenRule is the failure message's rule (plan:309, plan:362).
-const frozenRule = `The golden vectors freeze rendr's wire format at v2.0.0. After 2.0.0 this
-list changes only with a new wire minor version or an optional PREFACE
-feature bit, together with the vectors that define it; before 2.0.0 a change
-is deliberate and recorded in the milestone report. Update the list in the
-same change as the vectors:
+// frozenRule is the failure message's rule (plan:309, plan:362; M5 D2-6:
+// the one freeze rule, stated in the same words in the headers of
+// testdata/golden.txt and l4/testdata/meta-v1.txt).
+const frozenRule = `The golden vectors freeze rendr's wire format at v2.0.0. Before v2.0.0 a
+change is deliberate and recorded in the milestone report. After v2.0.0 a
+frozen vector changes only with a new wire minor version, an optional
+PREFACE feature bit, or a new version of a versioned payload format such
+as L4 metadata, together with the vectors that define it. Update the list
+in the same change as the vectors:
     go test ./internal/wire -run TestWireGoldenFrozen -refreeze`
 
 // TestWireGoldenFrozen is the wire freeze (m5 R4): testdata/frozen.sha256

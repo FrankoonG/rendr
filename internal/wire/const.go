@@ -188,35 +188,35 @@ const (
 func (t Type) Extension() bool { return t >= 0x80 }
 
 // CarrierLevel reports whether t is a carrier-level core type (PING, PONG,
-// CLOSE, GOAWAY, REL, RACK, DETACH), whose handle must be 0. Every other
-// core type is a session frame whose handle must not be 0: SessionHandle
-// on a dedicated carrier, the view's handle on a MUX trunk (M3-D4; the
-// carrier, not the codec, checks which handles it carries). ParseHeader
-// and ParseRel enforce both rules (ErrHandle). The handle of an extension
-// type is opaque and never checked.
+// CLOSE, GOAWAY, REL, RACK, DETACH, DOWN), whose handle must be 0. Every
+// other core type is a session frame whose handle must not be 0:
+// SessionHandle on a dedicated carrier, the view's handle on a MUX trunk
+// (M3-D4; the carrier, not the codec, checks which handles it carries).
+// ParseHeader and ParseRel enforce both rules (ErrHandle). The handle of an
+// extension type is opaque and never checked.
 func (t Type) CarrierLevel() bool {
 	switch t {
-	case TypePing, TypePong, TypeClose, TypeGoAway, TypeRel, TypeRack, TypeDetach:
+	case TypePing, TypePong, TypeClose, TypeGoAway, TypeRel, TypeRack, TypeDetach, TypeDown:
 		return true
 	}
 	return false
 }
 
-// Known reports whether t is one of the 18 core types of wire format v2:
-// the 13 of stream sessions (M1), DGRAM, PACK, REL and RACK (M2) and
-// DETACH (M3). 0x52 is never Known (TypeReservedR).
+// Known reports whether t is one of the 19 core types of wire format v2:
+// the 13 of stream sessions (M1), DGRAM, PACK, REL and RACK (M2), DETACH
+// (M3) and DOWN (M5, PA-86). 0x52 is never Known (TypeReservedR).
 func (t Type) Known() bool {
 	switch t {
 	case TypeOpen, TypeOpenAck, TypeJoin, TypeJoinAck, TypeData, TypeAck, TypeFin,
 		TypeRst, TypeSched, TypePing, TypePong, TypeClose, TypeGoAway,
-		TypeDgram, TypePack, TypeRel, TypeRack, TypeDetach:
+		TypeDgram, TypePack, TypeRel, TypeRack, TypeDetach, TypeDown:
 		return true
 	}
 	return false
 }
 
-// String returns the frame type name ("OPEN", "ACK", "DGRAM", "DETACH", ...) or
-// "0xNN".
+// String returns the frame type name ("OPEN", "ACK", "DGRAM", "DETACH",
+// "DOWN", ...) or "0xNN".
 func (t Type) String() string {
 	switch t {
 	case TypeOpen:
@@ -255,6 +255,8 @@ func (t Type) String() string {
 		return "RACK"
 	case TypeDetach:
 		return "DETACH"
+	case TypeDown:
+		return "DOWN"
 	}
 	const hex = "0123456789abcdef"
 	return string([]byte{'0', 'x', hex[t>>4], hex[t&0x0f]})

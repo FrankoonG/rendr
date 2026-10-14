@@ -92,6 +92,15 @@ Carriers:
 - rendr mux: by default the sessions of one Peer share the live carriers
   of a factory, on stream and datagram carriers; a new session or a
   failover uses a live carrier instead of dialling.
+- When a shared carrier dies at one end for a reason the other end cannot
+  see (a transport error, a PING timeout, a local close), that end reports
+  it with one DOWN frame on each of its other shared carriers to the same
+  instance that were dialled in the same direction, ahead of the sessions'
+  own route updates; the peer ends its end when the DOWN arrives (cause
+  `peer_down`), so the sessions on the carrier move about one one-way delay
+  after the death instead of after the peer's death deadline, however many
+  sessions the carrier carried (the exceptions are under Known
+  limitations).
 - Every frame carries a frame sequence number and a CRC32C; a carrier that
   violates the protocol is killed and the session survives.
 
@@ -167,10 +176,18 @@ Measured on idle Linux virtual machines; the methods are in the README's
 ### Wire format notes
 
 - Wire format version 2.0, frozen at this release: golden vectors cover
-  every structure, and later 2.x releases extend the format only with
-  optional PREFACE feature bits (an older peer ignores them) or a new minor
-  version. A peer that needs a feature the other lacks is answered FEATURE,
-  reported as `ErrVersion`.
+  every structure, and after 2.0.0 a frozen vector changes only with a new
+  wire minor version, an optional PREFACE feature bit (an older peer
+  ignores it), or a new version of a versioned payload format such as the
+  L4 metadata. A peer that needs a feature the other lacks is answered
+  FEATURE, reported as `ErrVersion`.
+- Shared carriers carry the carrier-level frame DOWN (type 0x37, a 4-byte
+  CarrierID): the carrier it names, between the same two instances and
+  dialled in the same direction, died at the sender's end. It is legal only
+  on a shared carrier and inside the reliable sublayer on datagram
+  carriers; a DOWN on any other carrier, or one naming the carrier it
+  arrives on, is a protocol violation, and one naming an unknown, ended or
+  retiring carrier is ignored.
 - The QUIC carriers' encapsulation is versioned by the ALPN `rendr/2-q1`
   and frozen with the wire format: each DATAGRAM payload is a 4-byte
   big-endian per-direction sequence number followed by one rendr datagram;
@@ -266,6 +283,28 @@ Packet sessions:
   OPEN_ACK or its first frame for the session is lost, the passive is held
   for one control retransmission timeout and datagrams it wrote right after
   `Confirm` can age out (about 1–2 % of such openings at 1 % loss).
+- A shared datagram carrier whose reliable control window (eight frames)
+  is already full when another shared carrier of the pair dies sends its
+  DOWN only after the oldest of them is acknowledged: the peer then moves
+  off the dead carrier up to one round trip later. The sessions' own route
+  updates (SCHED) still pass that window eight at a time, so a session's
+  `SchedEpoch` can settle ⌈k / 8⌉ round trips after a carrier death when
+  k sessions shared it; their traffic has moved by then.
+- When k shared carriers of the pair die together, each surviving datagram
+  carrier sends their DOWNs eight per round trip (its reliable control
+  window, in which its sessions' own control frames then wait), every
+  survivor in the same order, so the peer learns the last of them about
+  ⌈k / 8⌉ round trips later; a surviving stream carrier sends them at once.
+  A surviving carrier holds at most 32 unsent DOWNs and drops the oldest
+  beyond that: the peer learns those deaths as it would without DOWN (at
+  the latest at its own death deadline).
+- A datagram in flight toward the peer on a shared carrier that has just
+  died is lost if the DOWN, sent on another carrier, reaches the peer
+  before the peer has read it (the peer then ends its end of the dead
+  carrier): mainly those written in the instant of the death or, when the
+  dead carrier's path is the longer one, less than the difference of the
+  two paths' one-way delays before it. They count in the sender's `Sent` −
+  `PeerReceived`, as any datagram lost in flight on a dead carrier.
 <!-- CHECK at C-B: the M4 C3 packet-loss gap below (escalated; a failing-first row was proposed); drop or reword it if M5 fixed it -->
 - Replies a packet session sends on a carrier that a stimulus has just
   ended can be lost with no loss counter moving on either end.

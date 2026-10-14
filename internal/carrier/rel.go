@@ -358,9 +358,10 @@ func (c *Conn) relAdvance(cseq uint32) {
 // relDispatch dispatches one in-order inner frame (§A5.7): CLOSE and
 // GOAWAY set the carrier flags — the peer's CLOSE is only recorded here,
 // its retirement completes in the writer after the RACK covering it was
-// written or in the reader on the RACK of our CLOSE (R1-4); FIN, RST,
-// SCHED and PACK go to the endpoint (a violation on a carrier without a
-// session). It reports whether the reader continues.
+// written or in the reader on the RACK of our CLOSE (R1-4); DETACH and
+// DOWN are the trunk's (detach.go, down.go); FIN, RST, SCHED and PACK go
+// to the endpoint (a violation on a carrier without a session). It
+// reports whether the reader continues.
 func (c *Conn) relDispatch(h wire.RelHead, inner []byte, fseq uint32, now time.Time) bool {
 	switch h.Type {
 	case wire.TypeClose:
@@ -403,6 +404,15 @@ func (c *Conn) relDispatch(h wire.RelHead, inner []byte, fseq uint32, now time.T
 		}
 		if why != "" {
 			c.dgDropped(1) // §A3.3 on a datagram trunk: dropped and counted
+		}
+		return true
+	case wire.TypeDown:
+		// Another trunk of the pair died at the peer's end (PA-86;
+		// down.go): a violation on a dedicated carrier and when it names
+		// this trunk.
+		if why := c.onDown(inner); why != "" {
+			c.violation("REL{DOWN}: %s", why)
+			return false
 		}
 		return true
 	}
