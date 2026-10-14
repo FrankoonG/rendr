@@ -791,8 +791,10 @@ var (
 	// a refusal allocates nothing.
 	errUDPTooLarge error = &wire.DatagramTooLargeError{}
 	// errUDPWriteCount: a datagram write that reported another count than
-	// the datagram's length (L42, PA-19).
-	errUDPWriteCount = errors.New("rendr/carrier: UDP datagram write returned an invalid count")
+	// the datagram's length, or a batched write whose count has a shape it
+	// cannot have (L42, PA-19): ErrWriteCount itself, so the writer hands
+	// back none of the call's datagrams (dgOutcome).
+	errUDPWriteCount = ErrWriteCount
 	// errUDPReadCount: a datagram read that reported a count outside the
 	// buffer (L42).
 	errUDPReadCount = errors.New("rendr/carrier: UDP datagram read returned an invalid count")
