@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -68,11 +69,13 @@ func TestQUICDatagramPumpStallRefusedTakesNoSeq(t *testing.T) {
 
 // dropRelay forwards UDP datagrams between one QUIC client and a server
 // and, once armed, drops the client's next packet of at least 1000 bytes
-// (one carrying a 1000-byte DATAGRAM): a loss in the network.
+// (one carrying a 1000-byte DATAGRAM): a loss in the network. While block
+// is set it drops every client packet: a path that carries nothing.
 type dropRelay struct {
 	pc      *net.UDPConn
 	server  netip.AddrPort
 	arm     atomic.Bool
+	block   atomic.Bool
 	dropped atomic.Int64
 	done    chan struct{}
 }
@@ -103,7 +106,7 @@ func (r *dropRelay) run() {
 			continue
 		}
 		client = from
-		if n >= 1000 && r.arm.CompareAndSwap(true, false) {
+		if r.block.Load() || n >= 1000 && r.arm.CompareAndSwap(true, false) {
 			r.dropped.Add(1)
 			continue
 		}
@@ -169,10 +172,172 @@ func TestQUICDatagramNetworkLossNotClaimed(t *testing.T) {
 	}
 }
 
+// TestQUICDatagramEgressDropTakesNoSeq (KL-19): a datagram the egress
+// queue dropped for its age takes no sequence number, so the receiver
+// never reads the sender's own drops as gaps (counted twice: EgressDrops
+// at the sender, IngressDrops at the receiver during a lag). Stimulus: a
+// dialer carrier's path to a raw quic-go server carries nothing while 200
+// datagrams of 1000 bytes are written - quic-go takes what its congestion
+// window and its 32-frame send queue hold, the rest waits in the egress
+// queue until every datagram there is older than egressAge - then the
+// path returns, the sender works the egress queue off (quic-go's probes
+// make room), and fresh datagrams follow one at a time until five arrived
+// (a fresh one that aged out while quic-go recovered is dropped too).
+// Integrity: every datagram written took a number or is counted in
+// EgressDrops (some are), and every DATAGRAM arrived intact; the numbers
+// the server receives after the path returned are consecutive, and the
+// last fresh datagram carries the number right after those of every
+// DATAGRAM the dialer's quic-go sent before it (traced).
+func TestQUICDatagramEgressDropTakesNoSeq(t *testing.T) {
+	t.Cleanup(rendrtest.AssertNoLeak(t))
+	srvTLS, _ := testTLS(t)
+	srvTLS.NextProtos = []string{ALPN}
+	str := rawTransport(t)
+	ln, err := str.Listen(srvTLS, quicConfig(nil, 0, true, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	relay := newDropRelay(t, str.Conn.LocalAddr())
+	ft, ctr := &frameTracer{}, &Counters{}
+	dc, err := DatagramCarrier("q", relay.pc.LocalAddr().String(),
+		Options{TLS: clientOptions(t).TLS, Config: &qgo.Config{Tracer: ft.trace}, Counters: ctr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, _, err := dc.Dial(dialCtx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := pc.(*dgramConn)
+	t.Cleanup(func() { _ = w.Close() })
+	srv, err := ln.Accept(dialCtx(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The server records each DATAGRAM's number and its seqDatagram index.
+	type rcvd struct {
+		num uint32
+		idx int
+	}
+	var mu sync.Mutex
+	var got []rcvd
+	recvDone := make(chan struct{})
+	go func() {
+		defer close(recvDone)
+		for {
+			b, err := srv.ReceiveDatagram(context.Background())
+			if err != nil {
+				return
+			}
+			r := rcvd{idx: -1} // -1: not an intact seqDatagram after a number
+			if len(b) == seqLen+1000 && bytes.Equal(b[seqLen:], seqDatagram(int(binary.BigEndian.Uint32(b[seqLen:])), 1000)) {
+				r.num, r.idx = binary.BigEndian.Uint32(b), int(binary.BigEndian.Uint32(b[seqLen:]))
+			}
+			mu.Lock()
+			got = append(got, r)
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() { _ = srv.CloseWithError(0, ""); <-recvDone })
+	received := func() []rcvd {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]rcvd(nil), got...)
+	}
+
+	const burst, fresh = 200, 5
+	written := 0
+	write := func(i int) {
+		t.Helper()
+		if _, err := w.WriteTo(seqDatagram(i, 1000), nil); err != nil {
+			t.Fatal(err)
+		}
+		written++
+	}
+	write(0) // number 0
+	eventually(t, "the first datagram arrived", func() bool { return len(received()) == 1 })
+	relay.block.Store(true)
+	for i := 1; i <= burst; i++ {
+		write(i)
+	}
+	lastWrite := time.Now()
+	eventually(t, "every datagram the egress queue holds is older than egressAge", func() bool { return time.Since(lastWrite) > egressAge })
+	relay.block.Store(false)
+	// No WriteTo until the sender took every queued datagram (a WriteTo
+	// would drop the stale ones itself): it hands quic-go a datagram each
+	// time a probe makes room and drops the rest for their age.
+	eventually(t, "the sender worked the egress queue off", func() bool { _, _, n := egressHeld(w); return n == 0 })
+	if ctr.EgressDrops.Load() == 0 {
+		t.Fatal("no datagram aged out in the egress queue during the outage")
+	}
+	freshArrived := func() int {
+		r := received()
+		n := 0
+		for _, x := range r[1:] {
+			if x.idx >= 1000 {
+				n++
+			}
+		}
+		return n
+	}
+	idx := 1000
+	for deadline := time.Now().Add(4 * testEventuallyTime); freshArrived() < fresh; idx++ {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of the fresh datagrams arrived after the path returned", freshArrived())
+		}
+		write(idx)
+		want := idx
+		start := time.Now()
+		for time.Since(start) < 2*egressAge { // its arrival, or long enough for it to age out
+			if r := received(); r[len(r)-1].idx == want {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	final := idx
+	write(final) // quic-go recovered: sent at once, after every datagram it holds
+	eventually(t, "the last fresh datagram arrived", func() bool { r := received(); return r[len(r)-1].idx == final })
+
+	r := received()
+	sent := ft.sentDatagrams.Load()
+	drops := ctr.EgressDrops.Load()
+	t.Logf("written %d, DATAGRAMs sent %d, EgressDrops %d, received %d (numbers %d … %d after the path returned)",
+		written, sent, drops, len(r), r[1].num, r[len(r)-1].num)
+	if uint64(sent)+drops != uint64(written) {
+		t.Fatalf("EgressDrops %d and %d DATAGRAMs sent of %d written: want every datagram numbered or counted", drops, sent, written)
+	}
+	for k, x := range r {
+		if x.idx < 0 || k == 0 && (x.num != 0 || x.idx != 0) {
+			t.Fatalf("DATAGRAM %d received is not intact or not number 0 first: %+v", k, x)
+		}
+	}
+	for k := 2; k < len(r); k++ { // r[1:]: everything after the first arrived after the path returned
+		if r[k].num != r[k-1].num+1 {
+			t.Fatalf("after the path returned the numbers jump from %d to %d (datagrams %d and %d): a dropped datagram took a number",
+				r[k-1].num, r[k].num, r[k-1].idx, r[k].idx)
+		}
+	}
+	if x := r[len(r)-1]; x.num != uint32(sent)-1 {
+		t.Errorf("the last fresh datagram has number %d, want %d: the number after the %d DATAGRAMs quic-go sent before it",
+			x.num, sent-1, sent-1)
+	}
+}
+
 // TestQUICRxSeqAttribution (KL-19): rxSeq counts a gap only when quic-go's
 // queue may have overflowed - at least 128 datagrams taken since the pump
 // last found it empty, or the first datagram after such a run - and in
-// uint32 serial arithmetic; a reordered datagram counts nothing.
+// uint32 serial arithmetic; a reordered datagram counts nothing, counts
+// toward the run (it never starts a lag on a short run) and leaves the lag
+// to the datagram that shows the gap, also after the drain. Rows also pin
+// the documented inexact counts (Counters.IngressDrops): in order, a
+// network loss inside a lag counts too (an upper bound); on a reordering
+// path (the limitation rows), a drop whose gap a datagram showed before
+// the lag counts nothing, and a late datagram at or above the next
+// expected number that arrives after the drain ends the lag, so the drops
+// numbered above it count nothing.
 func TestQUICRxSeqAttribution(t *testing.T) {
 	const e = -1 // the pump found quic-go's queue empty
 	run := func(from, n int) []int {
@@ -201,9 +366,27 @@ func TestQUICRxSeqAttribution(t *testing.T) {
 		{"gap after 127 since empty", 0, cat([]int{e}, run(0, 127), []int{200}), 0},
 		{"gap after 128 since empty", 0, cat([]int{e}, run(0, 128), []int{200}), 72},
 		{"gap after the run and an empty queue", 0, cat([]int{e}, run(0, 128), []int{e, 200}), 72},
+		// In order, quic-go dropped nothing and the network lost 128: the
+		// loss counts like a drop (an upper bound).
+		{"network loss inside a lag counts", 0, cat([]int{e}, run(0, 128), []int{e, 129}), 1},
 		{"lag ends with the next datagram", 0, cat([]int{e}, run(0, 128), []int{e, 128, e, 300}), 0},
 		{"gaps all through a long run", 0, cat([]int{e}, run(0, 128), []int{130, 140}), 11},
 		{"reordered inside a lag", 0, cat([]int{e}, run(0, 128), []int{130, 129, 131}), 2},
+		{"reordered on a short run", 0, []int{e, 0, 1, 3, 2, 5}, 0},
+		{"reordered datagram completes the run", 0, cat([]int{e}, run(0, 126), []int{127, 126, 200}), 72},
+		// quic-go kept 0 … 99 and 101 … 128 and dropped 129 … 138; 100,
+		// delayed in the network, arrives after the drain.
+		{"straggler behind after the drain", 0, cat([]int{e}, run(0, 100), run(101, 28), []int{e, 100, 139}), 10},
+		// quic-go dropped 50, which arrived late into the full queue; 51
+		// showed its gap at the 51st datagram of the run.
+		{"limitation: gap shown before the lag", 0, cat([]int{e}, run(0, 50), run(51, 78), []int{e, 129}), 0},
+		// quic-go dropped 129 and 130; 128, delayed, arrives after the
+		// drain as the next expected number and ends the lag.
+		{"limitation: next expected after the drain", 0, cat([]int{e}, run(0, 128), []int{e, 128, 131}), 0},
+		// quic-go dropped 128, 130 and 131; 129, delayed, arrives after
+		// the drain above the next expected number: its own gap (128)
+		// counts, and it ends the lag, so 130 and 131 count nothing.
+		{"limitation: late datagram above next after the drain", 0, cat([]int{e}, run(0, 128), []int{e, 129, 132}), 1},
 		{"serial wrap", 0xffffff00, cat([]int{e}, run(0xffffff00-(1<<32), 128), []int{5}), 133},
 	} {
 		s := rxSeq{next: c.next}
@@ -218,6 +401,72 @@ func TestQUICRxSeqAttribution(t *testing.T) {
 		if got != c.want {
 			t.Errorf("%s: counted %d, want %d", c.name, got, c.want)
 		}
+	}
+}
+
+// TestQUICDatagramStragglerAfterStallCounted (KL-19): a datagram the
+// network delayed past a stall, arriving after the pump drained quic-go's
+// queue, leaves the lag to the next datagram, so the drops whose gap that
+// one shows are counted. Stimulus: a raw quic-go client numbers its own
+// DATAGRAMs; the passive's pump is held while seqs 1 … 140 except 100
+// arrive (quic-go keeps 128 and drops the rest), then released; once it
+// found quic-go's queue empty and waits, seq 100 arrives, then seq 141.
+// Integrity: quic-go handled every DATAGRAM; the delivered datagrams are
+// intact and in order - the head of the burst, 100, 141 - and
+// IngressDrops is exactly quic-go's drops.
+func TestQUICDatagramStragglerAfterStallCounted(t *testing.T) {
+	t.Cleanup(rendrtest.AssertNoLeak(t))
+	ft, rc := &frameTracer{}, &Counters{}
+	l, f := serveFake(t, Options{Config: &qgo.Config{Tracer: ft.trace}, Counters: rc})
+	qc, err := rawTransport(t).Dial(dialCtx(t), l.Addr(), rawClientTLS(t), quicConfig(nil, 0, false, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = qc.CloseWithError(0, "") })
+	numbered := func(seqs ...int) [][]byte { // DATAGRAM seq carries seqDatagram(seq, 1000)
+		var ps [][]byte
+		for _, s := range seqs {
+			ps = append(ps, framed(uint32(s), string(seqDatagram(s, 1000))))
+		}
+		return ps
+	}
+	rawSendTraced(t, qc, ft, numbered(0)...)
+	r := f.packet(t)
+	t.Cleanup(func() { _ = r.Close() })
+	if s := readSeqs(t, r, 1); s[0] != 0 {
+		t.Fatalf("first datagram seq %d", s[0])
+	}
+
+	var burst []int
+	for s := 1; s <= 140; s++ {
+		if s != 100 {
+			burst = append(burst, s)
+		}
+	}
+	parked, release := holdPump(t, r)
+	rawSendTraced(t, qc, ft, numbered(burst...)...)
+	kept := pinnedRcvQueue + parked() // what the pump took as the hold began, and quic-go's queue
+	release()
+	eventually(t, "the pump drained quic-go's queue", func() bool { return queued(r) == kept })
+	eventually(t, "the pump found quic-go's queue empty and waits", pumpWaits)
+	rawSendTraced(t, qc, ft, numbered(100)...)
+	eventually(t, "the pump took the straggler", func() bool { return queued(r) == kept+1 })
+	rawSendTraced(t, qc, ft, numbered(141)...)
+	eventually(t, "the trailing datagram arrived", func() bool { return queued(r) == kept+2 })
+
+	seqs := readSeqs(t, r, kept+2)
+	want := append(append([]int(nil), burst[:kept]...), 100, 141)
+	for k := range want {
+		if seqs[k] != want[k] {
+			t.Fatalf("delivered %v: datagram %d is seq %d, want %d", seqs, k, seqs[k], want[k])
+		}
+	}
+	if handled := ft.rcvDatagrams.Load(); handled != int64(len(burst)+3) {
+		t.Fatalf("quic-go handled %d DATAGRAMs, %d were sent", handled, len(burst)+3)
+	}
+	drops := uint64(len(burst) - kept) // seqs burst[kept] … 140
+	if in := rc.IngressDrops.Load(); in != drops {
+		t.Errorf("IngressDrops %d, quic-go dropped %d (seqs %d … 140): want them counted from 141's gap", in, drops, burst[kept])
 	}
 }
 
@@ -351,7 +600,7 @@ func TestQUICDatagramSeqBudget_L37(t *testing.T) {
 
 // TestQUICDatagramAcceptNoAlloc: taking a received DATAGRAM over - the
 // sequence check and the move to the ingress queue - and reading it
-// allocate nothing in steady state.
+// allocate nothing in steady state (asserted in the non-race lane, §A10.3).
 func TestQUICDatagramAcceptNoAlloc(t *testing.T) {
 	d := &dgramConn{sinks: []*Counters{{}}}
 	d.in.ring, d.in.max, d.in.wake = make([][]byte, ingressInit), 1<<20, make(chan struct{}, 1)
@@ -367,8 +616,55 @@ func TestQUICDatagramAcceptNoAlloc(t *testing.T) {
 			t.Fatalf("pop: %q, %v", got, err)
 		}
 	})
-	if allocs != 0 {
+	if !raceEnabled && allocs != 0 {
 		t.Errorf("%v allocations per datagram, want 0", allocs)
+	}
+}
+
+// TestQUICDatagramSendNoAlloc: one step of the send loop - framing a
+// datagram after its sequence number, handing it to quic-go (a stub here)
+// and classifying the result - allocates nothing, so a sent datagram costs
+// rendr no allocation in steady state (quic-go's own copy aside; asserted
+// in the non-race lane, §A10.3).
+// Integrity: each accepted datagram goes out framed after the next number;
+// one refused as too large, or failed otherwise, takes none and is
+// reported (the refusal with quic-go's limit).
+func TestQUICDatagramSendNoAlloc(t *testing.T) {
+	s := &sender{framed: make([]byte, seqLen, seqLen+DatagramBudget)}
+	p := seqDatagram(7, 1000)
+	last := make([]byte, 0, seqLen+DatagramBudget)
+	var refuse error
+	send := func(b []byte) error {
+		if refuse != nil {
+			return refuse
+		}
+		last = append(last[:0], b...)
+		return nil
+	}
+	allocs := testing.AllocsPerRun(1000, func() {
+		if tl, err := s.step(send, p); tl != nil || err != nil {
+			t.Fatalf("step: %v, %v", tl, err)
+		}
+	})
+	if !raceEnabled && allocs != 0 {
+		t.Errorf("%v allocations per sent datagram, want 0", allocs)
+	}
+	const steps = 1001 // AllocsPerRun's warm-up run and 1000
+	if s.seq != steps || binary.BigEndian.Uint32(last) != steps-1 || !bytes.Equal(last[seqLen:], p) {
+		t.Fatalf("after %d steps: next number %d, last DATAGRAM number %d (payload intact %v)",
+			steps, s.seq, binary.BigEndian.Uint32(last), bytes.Equal(last[seqLen:], p))
+	}
+	refuse = &qgo.DatagramTooLargeError{MaxDatagramPayloadSize: 1100}
+	if tl, err := s.step(send, p); tl == nil || tl.MaxDatagramPayloadSize != 1100 || !errors.Is(err, refuse) || s.seq != steps {
+		t.Errorf("a too-large refusal: %v, %v, next number %d; want the refusal, no number taken", tl, err, s.seq)
+	}
+	refuse = net.ErrClosed
+	if tl, err := s.step(send, p); tl != nil || !errors.Is(err, net.ErrClosed) || s.seq != steps {
+		t.Errorf("a failed send: %v, %v, next number %d; want the error, no number taken", tl, err, s.seq)
+	}
+	refuse = nil
+	if tl, err := s.step(send, p); tl != nil || err != nil || binary.BigEndian.Uint32(last) != steps || s.seq != steps+1 {
+		t.Errorf("the next accepted datagram: %v, %v, number %d; want %d", tl, err, binary.BigEndian.Uint32(last), steps)
 	}
 }
 
