@@ -495,7 +495,7 @@ the socket buffers (4 MiB read, 1 MiB write) and `MaxBatch` (32; 1–64).
 | What happened | What the application sees |
 |---|---|
 | the peer's FIN reached the contiguous delivery point | `Read` returns `io.EOF` — the only source of EOF |
-| a carrier's EOF, reset, timeout, read or write error, protocol violation, write stall or instance mismatch | nothing: rendr moves the session to another carrier |
+| a carrier's EOF, reset, timeout, read or write error, protocol violation, write stall or instance mismatch, or the peer's report that a shared carrier died at its end (`peer_down`) | nothing: rendr moves the session to another carrier |
 | no carrier for `NoPathGrace` (passive: `PassiveRetain`) | `ErrNoPath` |
 | the bound instance answered UNKNOWN_SESSION, or the peer restarted | `ErrSessionLost`; but when both ends negotiated the optional end-code feature bit on a stream carrier, a JOIN refused for a session the peer had reset returns that reset's `*AbortError` (`ErrAborted`, `Remote` true) instead |
 | the peer reset the session (its linger expired, its `Runtime.Close`, its idle timeout, `Conn.Abort`) | `ErrAborted`; `errors.As` gives `*AbortError{Code, Msg, Remote}` |
@@ -664,6 +664,13 @@ when the process may force it (`CAP_NET_ADMIN`); otherwise the kernel caps
 it at that limit. The defaults stay small because they apply to every
 session and socket of a Runtime with up to 10,000 sessions.
 
+Batched system calls make arrivals burstier: the datagrams one call moves
+reach the receiving session together. Size `Packet.Queue` for these bursts
+at the peak rate, not for the average rate. (At 80,000 datagrams a second,
+a receiver with the default 1 MiB `Packet.Queue` dropped about one
+datagram in 7,000 from its receive queue, counted in `DropRecvQueue`, with
+batching on, and none with batching off.)
+
 rendr 2.0.0 uses no UDP segmentation or receive offloads (GSO, GRO).
 
 ## Performance
@@ -700,11 +707,14 @@ stops after two failed steps. "A → B" is the dialer sending on its own
 socket to the passive's listening socket; "B → A" the passive sending
 through its listening socket to the dialer.
 
-<!-- FIGURE: packet-rate ceiling per direction (A → B, B → A) with MaxBatch default (32) and MaxBatch 1, plus the raw-UDP reference ceiling and the CPU microseconds per datagram per role, and the date; method: the ramp described above on an idle Linux VM; source case: perf/pps-ceiling at the M5 gate -->
+<!-- FIGURE: packet-rate ceiling per direction (A → B, B → A) with MaxBatch default (32) and MaxBatch 1, plus the raw-UDP reference ceiling, the CPU microseconds per datagram per direction and role (A, B; the role process's CPU time divided by the datagrams it sent and received, at the default arm's ceiling step of that direction), and the date; method: the ramp described above on an idle Linux VM; source case: perf/pps-ceiling at the M5 gate -->
 The packet-rate ceiling is {ceiling-ab} datagrams a second from A to B and
 {ceiling-ba} from B to A with the default `MaxBatch` ({ceiling-ab-1} and
 {ceiling-ba-1} with `MaxBatch` 1; raw UDP on the same path: {raw-ab} and
-{raw-ba}; {date}).
+{raw-ba}; {date}). At these default-`MaxBatch` ceilings each process used
+{cpu-ab-a} µs (A) and {cpu-ab-b} µs (B) of CPU time per datagram it sent
+or received from A to B, and {cpu-ba-a} µs and {cpu-ba-b} µs from B to A,
+the test application's own work included.
 
 **100,000 datagrams a second with failover (G3).** A packet session sends
 1,000-byte datagrams at 100,000 a second for 5 minutes over two paths while
@@ -715,7 +725,7 @@ duplicate datagram, losses only within 200 ms of a switching event, and
 every arrival gap caused by a switch under 200 ms. Sessions use the sizing
 of [Datagram I/O](#datagram-io-and-batching).
 
-<!-- FIGURE: G3 at 100 kpps, A → B, per mode (selector, bond, race): delivered fraction, worst switch gap, losses outside the event windows, and the date; method: G3 as described, 2 runs per mode; source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
+<!-- FIGURE: G3 at 100 kpps, A → B: the delivered fraction per mode (selector, bond, race), and over the three modes the longest switch gap and the losses outside the event windows, and the date; method: G3 as described, 2 runs per mode; source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
 At 100,000 datagrams a second, selector, bond and race sessions delivered
 {g3-sel}, {g3-bond} and {g3-race} of the datagrams sent, with the longest
 switch gap {g3-gap} ms and {g3-out} losses outside the event windows
@@ -727,9 +737,10 @@ three independent links between two virtual machines (50, 100 and
 link; steady goodput (the first 2 s excluded) is compared with the sum of
 the links' calibrated raw rates.
 
-<!-- FIGURE: G8 3-path steady goodput as a fraction of the summed calibrated link rates, the SHA-256 match, the longest zero-delivery gap, and the date; method: G8 as described, 2 runs; source case: gold/G8-3path at the M5 gate -->
+<!-- FIGURE: G8 3-path steady goodput as a fraction of the summed calibrated link rates, the SHA-256 match (the runs whose received 2 GiB matched the sender's SHA-256), the longest zero-delivery gap, and the date; method: G8 as described, 2 runs; source case: gold/G8-3path at the M5 gate -->
 A three-path bond reached {g8-ratio} of the summed link rates (criterion:
-at least 85 %), with the longest zero-delivery gap {g8-gap} ms ({date}).
+at least 85 %), with the longest zero-delivery gap {g8-gap} ms; the 2 GiB
+received matched the sender's SHA-256 in {g8-sha} of 2 runs ({date}).
 
 **Failover with an expensive carrier dial (G4-dialcost).** Two paths of
 100 Mbit/s and 150 ms round trip, each carrier a TLS-over-TCP dial that
@@ -790,7 +801,7 @@ packet sessions, `l4`, QUIC), together with the lesson cases.
 
 <!-- FIGURE: the M5 gate's result counts (rows PASS, FAIL, INVALID, FLAKY) on the release candidate commit, and the date; method: the cumulative M5 gate, every gold variant and lesson case of M1c-M5; source: the M5 gate run -->
 At the 2.0.0 release candidate, {gate-pass} gate rows passed, with
-{gate-fail} FAIL and {gate-flaky} FLAKY ({date}).
+{gate-fail} FAIL, {gate-invalid} INVALID and {gate-flaky} FLAKY ({date}).
 
 ## Known limitations and what is not in 2.0.0
 

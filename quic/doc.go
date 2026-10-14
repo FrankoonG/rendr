@@ -46,24 +46,24 @@
 // reorders by 3 packets or more the congestion window shrinks below the
 // path's rate, and a constant-rate flow loses datagrams to the egress
 // queue's 250-ms age limit (counted in Counters.EgressDrops). quic-go also
-// drops received DATAGRAM frames beyond 128 queued per connection without
-// a signal, and the limit is fixed: when the carrier's pump does not run
-// while more than 128 DATAGRAMs arrive (12.8 ms at 10,000 datagrams a
-// second; a 45-datagram loss at that rate takes about 17 ms) the excess
-// is lost. rendr cannot prevent it - the pump never waits while datagrams
-// are queued, nor on rendr's consumer - so the carrier counts these drops
-// in Counters.IngressDrops from the gaps in its sequence numbers, when the
-// next datagram arrives. When DATAGRAMs arrive in order the count is
-// exact, except that a loss in the network during such a lag is counted
-// too (an upper bound on a path that loses datagrams). On a path that
+// drops received DATAGRAM frames beyond 128 per connection without a
+// signal (a fixed limit rendr cannot prevent from overflowing when the
+// receiving process stalls): when the carrier's pump does not run while
+// more than 128 DATAGRAMs arrive (12.8 ms at 10,000 datagrams a second; a
+// 45-datagram loss at that rate takes about 17 ms) the excess is lost. The
+// pump never waits while datagrams are queued, nor on rendr's consumer.
+// The carrier counts them in Counters.IngressDrops from the gaps in its
+// per-DATAGRAM sequence numbers, when the next datagram arrives. When
+// DATAGRAMs arrive in order that count is exact, except that a datagram
+// lost in the network during such an overflow counts too. On a path that
 // reorders it is no bound: it can be too high (a datagram reordered during
-// such a lag is counted and still delivered) or too low (a late datagram
-// quic-go's full queue dropped after a later one was queued is missed,
-// and once the queue has drained, a late datagram numbered above every
-// one the carrier received hides the drops numbered above it). quic-go's
-// 256-packet queue of unprocessed packets, which drops when its own
-// connection goroutine stalls, is not visible to the carrier: such a loss
-// looks like a network loss. On reordering paths use the raw UDP carrier
+// an overflow counts and is still delivered) or too low (a late datagram
+// the full queue dropped after a later one was queued is missed, and once
+// the queue has drained, a late datagram numbered above every one received
+// hides the overflow's drops numbered above it). quic-go's 256-packet
+// queue of unprocessed packets, which drops when its own connection
+// goroutine stalls, is not visible to the carrier: such a drop looks like
+// a loss in the network. On reordering paths use the raw UDP carrier
 // (carrier/udp) or the QUIC stream carrier.
 //
 // The package uses only rendr's public API: its conns are ordinary embedder
