@@ -20,14 +20,15 @@ type Status struct {
 	// source, at most 64 KiB) holds no data while it waits and is not
 	// counted; a datagram read into it counts once it is queued for a
 	// flow. A udp.Listen socket that reads several datagrams per call
-	// (Linux amd64 and arm64, udp.Options.MaxBatch ≥ 2) also holds, from
-	// its first read on and while datagrams arrive, up to D − 1 more read
-	// buffers of its MaxDatagram class and D message headers of about 184
-	// bytes each, D = min(MaxBatch, 32), all counted (about 70 KiB at the
-	// defaults); once its read has waited one to two seconds without a
-	// datagram it returns them, and it reads one datagram per call until
-	// the next one arrives (a datagram carrier's reader does the same with
-	// its own extra buffers). So it is 0 with no session and no carrier,
+	// (Linux amd64 and arm64, udp.Options.MaxBatch other than 1: the
+	// default 0 selects 32) also holds, from its first read on and while
+	// datagrams arrive, up to D − 1 more read buffers of its MaxDatagram
+	// class and D message headers of about 184 bytes each,
+	// D = min(MaxBatch, 32), all counted (about 70 KiB at the defaults);
+	// once its read has waited one to two seconds without a datagram it
+	// returns them, and it reads one datagram per call until the next one
+	// arrives (a datagram carrier's reader does the same with its own
+	// extra buffers). So it is 0 with no session and no carrier,
 	// also while Listeners with FromPacketConn sources are open — within
 	// two seconds of their last datagram, or of their start if none
 	// arrived (plan:774) — and after Runtime.Close, except for buffers
@@ -164,21 +165,23 @@ type SessionStatus struct {
 // TxBytes count every copy.
 type RaceCounters struct {
 	CopyBytes uint64 // stream sender: payload bytes placed by a lane below another lane's cursor (extra copies)
-	Copies    uint64 // packet sender: extra placements of datagrams another lane already placed, less the carriers' refusals
+	Copies    uint64 // packet sender: extra placements of datagrams another lane already placed, less the carriers' refusals and the copies a dying carrier handed back unwritten
 }
 
 // PacketCounters count the datagrams of one packet session on this side.
 // Sent and the send-side drops add up to what WriteTo accepted (a datagram
-// still queued is in none of them; nothing is queued after the end): a
-// datagram a carrier refused as too large counts in DropTooLarge, not in
-// Sent. A datagram that was sent and not received was lost with a carrier,
-// dropped by the network, or counted in the peer's receive-side drops.
+// still queued is in none of them, nor is one a dying carrier handed back
+// unwritten while it waits to be placed again; nothing is queued after the
+// end): a datagram a carrier refused as too large counts in DropTooLarge,
+// not in Sent. A datagram that was sent and not received was lost with a
+// carrier, dropped by the network, or counted in the peer's receive-side
+// drops.
 type PacketCounters struct {
-	Sent          uint64 // handed to a carrier and not refused by it
+	Sent          uint64 // handed to a carrier, not refused by it and not handed back unwritten by a carrier that died (such a datagram leaves Sent until it is placed again, or is counted in a drop counter, so Sent can decrease between two snapshots)
 	Received      uint64 // accepted from carriers (distinct)
 	Duplicates    uint64 // received again inside the dedup window (the 16,384 datagrams behind the newest received), also after ReadFrom returned io.EOF; in a race session the members' copies of a datagram while they arrive inside the window (copies beyond it count in DropLate)
 	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
-	DropAge       uint64 // send side: not handed to a carrier within Packet.MaxAge while one existed
+	DropAge       uint64 // send side: not handed to a carrier within Packet.MaxAge of its WriteTo while one existed, also one a dying carrier handed back unwritten that was not placed again within MaxAge of its WriteTo
 	DropTooLarge  uint64 // send side: no live carrier could carry it, a carrier refused it as too large, or a budget shrink left it on a member too small for it while every member that can carry it was write-blocked or at its capacity
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no carrier
 	DropRecvQueue uint64 // receive side: evicted from a full receive queue (the application did not read)

@@ -463,7 +463,7 @@ the peer's FIN, transparent migration, versioned wire, bounded resources,
 | `Sessionless.PerInstance` / `.Total` / `.Idle` | 16 / 1024 / 30 s | 1–1024 / 1–65,536 / ≥ 3 × max(`PingIdle`, `Probe.Interval`) | probe carriers a passive keeps per dialer instance, in all, and without a PING |
 | `PacketPing` | 1 s | 0.2–10 s, ≤ `DeadMin`/2 | PING cadence of an active datagram carrier; delay of a packet session's accounting frame |
 | `Packet.Queue` | 1 MiB | 64 KiB–64 MiB | datagram bytes queued per direction (and Queue/64 datagrams); a full queue drops its oldest |
-| `Packet.MaxAge` | 100 ms | 10 ms–2 s | a datagram not handed to a carrier within this is dropped |
+| `Packet.MaxAge` | 100 ms | 10 ms–2 s | a datagram not handed to a carrier within `MaxAge` of its `WriteTo` is dropped; one a dying carrier hands back unwritten keeps that age |
 | `Packet.MaxPayload` | 65,507 B | 512–65,507 B | the largest datagram offered or accepted; a session fixes its limit at OPEN |
 | `OnEvent` | nil | — | event callback, on one worker goroutine fed by a bounded queue (256) |
 
@@ -577,15 +577,16 @@ Peer with two or more factories is woken once per probe sample of the Peer
 
 Packet sessions carry datagrams. `WriteTo` never waits: each datagram is
 queued and sent at most once, possibly reordered, and lost only in flight
-on a carrier that dies or when a bounded queue drops it (counted in
-`SessionStatus.Packet`). `ReadFrom` returns one datagram per call and
-`io.EOF` only after the peer closed its end and the datagrams already
-received were read. A datagram larger than `PacketConn.MaxPayload` fails
-with `ErrPacketTooLarge`; the limit is fixed at OPEN from the carriers'
-budgets (1,198 bytes over `carrier/udp` with its default `MaxDatagram`,
-1,127 bytes over QUIC DATAGRAM). With `Config.IdleTimeout`, every
-successful `WriteTo`, every received datagram and every datagram `ReadFrom`
-returns keeps a packet session alive.
+(dropped by the network, or on a carrier that dies) or when a bounded
+queue drops it; in `SessionStatus.Packet`, `Sent − PeerReceived` shows the
+former and the `Drop*` counters the latter. `ReadFrom` returns one
+datagram per call and `io.EOF` only after the peer closed its end and the
+datagrams already received were read. A datagram larger than
+`PacketConn.MaxPayload` fails with `ErrPacketTooLarge`; the limit is fixed
+at OPEN from the carriers' budgets (1,198 bytes over `carrier/udp` with
+its default `MaxDatagram`, 1,127 bytes over QUIC DATAGRAM). With
+`Config.IdleTimeout`, every successful `WriteTo`, every received datagram
+and every datagram `ReadFrom` returns keeps a packet session alive.
 
 **Batched system calls.** On Linux amd64 and arm64, rendr's own UDP
 sockets move several datagrams per system call: `sendmmsg` for the
@@ -603,9 +604,14 @@ Windows, macOS and the other architectures.
   socket reads at most 32 per call. Batching never delays a datagram: a
   writer sends what it has when it wakes, and a read returns what is
   queued. A dialer carrier's reader starts at one datagram per call and
-  doubles its depth while calls come back full (up to `MaxBatch`); the
-  extra receive buffers are charged to `MaxBufferedBytes` and released
-  after about a second idle.
+  doubles its depth while calls come back full (up to `MaxBatch`); a
+  `udp.Listen` socket reads at a fixed depth of min(`MaxBatch`, 32) from
+  its first read on. Either reader holds its extra receive buffers only
+  while datagrams arrive, charged to `MaxBufferedBytes` and counted, with
+  their message headers, in `Status.BufferedBytes` (about 70 KiB for a
+  listening socket at the defaults), and returns them one to two seconds
+  after the last datagram; it then reads one datagram per call until the
+  next one arrives.
 - Datagram contents, order, error handling and death rules are the same
   with batching on or off; only the number of system calls changes.
 - **Fallback.** When the kernel or a sandbox (a seccomp policy) refuses
@@ -623,8 +629,9 @@ Windows, macOS and the other architectures.
   `SentDatagrams / SendCalls > 1` shows that sends were batched, and the
   same ratio on the receive side shows how many datagrams the kernel had
   queued per wakeup. `ChargeRefused` counts receive buffers the memory
-  budget refused (the reader keeps its depth). Each counter is read on its
-  own, so a snapshot taken under load can be off by the calls in progress.
+  budget refused (a dialer carrier keeps its depth; a listening socket
+  reads with the buffers it got). Each counter is read on its own, so a
+  snapshot taken under load can be off by the calls in progress.
   QUIC and embedder sockets are not counted.
 
 **Sizing for high packet rates.** Size `Packet.Queue` and the UDP read
@@ -778,9 +785,14 @@ limitation of 2.0.0 with its consequence.
   quic-go also drops received DATAGRAM frames beyond 128 per connection
   (a fixed limit rendr cannot prevent from overflowing when the receiving
   process stalls); the carrier counts them in `Counters.IngressDrops` from
-  the gaps in its per-DATAGRAM sequence numbers (a network loss inside
-  such an overflow is counted there too). Use `carrier/udp` or the QUIC stream carrier on
-  reordering paths.
+  the gaps in its per-DATAGRAM sequence numbers. That count is exact when
+  DATAGRAMs arrive in order (a network loss inside such an overflow is
+  counted there too). On a path that reorders it is no bound: it can be
+  too high (a datagram reordered during an overflow is counted and still
+  delivered) and too low (a late datagram that quic-go's full queue
+  dropped after a later one had already shown its gap, or drops whose gap
+  shows only after a reordered datagram). Use `carrier/udp` or the QUIC
+  stream carrier on reordering paths.
 - **Synchronous-Write carriers at `GOMAXPROCS=1`.** A carrier conn whose
   `Write` returns only after the far end read the bytes (a `net.Pipe`-like
   in-process tunnel) may give no probe RTT evidence on one P: a cold Dial
