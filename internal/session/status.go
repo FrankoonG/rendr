@@ -18,6 +18,13 @@ type statusSnap struct {
 	state State
 	err   error // the end error once state == StateEnded
 
+	// peer is the bound peer instance (F-8): a passive's from its first
+	// snapshot, a dialer's from the snapshot that left StatePending (zero
+	// before), so Status reports it with the state of the same snapshot.
+	// The open writes a dialer's Session.peer after an EarlyReturn Dial
+	// returned, so Status reads the peer here, never from that field.
+	peer [16]byte
+
 	epoch  uint32 // SchedEpoch: dialer: last published; passive: last applied
 	echoed uint32 // SchedEchoed: dialer: highest epoch the passive echoed
 
@@ -65,6 +72,7 @@ func (a *actor) publishLocked(now time.Time) {
 	ctl := &s.ctl
 	sn := &statusSnap{
 		state:       ctl.state,
+		peer:        s.peer, // the actor is the field's only writer
 		epoch:       ctl.epoch,
 		echoed:      ctl.echoed,
 		migDeath:    ctl.migDeath,
@@ -103,7 +111,7 @@ func (a *actor) publishLocked(now time.Time) {
 // initialSnapLocked publishes the snapshot of a session that is not yet
 // visible to any other goroutine (Dial, NewPending).
 func (s *Session) initialSnapLocked() {
-	sn := &statusSnap{state: s.ctl.state, epoch: s.ctl.epoch}
+	sn := &statusSnap{state: s.ctl.state, peer: s.peer, epoch: s.ctl.epoch}
 	for _, l := range s.lanes {
 		sn.lanes = append(sn.lanes, laneSnap{id: l.id, name: l.c.Name(), gen: l.gen, state: l.state, conn: l.c})
 	}
@@ -120,12 +128,15 @@ func (s *Session) initialSnapLocked() {
 // in every mode; a race session's extra copies are in Race (sender) and
 // DupBytes or PacketCounters.Duplicates (receiver), and its carriers' rows
 // count every physical copy (M3-D35, L35). No figure is derived from a
-// race's members (no aggregate rate or latency: Unknown, PA-36).
+// race's members (no aggregate rate or latency: Unknown, PA-36). The peer
+// instance is the snapshot's (F-8): zero while a dialer's snapshot says
+// StatePending, never Session.peer read while the open may write it.
 func (s *Session) status() Status {
 	sn := s.snap.Load()
-	out := Status{ID: s.id, Mode: s.p.Mode, Role: s.p.Role, PeerInstance: s.peer, Kind: s.Kind()}
+	out := Status{ID: s.id, Mode: s.p.Mode, Role: s.p.Role, Kind: s.Kind()}
 	var ctr PacketCounters
 	if sn != nil {
+		out.PeerInstance = sn.peer
 		out.State, out.Err = sn.state, sn.err
 		out.SchedEpoch, out.SchedEchoed = sn.epoch, sn.echoed
 		if s.p.Role == RolePassive {
@@ -161,6 +172,7 @@ func (s *Session) status() Status {
 	}
 	s.mu.Unlock()
 	if sn == nil {
+		out.PeerInstance = s.PeerInstance()
 		if s.pk != nil {
 			out.Packet = &ctr
 		}

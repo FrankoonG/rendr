@@ -44,11 +44,15 @@ type Session struct {
 	meta []byte   // immutable: the OPEN metadata, owned by the session
 
 	// peer is the bound peer instance. Passive: set at NewPending (the
-	// dialer's InstanceID). Dialer: written once by the actor at the first
-	// OPEN_ACK(OK), right before bound is set.
+	// dialer's InstanceID). Dialer: written once by the actor, under mu,
+	// at the first OPEN_ACK(OK), right before bound is set — with
+	// EarlyReturn after Dial returned. Only the actor and the check
+	// closures of its dial attempts (after bound) read it directly; every
+	// other reader goes through PeerInstance (after bound) or the status
+	// snapshot (statusSnap.peer) (F-8).
 	peer [16]byte
-	// bound (A) dialer: set right after peer; attempt check closures read
-	// peer only after observing bound (design §6.6).
+	// bound (A) dialer: set right after peer; attempt check closures and
+	// PeerInstance read peer only after observing bound (design §6.6).
 	bound atomic.Bool
 
 	mu sync.Mutex

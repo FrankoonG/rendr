@@ -511,7 +511,7 @@ func (s *churn) runRST(addr string) error {
 // Conn.Abort: net.ErrClosed) at pe; a Link was killed at k within
 // churnRSTInFlight after pe (the RST still on its way); and the dialer's
 // session lost a carrier of that Link to the kill (transport_error, at or
-// after k).
+// after k — or peer_down, peerDownAfterKill).
 func (s *churn) rstLostByKill(in *ingress, serr error) error {
 	if !strings.Contains(serr.Error(), "UNKNOWN_SESSION") {
 		return fmt.Errorf("the loss %q is not a JOIN's UNKNOWN_SESSION answer", serr)
@@ -533,7 +533,7 @@ func (s *churn) rstLostByKill(in *ingress, serr error) error {
 			continue
 		}
 		for _, ev := range s.w.dev.of(rendr.EventCarrierDown) {
-			if ev.Session != id || ev.Cause != rendr.CauseTransportError || ev.Time.Before(k.at) {
+			if ev.Session != id || ev.Time.Before(k.at) || ev.Cause != rendr.CauseTransportError && !peerDownAfterKill(ev, k.at) {
 				continue
 			}
 			if cs, ok := carrierOf(st, ev.Carrier); ok && cs.Name == k.name {
@@ -544,6 +544,15 @@ func (s *churn) rstLostByKill(in *ingress, serr error) error {
 			k.name, k.at.Sub(s.start), k.at.Sub(pe.Time), st.Carriers)
 	}
 	return fmt.Errorf("no kill within %v after the passive's end at +%v", churnRSTInFlight, pe.Time.Sub(s.start))
+}
+
+// peerDownAfterKill reports whether the dialer's CarrierDown ev is the
+// passive's report of a kill at at (PA-86): Link.Kill closes both ends of
+// the Link's trunks at at, and the passive's DOWN on a trunk of the other
+// Link can reach the dialer before its own detection, which then records
+// peer_down, dated no earlier than the kill (the passive's transport_error).
+func peerDownAfterKill(ev rendr.Event, at time.Time) bool {
+	return ev.Cause == rendr.CausePeerDown && !ev.Time.Before(at)
 }
 
 // runStall (R1-3): the client writes 1 KiB, half-closes, and Closes 1 s

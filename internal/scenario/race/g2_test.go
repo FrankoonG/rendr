@@ -35,9 +35,10 @@ import (
 // the dialer per kill (every kill is effective: the dialer's request was
 // in flight on the killed member, M3-D34) and Rejoins + 1 per kill; each
 // killed carrier recorded dead with transport_error on both ends within
-// 2 s (E42); no migration in the baseline; a clean end with io.EOF on both
-// ends and nothing left after Runtime.Close. No quality event: race has no
-// quality switching (plan:741).
+// 2 s (E42; PA-86: or, on one end, peer_down no earlier than the other
+// end's: killedCause); no migration in the baseline; a clean end with
+// io.EOF on both ends and nothing left after Runtime.Close. No quality
+// event: race has no quality switching (plan:741).
 func TestG2RaceMiniature(t *testing.T) {
 	synctest.Test(t, g2)
 }
@@ -199,11 +200,16 @@ func g2(t *testing.T) {
 		t.Fatalf("Rejoins rose by %d for %d kills", r, len(ks))
 	}
 	for i, k := range ks {
+		var evs [2]rendr.Event
 		for j, l := range []*eventLog{w.dev, w.pev} {
 			ev, ok := l.downOf(k.id)
-			if !ok || ev.Cause != rendr.CauseTransportError || ev.Time.Sub(k.at) > 2*time.Second {
-				t.Fatalf("kill %d: the %s's death record of %d: %+v (found %v), want transport_error within 2 s", i, side(j), k.id, ev, ok)
+			if !ok || ev.Time.Sub(k.at) > 2*time.Second {
+				t.Fatalf("kill %d: the %s's death record of %d: %+v (found %v), want one within 2 s", i, side(j), k.id, ev, ok)
 			}
+			evs[j] = ev
+		}
+		if bad := killedCause(evs); bad != "" {
+			t.Fatalf("kill %d of %d: %s", i, k.id, bad)
 		}
 	}
 	t.Logf("%d kills; migrations: dialer %+v, passive %+v; Rejoins +%d", len(ks), ds.Migrations, ps.Migrations, ds.Rejoins-ds0.Rejoins)

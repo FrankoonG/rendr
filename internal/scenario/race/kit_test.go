@@ -644,6 +644,25 @@ func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID
 	}
 }
 
+// killedCause checks the death records of a member killed with Link.Kill
+// (evs: the dialer's and the passive's EventCarrierDown of it) and returns
+// "" or what is wrong. The Link closes both ends at once and each records
+// transport_error; PA-86: the member's carrier is a MUX trunk and the
+// other member's trunk survives, so an end may learn of the other end's
+// death first from its DOWN and record peer_down, dated no earlier than
+// the other end's transport_error (at least one end records
+// transport_error).
+func killedCause(evs [2]rendr.Event) string {
+	for i, ev := range evs {
+		other := evs[1-i]
+		if ev.Cause != rendr.CauseTransportError && !(ev.Cause == rendr.CausePeerDown && other.Cause == rendr.CauseTransportError && !ev.Time.Before(other.Time)) {
+			return fmt.Sprintf("the %s's death record %+v (the %s's: %v at %v), want transport_error (or peer_down no earlier than the other end's)",
+				side(i), ev, side(1-i), other.Cause, other.Time)
+		}
+	}
+	return ""
+}
+
 // dropTarget returns the Seq of the link's one open session carrier just
 // before the DROP: the carrier under the race member the DROP kills.
 func dropTarget(t testing.TB, l *rendrtest.Link) int {

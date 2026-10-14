@@ -13,8 +13,14 @@ func (s *Session) ID() [16]byte {
 }
 
 // PeerInstance returns the bound peer InstanceID (dialer: from the PREFACE_ACK
-// of the carrier that carried the first OPEN_ACK(OK); passive: the dialer's).
+// of the carrier that carried the first OPEN_ACK(OK); passive: the dialer's),
+// or the zero ID while PeerBound is false: an EarlyReturn dialer's open
+// writes the field after Dial returned, so it is read only after bound,
+// which the actor stores right after that write, was seen set (F-8).
 func (s *Session) PeerInstance() [16]byte {
+	if !s.PeerBound() {
+		return [16]byte{}
+	}
 	return s.peer
 }
 
