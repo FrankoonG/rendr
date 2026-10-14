@@ -3,5 +3,7 @@
 package mux
 
 // raceEnabled: under the race detector the bulk scenarios run their race
-// size (M3 design R1-11: the same criteria on a smaller volume).
+// size (M3 design R1-11: the same criteria on a smaller volume), and
+// TestMuxBulkBothWaysKeepsTheLink runs two of its three Links (bulkLinks).
+// TestRaceLaneSubtests checks this switch against the binary's build.
 const raceEnabled = true

@@ -54,12 +54,29 @@ import (
 // still carries every session, as the premise requires: M4 puts each
 // forwarded TCP connection on shared trunks, far beyond 32. The event
 // queues hold every session's events of the close (premise: none dropped).
+//
+// Lanes (trunkLearnSessions): sessions=256 runs only outside -race; 8 and
+// 32 run in every lane, with the same bound.
 func TestPacketTrunkCloseEverySessionLearns_L45_L39(t *testing.T) {
-	for _, n := range []int{8, 32, 256} {
+	for _, n := range trunkLearnSessions() {
 		t.Run(fmt.Sprintf("sessions=%d", n), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) { trunkCloseLearns(t, n) })
 		})
 	}
+}
+
+// trunkLearnSessions returns the session counts
+// TestPacketTrunkCloseEverySessionLearns_L45_L39 runs in this lane: 8, 32
+// and 256 in the non-race unit and sweep lanes, and 8 and 32 under -race
+// (racebudget: the C-P round 2 decision runs the row's heaviest subtest,
+// sessions=256, only outside -race). The bound is the same in every lane,
+// and sessions=32, which fails without PA-86 as sessions=256 does, runs in
+// both. TestRaceLaneSubtests checks the list against the binary's build.
+func trunkLearnSessions() []int {
+	if raceEnabled {
+		return []int{8, 32}
+	}
+	return []int{8, 32, 256}
 }
 
 // sessionDownOf returns the EventCarrierDown of carrier id in session sid.
