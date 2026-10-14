@@ -107,20 +107,23 @@ type Status struct {
 // rendr.RaceCounters; M3-D35).
 type RaceCounters struct {
 	CopyBytes uint64 // stream: payload bytes placed below another lane's cursor
-	Copies    uint64 // packet: extra placements of datagrams another lane already placed, less the carriers' refusals (raceRefused)
+	Copies    uint64 // packet: extra placements of datagrams another lane already placed, less the copies a dying carrier handed back unwritten (exact, pkt_unsent.go) and the carriers' refusals (raceRefused: an upper bound)
 }
 
 // PacketCounters count the datagrams of one packet session on this side
 // (field-for-field rendr.PacketCounters; M2-D61). In a Status snapshot a
 // datagram a carrier refused as too large counts in DropTooLarge and not in
 // Sent, so Sent + DropQueue + DropAge + DropTooLarge + DropNoPath + still
-// queued = accepted by WriteTo (M2 design §A7.2, Revision 1, R1-31).
+// queued = accepted by WriteTo (M2 design §A7.2, Revision 1, R1-31). Still
+// queued includes a datagram a dying carrier handed back that waits to be
+// placed again (pkt_unsent.go; in race also a queued one whose every
+// placement came back).
 type PacketCounters struct {
-	Sent          uint64 // placed on a carrier (seq assigned), not refused by it and not handed back unwritten by a dying one (pkt_unsent.go)
+	Sent          uint64 // placed on a carrier (seq assigned), not refused by it and not handed back unwritten by a dying one (pkt_unsent.go: it can fall until the datagram is placed again; race: once while a placement may have left)
 	Received      uint64 // accepted from carriers (new seqs)
 	Duplicates    uint64 // received again inside the dedup window, also after the peer's FIN was delivered (M3-D35); in a race session the members' copies while they arrive inside the window (KL-15)
-	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, or still queued at the end
-	DropAge       uint64 // send side: older than Packet.MaxAge before placement while a data lane existed
+	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, still queued at the end or at a peer FIN that came before ours was requested (PA-6), or handed back unwritten after either or while maxRedo returned DGRAMs waited (pkt_unsent.go)
+	DropAge       uint64 // send side: older than Packet.MaxAge since WriteTo before placement while a data lane existed (also after a dying carrier handed it back unwritten)
 	DropTooLarge  uint64 // send side: no live data lane could carry it, a carrier refused it as too large, or a budget shrink left it on a member too small for it while every member that can carry it was write-blocked or at its capacity (M2-D45, L37)
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no data lane
 	DropRecvQueue uint64 // receive side: evicted by a full receive queue (the application did not read)

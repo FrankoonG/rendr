@@ -588,6 +588,7 @@ type OwnedUDPSocket struct {
 	u        *net.UDPConn
 	limit    int // MaxDatagram
 	maxBatch int // carrier/udp Options.MaxBatch, normalised: 1 … udpsocket.MaxMsgs
+	readBuf  int // the read buffer size Listen asked for (NewOwnedUDPListenSocket); 0: none recorded
 }
 
 // NewOwnedUDPSocket returns the token for u with its MaxDatagram and
@@ -606,8 +607,27 @@ func NewOwnedUDPSocketBatch(u *net.UDPConn, maxDatagram, maxBatch int) *OwnedUDP
 	return &OwnedUDPSocket{u: u, limit: maxDatagram, maxBatch: normMaxBatch(maxBatch)}
 }
 
+// NewOwnedUDPListenSocket is NewOwnedUDPSocketBatch for carrier/udp's
+// Listen, which also records the read buffer size it asked the kernel for
+// (Options.ReadBuffer, or its default for 0; a negative size records
+// none): package udpflow lets each flow's inbox queue up to it in bytes,
+// beyond its datagram bound (ReadBuffer; M5 work item inboxtime, F-6).
+func NewOwnedUDPListenSocket(u *net.UDPConn, maxDatagram, maxBatch, readBuffer int) *OwnedUDPSocket {
+	s := NewOwnedUDPSocketBatch(u, maxDatagram, maxBatch)
+	s.readBuf = max(readBuffer, 0)
+	return s
+}
+
 // MaxDatagram returns the largest UDP payload the socket reads and writes.
 func (s *OwnedUDPSocket) MaxDatagram() int { return s.limit }
+
+// ReadBuffer returns the read buffer size carrier/udp's Listen asked the
+// kernel for when it opened the socket — the size the embedder configured,
+// not what the kernel reports (Linux caps an unprivileged request at
+// rmem_max, doubles it for its bookkeeping overhead and reports the doubled
+// value) — or 0 for a token built without one (NewOwnedUDPSocket,
+// NewOwnedUDPSocketBatch).
+func (s *OwnedUDPSocket) ReadBuffer() int { return s.readBuf }
 
 // MaxBatch returns the socket's normalised Options.MaxBatch (1 … 64).
 func (s *OwnedUDPSocket) MaxBatch() int { return s.maxBatch }
@@ -791,8 +811,10 @@ var (
 	// a refusal allocates nothing.
 	errUDPTooLarge error = &wire.DatagramTooLargeError{}
 	// errUDPWriteCount: a datagram write that reported another count than
-	// the datagram's length (L42, PA-19).
-	errUDPWriteCount = errors.New("rendr/carrier: UDP datagram write returned an invalid count")
+	// the datagram's length, or a batched write whose count has a shape it
+	// cannot have (L42, PA-19): ErrWriteCount itself, so the writer hands
+	// back none of the call's datagrams (dgOutcome).
+	errUDPWriteCount = ErrWriteCount
 	// errUDPReadCount: a datagram read that reported a count outside the
 	// buffer (L42).
 	errUDPReadCount = errors.New("rendr/carrier: UDP datagram read returned an invalid count")

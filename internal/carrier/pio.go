@@ -72,7 +72,11 @@ type PacketIO interface {
 	// matching wire.ErrDatagramTooLarge refuses this datagram only (the
 	// carrier lives, M2-D25); ErrNoise loses this datagram only; any other
 	// error, and an invalid count, ends the carrier (L42: never retried on
-	// it).
+	// it). An invalid count — the socket or conn reported another count
+	// than the datagram's — is returned as an error matching ErrWriteCount
+	// (or udpsocket.ErrInvalidCount): the datagram may have left, so the
+	// writer hands it back to no session (DgramReturner), while after any
+	// other death it goes back, as never sent.
 	WriteDatagram(b []byte) error
 	// WriteDatagramTo sends b to dst instead of the current peer (a rebind
 	// challenge, M2-D27); ErrNoRebind (or an error wrapping it) on
@@ -197,8 +201,14 @@ type BatchIO interface {
 	// sent; err, if any, is ds[n]'s, classified as WriteDatagram's error
 	// would be (wire.ErrDatagramTooLarge, ErrNoise, or death). A count
 	// outside [0, len(ds)], n < len(ds) without an error, or n == len(ds)
-	// with one (an error of no datagram), is death (L42). The writer never
-	// passes more than MaxBatch() datagrams.
+	// with one (an error of no datagram), is death (L42). So is an invalid
+	// count the transport finds itself — a datagram write or a system call
+	// that reported another count than it was given — which it returns as
+	// ds[n]'s error, matching ErrWriteCount or udpsocket.ErrInvalidCount.
+	// After either, which of the call's datagrams left is unknown: the
+	// writer hands back none of ds, only the round's datagrams that no call
+	// was given (DgramReturner). The writer never passes more than
+	// MaxBatch() datagrams.
 	WriteDatagrams(ds [][]byte) (n int, err error)
 	// ReadDatagrams fills rs[:n], n ≥ 1, in arrival order, each what
 	// ReadDatagram would have returned for that datagram, or returns n = 0

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/rendrtest"
+	qgo "github.com/quic-go/quic-go"
 )
 
 // update rewrites testdata/dgram-q1.txt from what a dialer carrier sends.
@@ -97,8 +99,11 @@ func (g *dgramGolden) format() []byte {
 // server, which must negotiate the file's ALPN and receive exactly the
 // file's DATAGRAM payloads; then a raw quic-go client sends the file's
 // payloads to a Listener, whose carrier must deliver exactly the rendr
-// datagrams. In-tree, the rendr datagrams are also checked against the
-// root module's wire golden vectors of the same names.
+// datagrams and count no drop. The passive's reading of the sequence
+// number is pinned by continuing the file's numbering in code past a
+// stall: the drops quic-go's full queue made must be counted exactly from
+// the gap. In-tree, the rendr datagrams are also checked against the root
+// module's wire golden vectors of the same names.
 func TestQUICDatagramGolden(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	inner := make([][]byte, len(dgramGoldenInner))
@@ -173,7 +178,8 @@ func TestQUICDatagramGolden(t *testing.T) {
 	}
 
 	// Passive: the file's payloads are what a carrier accepts.
-	l, f := serveFake(t, Options{})
+	ft := &frameTracer{}
+	l, f := serveFake(t, Options{Config: &qgo.Config{Tracer: ft.trace}})
 	qc, err := rawTransport(t).Dial(dialCtx(t), l.Addr(), rawClientTLS(t), quicConfig(nil, 0, false, true))
 	if err != nil {
 		t.Fatal(err)
@@ -195,6 +201,40 @@ func TestQUICDatagramGolden(t *testing.T) {
 	}
 	if s := l.Stats(); s.DatagramDrops != 0 {
 		t.Errorf("DatagramDrops %d after the file's consecutive sequence numbers, want 0", s.DatagramDrops)
+	}
+
+	// Passive: how it reads the number. The file's numbering continues in
+	// code (the header's rule: one per datagram, big-endian, before the
+	// datagram); a burst the held pump does not take overflows quic-go's
+	// 128-entry queue, and the passive counts exactly the drops the next
+	// number's gap shows - a passive that read the number at another
+	// offset, in another byte order or not at all counts another number.
+	next := uint32(len(want.dgs))
+	payload := func(k int) []byte { return inner[k%len(inner)] }
+	var burst [][]byte
+	for k := range 200 {
+		burst = append(burst, append(binary.BigEndian.AppendUint32(nil, next+uint32(k)), payload(k)...))
+	}
+	parked, release := holdPump(t, d)
+	rawSendTraced(t, qc, ft, burst...)
+	kept := pinnedRcvQueue + parked() // what the pump took as the hold began, and quic-go's queue
+	release()
+	eventually(t, "the pump drained quic-go's queue", func() bool { return queued(d) == kept })
+	rawSendTraced(t, qc, ft, append(binary.BigEndian.AppendUint32(nil, next+uint32(len(burst))), payload(len(burst))...))
+	eventually(t, "the trailing datagram arrived", func() bool { return queued(d) == kept+1 })
+	_ = d.SetReadDeadline(time.Now().Add(testEventuallyTime))
+	for k := range kept + 1 {
+		w := payload(k)
+		if k == kept {
+			w = payload(len(burst))
+		}
+		if n, _, err := d.ReadFrom(buf); err != nil || !bytes.Equal(buf[:n], w) {
+			t.Fatalf("passive datagram %d after the file's: %x, %v; want %x", k, buf[:n], err, w)
+		}
+	}
+	if s := l.Stats(); s.DatagramDrops != uint64(len(burst)-kept) {
+		t.Errorf("DatagramDrops %d after DATAGRAMs %d … %d of which quic-go dropped %d … %d: want %d, counted from %d's gap",
+			s.DatagramDrops, next, next+uint32(len(burst)), next+uint32(kept), next+uint32(len(burst))-1, len(burst)-kept, next+uint32(len(burst)))
 	}
 }
 

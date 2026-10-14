@@ -98,7 +98,10 @@ func listen(ctx context.Context, network, address string, o Options) (net.Packet
 			return nil, err
 		}
 	}
-	return carrier.NewOwnedUDPSocketBatch(u, maxDatagram, o.MaxBatch), nil
+	// The token records the read buffer asked for: package udpflow lets
+	// each flow's inbox queue up to it in bytes, beyond M2's 512 datagrams
+	// (M5 work item inboxtime, F-6).
+	return carrier.NewOwnedUDPListenSocket(u, maxDatagram, o.MaxBatch, rbuf), nil
 }
 
 // configure gives a fresh socket don't-fragment with probe semantics and
