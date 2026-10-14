@@ -31,19 +31,24 @@
 // WriteTo sends one datagram of at most MaxPayload bytes (fixed at OPEN;
 // larger ones fail with ErrPacketTooLarge) and whose ReadFrom returns one.
 // Datagrams are delivered at most once, possibly reordered, never
-// retransmitted; they are lost only in flight on a carrier that dies or
-// when a bounded queue drops them (counted). Their carriers are datagram
-// carriers — the built-in raw UDP carrier (package carrier/udp, with a
-// listening socket served through FromPacketConn), the QUIC carriers of
-// the nested module github.com/FrankoonG/rendr/quic/v2, or an embedder's
-// net.PacketConn (DatagramCarrier, Listener.HandlePacket) — and stream
-// carriers too. ReadFrom returns io.EOF only after the peer closed its end
-// and the datagrams this side holds were read; a carrier change is as
-// invisible as for a stream session. On Linux amd64 and arm64 the sockets
-// package carrier/udp creates move up to its Options.MaxBatch datagrams
-// per system call (sendmmsg, recvmmsg), with a one-way fallback to one
-// call per datagram where the kernel refuses them; Status.Datagram counts
-// the calls and the datagrams they moved.
+// retransmitted; they are lost only in flight (dropped by the network, or
+// on a carrier that dies) or when a bounded queue or budget drops them. A
+// packet session counts its own drops in the Drop* counters of
+// SessionStatus.Packet; a datagram a carrier or a raw-UDP flow drops
+// counts in Status.Datagram, CarrierStatus.Dropped or a QUIC carrier's
+// Counters and, like a loss in flight, in the sender's Sent − PeerReceived
+// (see PacketCounters). Their carriers are datagram carriers — the
+// built-in raw UDP carrier (package carrier/udp, with a listening socket
+// served through FromPacketConn), the QUIC carriers of the nested module
+// github.com/FrankoonG/rendr/quic/v2, or an embedder's net.PacketConn
+// (DatagramCarrier, Listener.HandlePacket) — and stream carriers too.
+// ReadFrom returns io.EOF only after the peer closed its end and the
+// datagrams this side holds were read; a carrier change is as invisible
+// as for a stream session. On Linux amd64 and arm64 the sockets package
+// carrier/udp creates move up to its Options.MaxBatch datagrams per
+// system call (sendmmsg, recvmmsg), with a one-way fallback to one call
+// per datagram where the kernel refuses them; Status.Datagram counts the
+// calls and the datagrams they moved.
 //
 // Race sessions (ModeRace) take their member carriers as bond sessions do
 // and send every byte or datagram on each of them; the receiver keeps the
