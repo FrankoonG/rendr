@@ -78,12 +78,14 @@ const (
 
 // unsentStim is the stimulus of the unsent rows: armed with the victim
 // carrier, it closes the dialer's conn of that carrier once, in the
-// dialer writer's BeforeWrite of a datagram holding a request DGRAM. It
-// also counts the dialer's request datagrams per carrier (every write
-// attempt, the failed one included).
+// dialer writer's BeforeWrite of a datagram holding a request DGRAM —
+// after holding that write for hold first (0: none), as a write that
+// blocks until its stall window would. It also counts the dialer's request
+// datagrams per carrier (every write attempt, the failed one included).
 type unsentStim struct {
 	vic   atomic.Uint32 // 0: not armed
 	fired atomic.Bool
+	hold  time.Duration
 	mu    sync.Mutex
 	at    time.Time
 	err   error
@@ -104,6 +106,9 @@ func (s *unsentStim) before(id uint32, frames, bytes int) {
 	s.mu.Unlock()
 	if v := s.vic.Load(); v == 0 || id != v || !s.fired.CompareAndSwap(false, true) {
 		return
+	}
+	if s.hold > 0 {
+		time.Sleep(s.hold)
 	}
 	pc := s.conn(rendr.CarrierID(id))
 	err := errors.New("no registered conn")
@@ -295,6 +300,141 @@ func TestPacketCarrierCloseUnsentNoPath_L39(t *testing.T) {
 		w.noViolation()
 		w.close()
 	})
+}
+
+// TestPacketCarrierCloseUnsentAged_L40 (M5 review D2-1; plan:286, M2-D35,
+// L40) is the unsent row with a write that blocks first: the victim's
+// writer is held in Hooks.BeforeWrite of a request datagram for twice
+// MaxAge, as a write blocked until its stall window, then its conn is
+// closed. The round's request comes back older than MaxAge since its
+// WriteTo, and a returned datagram keeps that age: bond and selector count
+// it and never deliver it stale on the surviving carrier (with its age
+// restarted at the hand-back the passive read it 200 ms late). The client
+// writes nothing while the write is held, so nothing else ages. Criteria:
+//
+//   - Stimulus: the hook fired and held a request; the dialer recorded the
+//     victim's death (transport_error).
+//   - Age: the held request never reached the passive's application; the
+//     dialer counts it in one drop counter, as its queue would (M2-D35):
+//     DropAge while a data lane exists (bond's other member; a selector's
+//     standby carrier, up before the victim died, is activated at once),
+//     DropNoPath when the selector has no carrier to fall back to and ages
+//     it while the failover dials one.
+//   - Accounting: settled, the dialer's Sent equals its PeerReceived and the
+//     echo's reads, and Sent plus that drop equals the requests written.
+//   - Integrity: no duplicate or damaged datagram, no violation, a clean
+//     end.
+func TestPacketCarrierCloseUnsentAged_L40(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode rendr.Mode
+	}{{"bond", rendr.ModeBond}, {"selector", rendr.ModeSelector}} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { unsentAged(t, tc.mode) })
+		})
+	}
+}
+
+func unsentAged(t *testing.T, mode rendr.Mode) {
+	stim := &unsentStim{hold: 2 * clMaxAge}
+	w := newWorldHooked(t, worldOpts{oneWay: clOneWay}, &testhooks.Hooks{BeforeWrite: stim.before}, nil, "u1", "u2")
+	stim.conn = w.conn
+	dc, pc := w.open(w.peer("u1", "u2"), rendr.DialOptions{Mode: mode})
+	vic, ok := liveNamed(dc.Status(), "u1")
+	if !ok {
+		t.Fatalf("the session did not open on u1: %+v", dc.Status().Carriers)
+	}
+	if mode == rendr.ModeBond {
+		waitFor(t, 2*time.Second, "two members on both ends", func() bool {
+			return len(liveOf(dc.Status())) == 2 && len(liveOf(pc.Status())) == 2
+		})
+	}
+	const seed = 0x779
+	echo := startEcho(pc, seed)
+	ver := rendrtest.NewPacketVerifier(seed)
+	rdone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, dc.MaxPayload()+1)
+		for {
+			n, _, err := dc.ReadFrom(buf)
+			if err != nil {
+				rdone <- err
+				return
+			}
+			if verr := ver.Add(buf[:n], time.Now()); verr != nil {
+				rdone <- verr
+				return
+			}
+		}
+	}()
+	start := time.Now()
+	buf := make([]byte, urSize)
+	var pause time.Duration
+	held := int64(-1)
+	for seq := range uint64(clRequests) {
+		sleepUntil(start.Add(time.Duration(seq)*clGap + pause))
+		if seq == urArm {
+			stim.vic.Store(uint32(vic.ID))
+		}
+		if _, err := dc.WriteTo(rendrtest.PacketPayload(buf, seed, seq, urSize, time.Now()), nil); err != nil {
+			t.Fatalf("WriteTo of request %d: %v", seq, err)
+		}
+		synctest.Wait() // the dialer's writer has written it, failed to, or is held in the hook
+		if held < 0 && stim.fired.Load() {
+			held = int64(seq)    // the only request not yet written
+			pause = 3 * clMaxAge // past the hold: no WriteTo while the write is held
+		}
+	}
+	waitFor(t, 10*time.Second, "the packet accounting to settle", func() bool {
+		ds, ps := dc.Status().Packet, pc.Status().Packet
+		return ds.PeerReceived == ps.Received && ps.PeerReceived == ds.Received && echo.reads.Load() == int64(ps.Received)
+	})
+	ds, ps := *dc.Status().Packet, *pc.Status().Packet
+
+	// Stimulus.
+	stim.mu.Lock()
+	at, cerr := stim.at, stim.err
+	stim.mu.Unlock()
+	if held < 0 || cerr != nil {
+		t.Fatalf("stimulus: the held close in BeforeWrite of a request datagram on carrier %d did not happen (fired %v, close %v)", vic.ID, stim.fired.Load(), cerr)
+	}
+	down, ok := w.dev.downOf(vic.ID)
+	if !ok || down.Cause != rendr.CauseTransportError {
+		t.Fatalf("stimulus: the dialer's CarrierDown of %d is %+v (found %v), want transport_error", vic.ID, down, ok)
+	}
+	fallback := mode == rendr.ModeBond // bond: the other member is a data lane throughout
+	for _, ev := range w.dev.of(rendr.EventCarrierUp) {
+		if ev.Carrier != vic.ID && ev.Time.Before(down.Time) {
+			fallback = true // a carrier the selector activates at the victim's death
+		}
+	}
+
+	// Age: the held request is counted, never delivered stale.
+	if when, ok := echo.echoedAt(uint64(held)); ok {
+		t.Fatalf("request %d, held %v in its write, reached the passive at %v after the start: older than MaxAge %v since its WriteTo",
+			held, stim.hold, when.Sub(start), clMaxAge)
+	}
+	aged := ds.DropAge
+	if !fallback {
+		aged = ds.DropNoPath
+	}
+	if aged != 1 || drops(&ds) != 1 {
+		t.Fatalf("the dialer counts %+v (a carrier to fall back to: %v): want the held request DropAge with one, DropNoPath without, and no other drop",
+			ds, fallback)
+	}
+
+	// Accounting.
+	if r := echo.reads.Load(); ds.Sent != ds.PeerReceived || int64(ds.Sent) != r || ds.Sent+aged != clRequests {
+		t.Fatalf("the dialer counts %+v and the passive read %d of %d: want Sent = PeerReceived = reads and Sent + the drop = requests",
+			ds, r, clRequests)
+	}
+	if res := echo.v.Result(); res.Duplicates+res.Corrupt+res.BadSize != 0 {
+		t.Fatalf("integrity at the passive: %+v", res)
+	}
+	t.Logf("%v: held request %d for %v on carrier %d, closed %v after the start (a carrier to fall back to: %v); dialer %+v; passive %+v",
+		mode, held, stim.hold, vic.ID, at.Sub(start), fallback, ds, ps)
+
+	unsentEnd(t, w, dc, pc, echo, rdone, ver)
 }
 
 // unsentEnd is the clean end of the unsent rows: the dialer closes, its

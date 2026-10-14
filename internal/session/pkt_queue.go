@@ -85,8 +85,8 @@ func (q *pring) data(d *pdesc) ([]byte, *carrier.Buf) {
 // caller copies the datagram into (under the same lock section). Before
 // it, the oldest datagrams are evicted while the queue's charge or count
 // would exceed its bounds (drop-oldest, M2-D33/M2-D37); evicted counts
-// those never placed (a race head another lane already placed was sent,
-// M3-D32). A chunk the pool refuses evicts the head once and is tried
+// those never placed (a race head with a placement that may have left was
+// sent, M3-D32). A chunk the pool refuses evicts the head once and is tried
 // again; a second refusal drops the new datagram: ok is false (and slot
 // nil). ext is always taken (ok true).
 func (q *pring) push(n int, at int64, ext *carrier.Buf, pool *carrier.BufPool, budget *carrier.Budget) (slot []byte, evicted int, ok bool) {
@@ -133,7 +133,7 @@ func (q *pring) push(n int, at int64, ext *carrier.Buf, pool *carrier.BufPool, b
 	i := (q.head + q.n) & (len(q.desc) - 1)
 	q.desc[i] = pdesc{chunk: chunk, off: uint32(off), n: uint32(n), at: at, ext: ext}
 	if q.seq != nil {
-		q.seq[i] = 0
+		q.seq[i], q.cell[i] = 0, 0
 	}
 	q.n++
 	q.charge += c
@@ -146,27 +146,33 @@ func (q *pring) push(n int, at int64, ext *carrier.Buf, pool *carrier.BufPool, b
 func (q *pring) grow() {
 	d := make([]pdesc, 2*len(q.desc))
 	var sq []uint64
+	var sc []int32
 	if q.seq != nil {
-		sq = make([]uint64, len(d))
+		sq, sc = make([]uint64, len(d)), make([]int32, len(d))
 	}
 	for i := range q.n {
 		j := (q.head + i) & (len(q.desc) - 1)
 		d[i] = q.desc[j]
 		if sq != nil {
-			sq[i] = q.seq[j]
+			sq[i], sc[i] = q.seq[j], q.cell[j]
 		}
 	}
-	q.desc, q.seq, q.head = d, sq, 0
+	q.desc, q.seq, q.cell, q.head = d, sq, sc, 0
 }
 
 // pop removes the head descriptor and returns it; its ext reference (if
-// any) moves to the caller. A caller that still needs the bytes of a
-// chunk datagram references the chunk before (the pop may release it).
+// any) moves to the caller, and a race descriptor's reference on its cell
+// goes. A caller that still needs the bytes of a chunk datagram references
+// the chunk before (the pop may release it).
 func (q *pring) pop() pdesc {
 	d := q.desc[q.head]
 	q.desc[q.head] = pdesc{}
 	if q.seq != nil {
-		q.seq[q.head] = 0
+		if c := q.cell[q.head]; c != 0 {
+			q.cellAt(c).queued = false
+			q.cellUnref(c)
+		}
+		q.seq[q.head], q.cell[q.head] = 0, 0
 	}
 	q.pos++
 	q.head = (q.head + 1) & (len(q.desc) - 1)
@@ -188,8 +194,9 @@ func (q *pring) popRef() ([]byte, *carrier.Buf) {
 	return data, buf
 }
 
-// evict drops the head datagram and returns 1 when it was never placed
-// (always outside race; a race head may have been placed, M3-D32), else 0.
+// evict drops the head datagram and returns 1 when it counts as never
+// placed (always outside race; a race head may have been placed, M3-D32),
+// else 0.
 func (q *pring) evict() int {
 	unplaced := 1
 	if q.headPlaced() {
@@ -200,10 +207,13 @@ func (q *pring) evict() int {
 	return unplaced
 }
 
-// headPlaced reports whether the head descriptor was placed (race only:
-// its seq is fixed; q.n > 0).
+// headPlaced reports whether a placement of the head descriptor may have
+// left (race only: its seq is fixed and not every placement of it was
+// handed back by a dying carrier, pkt_unsent.go; q.n > 0). One whose every
+// placement came back counts as never placed: it leaves the queue counted
+// as a drop.
 func (q *pring) headPlaced() bool {
-	return q.seq != nil && q.seq[q.head] != 0
+	return q.seq != nil && q.seq[q.head] != 0 && q.cellAt(q.cell[q.head]).pc > 0
 }
 
 // trim releases the chunks no queued datagram needs any more: every chunk
@@ -235,8 +245,8 @@ func (q *pring) releaseFront() {
 }
 
 // releaseAll drops every queued datagram and every chunk and returns how
-// many of them were never placed (all of them outside race). The rings
-// keep their capacity.
+// many of them count as never placed (all of them outside race; evict).
+// The rings keep their capacity.
 func (q *pring) releaseAll() int {
 	n := 0
 	for q.n > 0 {

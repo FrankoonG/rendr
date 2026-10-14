@@ -198,9 +198,10 @@ func (s *Session) requeueLocked(l *lane) (bytes uint64) {
 // the death bump, which re-places the PACK flags and the epoch echo on a
 // survivor — then recomputes its routing summary and wakes the data lanes
 // for the queued datagrams and the FIN (pktRecomputeLocked,
-// pktWakeLocked). Nothing is requeued: it returns 1 when l placed a DGRAM
-// within the last PacketPing, so that the bond death counts (M2-D44), else
-// 0.
+// pktWakeLocked); a race session keeps the lane's placement record for its
+// carrier's hand-back (pktLaneGoneLocked). Nothing is requeued: it returns
+// 1 when l placed a DGRAM within the last PacketPing, so that the bond
+// death counts (M2-D44), else 0.
 func (s *Session) laneGoneLocked(l *lane) (requeued uint64) {
 	if l.state != LaneDead || l.data {
 		panic("rendr/session: laneGoneLocked on a lane that is not dead and data-ineligible")
@@ -218,6 +219,7 @@ func (s *Session) laneGoneLocked(l *lane) (requeued uint64) {
 		st.gapLane = nil
 	}
 	if s.pk != nil {
+		s.pktLaneGoneLocked(l)
 		now := time.Now()
 		if !st.ended {
 			s.bumpNowLocked() // the PACK flags and the echo go out on a survivor (M2-D39)
