@@ -209,20 +209,29 @@ func (d *dgramConn) accept(b []byte) bool {
 // rxSeq attributes the gaps in a direction's sequence numbers (KL-19).
 // quic-go drops a received DATAGRAM only while its receive queue holds
 // quicRcvQueue, every one of which arrived after the pump last found the
-// queue empty and is taken by the pump before the datagram that shows the
-// gap. So a gap shown while fewer than quicRcvQueue datagrams were taken
-// since the pump last found the queue empty - and none since a run that
-// reached quicRcvQueue - is no quic-go drop: the network lost or
-// reordered those datagrams, which no counter claims. Any other gap is
-// counted in IngressDrops: exactly quic-go's drops for in-order arrival,
-// with network losses and reordering inside such a lag counted too (they
-// cannot be told apart). A datagram behind the next expected one
-// (reordered) is delivered and counts nothing; the gap of a drop at the
-// end of a burst is counted when the next datagram arrives.
+// queue empty; when DATAGRAMs arrive in order, the pump takes all of them
+// before the datagram that shows the gap. So a gap shown while fewer than
+// quicRcvQueue datagrams were taken since the pump last found the queue
+// empty - and none since a run that reached quicRcvQueue - is no quic-go
+// drop: the network lost or reordered those datagrams, which no counter
+// claims. Any other gap is counted in IngressDrops: exactly quic-go's
+// drops for in-order arrival. A datagram behind the next expected one
+// (reordered) is delivered, counts nothing and leaves any lag to the
+// datagram that shows the gap; the gap of a drop at the end of a burst is
+// counted when the next datagram arrives.
+//
+// When DATAGRAMs are reordered the count is no bound, and O(1) state
+// cannot tell the cases apart. A network loss or reordering inside a lag
+// is counted too (an over-count). A drop is missed when the datagram that
+// shows its gap was taken before the lag began (a late datagram the full
+// queue dropped after its successor had arrived), or when a late datagram
+// carrying the next expected number arrives after the drain: it ends the
+// lag, and the gap of the drops after it shows at the next datagram
+// (under-counts).
 type rxSeq struct {
 	next uint32 // the sequence number expected next
 	run  int    // datagrams taken since the pump last found quic-go's queue empty
-	lag  bool   // quic-go's queue may have been full since the last datagram taken
+	lag  bool   // quic-go's queue may have been full since the last datagram taken in order
 }
 
 // empty records that the pump found quic-go's queue empty: a new run
@@ -233,31 +242,33 @@ func (s *rxSeq) empty() { s.run = 0 }
 // take records the datagram numbered seq and returns the drops its gap
 // shows.
 func (s *rxSeq) take(seq uint32) uint64 {
-	var n uint64
+	s.run++
 	if gap := int32(seq - s.next); gap >= 0 {
+		var n uint64
 		if s.lag {
 			n = uint64(gap)
 		}
 		s.next = seq + 1
+		s.lag = s.run >= quicRcvQueue
+		return n
 	}
-	s.run++
-	s.lag = s.run >= quicRcvQueue
-	return n
+	s.lag = s.lag || s.run >= quicRcvQueue // a reordered datagram leaves the lag to the one that shows the gap
+	return 0
 }
 
 // send drains the egress queue, dropping a datagram older than egressAge;
 // an error is kept for the next WriteTo: once for a too-large datagram
 // (the budget shrinks), for good when the connection failed. At its exit
 // the datagrams still queued are discarded and counted. Each datagram is
-// sent after its sequence number from one reused buffer (SendDatagram
-// copies it); a datagram quic-go accepted takes the next number.
+// sent after its sequence number (sender.step); one dropped for its age
+// is never numbered.
 func (d *dgramConn) send() {
 	defer d.exit(d.sent)
 	defer d.discard()
 	q, done := &d.out, d.qc.Context().Done()
 	var cur []byte
-	var seq uint32
-	framed := make([]byte, seqLen, seqLen+int(d.max.Load())) // d.max only falls after attach
+	s := sender{framed: make([]byte, seqLen, seqLen+int(d.max.Load()))} // d.max only falls after attach
+	sendDatagram := d.qc.SendDatagram
 	for {
 		q.mu.Lock()
 		q.give(cur) // the previous datagram's buffer: SendDatagram copied it, or it was dropped
@@ -283,14 +294,9 @@ func (d *dgramConn) send() {
 			d.drops(true, 1)
 			continue
 		}
-		binary.BigEndian.PutUint32(framed, seq)
-		framed = append(framed[:seqLen], cur...)
-		err := d.qc.SendDatagram(framed) // copies framed
-		var tl *qgo.DatagramTooLargeError
-		switch {
+		switch tl, err := s.step(sendDatagram, cur); {
 		case err == nil:
-			seq++
-		case errors.As(err, &tl):
+		case tl != nil:
 			m := max(carrierLimit(int(tl.MaxDatagramPayloadSize)), 0)
 			if int64(m) < d.max.Load() { // only the sender lowers it after attach
 				d.max.Store(int64(m))
@@ -301,6 +307,35 @@ func (d *dgramConn) send() {
 			q.setErr(d.cause(err), true)
 			return
 		}
+	}
+}
+
+// sender is the numbering state of a connection's send loop: the buffer
+// each datagram is framed in after its sequence number (reused, since
+// SendDatagram copies it), the number the next datagram quic-go accepts
+// takes, and the target errors.As fills, which lives as long as the loop
+// so that sending allocates nothing per datagram.
+type sender struct {
+	framed []byte
+	seq    uint32
+	tl     *qgo.DatagramTooLargeError
+}
+
+// step frames p after the next sequence number and hands it to send
+// (quic-go's SendDatagram). A datagram send accepted takes the number
+// (nil, nil). One it refused takes none: step returns the error, with the
+// refusal when it is a quic-go DatagramTooLargeError (its limit now).
+func (s *sender) step(send func([]byte) error, p []byte) (*qgo.DatagramTooLargeError, error) {
+	binary.BigEndian.PutUint32(s.framed, s.seq)
+	s.framed = append(s.framed[:seqLen], p...)
+	switch err := send(s.framed); {
+	case err == nil:
+		s.seq++
+		return nil, nil
+	case errors.As(err, &s.tl):
+		return s.tl, err
+	default:
+		return nil, err
 	}
 }
 

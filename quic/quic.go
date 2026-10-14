@@ -100,12 +100,14 @@ type Counters struct {
 	// by a full ingress queue (L46), or by quic-go's own 128-entry receive
 	// queue while the carrier's pump lagged behind it (KL-19). The latter
 	// are counted from the gaps in the carrier's sequence numbers when the
-	// next datagram arrives: exactly for in-order arrival; a datagram the
-	// network lost or reordered while the pump lagged counts here too (a
-	// reordered one is still delivered, so delivered + IngressDrops can
-	// exceed what the peer sent: an upper bound, not an equality), one
-	// lost while the pump kept up counts nowhere (a transport loss).
-	// Nothing is counted once the carrier was closed.
+	// next datagram arrives, exactly when DATAGRAMs arrive in order. On a
+	// path that reorders the count is no bound: it can be too high (a
+	// datagram reordered or lost in the network during a lag counts too;
+	// a reordered one is still delivered) and too low (a late datagram
+	// quic-go's full queue dropped after a later one had already shown its
+	// gap, or drops whose gap shows only after a reordered datagram). A
+	// datagram lost while the pump kept up counts nowhere (a transport
+	// loss). Nothing is counted once the carrier was closed.
 	IngressDrops atomic.Uint64
 	// EgressDrops: DATAGRAMs the egress queue dropped — one older than
 	// 250 ms (when its turn came, or when a newer one was queued), the
