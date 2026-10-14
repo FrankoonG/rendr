@@ -36,9 +36,10 @@ type reader struct {
 	at [srcMaxDepth]uint8
 
 	// The extras of a read at depth D ≥ 2 — slots 1 … D−1 and bt, a Batch
-	// of D messages taken from the Source's pool (s.rpool, so a regrow
-	// allocates nothing) and charged to Stages while held (btBytes, D ×
-	// batchMsgBytes; R1-5 rules 1 and 4) — and their idle release
+	// of D messages taken from the Source's pool (s.rpool: a regrow reuses
+	// a resting one and allocates only when its P's pool holds none, setIO)
+	// and charged to Stages while held (btBytes, D × batchMsgBytes; R1-5
+	// rules 1 and 4) — and their idle release
 	// (plan:774; M5 design R1-5 rule 3, which srcidle applies to the
 	// passive Source). The reads of rendr's own socket go through rd, the
 	// dialer reader's udpsocket.Reader, whose four-state word says who owns
@@ -250,7 +251,10 @@ func (r *reader) fill(d int) int {
 // charged to Stages before rd holds it, and arms the idle release; the
 // slots 1 … D−1 follow in fill. rd refuses the Batch while an idle
 // release still returns the previous extras: the Batch goes back with its
-// charge and the read stays at depth 1.
+// charge and the read stays at depth 1. rpool allocates a Batch only when
+// this P's pool holds none (setIO) — the case of such a refused Hold,
+// whose release has not put its Batch back yet: both then rest in rpool
+// once the release completed.
 func (r *reader) hold() {
 	if r.rd == nil {
 		return // tokenIO: one datagram per call
@@ -351,12 +355,14 @@ func (r *reader) idleFire() {
 
 // endIdle ends the idle release when the reader exits: a firing in
 // progress completes first — its charges are back before Done — and none
-// releases or re-arms after it; extras the reader holds go back.
+// releases or re-arms after it: idleT is stopped under relMu, after
+// ended is set, so a re-arm by the firing that held relMu is cancelled
+// and a later firing returns at ended; extras the reader holds go back.
 func (r *reader) endIdle() {
 	if r.idleT != nil {
-		r.idleT.Stop()
 		r.relMu <- struct{}{}
 		r.ended = true
+		r.idleT.Stop()
 		<-r.relMu
 	}
 	r.dropExtras()

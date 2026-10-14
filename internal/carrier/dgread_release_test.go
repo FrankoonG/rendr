@@ -63,7 +63,7 @@ func TestDgramIdleReleaseGenOfReleasedHeader(t *testing.T) {
 	f, _ := newFakeIOPair(t, 1200)
 	fb := newFakeBatch(f, 32)
 	stages := NewBudget(1 << 20)
-	rd := &dgReader{dio: fb}
+	rd := &dgReader{dio: fb, relMu: make(chan struct{}, 1)} // as startDepth makes it
 	fb.onRelease(rd.releaseHdr)
 	rd.idleT = time.AfterFunc(time.Hour, func() {})
 	rd.idleT.Stop()

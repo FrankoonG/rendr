@@ -3,7 +3,6 @@ package udpflow
 import (
 	"net"
 	"net/netip"
-	"time"
 	"unsafe"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -33,11 +32,12 @@ const (
 // period and mechanism, which srcidle applies to the passive Source): an
 // idle Source holds what it held at M4 — slot 0, uncharged — within
 // 2 × batchIdleRelease of its last datagram, or of its start if it never
-// read one. It is internal/carrier's batchIdleRelease, 1 s, which the
-// root package's TestIdlePacketListenerBufferedBytesZero_plan774 assumes;
-// TestBatchIdleReleaseShared in both packages pins the value. A Source
-// takes it at NewSource; tests lower it.
-var batchIdleRelease = time.Second
+// read one. It is the shared udpsocket.IdleRelease, internal/carrier's
+// batchIdleRelease too, by which the root package's
+// TestIdlePacketListenerBufferedBytesZero_plan774 bounds its waits;
+// TestBatchIdleReleaseShared in both packages pins it. A Source takes it
+// at NewSource; tests lower it.
+var batchIdleRelease = udpsocket.IdleRelease
 
 // sockIO is how a Source moves datagrams on rendr's own socket: a
 // *udpsocket.Conn (several datagrams per system call on Linux amd64/arm64,
@@ -172,9 +172,15 @@ func (tokenIO) MaxBatch() int        { return 1 }
 // extras (reader.hold). wpool holds the writers' call state (wbatch, a
 // Batch of MaxBatch messages), idle ones numbering at most the flows that
 // wrote at once; rpool the reader's Batch of min(MaxBatch, 32) messages,
-// the depth of its reads (R1-6), which its idle release, a fall to depth
-// 1, its exit or a refused Hold puts back (srcidle): two at most, one
-// while no idle release is in flight.
+// the depth of its reads (R1-6): one is held while the Source reads, and
+// its idle release, a fall to depth 1, its exit or a refused Hold puts it
+// back (srcidle). The idle Batches of both pools are uncharged and
+// reclaimed by the garbage collector; until a collection their number is
+// bounded only by the pool's per-P caches. A regrow (reader.hold)
+// allocates a Batch only when its P's pool holds none — after a release
+// still in flight, whose Batch is not back yet, or when the reader runs
+// on another P than the one a Batch went back to — and steady-state reads
+// allocate nothing per datagram.
 func (s *Source) setIO(io sockIO) {
 	s.bio = io
 	mb := io.MaxBatch()
@@ -260,8 +266,10 @@ func (s *Source) writeBatch(ds [][]byte, dst netip.AddrPort, addr *net.UDPAddr) 
 // own listening socket as M2 does: too large (EMSGSIZE, WSAEMSGSIZE) →
 // a refusal without a size (Max 0: the MTU probe decides, M2-D25); noise
 // (ICMP class, ENOBUFS, a local filter's EPERM, Temporary()) and an abort
-// of the shared socket → carrier.ErrNoise; anything else — an invalid
-// count (L42) included — as is (the carrier dies).
+// of the shared socket → carrier.ErrNoise; anything else as is (the
+// carrier dies) — an invalid count (L42) included: udpsocket.ErrInvalidCount
+// stays itself, so the carrier's writer hands back none of the datagrams
+// the misreporting call was given.
 func ownedWriteErr(err error) error {
 	switch carrier.ClassifyPacketErr(err, true) {
 	case carrier.PacketErrNoise, carrier.PacketErrAbort:
