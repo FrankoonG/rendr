@@ -3,6 +3,7 @@ package udpflow
 import (
 	"net"
 	"net/netip"
+	"time"
 	"unsafe"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
@@ -26,6 +27,18 @@ const (
 	batchMsgBytes = 112 + 72
 )
 
+// batchIdleRelease is how long a Source's reader may stay parked holding
+// its extras — slots 1 … D−1 and its Batch — before the idle release
+// returns them (plan:774; M5 design R1-5 rule 3, the dialer reader's
+// period and mechanism, which srcidle applies to the passive Source): an
+// idle Source holds what it held at M4 — slot 0, uncharged — within
+// 2 × batchIdleRelease of its last datagram, or of its start if it never
+// read one. It is internal/carrier's batchIdleRelease, 1 s, which the
+// root package's TestIdlePacketListenerBufferedBytesZero_plan774 assumes;
+// TestBatchIdleReleaseShared in both packages pins the value. A Source
+// takes it at NewSource; tests lower it.
+var batchIdleRelease = time.Second
+
 // sockIO is how a Source moves datagrams on rendr's own socket: a
 // *udpsocket.Conn (several datagrams per system call on Linux amd64/arm64,
 // counted in Env.Dgram.IO) or, for a token that does not expose its socket,
@@ -37,6 +50,45 @@ type sockIO interface {
 	WriteBatch(b *udpsocket.Batch, ms []udpsocket.Msg) (int, error)
 	Mode() udpsocket.Mode
 	MaxBatch() int
+}
+
+// srcReader is how a Source reads rendr's own socket at depth D ≥ 2: the
+// dialer reader's udpsocket.Reader over the Source's Conn — its four-state
+// word (idle, held, parked, releasing) says who owns the extras, so the
+// idle release can take them from a read parked in the netpoller (M5
+// design R1-5 rule 3, R3-10; srcidle) — or a seam fake with the same
+// protocol. One goroutine (the Source's reader) calls ReadBatch, Hold,
+// Held and Drop; the idle-release timer calls Parks, Holding and
+// TryRelease.
+type srcReader interface {
+	ReadBatch(ms []udpsocket.Msg) (int, error)
+	Hold(b *udpsocket.Batch) (old *udpsocket.Batch, ok bool)
+	Held() bool
+	Drop() *udpsocket.Batch
+	Parks() uint64
+	Holding() bool
+	TryRelease(seq uint64) bool
+}
+
+var _ srcReader = (*udpsocket.Reader)(nil)
+
+// readerIO is a seam sockIO that brings its own srcReader (tests).
+type readerIO interface {
+	newReader(release func(*udpsocket.Batch)) srcReader
+}
+
+// newSrcReader returns the srcReader of io, whose idle release returns the
+// extras through release (on the timer's goroutine): a udpsocket.Reader
+// for rendr's own Conn, a seam's own, or nil — tokenIO reads one datagram
+// per call and holds no extras.
+func newSrcReader(io sockIO, release func(*udpsocket.Batch)) srcReader {
+	switch c := io.(type) {
+	case *udpsocket.Conn:
+		return udpsocket.NewReader(c, release)
+	case readerIO:
+		return c.newReader(release)
+	}
+	return nil
 }
 
 // batchToken is the part of *carrier.OwnedUDPSocket a batched Source needs
@@ -112,12 +164,17 @@ func (tokenIO) MaxBatch() int        { return 1 }
 // setIO makes io the Source's socket path (NewSource for rendr's own
 // socket; tests). It runs before Run.
 //
-// The writers' pool (wpool) is the one recorded exception to "every held
-// buffer is visible in BufferedBytes" (R1-5 rule 1, M5 design R3-28): an
-// idle wbatch resting in it is not charged. The garbage collector may
-// reclaim it at any time, a Batch in use is charged to Env.Stages for its
-// call (writeBatch), and the idle ones number at most the flows that
-// wrote at once.
+// The Source's two pools are the recorded exception to "every held buffer
+// is visible in BufferedBytes" (R1-5 rule 1, M5 design R3-28): an idle
+// Batch resting in one is not charged. The garbage collector may reclaim
+// it at any time, and a Batch in use is charged to Env.Stages — a
+// writer's for its call (writeBatch), the reader's while it holds its
+// extras (reader.hold). wpool holds the writers' call state (wbatch, a
+// Batch of MaxBatch messages), idle ones numbering at most the flows that
+// wrote at once; rpool the reader's Batch of min(MaxBatch, 32) messages,
+// the depth of its reads (R1-6), which its idle release, a fall to depth
+// 1, its exit or a refused Hold puts back (srcidle): two at most, one
+// while no idle release is in flight.
 func (s *Source) setIO(io sockIO) {
 	s.bio = io
 	mb := io.MaxBatch()
@@ -128,6 +185,8 @@ func (s *Source) setIO(io sockIO) {
 		}
 		return w
 	}
+	d := min(mb, srcMaxDepth)
+	s.rpool.New = func() any { return udpsocket.NewBatch(d) }
 }
 
 // wbatch is a flow writer's call state on the shared socket: the messages

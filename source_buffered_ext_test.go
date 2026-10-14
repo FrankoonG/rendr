@@ -19,9 +19,13 @@ import (
 //     0, the read buffer charged to nothing while the source waits;
 //   - the default MaxBatch: 0 where rendr does not batch; on Linux amd64
 //     and arm64 each source holds its extra receive slots and its Batch
-//     (R1-4 rule 2, R1-5 rule 4; internal/udpflow's
-//     TestFlowOwnedSocketCharge pins the amount), so BufferedBytes is
-//     positive and does not move while more junk is read and dropped.
+//     from its first read on and while datagrams arrive (R1-4 rule 2,
+//     R1-5; internal/udpflow's TestFlowOwnedSocketCharge pins the
+//     amount), so BufferedBytes is positive and does not move while more
+//     junk is read and dropped; once the junk stops, the sources' idle
+//     release returns the extras and BufferedBytes is 0 again within
+//     2 × batchIdleRelease (plan:774; srcidle,
+//     TestIdlePacketListenerBufferedBytesZero_plan774).
 //
 // Runtime.Close returns everything: BufferedBytes 0.
 func TestIdleUDPSourceBufferedBytes(t *testing.T) {
@@ -87,6 +91,7 @@ func TestIdleUDPSourceBufferedBytes(t *testing.T) {
 					t.Fatalf("two idle batching sources: BufferedBytes %d after more junk, %d before; junk must cost nothing", b, st.BufferedBytes)
 				}
 			}
+			idleZero(t, rt, "two udp.Listen sources once the junk stopped")
 			rt.Close()
 			if st := rt.Status(); st.Datagram.Sources != 0 || st.BufferedBytes != 0 {
 				t.Fatalf("after Close: %+v", st)

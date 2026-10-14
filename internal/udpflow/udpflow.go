@@ -131,9 +131,15 @@ type Source struct {
 
 	// bio moves datagrams on pc when pc is exactly rendr's own listening
 	// socket (several per system call where it batches, M5-D10); nil for
-	// a foreign conn. wpool holds the flow writers' call state (wbatch).
+	// a foreign conn. wpool holds the flow writers' call state (wbatch),
+	// rpool the reader's Batch (reader.hold); setIO.
 	bio   sockIO
 	wpool sync.Pool
+	rpool sync.Pool
+	// idleRel is the idle release's period (batchIdleRelease at
+	// NewSource): the extras of a reader that stayed parked for a whole
+	// period go back (reader.idleFire).
+	idleRel time.Duration
 
 	maxDgram  int              // the largest datagram read: the token's MaxDatagram(), else wire.MaxDatagram
 	dbufs     *carrier.BufPool // Env.DBufs (a private pool when the Env has none)
@@ -202,7 +208,7 @@ func NewSource(env *carrier.Env, pc net.PacketConn, lim Limits) *Source {
 	s := &Source{env: env, pc: pc, lim: lim.normalized(), maxDgram: wire.MaxDatagram,
 		dbufs: env.DBufs, stages: env.Stages, firstCseq: env.Presets.FirstCseq, firstFseq: env.Presets.FirstFseq,
 		quit: make(chan struct{}), flows: make(map[uint64]*Flow), perIP: make(map[netip.Addr][2]int32),
-		tombs: make(map[uint64]time.Time), done: make(chan struct{})}
+		tombs: make(map[uint64]time.Time), done: make(chan struct{}), idleRel: batchIdleRelease}
 	if s.dbufs == nil {
 		s.dbufs = carrier.NewDatagramBufPool()
 	}

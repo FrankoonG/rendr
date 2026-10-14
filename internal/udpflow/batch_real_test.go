@@ -150,6 +150,39 @@ func (c *loopSock) WriteBatch(_ *udpsocket.Batch, ms []udpsocket.Msg) (int, erro
 	return len(ms), nil
 }
 
+// newReader implements readerIO: a loopReader.
+func (c *loopSock) newReader(release func(*udpsocket.Batch)) srcReader {
+	r := &loopReader{c: c}
+	r.release = release
+	return r
+}
+
+// loopReader is loopSock's srcReader: udpsocket.Reader's word (fakeWord)
+// over a socket that always has datagrams, so a read never waits —
+// allocation-free. releaseNext (the reader goroutine's) makes the next
+// read holding its extras wait a whole period first: it parks, and the
+// idle release takes the parked extras (TryRelease) before the read
+// callback runs again.
+type loopReader struct {
+	fakeWord
+	c           *loopSock
+	releaseNext bool
+}
+
+// ReadBatch reads up to len(ms) datagrams while the reader holds (or takes
+// back) its extras, else one, into ms[0].
+func (r *loopReader) ReadBatch(ms []udpsocket.Msg) (int, error) {
+	if r.releaseNext && r.Held() {
+		r.releaseNext = false
+		r.park()
+		r.TryRelease(r.Parks())
+	}
+	if !r.unpark() {
+		ms = ms[:1]
+	}
+	return r.c.ReadBatch(nil, ms)
+}
+
 func (c *loopSock) Mode() udpsocket.Mode                   { return udpsocket.ModeBatch }
 func (c *loopSock) MaxBatch() int                          { return c.max }
 func (c *loopSock) ReadFrom([]byte) (int, net.Addr, error) { return 0, nil, net.ErrClosed }
@@ -172,6 +205,7 @@ func TestSourceBatchStepZeroAllocs_L54(t *testing.T) {
 	s := newSeamSource(env, c, c, seamDgram, Limits{})
 	var f *Flow
 	r := &reader{s: s, admit: func(g *Flow) { f = g }}
+	r.startDepth() // as loopOwned: the reads go through the reader's word
 	s.route(r, h1(1, wire.TypeOpen, 1), c.from, nil, false)
 	if f == nil {
 		t.Fatal("no flow admitted")
