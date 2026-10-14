@@ -164,10 +164,10 @@ func (tokenIO) MaxBatch() int        { return 1 }
 // setIO makes io the Source's socket path (NewSource for rendr's own
 // socket; tests). It runs before Run.
 //
-// The Source's two pools are the recorded exception to "every held buffer
-// is visible in BufferedBytes" (R1-5 rule 1, M5 design R3-28): an idle
-// Batch resting in one is not charged. The garbage collector may reclaim
-// it at any time, and a Batch in use is charged to Env.Stages — a
+// The Source's two Batch pools are the recorded exception to "every held
+// buffer is visible in BufferedBytes" (R1-5 rule 1, M5 design R3-28): an
+// idle Batch resting in one is not charged. The garbage collector may
+// reclaim it at any time, and a Batch in use is charged to Env.Stages — a
 // writer's for its call (writeBatch), the reader's while it holds its
 // extras (reader.hold). wpool holds the writers' call state (wbatch, a
 // Batch of MaxBatch messages), one in use per flow writing at that moment;
@@ -180,7 +180,9 @@ func (tokenIO) MaxBatch() int        { return 1 }
 // Batch only when its P's pool holds none — for the reader, after a
 // release still in flight, whose Batch is not back yet, or when it runs on
 // another P than the one a Batch went back to — and steady-state reads
-// and writes allocate nothing per datagram.
+// and writes allocate nothing per datagram. The idle inbox blocks of bpool
+// (NewSource, every Source) are the same exception; a block in a flow's
+// inbox is charged (Source.takeBlock).
 func (s *Source) setIO(io sockIO) {
 	s.bio = io
 	mb := io.MaxBatch()

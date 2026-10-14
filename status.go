@@ -15,10 +15,11 @@ type Status struct {
 	// receive and write buffers, and the datagrams queued for raw-UDP
 	// flows) plus the carrier reader stages (about 16 KiB per live stream
 	// carrier, the datagram classes of a datagram carrier, and a raw-UDP
-	// flow's control reserve while it holds datagrams). The read buffer a
-	// FromPacketConn source keeps for its socket (one datagram buffer per
-	// source, at most 64 KiB) holds no data while it waits and is not
-	// counted; a datagram read into it counts once it is queued for a
+	// flow's control reserve and its queue's entry blocks, about 5 KiB per
+	// 64 datagrams beyond its first 8, while it holds datagrams). The read
+	// buffer a FromPacketConn source keeps for its socket (one datagram
+	// buffer per source, at most 64 KiB) holds no data while it waits and
+	// is not counted; a datagram read into it counts once it is queued for a
 	// flow. A udp.Listen socket that reads several datagrams per call
 	// (Linux amd64 and arm64, udp.Options.MaxBatch other than 1: the
 	// default 0 selects 32) also holds, from its first read on and while

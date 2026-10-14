@@ -11,12 +11,15 @@ import (
 )
 
 // TestFlowCloseDropsRing_W4L2 (W4-L2-1; invariant 4): a flow whose inbox
-// once burst to the full Limits.Inbox keeps its grown ring only until it
-// closes. Close releases the queued buffers (the Budget is back to zero),
-// drops the ring itself — so a record that still references the closed
-// *Flow pins no inbox — and Removed reports the removal; a datagram for
-// the closed flow is dropped (a tombstone), and its reader gets
-// net.ErrClosed, never a stale datagram.
+// burst to the full Limits.Inbox holds its grown storage — pooled blocks,
+// each charged to Stages (inboxtime) — only until it closes. Close
+// releases the queued buffers (the Budget is back to zero) and every block
+// with its charge (Stages back to zero), drops its first block — so a
+// record that still references the closed *Flow pins no inbox — and
+// Removed reports the removal; a datagram for the closed flow is dropped
+// (a tombstone), and its reader gets net.ErrClosed, never a stale
+// datagram. (Before inboxtime the row read the ring's length; the rule is
+// unchanged, and the block list's capacity and charge replace it.)
 func TestFlowCloseDropsRing_W4L2(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		env := testEnv(1 << 30)
@@ -33,33 +36,39 @@ func TestFlowCloseDropsRing_W4L2(t *testing.T) {
 		if f.Removed() {
 			t.Fatal("a live flow reports Removed")
 		}
-		// Nobody reads: the inbox grows its ring to the full Inbox.
+		// Nobody reads: the inbox grows its storage to the full Inbox.
 		for i := range DefaultInbox {
 			h.c.send(dg(1, pingFrame(uint32(i+2))), udpAddr(2, 1000))
 		}
 		synctest.Wait()
 		f.mu.Lock()
-		grown, queued := len(f.ring), f.n
+		grown, blocks, queued := inboxStorageLocked(f)
 		f.mu.Unlock()
-		if grown != DefaultInbox || queued != DefaultInbox || env.Budget.Used() == 0 {
-			t.Fatalf("the burst: ring %d, queued %d, budget %d; want %d queued in a full ring, charged",
-				grown, queued, env.Budget.Used(), DefaultInbox)
+		// Exactly the first block and pooledFor(512) = 8 pooled ones, each
+		// charged once: 8 + 8 × 64 = 520 entries for 512 datagrams.
+		wantBlocks := pooledFor(DefaultInbox)
+		if blocks != wantBlocks || grown != minRing+wantBlocks*blockLen || queued != DefaultInbox || env.Budget.Used() == 0 || env.Stages.Used() != int64(wantBlocks)*blockBytes {
+			t.Fatalf("the burst: storage %d entries in %d pooled blocks, queued %d, Budget %d, Stages %d; want %d queued, charged, in %d entries of %d pooled blocks of %d B each in Stages",
+				grown, blocks, queued, env.Budget.Used(), env.Stages.Used(), DefaultInbox, minRing+wantBlocks*blockLen, wantBlocks, blockBytes)
 		}
 
 		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
 		f.mu.Lock()
-		ring, n := f.ring, f.n
+		head, tail, base, n := f.head, f.tail, f.base, f.n
 		f.mu.Unlock()
-		if ring != nil || n != 0 {
-			t.Fatalf("after Close: ring of %d entries (%d queued) still held, want none", len(ring), n)
+		if head != nil || tail != nil || base != nil || n != 0 {
+			t.Fatalf("after Close: inbox blocks still held (%d queued), want none", n)
 		}
 		if !f.Removed() {
 			t.Fatal("a closed flow does not report Removed")
 		}
 		if used := env.Budget.Used(); used != 0 {
 			t.Fatalf("after Close: Budget holds %d bytes", used)
+		}
+		if used := env.Stages.Used(); used != 0 {
+			t.Fatalf("after Close: Stages holds %d bytes (the inbox blocks' charges)", used)
 		}
 		if st := h.s.Stats(); st.Flows != 0 {
 			t.Fatalf("after Close: Stats %+v, want no flow", st)
