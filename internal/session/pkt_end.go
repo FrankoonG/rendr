@@ -67,8 +67,12 @@ func (s *Session) pktFinLocked(final uint64) error {
 	st.peerFin, st.peerFinSet = final, true
 	if !st.fin.requested {
 		// The peer closed: it reads nothing more, so nothing queued is
-		// worth sending and our FIN follows at once (PA-6).
+		// worth sending and our FIN follows at once (PA-6) — nor is a DGRAM
+		// a dying carrier hands back from now on (pkt_unsent.go). A FIN
+		// that answers ours releases nothing: the peer still reads what
+		// our final seq covers.
 		st.fin.requested = true
+		pk.peerFirst = true
 		pk.ctr.DropQueue += uint64(pk.tx.releaseAll() + pk.txBig.releaseAll())
 		s.pktRedoReleaseLocked()
 	}

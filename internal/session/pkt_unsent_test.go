@@ -171,18 +171,19 @@ func TestPacketUnsentReplaced_L39(t *testing.T) {
 }
 
 // TestPacketRaceUnsentReplaced_L39: a race session's returned DGRAM (M5
-// pktloss; M3-D32). While another live member carries its own copy the
-// returned copy is not placed again and Race.Copies loses it; with no
-// other live member it waits, and a member that becomes a data lane later
-// — idle, with nothing new queued — is woken for it and places it once,
-// seq unchanged. Mutants: a covered copy placed again; a race wake that
+// pktloss; M3-D32). While another placement of the datagram may have left
+// (the other member placed its copy) the returned copy is not placed again
+// and Race.Copies loses it; when it was the only one and its descriptor
+// left the ring, it waits, and a member that becomes a data lane later —
+// idle, with nothing new queued — is woken for it and places it once, seq
+// unchanged. Mutants: a covered copy placed again; a race wake that
 // ignores the waiting DGRAM.
 func TestPacketRaceUnsentReplaced_L39(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s := dpSession(dpOpt{mode: ModeRace})
 		l1, _ := dpAddLane(s, 1, true, true)
 		l2, _ := dpAddLane(s, 2, true, true)
-		l1.c, l2.c = &carrier.Conn{}, &carrier.Conn{} // bare identities: no death record (raceCoveredLocked reads it)
+		l1.c, l2.c = &carrier.Conn{}, &carrier.Conn{} // bare identities: no death record
 		dpIdle(l1)
 		dpIdle(l2)
 		copies := func() uint64 { return dpLocked(s, func(_ *stream, pk *packet) uint64 { return pk.copies }) }
