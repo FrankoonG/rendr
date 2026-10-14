@@ -31,8 +31,9 @@ import (
 // transfer time at most 1.10 × the control's; at least 3 death migrations
 // on the sending side B (M3-D34: each kill hits a member with in-flight
 // data); Rejoins + 3 on the dialer; each killed carrier's death record on
-// both ends with transport_error; a clean end with io.EOF on both ends and
-// nothing left after Runtime.Close.
+// both ends with transport_error (PA-86: or, on one end, peer_down no
+// earlier than the other end's: killedCause); a clean end with io.EOF on
+// both ends and nothing left after Runtime.Close.
 func TestG1RaceMiniature(t *testing.T) {
 	size := int64(256 << 20)
 	if raceEnabled {
@@ -129,11 +130,16 @@ func g1(t *testing.T, size int64, rate float64, kills bool) time.Duration {
 			t.Fatalf("Rejoins rose by %d for 3 kills, want ≥ 3", r)
 		}
 		for i, k := range ks {
+			var evs [2]rendr.Event
 			for j, l := range []*eventLog{w.dev, w.pev} {
 				ev, ok := l.downOf(k.id)
-				if !ok || ev.Cause != rendr.CauseTransportError {
-					t.Fatalf("kill %d: the %s's death record of %d: %+v (found %v), want transport_error", i, side(j), k.id, ev, ok)
+				if !ok {
+					t.Fatalf("kill %d: no %s death record of %d", i, side(j), k.id)
 				}
+				evs[j] = ev
+			}
+			if bad := killedCause(evs); bad != "" {
+				t.Fatalf("kill %d of %d: %s", i, k.id, bad)
 			}
 			t.Logf("kill %d of %s's member %d at +%v", i, k.name, k.id, k.at.Sub(tx.start))
 		}
