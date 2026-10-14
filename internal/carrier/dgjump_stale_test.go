@@ -81,7 +81,7 @@ func TestDatagramJumpStalePongNoProof_L14_L43(t *testing.T) {
 		if !s.c.pingOutstanding(ours.ID, ours.Nonce) {
 			t.Fatalf("stimulus: PING %d is not outstanding", ours.ID)
 		}
-		p.fseq += 5000 // lost in the outage
+		p.fseq += fjOutage // lost in the outage
 		// Its id with another nonce (another incarnation's PONG) proves
 		// nothing.
 		p.send(dgramFrame(50, 100), pingFrame(wire.TypePong, wire.Ping{ID: ours.ID, Nonce: ours.Nonce ^ 1}))
