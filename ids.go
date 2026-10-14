@@ -223,8 +223,9 @@ const (
 	CauseQuality           Cause = 9 // only in EventMigration: a selector quality switch
 	// CausePeerDown: a carrier shared by several sessions (rendr mux) that
 	// the peer reported dead at its end, on another shared carrier between
-	// the same two instances; it ends here at once, as by a transport error,
-	// instead of at this side's death deadline.
+	// the same two instances dialled in the same direction; it ends here
+	// when the report arrives, as by a transport error, instead of at this
+	// side's death deadline.
 	CausePeerDown Cause = 10
 )
 

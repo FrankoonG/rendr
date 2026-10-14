@@ -43,19 +43,33 @@ import (
 // death SCHEDs on the surviving trunk, kills the passive's end of it
 // (cause peer_down) one one-way delay after the close, whatever N is,
 // while the death SCHEDs themselves still pass the REL window eight at a
-// time (they change the epoch only; the replies have moved). Without it
-// the passive's end lives until its ping timeout, so the row fails at 32
-// sessions and more on the merge-base. The 256-session subtest raises the
-// datagram trunk's view cap (64 by default, MuxMaxViewsDatagram) on both
-// Runtimes so that one trunk still carries every session, as the premise
-// requires: M4 puts each forwarded TCP connection on shared trunks, far
-// beyond 32.
+// time (they change the epoch only; the replies have moved). A move of the
+// second kind counts only by that mechanism: the session's passive
+// recorded the trunk's CarrierDown with cause peer_down, no earlier than
+// one one-way delay after the close (the DOWN's flight) and no later than
+// the poll that saw the move. Without PA-86 the passive's end lives until
+// its ping timeout, so the row fails at 32 sessions and more on the
+// merge-base. The 256-session subtest raises the datagram trunk's view cap
+// (64 by default, MuxMaxViewsDatagram) on both Runtimes so that one trunk
+// still carries every session, as the premise requires: M4 puts each
+// forwarded TCP connection on shared trunks, far beyond 32. The event
+// queues hold every session's events of the close (premise: none dropped).
 func TestPacketTrunkCloseEverySessionLearns_L45_L39(t *testing.T) {
 	for _, n := range []int{8, 32, 256} {
 		t.Run(fmt.Sprintf("sessions=%d", n), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) { trunkCloseLearns(t, n) })
 		})
 	}
+}
+
+// sessionDownOf returns the EventCarrierDown of carrier id in session sid.
+func sessionDownOf(l *eventLog, sid rendr.SessionID, id rendr.CarrierID) (rendr.Event, bool) {
+	for _, ev := range l.of(rendr.EventCarrierDown) {
+		if ev.Session == sid && ev.Carrier == id {
+			return ev, true
+		}
+	}
+	return rendr.Event{}, false
 }
 
 // trunkSess is one session of the trunk row.
@@ -73,6 +87,7 @@ func trunkCloseLearns(t *testing.T, n int) {
 	if n >= 64 {
 		o.ov.MuxMaxViewsDatagram = 2 * n // one trunk per link carries every session (the premise below)
 	}
+	o.ov.EventQueue = 16*n + 256 // every session's CarrierDown and migration events of the close, with room (Config.OnEvent's default queue is 256)
 	w := newWorld(t, o, "u1", "u2")
 	p := w.peer("u1", "u2")
 	ss := make([]*trunkSess, n)
@@ -208,6 +223,9 @@ func trunkCloseLearns(t *testing.T, n int) {
 	slices.Sort(sorted)
 	t.Logf("%d sessions on trunks %d (closed) and its mate: moved off after the close: min %v, median %v, max %v (bound %v); %d by a SCHED, %d by their end of the trunk ending",
 		n, vic.ID, sorted[0], sorted[n/2], sorted[n-1], bound, bySched, n-bySched)
+	if st := w.p.Status(); st.EventsDropped != 0 {
+		t.Fatalf("premise: the passive Runtime dropped %d events", st.EventsDropped)
+	}
 	var late []string
 	for i, d := range learn {
 		switch {
@@ -215,6 +233,17 @@ func trunkCloseLearns(t *testing.T, n int) {
 			late = append(late, fmt.Sprintf("session %d never applied a post-close SCHED and kept the closed trunk", i))
 		case d > bound:
 			late = append(late, fmt.Sprintf("session %d after %v", i, d))
+		}
+		if d < 0 || bySchedOf[i] {
+			continue
+		}
+		// Moved because its end of the trunk ended: only by the dialer's
+		// DOWN (rendr.CausePeerDown, compared by its name so that the row
+		// builds on the merge-base too).
+		ev, ok := sessionDownOf(w.pev, ss[i].pc.ID(), vic.ID)
+		if !ok || ev.Cause.String() != "peer_down" || ev.Time.Before(tClose.Add(clOneWay)) || ev.Time.After(tClose.Add(d)) {
+			late = append(late, fmt.Sprintf("session %d: its end of the trunk ended (found %v) %v after the close with %v, want peer_down within [one-way, %v]",
+				i, ok, ev.Time.Sub(tClose), ev.Cause, d))
 		}
 	}
 	// Every reply written after its passive learned arrives.

@@ -51,13 +51,25 @@ import (
 // DOWN exists only at a death, and the writer's cost in steady state is
 // one atomic load per reliable session frame.
 
-// downCap bounds a trunk's pending DOWNs. A pool keeps one trunk per
-// factory and session kind (M3-D17, KINDSPLIT) and a Peer has at most
-// wire.MaxSchedIDs factories, so 2 × wire.MaxSchedIDs trunks of one pair
-// can die between two writer rounds of a surviving trunk in the ordinary
-// case; a burst beyond it drops the oldest pending DOWN, and the peer then
-// learns that death by its own detection (its death deadline).
-const downCap = 2 * wire.MaxSchedIDs
+// downCap bounds a trunk's pending DOWNs (invariant 4). It is a chosen
+// bound, not one derived from the pair: a pair has no fixed number of
+// trunks. A pool dials another trunk of a factory and session kind whenever
+// its trunks of that kind are at their view cap, write-blocked, at OPEN
+// capacity or hold the session's unreaped view (usableForMux), and a pair
+// spans every Peer of the dialer Runtime toward that instance, so only
+// MaxSessions × MaxCarriersPerSession bounds it. 32 IDs (128 bytes a
+// trunk) hold a burst of 32 deaths in the pair between two placements of a
+// survivor. What a burst of k deaths costs (TestDownBurstPaced_PA86): a
+// stream survivor places every pending DOWN in its next round; a datagram
+// survivor places at most wire.RelWindow per round trip (its REL window,
+// shared with its sessions' reliable frames, which wait behind the DOWNs),
+// and every survivor places them in the same order (oldest first), so when
+// every survivor is a datagram trunk the peer learns the k deaths over
+// about ⌈k/8⌉ round trips however many survivors there are; beyond the
+// bound the oldest pending DOWN is dropped and counted, and the peer
+// learns that death by its own detection (its death deadline), as before
+// PA-86.
+const downCap = 32
 
 // downQueue is a trunk's pending DOWNs: the CarrierIDs of dead trunks of
 // its pair whose DOWN its writer has not placed yet, oldest first, each at

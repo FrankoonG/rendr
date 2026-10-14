@@ -32,7 +32,10 @@ import (
 // two requests' arrivals) and no DGRAM byte of the churn session there
 // from the next poll on, although that trunk lives on at the passive until
 // the dialer's DOWN for it, which arrives with the SCHED (PA-86: then it
-// ends there with peer_down); the
+// ends there with peer_down, in every mode here, since the long session's
+// trunk is another trunk of the pair; the no-write criteria then hold by
+// that death, and the packet package's selector row proves them on a
+// carrier that lives on at the passive); the
 // passive learned within one one-way delay (race, bond) or within the
 // failover view's JOIN round trip plus one one-way delay (selector); and
 // the dialer's direction loses nothing (a request whose write failed on

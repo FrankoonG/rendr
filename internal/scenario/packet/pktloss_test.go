@@ -77,7 +77,10 @@ import (
 // closed trunk, one REL ahead of the SCHED, ends the passive's end
 // (peer_down), so the carrier no longer outlives the observation there;
 // the premise accepts that end in the instant the passive learns, and
-// every other criterion is unchanged. Because the passive cannot know
+// every other criterion is unchanged — (a) then holds by the trunk's
+// death, and only the selector row, which has no other trunk of the pair
+// at the close and keeps the strict premise, still proves (a) on a carrier
+// that lives on at the passive. Because the passive cannot know
 // earlier than one one-way delay after the close, rendr has nothing more
 // to count than PeerReceived already shows: the gap is the G6 judge's
 // attribution of a loss on a carrier its own stimulus ended (its
@@ -280,9 +283,14 @@ func closeLossInFlight(t *testing.T, mode rendr.Mode) {
 		// dialer's DOWN for the closed one arrives one REL ahead of the
 		// SCHED; it ends the passive's end (peer_down) in the instant the
 		// passive learns, so the passive also stops writing there by the
-		// trunk's death. Any other end before the observation's is the
-		// premise's failure (selector: no second trunk at the close, no
-		// DOWN — the carrier lives on at the passive until its ping_timeout).
+		// trunk's death, and (a) below holds by that death. Any other end
+		// before the observation's is the premise's failure. Selector holds
+		// no second trunk at the close, so no DOWN: its closed carrier must
+		// outlive the observation (until its ping_timeout), and the selector
+		// row keeps (a) exercised on a live carrier.
+		if mode == rendr.ModeSelector {
+			t.Fatalf("premise: the closed carrier died on the passive %v after the close (selector: no DOWN, it must outlive the observation)", last.at.Sub(tClose))
+		}
 		if pd, ok := w.pev.downOf(vic.ID); !ok || pd.Cause != rendr.CausePeerDown || pd.Time.Before(tClose.Add(clOneWay)) || pd.Time.After(tLearn) {
 			t.Fatalf("premise: the closed carrier died on the passive %v after the close (it must outlive the observation, or end by the dialer's DOWN when the passive learns: %+v, found %v)",
 				last.at.Sub(tClose), pd, ok)

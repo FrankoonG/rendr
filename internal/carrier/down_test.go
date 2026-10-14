@@ -1,8 +1,10 @@
 package carrier
 
 import (
+	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"testing/synctest"
@@ -172,8 +174,9 @@ var downCauses = []struct {
 // peer instance, same direction — and the survivor's writer places it at
 // once, bare on a stream trunk and REL-wrapped (inner handle 0) on a
 // datagram trunk; never on a trunk of another pair (another peer instance,
-// or the other direction toward the same instance), and only for the
-// causes of downCauses. A dedicated carrier's death sends none.
+// or the other direction toward the same instance), never on the dying
+// trunk itself, and only for the causes of downCauses. A dedicated
+// carrier's death sends none.
 func TestDownSentForTrunkDeath_PA86(t *testing.T) {
 	for _, kind := range []string{"stream", "datagram"} {
 		for _, tc := range downCauses {
@@ -265,6 +268,15 @@ func downSentRow(t *testing.T, dg bool, cause Cause, want bool) {
 		if want && n != 1 || !want && n != 0 {
 			t.Errorf("%v: mate %d had queued %d DOWNs when the dying trunk's doorbell rang, want %v", cause, mates[i].s.c.ID(), n, want)
 		}
+	}
+	// The death is reported on the mates only: the dying trunk queues no
+	// DOWN naming itself (its peer would take one for a violation, and its
+	// writer may still run a round) and writes none.
+	if q := dying.s.c.downs.pending(); len(q) != 0 {
+		t.Errorf("%v: the dying trunk holds pending DOWNs %v", cause, q)
+	}
+	if got := downs(dying); len(got) != 0 {
+		t.Errorf("%v: the dying trunk wrote DOWNs %v", cause, got)
 	}
 	var wantIDs []uint32
 	if want {
@@ -598,26 +610,77 @@ func deathSched(epoch uint32, ids ...uint32) []byte {
 	return b[:wire.PutSched(b, &s)]
 }
 
-// TestDownPrecedesDeathScheds_PA86 (ordering): on a datagram trunk the
-// DOWN of a dead trunk of the pair takes a REL cseq below that of every
-// death SCHED its sessions place after the death, so the peer applies the
-// trunk's death before any session's new route and needs no SCHED to move
-// off the dead trunk (the REL window paces SCHEDs eight at a time). Both
-// writer states: between rounds (its carrier control places the DOWN
-// first), and inside a round whose later calls place the SCHEDs (a reliable
-// session frame goes behind every DOWN queued before it). Premise: the
-// window has room for the DOWN and all six SCHEDs.
+// TestDownPrecedesDeathScheds_PA86 (ordering): the DOWN of a dead trunk of
+// the pair goes ahead of every death SCHED the sessions place on the
+// surviving trunk after the death — on a datagram trunk a REL cseq below
+// every SCHED's, on a stream trunk earlier in the byte stream — so the peer
+// applies the trunk's death before any session's new route and needs no
+// SCHED to move off the dead trunk (on a datagram trunk the REL window
+// paces SCHEDs eight at a time). Both writer states: between rounds (its
+// carrier control places the DOWN first), and inside a round whose later
+// calls place the SCHEDs (a reliable session frame goes behind every DOWN
+// queued before it: the fence the writer arms on both kinds). Premise
+// (datagram): the window has room for the DOWN and all six SCHEDs.
 func TestDownPrecedesDeathScheds_PA86(t *testing.T) {
-	t.Run("between rounds", func(t *testing.T) { synctest.Test(t, func(t *testing.T) { downOrderRow(t, false) }) })
-	t.Run("inside a round", func(t *testing.T) { synctest.Test(t, func(t *testing.T) { downOrderRow(t, true) }) })
+	for _, kind := range []string{"stream", "datagram"} {
+		dg := kind == "datagram"
+		t.Run(kind+"/between rounds", func(t *testing.T) { synctest.Test(t, func(t *testing.T) { downOrderRow(t, dg, false) }) })
+		t.Run(kind+"/inside a round", func(t *testing.T) { synctest.Test(t, func(t *testing.T) { downOrderRow(t, dg, true) }) })
+	}
 }
 
-func downOrderRow(t *testing.T, inside bool) {
+// holdWrite makes the trunk's writer enter a write and stay inside it until
+// the returned release runs (at the latest at the row's cleanup, so that a
+// failing row ends cleanly): view 1 places one frame that is not reliable
+// (an ACK on a stream trunk, a PACK on a datagram trunk) and the write that
+// carries it blocks (the stream trunk's frame tap, whose release
+// downStream's cleanup runs; the datagram link's write script).
+func (r *downRx) holdWrite(t *testing.T) (release func()) {
+	t.Helper()
+	src := r.s.v1.src
+	if r.stream != nil {
+		r.s.tap.hold()
+		src.addCtl(hFrame{t: wire.TypeAck, payload: ackPayload()})
+		r.s.c.Wake()
+		synctest.Wait()
+		if n := ctlPending(src); n != 0 {
+			t.Fatalf("premise: the held round placed nothing (%d frames unplaced)", n)
+		}
+		return r.s.tap.release
+	}
+	hold, inWrite := make(chan struct{}), make(chan struct{})
+	var once atomic.Bool
+	var rel sync.Once
+	release = func() { rel.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	r.s.c.dg.io.(*fakeIO).setOut(func([]byte) error {
+		if once.CompareAndSwap(false, true) {
+			close(inWrite)
+			<-hold
+		}
+		return nil
+	})
+	pk := make([]byte, wire.PackLen)
+	wire.PutPack(pk, &wire.Pack{})
+	src.addCtl(hFrame{t: wire.TypePack, payload: pk})
+	r.s.c.Wake()
+	waitDone(t, inWrite, "the held write")
+	return release
+}
+
+// ctlPending returns the control frames a vSource has not placed yet.
+func ctlPending(s *vSource) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.ctl)
+}
+
+func downOrderRow(t *testing.T, dg, inside bool) {
 	env := downEnv()
-	dying, _ := downDg(t, env, 101, true, mPassiveInst)
-	s, p := downDg(t, env, 102, true, mPassiveInst)
+	dying := newDownRx(t, env, dg, 101, true, mPassiveInst)
+	sv := newDownRx(t, env, dg, 102, true, mPassiveInst)
+	s := sv.s
 	const k = 6 // sessions with a lane on both trunks; one more view holds the round
-	var rs relSeq
 	var views []*Conn
 	var waits []func() (*Established, error)
 	for i := range k + 1 {
@@ -626,7 +689,11 @@ func downOrderRow(t *testing.T, inside bool) {
 	}
 	synctest.Wait()
 	for _, v := range views {
-		p.send(rs.rel(wire.TypeOpenAck, 0, v.Handle(), okAck(wire.TypeOpenAck)))
+		if dg {
+			sv.raw.send(sv.rs.rel(wire.TypeOpenAck, 0, v.Handle(), okAck(wire.TypeOpenAck)))
+		} else if err := sv.stream.send(wire.TypeOpenAck, 0, v.Handle(), okAck(wire.TypeOpenAck)); err != nil {
+			t.Fatalf("OPEN_ACK: %v", err)
+		}
 	}
 	for _, w := range waits {
 		if _, err := w(); err != nil {
@@ -638,14 +705,16 @@ func downOrderRow(t *testing.T, inside bool) {
 		mvs[i] = s.attach(v)
 	}
 	synctest.Wait()
-	s.c.mu.Lock()
-	last := s.c.dg.rel.next - 1
-	s.c.mu.Unlock()
-	p.send(rackFrame(last, 0)) // the OPENs are acknowledged: the REL window is free
-	synctest.Wait()
-	p.read()
-	if room := s.c.RelRoom(); room < k+1 {
-		t.Fatalf("premise: REL room %d, want ≥ %d", room, k+1)
+	if dg {
+		s.c.mu.Lock()
+		last := s.c.dg.rel.next - 1
+		s.c.mu.Unlock()
+		sv.raw.send(rackFrame(last, 0)) // the OPENs are acknowledged: the REL window is free
+		synctest.Wait()
+		sv.raw.read()
+		if room := s.c.RelRoom(); room < k+1 {
+			t.Fatalf("premise: REL room %d, want ≥ %d", room, k+1)
+		}
 	}
 
 	release := func() {}
@@ -653,18 +722,11 @@ func downOrderRow(t *testing.T, inside bool) {
 		// Round R−1 is held inside its write while every view is readied, so
 		// round R calls them all; the first (handle 2, the lowest: no view
 		// was served payload yet) holds round R inside its Fill.
-		fio := s.c.dg.io.(*fakeIO)
-		hold, inWrite := make(chan struct{}), make(chan struct{})
-		var once atomic.Bool
-		fio.setOut(func([]byte) error {
-			if once.CompareAndSwap(false, true) {
-				close(inWrite)
-				<-hold
-			}
-			return nil
-		})
 		block, entered := make(chan struct{}), make(chan struct{})
 		var armed atomic.Bool
+		var rel sync.Once
+		release = func() { rel.Do(func() { close(block) }) }
+		t.Cleanup(release) // a failing row ends cleanly
 		hb := mvs[0].src
 		hb.mu.Lock()
 		hb.hook = func(*Conn, *Batch) {
@@ -674,20 +736,17 @@ func downOrderRow(t *testing.T, inside bool) {
 			}
 		}
 		hb.mu.Unlock()
-		pk := make([]byte, wire.PackLen)
-		wire.PutPack(pk, &wire.Pack{})
-		hb.addCtl(hFrame{t: wire.TypePack, payload: pk})
-		mvs[0].c.Wake()
-		<-inWrite
+		// holdWrite places view 1's frame; view 1 is not one of the views
+		// readied below, and its round is R−1.
+		releaseWrite := sv.holdWrite(t)
 		for _, mv := range mvs {
 			mv.c.Wake()
 		}
 		armed.Store(true)
-		close(hold)
-		<-entered
-		release = func() { close(block) }
+		releaseWrite()
+		waitDone(t, entered, "round R inside the first view's Fill")
 	}
-	dying.c.KillTrunk(CauseTransportError, "test: the other trunk of the pair dies")
+	dying.s.c.KillTrunk(CauseTransportError, "test: the other trunk of the pair dies")
 	// The sessions on the dead trunk learn of the death (after its record:
 	// the DOWN is already queued) and place their death SCHEDs on their
 	// lanes of the surviving trunk.
@@ -697,7 +756,28 @@ func downOrderRow(t *testing.T, inside bool) {
 	}
 	release()
 	synctest.Wait()
-	rels, bare := relsWritten(p.read())
+	if !dg {
+		downAt, downs, scheds := -1, 0, 0
+		for i, f := range sv.stream.received() {
+			switch f.Type {
+			case wire.TypeDown:
+				downs++
+				if id, err := wire.ParseDown(f.Payload); err == nil && id == 101 && downAt < 0 {
+					downAt = i
+				}
+			case wire.TypeSched:
+				scheds++
+				if downAt < 0 {
+					t.Errorf("death SCHED of handle %d (frame %d) precedes the DOWN in the byte stream", f.Handle, i)
+				}
+			}
+		}
+		if downAt < 0 || downs != 1 || scheds != k {
+			t.Fatalf("stream: DOWN(101) at frame %d (%d DOWNs), %d death SCHEDs (want one DOWN and %d)", downAt, downs, scheds, k)
+		}
+		return
+	}
+	rels, bare := relsWritten(sv.raw.read())
 	found, scheds := false, 0
 	var down uint32
 	for _, r := range rels {
@@ -719,15 +799,15 @@ func downOrderRow(t *testing.T, inside bool) {
 }
 
 // TestDownQueueBound_PA86 (bound): a trunk's pending DOWNs are
-// deduplicated by CarrierID and bounded by downCap = 2 × wire.MaxSchedIDs
-// (one trunk per factory and session kind of a Peer's pool); an overflow
-// drops the oldest and counts it, the rest keeps its order; the writer
-// places them oldest first and only while they fit (a datagram batch's REL
-// room), keeping the rest pending in order; a trunk that ended or wrote
-// its CLOSE takes none.
+// deduplicated by CarrierID and bounded by downCap (32, a chosen bound:
+// down.go); an overflow drops the oldest and counts it, the rest keeps its
+// order; the writer places them oldest first and only while they fit (a
+// datagram batch's REL room), keeping the rest pending in order; a trunk
+// that ended or wrote its CLOSE takes none. TestDownBurstPaced_PA86 drives
+// the same bound through real writers.
 func TestDownQueueBound_PA86(t *testing.T) {
-	if downCap != 2*wire.MaxSchedIDs {
-		t.Fatalf("downCap %d, want 2 × wire.MaxSchedIDs", downCap)
+	if downCap != 32 {
+		t.Fatalf("downCap %d, want 32 (the bound the public docs state)", downCap)
 	}
 	env := downEnv()
 	a, b := net.Pipe()
@@ -827,4 +907,209 @@ func TestTrunkSetMembership_PA86(t *testing.T) {
 		}
 		synctest.Wait()
 	})
+}
+
+// TestDownBurstPaced_PA86 (bound, a burst of deaths): k trunks of a pair
+// die while a surviving trunk of the pair is inside a write and cannot
+// place. Every death queues its DOWN on the survivor; beyond downCap the
+// oldest are dropped and counted (the peer learns those deaths by its own
+// detection), and the survivor holds the newest downCap, oldest first.
+// Once it writes again it places them in that order: a stream survivor all
+// of them in its next round; a datagram survivor at most wire.RelWindow
+// per round trip — one REL window, the next only after the peer's RACK —
+// so through it the peer learns the deaths over ⌈min(k, downCap)/8⌉ round
+// trips. k = 12 exceeds one REL window, k = 50 the bound.
+func TestDownBurstPaced_PA86(t *testing.T) {
+	for _, kind := range []string{"stream", "datagram"} {
+		for _, k := range []int{12, 50} {
+			t.Run(fmt.Sprintf("%s/k=%d", kind, k), func(t *testing.T) {
+				synctest.Test(t, func(t *testing.T) { downBurstRow(t, kind == "datagram", k) })
+			})
+		}
+	}
+}
+
+func downBurstRow(t *testing.T, dg bool, k int) {
+	env := downEnv()
+	surv := newDownRx(t, env, dg, 500, true, mPassiveInst)
+	victims := make([]*downRx, k)
+	for i := range victims {
+		victims[i] = newDownRx(t, env, dg, uint32(1+i), true, mPassiveInst)
+	}
+	synctest.Wait()
+	surv.downs() // what the starts wrote
+	if dg && surv.s.c.RelRoom() != wire.RelWindow {
+		t.Fatalf("premise: the survivor's REL room is %d, want the whole window %d", surv.s.c.RelRoom(), wire.RelWindow)
+	}
+	release := surv.holdWrite(t)
+	for _, v := range victims {
+		v.s.c.KillTrunk(CauseTransportError, "test: a burst of deaths in the pair")
+	}
+	synctest.Wait()
+	var want []uint32 // the newest downCap deaths, oldest first
+	for id := max(1, k-downCap+1); id <= k; id++ {
+		want = append(want, uint32(id))
+	}
+	q := &surv.s.c.downs
+	q.mu.Lock()
+	queued, dropped := q.queued, q.dropped
+	q.mu.Unlock()
+	if got := q.pending(); !sameIDs(got, want) || queued != uint64(k) || dropped != uint64(max(0, k-downCap)) {
+		t.Fatalf("the held survivor: pending %v, %d queued, %d dropped; want %v, %d queued, %d dropped", got, queued, dropped, want, k, max(0, k-downCap))
+	}
+	release()
+	synctest.Wait()
+	if !dg {
+		// No REL window on a stream trunk: the next round places them all.
+		if got := surv.downs(); !sameIDs(got, want) {
+			t.Fatalf("the stream survivor wrote DOWNs %v, want %v", got, want)
+		}
+		if p := q.pending(); len(p) != 0 {
+			t.Fatalf("the stream survivor still holds %v", p)
+		}
+		return
+	}
+	// One REL window per round trip: a flight, then nothing until the
+	// peer's RACK of it, then the next.
+	var got []uint32
+	flights := 0
+	for len(got) < len(want) {
+		flights++
+		if flights > len(want) {
+			t.Fatalf("no progress after %d flights: wrote %v of %v", flights, got, want)
+		}
+		rels, bare := relsWritten(surv.raw.read())
+		if bare != 0 {
+			t.Fatalf("flight %d: %d bare DOWNs", flights, bare)
+		}
+		n := 0
+		var last uint32
+		for _, r := range rels {
+			if r.t != wire.TypeDown {
+				t.Fatalf("flight %d: a REL{%v} among the DOWNs", flights, r.t)
+			}
+			id, err := wire.ParseDown(r.p)
+			if err != nil {
+				t.Fatalf("flight %d: %v", flights, err)
+			}
+			got, last, n = append(got, id), r.cseq, n+1
+		}
+		if exp := min(wire.RelWindow, len(want)-len(got)+n); n != exp {
+			t.Fatalf("flight %d carried %d DOWNs, want %d (one REL window a round trip)", flights, n, exp)
+		}
+		if p := q.pending(); len(p) != len(want)-len(got) {
+			t.Fatalf("after flight %d: %d DOWNs pending, want %d", flights, len(p), len(want)-len(got))
+		}
+		surv.raw.send(rackFrame(last, 0))
+		synctest.Wait()
+	}
+	if nf := (len(want) + wire.RelWindow - 1) / wire.RelWindow; !sameIDs(got, want) || flights != nf {
+		t.Fatalf("the datagram survivor wrote DOWNs %v in %d flights, want %v in %d", got, flights, want, nf)
+	}
+	if rels, _ := relsWritten(surv.raw.read()); len(rels) != 0 {
+		t.Fatalf("RELs after the last flight: %+v", rels)
+	}
+}
+
+// TestDownReceiverRetiring_PA86 (receiver, a retirement under way): a DOWN
+// naming a live trunk of the pair whose planned retirement has begun
+// leaves it to that retirement (L05), in each state the rule reads besides
+// a CLOSE already written (TestDownReceiver_PA86): our CLOSE queued but not
+// yet written (its writer is still inside an earlier write), and the
+// peer's CLOSE recorded in the instant before the trunk queues its own
+// (its reader is held in the doorbell it rings between the two). The trunk
+// lives through the DOWN and ends retired by the CLOSE exchange.
+func TestDownReceiverRetiring_PA86(t *testing.T) {
+	for _, kind := range []string{"stream", "datagram"} {
+		dg := kind == "datagram"
+		t.Run(kind+"/our CLOSE queued", func(t *testing.T) { synctest.Test(t, func(t *testing.T) { downRetiringRow(t, dg, false) }) })
+		t.Run(kind+"/the peer's CLOSE arriving", func(t *testing.T) { synctest.Test(t, func(t *testing.T) { downRetiringRow(t, dg, true) }) })
+	}
+}
+
+// retiring reports the trunk's planned retirement state (our CLOSE queued).
+func (r *downRx) retiring() bool {
+	tr := r.s.c.trunk
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	return tr.st.retiring
+}
+
+// sendClose makes the peer send its CLOSE (bare on a stream trunk, REL on a
+// datagram trunk).
+func (r *downRx) sendClose(t *testing.T) {
+	p := []byte{byte(wire.CloseRetire)}
+	if r.stream != nil {
+		if err := r.stream.send(wire.TypeClose, 0, 0, p); err != nil {
+			t.Fatalf("CLOSE: %v", err)
+		}
+		return
+	}
+	r.raw.send(r.rs.rel(wire.TypeClose, 0, 0, p))
+}
+
+func downRetiringRow(t *testing.T, dg, peerFirst bool) {
+	env := downEnv()
+	rx := newDownRx(t, env, dg, 121, true, mPassiveInst)
+	tg := newDownRx(t, env, dg, 122, true, mPassiveInst)
+	synctest.Wait()
+	tg.downs() // what the start wrote
+	c := tg.s.c
+	var resume func()
+	if peerFirst {
+		// The reader records the peer's CLOSE, rings the views, then queues
+		// our CLOSE: the doorbell holds it in between.
+		block, entered := make(chan struct{}), make(chan struct{})
+		var armed atomic.Bool
+		armed.Store(true)
+		var rel sync.Once
+		resume = func() { rel.Do(func() { close(block) }) }
+		t.Cleanup(resume) // a failing row ends cleanly
+		c.bell.Store(&ringer{bellFunc(func() {
+			if c.PeerClosed() && armed.CompareAndSwap(true, false) {
+				close(entered)
+				<-block
+			}
+		})})
+		tg.sendClose(t)
+		waitDone(t, entered, "the reader in the doorbell after the peer's CLOSE")
+		if !c.PeerClosed() || tg.retiring() || c.TrunkCloseSent() {
+			t.Fatalf("premise: peer closed %v, our CLOSE queued %v, written %v; want only the peer's CLOSE", c.PeerClosed(), tg.retiring(), c.TrunkCloseSent())
+		}
+	} else {
+		resume = tg.holdWrite(t)
+		c.RetireTrunk(wire.CloseRetire)
+		synctest.Wait()
+		if !tg.retiring() || c.TrunkCloseSent() || c.PeerClosed() {
+			t.Fatalf("premise: our CLOSE queued %v, written %v, peer closed %v; want it queued only", tg.retiring(), c.TrunkCloseSent(), c.PeerClosed())
+		}
+	}
+	rx.sendDown(122)
+	synctest.Wait()
+	if d, cause, detail, _ := c.Death(); d {
+		t.Fatalf("the retiring trunk ended by the DOWN: %v %q", cause, detail)
+	}
+	if d, cause, detail, _ := rx.s.c.Death(); d {
+		t.Fatalf("the receiving trunk died: %v %q", cause, detail)
+	}
+	resume()
+	synctest.Wait()
+	if !c.TrunkCloseSent() {
+		t.Fatal("our CLOSE was not written once the trunk could write")
+	}
+	// The peer completes the CLOSE exchange.
+	if dg {
+		ourClose, ok := closeCseq(tg.raw.read())
+		if !ok {
+			t.Fatal("no REL{CLOSE} on the wire")
+		}
+		tg.raw.send(rackFrame(ourClose, 0))
+	}
+	if !peerFirst {
+		tg.sendClose(t)
+	}
+	hWait(t, c)
+	if _, cause, detail, _ := c.Death(); cause != CauseRetired || !strings.Contains(detail, "CLOSE exchange complete") {
+		t.Fatalf("the trunk ended %v %q, want retired by the CLOSE exchange", cause, detail)
+	}
 }

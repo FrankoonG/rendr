@@ -3,6 +3,7 @@ package packet
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -45,10 +46,29 @@ func TestPacketCloseInWriteRoundPassiveLearns_L45_L39(t *testing.T) {
 
 func closeInRoundLearns(t *testing.T, mode rendr.Mode) {
 	stim := &unsentStim{}
+	// The dialer's last published SCHED epoch in the instant before the
+	// stimulus closes the conn, read in the write hook that closes it: an
+	// epoch above it was published after the close. The observer cannot
+	// tell it: its poll in the close's own virtual instant may run after
+	// the dialer's death verdict and already see the death's epoch.
+	var dcRef atomic.Pointer[rendr.PacketConn]
+	var preEpoch atomic.Int64
+	preEpoch.Store(-1)
+	before := func(id uint32, frames, bytes int) {
+		e := int64(-1)
+		if dc := dcRef.Load(); dc != nil && id != 0 && id == stim.vic.Load() && !stim.fired.Load() {
+			e = int64(dc.Status().SchedEpoch) // only the victim's writer calls with its ID: nothing fires in between
+		}
+		stim.before(id, frames, bytes)
+		if e >= 0 && stim.fired.Load() {
+			preEpoch.CompareAndSwap(-1, e)
+		}
+	}
 	rec := &replyWrites{lo: urSize, hi: urSize + urSpan}
-	w := newWorldHooked(t, worldOpts{oneWay: clOneWay}, &testhooks.Hooks{BeforeWrite: stim.before}, &testhooks.Hooks{BeforeWrite: rec.before}, "u1", "u2")
+	w := newWorldHooked(t, worldOpts{oneWay: clOneWay}, &testhooks.Hooks{BeforeWrite: before}, &testhooks.Hooks{BeforeWrite: rec.before}, "u1", "u2")
 	stim.conn = w.conn
 	dc, pc := w.open(w.peer("u1", "u2"), rendr.DialOptions{Mode: mode})
+	dcRef.Store(dc)
 	vic, ok := liveNamed(dc.Status(), "u1")
 	if !ok {
 		t.Fatalf("the session did not open on u1: %+v", dc.Status().Carriers)
@@ -132,12 +152,11 @@ func closeInRoundLearns(t *testing.T, mode rendr.Mode) {
 	if !ok || down.Cause != rendr.CauseTransportError {
 		t.Fatalf("stimulus: the dialer's CarrierDown of %d is %+v (found %v), want transport_error", vic.ID, down, ok)
 	}
-	var ePre uint32
-	for _, o := range obs {
-		if !o.at.After(tClose) {
-			ePre = o.dEpoch
-		}
+	e := preEpoch.Load()
+	if e < 0 {
+		t.Fatalf("stimulus: the dialer's SCHED epoch before the close was not recorded")
 	}
+	ePre := uint32(e)
 
 	// L45: the passive applies a post-close SCHED within one one-way delay.
 	var tLearn time.Time
