@@ -120,10 +120,15 @@ type duplexResult struct {
 // cap. Those bytes stand in that side's own direction, so each side adds
 // at most one batch's serialization at the link rate, BatchBudget/rate, to
 // the round trip: 2·BatchBudget/rate in all (125 ms at 4 MiB/s with the
-// 256-KiB batch), whatever k reads, since the term is bounded in bytes and
-// not priced at the estimate's overestimate. Where Writes never block (the
-// deep Links) wlag stays 0 and this part is unused headroom. The bound
-// without it predates PA-84: on a rare path of
+// 256-KiB batch), whatever k reads: the term is priced at the rate
+// estimate but capped at one batch, so its bytes, and their queueing at
+// the link rate, do not grow with k. Where Writes never block (the deep
+// Links) wlag stays 0 and this part is unused headroom, so the judge is
+// that much looser there: a reverse-queue allowance priced at the rate
+// estimate instead of min(delivered rate, estimate) (the feedback M3-D68
+// rules out) no longer fails rtt20ms/2MiBps/buf2048KiB/1m0s on srtt;
+// TestCapacityDuplex and six other duplex and skew rows still reject it.
+// The bound without the term predates PA-84: on a rare path of
 // TestDuplexPeerClockSkew_L15/drift1%/4MiBps whose rate peaks came out
 // low the passive's cap carried the allowance and its srtt passed that
 // bound (TestLatencyBoundCoversWriteLag_PA84 has the figures).
@@ -455,7 +460,7 @@ func duplexBothWaysCases() []duplexBothWaysCase {
 // (srtt 1.28 s against 1.27 s, the floor 0.21 s short). Its slack of 1.5
 // dates from the bound without PA-84's two batches (1.02 s, a quarter
 // short): on its deep Link Writes never block, so wlag stays 0 and those
-// 250 ms are headroom it does not use.
+// 250 ms (375 ms after the slack) are headroom it does not use.
 //
 // Under -race (R1-23 lever 1, I3: the rows took 90 s of the Linux race
 // lane's carrier package) the 0.5 % drift and the 1-s step run, both at
@@ -519,11 +524,14 @@ func TestDuplexPeerClockSkew_L15(t *testing.T) {
 // 747 ms and 821.598008 ms against the passive's bound 798.6056 ms; the
 // passive's cap was 2,677 KiB (2,075 on the usual path). A rerun of b180101
 // with the exact values logged met that path again, 1 of 480, with the same
-// srtt and bound; the values below are its. The usual path (the other 479)
-// has about the same passive srtt (820 ms), but its higher peaks (9.3 and
-// 8.2 MiB/s) put the bound without PA-84's term at 1.06 s, so that bound
-// failed only where the peaks came out low; with the term, the largest
-// passive srtt over the 480 runs is 0.89 of the bound.
+// srtt and bound; the values below are its. The usual path (rate peaks 9.3
+// and 8.2 MiB/s, srtt max 726 and 820 ms: 444 of the rerun's 480 runs,
+// 428 of 480 at the RC cut) has about the same passive srtt, but its
+// higher peaks put the bound without PA-84's term at 1.06 s; the other
+// runs had other peaks, and short of the failing one the closest passive
+// srtt came to 0.97 of that bound. So that bound failed only where the
+// peaks came out low; with the term, the largest passive srtt over the
+// rerun's 480 runs is 0.89 of the bound.
 //
 //   - Premise: PA-84's term (sched.CapacityDuplex with the BatchBudget the
 //     carrier passes it, trunk.capacityLocked) adds at most one batch to a
