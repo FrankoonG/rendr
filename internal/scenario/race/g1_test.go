@@ -78,6 +78,7 @@ func g1(t *testing.T, size int64, rate float64, kills bool) time.Duration {
 		at   time.Time
 		name string
 		id   rendr.CarrierID
+		pair bool // killPairTrunk at the kill
 	}
 	var ks []kill
 	var rejoins0 uint64
@@ -100,6 +101,7 @@ func g1(t *testing.T, size int64, rate float64, kills bool) time.Duration {
 				}
 			}
 			m, _ := liveNamed(ds, name)
+			pair := w.killPairTrunk(ds, name)
 			l := w.link(name)
 			before := l.Stats().Session.Killed
 			at := time.Now()
@@ -107,7 +109,7 @@ func g1(t *testing.T, size int64, rate float64, kills bool) time.Duration {
 			if l.Stats().Session.Killed == before {
 				t.Fatalf("stimulus: kill %d of %s ended no session carrier", i, name)
 			}
-			ks = append(ks, kill{at, name, m.ID})
+			ks = append(ks, kill{at, name, m.ID, pair})
 		}
 	}
 	down.wait(t, 2*time.Minute)
@@ -138,7 +140,7 @@ func g1(t *testing.T, size int64, rate float64, kills bool) time.Duration {
 				}
 				evs[j] = ev
 			}
-			if bad := killedCause(evs); bad != "" {
+			if bad := killedCause(evs, k.pair); bad != "" {
 				t.Fatalf("kill %d of %d: %s", i, k.id, bad)
 			}
 			t.Logf("kill %d of %s's member %d at +%v", i, k.name, k.id, k.at.Sub(tx.start))

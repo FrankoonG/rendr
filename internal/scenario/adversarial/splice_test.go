@@ -112,16 +112,29 @@ func downOf(t testing.TB, l *eventLog, sid rendr.SessionID, id rendr.CarrierID) 
 // sequence), CRC or header check in the middle of a frame — and Y's
 // verifier proves that none of X's payload reached Y's application; X's
 // carrier lives on untouched (it only lent its frames), Y redials or
-// carries on with its other member, and both streams arrive intact.
+// carries on with its other member, and both streams arrive intact. Under
+// -race each cut runs one dedicated and one MUX setup (spliceRows).
 func TestAdvSpliceTwoSessions_L41_L43(t *testing.T) {
-	for _, mid := range []bool{false, true} {
-		name := "boundary"
-		if mid {
-			name = "midframe"
-		}
-		t.Run(name, func(t *testing.T) {
-			eachSetup(t, func(t *testing.T, s setup) { spliceRow(t, s, mid, s.sessions, s.sessions) })
+	for i, row := range spliceRows() {
+		mid := i == 1
+		t.Run(row.name, func(t *testing.T) {
+			eachSetupOf(t, row.setups, func(t *testing.T, s setup) { spliceRow(t, s, mid, s.sessions, s.sessions) })
 		})
+	}
+}
+
+// spliceRows are TestAdvSpliceTwoSessions_L41_L43's subtests (boundary,
+// midframe) with their setups in the binary's lane: every setup, or under
+// -race (R1-23 lever 1; the race-unit target of 270 s per pass, m5's
+// prerc decision) one dedicated and one MUX setup per cut, so that each
+// cut's check (fseq at a boundary, CRC or header in a frame) meets both
+// carrier kinds and Y's two recoveries both run (a selector's redial, a
+// member that carries on): boundary selector and mux-bond, midframe race
+// and mux-selector. TestRaceLaneSubtests checks the lists.
+func spliceRows() []setupRow {
+	return []setupRow{
+		{"boundary", raceNamed(setups(), "selector", "mux-bond")},
+		{"midframe", raceNamed(setups(), "race", "mux-selector")},
 	}
 }
 

@@ -40,15 +40,16 @@ func realLossWindows() (pre, post time.Duration) {
 // keeps every datagram that was not in flight on the dead one. Under the
 // race detector the timeline is 4 s with the kill at 2 s (m3 R1-23's
 // first lever: 6 s with the kill at 3 s from I3 of M4 until I1 of M5,
-// whose race-unit passes reached 306 s), with the same criteria; the
-// non-race lanes keep 10 s.
+// whose race-unit passes reached 306 s), in selector mode only
+// (udpEndToEndModes), with the same criteria; the non-race lanes keep
+// 10 s in both modes.
 func TestUDPEndToEnd(t *testing.T) {
 	pre, post := realLossWindows()
 	duration, every := 10*time.Second, 5*time.Second
 	if loopbackRace {
 		duration, every = 4*time.Second, 2*time.Second
 	}
-	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
+	for _, mode := range udpEndToEndModes() {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Cleanup(rendrtest.AssertNoLeak(t))
 			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: duration, every: every,
@@ -65,9 +66,9 @@ func TestUDPEndToEnd(t *testing.T) {
 // turn). It is a long real-time load, so -short skips it; the pool lanes
 // run it without -short.
 //
-// Under the race detector it runs 8 s per mode (two kills, 3 s apart: in
-// bond mode each member once; 30 s with kills 10 s apart until I3 of M4,
-// 12 s with kills 4 s apart until I1 of M5)
+// Under the race detector it runs 8 s (two kills, 3 s apart: in bond mode
+// each member once; 30 s with kills 10 s apart until I3 of M4, 12 s with
+// kills 4 s apart until I1 of M5), in bond mode only (smokeUDP60Modes),
 // with the same criteria: the unit suite's -race lane has a 5-minute
 // wall-clock budget (plan §9.0; m3 R1-23's first lever) and a required
 // test must not skip there, while the 60-s timeline at full rate stays in
@@ -81,11 +82,42 @@ func TestPacketSmokeUDP60_CA(t *testing.T) {
 		rate, duration, every = 2000, 8*time.Second, 3*time.Second
 	}
 	pre, post := realLossWindows()
-	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
+	for _, mode := range smokeUDP60Modes() {
 		t.Run(mode.String(), func(t *testing.T) {
 			t.Cleanup(rendrtest.AssertNoLeak(t))
 			runSmoke(t, smokeUDPNet(t), smokeRun{mode: mode, duration: duration, every: every,
 				rate: rate, back: 1000, lossWin: post, preWin: pre}, rendr.Config{})
 		})
 	}
+}
+
+// udpEndToEndModes are TestUDPEndToEnd's subtests: selector and bond.
+// Under -race (R1-23 lever 1; the race-unit target of 270 s per pass,
+// m5's prerc decision) its timeline — 2,000 datagrams per second and
+// 1,000 back over carrier/udp, a carrier closed under rendr — repeats
+// TestPacketSmokeUDP_CA's race timeline (the same rates, a carrier closed
+// every 2 s), which runs both modes, so it runs selector only, the mode
+// whose kill is a migration of the session's one active carrier, with
+// unchanged criteria. The non-race lanes run both; TestRaceLaneSubtests
+// checks the lists.
+func udpEndToEndModes() []rendr.Mode {
+	if loopbackRace {
+		return []rendr.Mode{rendr.ModeSelector}
+	}
+	return []rendr.Mode{rendr.ModeSelector, rendr.ModeBond}
+}
+
+// smokeUDP60Modes are TestPacketSmokeUDP60_CA's subtests: selector and
+// bond. Under -race (R1-23 lever 1; the race-unit target of 270 s per
+// pass, m5's prerc decision) its timeline — 2,000 datagrams per second
+// over carrier/udp with two kills — repeats TestPacketSmokeUDP_CA's race
+// timeline, which runs both modes, so it runs bond only, the mode whose
+// two kills reach each member once, with unchanged criteria. The non-race
+// lanes run both at 10,000 datagrams per second for 60 s;
+// TestRaceLaneSubtests checks the lists.
+func smokeUDP60Modes() []rendr.Mode {
+	if loopbackRace {
+		return []rendr.Mode{rendr.ModeBond}
+	}
+	return []rendr.Mode{rendr.ModeSelector, rendr.ModeBond}
 }

@@ -292,7 +292,7 @@ func runStreamSmoke(t *testing.T, mode rendr.Mode, size int64) {
 // TestPacketRaceSmoke_CR: the C-A packet smoke (runSmoke) for a race
 // session over the DatagramLink and the DatagramHub: 60 virtual seconds
 // at 10,000 datagrams per second and 1,000 back (30 s at 400 each way
-// under -race), a
+// under -race, there over the DatagramHub only: raceSmokeNets), a
 // member's carrier closed every 10 s in turn. On top of runSmoke's
 // checks (no corrupt, resized or application-duplicated datagram, losses
 // only near kills or counted, the counters adding up, nothing left after
@@ -308,10 +308,7 @@ func TestPacketRaceSmoke_CR(t *testing.T) {
 		// exceeded 300 s), with the same criteria.
 		rate, back, duration = 400, 400, 30*time.Second
 	}
-	for _, tr := range []struct {
-		name string
-		net  func() *smokeNet
-	}{{"DatagramLink", smokeLinkNet}, {"DatagramHub", smokeHubNet}} {
+	for _, tr := range raceSmokeNets() {
 		t.Run(tr.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				live0, parked0 := testhooks.LiveSessions.Load(), testhooks.ParkedSessions.Load()
@@ -323,6 +320,21 @@ func TestPacketRaceSmoke_CR(t *testing.T) {
 			})
 		})
 	}
+}
+
+// raceSmokeNets are TestPacketRaceSmoke_CR's subtests: the DatagramLink and
+// the DatagramHub (smokeTransports). Under -race (R1-23 lever 1; the
+// race-unit target of 270 s per pass, m5's prerc decision) the DatagramHub
+// only, with the same criteria: the row's own rules — race's delivery,
+// Duplicates and Race.Copies — are the mode's, the same on either
+// transport, and TestPacketSmoke_CA's race subset runs each transport. The
+// non-race lanes run both; TestRaceLaneSubtests checks the lists.
+func raceSmokeNets() []smokeTransport {
+	all := smokeTransports()
+	if loopbackRace {
+		return all[1:]
+	}
+	return all
 }
 
 // TestIdleSessionsPark_CR: n sessions (1,000; 250 under -race) between two

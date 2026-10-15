@@ -84,7 +84,7 @@ func TestAdvRelaySwitchLearnsByDown_PA86(t *testing.T) {
 		}
 		// The dialer's own end comes at least switchSlowA after the
 		// passive's; a DOWN, where one exists, within that window.
-		if late := de.Time.Sub(pe.Time); pe.Cause != rendr.CauseTransportError || de.Cause != want || late < 0 || late < switchSlowA != survivor {
+		if late := de.Time.Sub(pe.Time); pe.Cause != rendr.CauseTransportError || de.Cause != want || late < 0 || (late < switchSlowA) != survivor {
 			t.Fatalf("the switched carrier's CarrierDown: dialer %v at +%v, passive %v at +%v; want the passive's transport_error, then the dialer's %v %s %v later",
 				de.Cause, de.Time.Sub(switchAt), pe.Cause, pe.Time.Sub(switchAt), want, map[bool]string{true: "less than", false: "at least"}[survivor], switchSlowA)
 		}

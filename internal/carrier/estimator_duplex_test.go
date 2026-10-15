@@ -304,8 +304,9 @@ func requireShares(t *testing.T, r duplexResult) {
 // carries less than 0.870 with the allowance (m5-estimator §3.3).
 //
 // Under -race (R1-23 lever 1, I3: the rows took 43 s of the Linux race
-// lane's carrier package) the 6-s rows and the cheapest 60-s row (1 MiB/s)
-// run, with the same criteria; the non-race lanes run all ten.
+// lane's carrier package) the 6-s rows at a 20 ms RTT and the cheapest
+// 60-s row (1 MiB/s) run, with the same criteria; the non-race lanes run
+// all ten (duplexBothWaysCases).
 //
 // PASS: over the window after the warm-up, while both flows run, each
 // direction carries ≥ 0.85 of the link; the price of the allowance is
@@ -319,38 +320,8 @@ func requireShares(t *testing.T, r duplexResult) {
 // the two deep Links and read the reverse queue that much short). Both
 // flows then complete intact and in order, and neither carrier dies.
 func TestDuplexKeepsBothDirections_L15(t *testing.T) {
-	const ms = time.Millisecond
-	for _, tc := range []struct {
-		rtt    time.Duration
-		rate   float64
-		buf    int // the link's buffer per direction
-		span   time.Duration
-		race   bool // runs under -race too
-		suffix string
-		// late, dlate, stalls: duplexCase's.
-		late, dlate time.Duration
-		stalls      []duplexStall
-	}{
-		{rtt: 20 * ms, rate: 4 << 20, buf: 2 << 20, span: 6 * time.Second, race: true},
-		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true},
-		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "late100ms", late: 100 * ms},
-		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "dlate292ms", dlate: 292 * ms},
-		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "stalls",
-			stalls: []duplexStall{{at: 465 * ms, d: 106 * ms}, {passive: true, at: 1077 * ms, d: 50 * ms}}},
-		{rtt: 100 * ms, rate: 16 << 20, buf: 64 << 20, span: 6 * time.Second, race: true},
-		{rtt: 20 * ms, rate: 4 << 20, buf: 2 << 20, span: time.Minute},
-		{rtt: 20 * ms, rate: 2 << 20, buf: 2 << 20, span: time.Minute},
-		{rtt: 20 * ms, rate: 1 << 20, buf: 1 << 20, span: time.Minute, race: true},
-		{rtt: 20 * ms, rate: 8 << 20, buf: 8 << 20, span: time.Minute},
-	} {
-		if carrierRace && !tc.race {
-			continue
-		}
-		name := fmt.Sprintf("rtt%v/%gMiBps/buf%dKiB/%v", tc.rtt, tc.rate/(1<<20), tc.buf>>10, tc.span)
-		if tc.suffix != "" {
-			name += "/" + tc.suffix
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range duplexBothWaysCases() {
+		t.Run(tc.name(), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				r := duplexRun(t, duplexCase{rtt: tc.rtt, rate: tc.rate, buf: tc.buf, warm: 2 * time.Second, span: tc.span,
 					late: tc.late, dlate: tc.dlate, stalls: tc.stalls})
@@ -367,6 +338,73 @@ func TestDuplexKeepsBothDirections_L15(t *testing.T) {
 			})
 		})
 	}
+}
+
+// duplexBothWaysCase is one subtest of TestDuplexKeepsBothDirections_L15.
+type duplexBothWaysCase struct {
+	rtt    time.Duration
+	rate   float64
+	buf    int // the link's buffer per direction
+	span   time.Duration
+	race   bool // runs under -race too
+	suffix string
+	// late, dlate, stalls: duplexCase's.
+	late, dlate time.Duration
+	stalls      []duplexStall
+}
+
+func (tc duplexBothWaysCase) name() string {
+	name := fmt.Sprintf("rtt%v/%gMiBps/buf%dKiB/%v", tc.rtt, tc.rate/(1<<20), tc.buf>>10, tc.span)
+	if tc.suffix != "" {
+		name += "/" + tc.suffix
+	}
+	return name
+}
+
+// duplexBothWaysCases are the subtests of TestDuplexKeepsBothDirections_L15
+// in the binary's lane: all ten, or under -race the rows marked race. Which
+// rule each race row covers (R1-23 lever 1; the race-unit target of 270 s
+// per pass, m5's prerc decision; TestRaceLaneSubtests checks the lists):
+//
+//   - rtt20ms/4MiBps/buf2048KiB/6s: the failing-first row of the duplex
+//     capacity (0.15 of the link before m3 8a9b989) and the latency and
+//     one-way floor bounds on a 2-MiB buffer;
+//   - rtt20ms/2MiBps/buf128KiB/6s: the short-queue guard (KL-20's row), and
+//     its late100ms, dlate292ms and stalls variants: the write-lag part
+//     (the first two kill its mutant) and its price;
+//   - rtt20ms/1MiBps/buf1024KiB/1m0s: the long window on a deep Link, whose
+//     standing queues a 6-s window understates.
+//
+// The 100-ms row (16 MiB/s, a 64-MiB buffer; 0.17 of the link before the
+// fix, 5.6 s of a Linux race pass) is the first rule's on a longer path; it
+// runs in the non-race lanes, as the other 60-s rows do, and under -race
+// TestByteClockDuplexRateBounded_L32 still drives that path with bulk both
+// ways.
+func duplexBothWaysCases() []duplexBothWaysCase {
+	const ms = time.Millisecond
+	all := []duplexBothWaysCase{
+		{rtt: 20 * ms, rate: 4 << 20, buf: 2 << 20, span: 6 * time.Second, race: true},
+		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true},
+		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "late100ms", late: 100 * ms},
+		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "dlate292ms", dlate: 292 * ms},
+		{rtt: 20 * ms, rate: 2 << 20, buf: (2 << 20) / 16, span: 6 * time.Second, race: true, suffix: "stalls",
+			stalls: []duplexStall{{at: 465 * ms, d: 106 * ms}, {passive: true, at: 1077 * ms, d: 50 * ms}}},
+		{rtt: 100 * ms, rate: 16 << 20, buf: 64 << 20, span: 6 * time.Second},
+		{rtt: 20 * ms, rate: 4 << 20, buf: 2 << 20, span: time.Minute},
+		{rtt: 20 * ms, rate: 2 << 20, buf: 2 << 20, span: time.Minute},
+		{rtt: 20 * ms, rate: 1 << 20, buf: 1 << 20, span: time.Minute, race: true},
+		{rtt: 20 * ms, rate: 8 << 20, buf: 8 << 20, span: time.Minute},
+	}
+	if !carrierRace {
+		return all
+	}
+	var out []duplexBothWaysCase
+	for _, tc := range all {
+		if tc.race {
+			out = append(out, tc)
+		}
+	}
+	return out
 }
 
 // TestDuplexPeerClockSkew_L15 (M3 estimator review; noteOWD's floor): bulk

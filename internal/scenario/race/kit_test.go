@@ -647,20 +647,46 @@ func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID
 // killedCause checks the death records of a member killed with Link.Kill
 // (evs: the dialer's and the passive's EventCarrierDown of it) and returns
 // "" or what is wrong. The Link closes both ends at once and each records
-// transport_error; PA-86: the member's carrier is a MUX trunk and the
-// other member's trunk survives, so an end may learn of the other end's
+// transport_error. PA-86 relaxes that only when pairTrunk holds — the
+// member's carrier is a MUX trunk and another trunk of the pair survives
+// the kill (killPairTrunk) —: an end may then learn of the other end's
 // death first from its DOWN and record peer_down, dated no earlier than
 // the other end's transport_error (at least one end records
-// transport_error).
-func killedCause(evs [2]rendr.Event) string {
+// transport_error). A dedicated carrier, or a trunk without a surviving
+// trunk of its pair, has no DOWN to learn from and stays strict.
+func killedCause(evs [2]rendr.Event, pairTrunk bool) string {
 	for i, ev := range evs {
 		other := evs[1-i]
-		if ev.Cause != rendr.CauseTransportError && !(ev.Cause == rendr.CausePeerDown && other.Cause == rendr.CauseTransportError && !ev.Time.Before(other.Time)) {
-			return fmt.Sprintf("the %s's death record %+v (the %s's: %v at %v), want transport_error (or peer_down no earlier than the other end's)",
-				side(i), ev, side(1-i), other.Cause, other.Time)
+		learned := pairTrunk && ev.Cause == rendr.CausePeerDown && other.Cause == rendr.CauseTransportError && !ev.Time.Before(other.Time)
+		if ev.Cause != rendr.CauseTransportError && !learned {
+			want := "transport_error (a dedicated carrier or no surviving trunk of the pair: no DOWN)"
+			if pairTrunk {
+				want = "transport_error (or peer_down no earlier than the other end's)"
+			}
+			return fmt.Sprintf("the %s's death record %+v (the %s's: %v at %v), want %s",
+				side(i), ev, side(1-i), other.Cause, other.Time, want)
 		}
 	}
 	return ""
+}
+
+// killPairTrunk reports, just before a Link.Kill of link name, whether the
+// session's live member on it is a MUX trunk with a surviving trunk of its
+// pair (killedCause's PA-86 premise): the link's factory shares its
+// carriers (no Props.CheapSubflow), the dialer Runtime counts at least two
+// live MUX carriers (the member's and another), and the session (ds, the
+// dialer's Status) holds a live member on another link, whose trunk the
+// kill leaves alive.
+func (w *world) killPairTrunk(ds rendr.SessionStatus, name string) bool {
+	if w.spec(name).props.CheapSubflow || w.d.Status().Mux.Carriers < 2 {
+		return false
+	}
+	for _, c := range liveOf(ds) {
+		if c.Name != name {
+			return true
+		}
+	}
+	return false
 }
 
 // dropTarget returns the Seq of the link's one open session carrier just

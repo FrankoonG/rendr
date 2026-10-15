@@ -233,9 +233,11 @@ func schedTrigger(t testing.TB, w *world, x *pair, arm func(tm *rendrtest.Tamper
 // TestAdvDroppedFrame_L43: DropFrame of one DATA (Up), one ACK (Down) and
 // one SCHED (Up): the next frame shows the gap in the frame sequence, the
 // receiving end kills that carrier (protocol_violation "fseq"), the
-// session replays from the ACK edge and the stream arrives intact.
+// session replays from the ACK edge and the stream arrives intact. Under
+// -race each frame runs one dedicated and one MUX setup (droppedFrameRows).
 func TestAdvDroppedFrame_L43(t *testing.T) {
-	for _, c := range []struct {
+	rows := droppedFrameRows()
+	for i, c := range []struct {
 		name string
 		dir  rendrtest.Dir
 		typ  rendrtest.FrameType
@@ -245,7 +247,7 @@ func TestAdvDroppedFrame_L43(t *testing.T) {
 		{"SCHED", rendrtest.Up, rendrtest.FrameSched},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			eachSetup(t, func(t *testing.T, s setup) {
+			eachSetupOf(t, rows[i].setups, func(t *testing.T, s setup) {
 				runStream(t, s, streamAttack{dir: c.dir, typ: c.typ, sch: c.typ == rendrtest.FrameSched,
 					arm:  func(tm *rendrtest.Tamper, _ *pair) { tm.DropFrame(c.dir, rendrtest.NextOfType(c.typ)) },
 					ops:  stat(func(st rendrtest.TamperStats) int { return st.Dropped }),
@@ -258,9 +260,11 @@ func TestAdvDroppedFrame_L43(t *testing.T) {
 // TestAdvDuplicatedFrame_L43: DuplicateFrame of a DATA (Up) and of an ACK
 // (Down): the copy's fseq is not the next one, the receiving end kills
 // the carrier (protocol_violation "fseq") and no byte is delivered twice
-// (the verifier reads every byte once, in order).
+// (the verifier reads every byte once, in order). Under -race each frame
+// runs one dedicated and one MUX setup (duplicatedFrameRows).
 func TestAdvDuplicatedFrame_L43(t *testing.T) {
-	for _, c := range []struct {
+	rows := duplicatedFrameRows()
+	for i, c := range []struct {
 		name string
 		dir  rendrtest.Dir
 		typ  rendrtest.FrameType
@@ -269,7 +273,7 @@ func TestAdvDuplicatedFrame_L43(t *testing.T) {
 		{"ACK", rendrtest.Down, rendrtest.FrameAck},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			eachSetup(t, func(t *testing.T, s setup) {
+			eachSetupOf(t, rows[i].setups, func(t *testing.T, s setup) {
 				runStream(t, s, streamAttack{dir: c.dir, typ: c.typ,
 					arm:  func(tm *rendrtest.Tamper, _ *pair) { tm.DuplicateFrame(c.dir, rendrtest.NextOfType(c.typ)) },
 					ops:  stat(func(st rendrtest.TamperStats) int { return st.Duplicated }),
@@ -279,16 +283,50 @@ func TestAdvDuplicatedFrame_L43(t *testing.T) {
 	}
 }
 
+// droppedFrameRows are TestAdvDroppedFrame_L43's subtests (DATA, ACK,
+// SCHED) with their setups in the binary's lane: every setup, or under
+// -race (R1-23 lever 1; the race-unit target of 270 s per pass, m5's
+// prerc decision) one dedicated and one MUX setup per frame, so that each
+// frame's rule (its gap names "fseq") meets both carrier kinds and each
+// mode runs once on each: DATA selector and mux-bond, ACK bond and
+// mux-race, SCHED race and mux-selector. TestRaceLaneSubtests checks the
+// lists.
+func droppedFrameRows() []setupRow {
+	return []setupRow{
+		{"DATA", raceNamed(setups(), "selector", "mux-bond")},
+		{"ACK", raceNamed(setups(), "bond", "mux-race")},
+		{"SCHED", raceNamed(setups(), "race", "mux-selector")},
+	}
+}
+
+// duplicatedFrameRows are TestAdvDuplicatedFrame_L43's subtests (DATA,
+// ACK) with their setups in the binary's lane: every setup, or under -race
+// one dedicated and one MUX setup per frame, every mode once among them:
+// DATA selector and mux-bond, ACK race and mux-selector (as
+// droppedFrameRows).
+func duplicatedFrameRows() []setupRow {
+	return []setupRow{
+		{"DATA", raceNamed(setups(), "selector", "mux-bond")},
+		{"ACK", raceNamed(setups(), "race", "mux-selector")},
+	}
+}
+
 // TestAdvReplayedFrame_L43: ReplayFrame of a DATA frame re-sent 1 MiB of
 // the carrier's frames later: its old fseq kills the carrier at the
 // passive (protocol_violation "fseq") and nothing is delivered again.
+// Under -race (R1-23 lever 1; the race-unit target of 270 s per pass,
+// m5's prerc decision) the row runs the three dedicated setups and
+// mux-bond — each mode once, and the MUX trunk in the mode whose member
+// carries about half the stream, the case the replay distance is sized
+// for — with the same criteria; mux-selector and mux-race (10.7 s of a
+// Linux race pass) run in the non-race lanes.
 func TestAdvReplayedFrame_L43(t *testing.T) {
 	const later = 1 << 20
 	// A bond member carries about half the stream: 1 MiB of its frames is
 	// about 2 MiB of the stream, and the replay must still meet data in
 	// flight (the same size under -race: the row is cheap).
 	n := int64(6 << 20)
-	eachSetup(t, func(t *testing.T, s setup) {
+	eachSetupOf(t, replayedFrameSetups(), func(t *testing.T, s setup) {
 		runStream(t, s, streamAttack{n: n, dir: rendrtest.Up, typ: rendrtest.FrameData,
 			arm: func(tm *rendrtest.Tamper, _ *pair) {
 				// The frames that follow the replayed one up to 1 MiB, from
@@ -304,6 +342,23 @@ func TestAdvReplayedFrame_L43(t *testing.T) {
 			ops:  stat(func(st rendrtest.TamperStats) int { return st.Replayed }),
 			want: []string{"fseq"}})
 	})
+}
+
+// writerMutationSetups are TestAdvWriterBufferMutation_L43's setups in the
+// binary's lane: every setup, or under -race (R1-23 lever 1; the race-unit
+// target of 270 s per pass, m5's prerc decision) the three dedicated
+// setups — each mode's cut once — and mux-race, the shared trunk in the
+// mode whose copies would show a mutated replay as a race copy mismatch,
+// with the same criteria; mux-selector and mux-bond run in the non-race
+// lanes. TestRaceLaneSubtests checks the lists.
+func writerMutationSetups() []setup {
+	return raceNamed(setups(), "selector", "bond", "race", "mux-race")
+}
+
+// replayedFrameSetups are TestAdvReplayedFrame_L43's setups in the
+// binary's lane (TestRaceLaneSubtests checks the lists).
+func replayedFrameSetups() []setup {
+	return raceNamed(setups(), "selector", "bond", "race", "mux-bond")
 }
 
 // zeroingConn is an embedder carrier conn that scribbles over the buffer
@@ -329,9 +384,10 @@ func (c *zeroingConn) Write(p []byte) (int, error) {
 // ACK edge instead of relying on the other member's copies —: the replay
 // comes from rendr's own send buffer, so it is exact (a race copy compared
 // with a mutated one would be a "race copy mismatch" violation), and the
-// stream arrives intact.
+// stream arrives intact. Under -race the row runs the dedicated setups and
+// mux-race (writerMutationSetups).
 func TestAdvWriterBufferMutation_L43(t *testing.T) {
-	eachSetup(t, func(t *testing.T, s setup) {
+	eachSetupOf(t, writerMutationSetups(), func(t *testing.T, s setup) {
 		n := int64(4 << 20)
 		if raceEnabled {
 			n = 2 << 20
