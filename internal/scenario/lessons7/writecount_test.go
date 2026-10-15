@@ -30,9 +30,9 @@ import (
 // dialer's session dropped the second copy as a Duplicate.
 //
 // A bond session over the hub (h0: a raw-UDP flow on the passive) and a
-// DatagramLink (a, HandlePacket), the same one-way delay on both; the
-// passive writes mcCount datagrams of mcSize bytes, one per millisecond,
-// and the wrapper is armed after mcArm of them. Criteria:
+// DatagramLink (a, HandlePacket), a 1 ms slower than the hub (mcDownLag);
+// the passive writes mcCount datagrams of mcSize bytes, one per
+// millisecond, and the wrapper is armed after mcArm of them. Criteria:
 //
 //   - Stimulus: the wrapper misreported a write of a data datagram on the
 //     hub's socket, and the passive's h0 carrier died of it
@@ -56,13 +56,24 @@ func TestPacketFlowMisreportedWriteSentOnce_L42(t *testing.T) {
 
 // Schedule of the row.
 const (
-	mcOneWay = 5 * time.Millisecond // every path: RTT 10 ms
+	mcOneWay = 5 * time.Millisecond // the hub: RTT 10 ms
 	mcGap    = time.Millisecond
 	mcCount  = 64
 	mcArm    = 10  // the wrapper is armed after this many datagrams
 	mcSize   = 777 // bytes per datagram: a data datagram holds [mcSize, mcSize+mcSpan) bytes of frames
 	mcSpan   = 400 // the frames a datagram may carry in front of its DGRAM; a padded PONG is larger
 	mcSeed   = 0x42c
+
+	// mcDownLag makes link a slower than the hub (PA-86 limit (c)): h0's
+	// death at the misreported write sends DOWN(h0) over a in the same
+	// virtual instant, and on paths of equal delay the DOWN reached the
+	// dialer in the instant the misreported datagram did; when the dialer
+	// handled it first, h0's end died there and the datagram in flight on
+	// it was lost (L39, as PA-86 accepts), so the accounting never
+	// settled. One millisecond more on a lets the datagram arrive first.
+	// Not less: with a faster than the hub the bond places the data on a,
+	// and the hub's socket has no data datagram to misreport.
+	mcDownLag = time.Millisecond
 )
 
 // miscountPC is the passive's hub socket: the tap (it decodes and records
@@ -153,7 +164,7 @@ func misreportedFlow(t *testing.T) {
 	mc := &miscountPC{}
 	tries := &dataTries{}
 	w := newMiscountWorld(t, worldOpts{hubUp: mcOneWay, hubDown: mcOneWay}, mc, &testhooks.Hooks{BeforeWrite: tries.before})
-	_, link := w.addLink("a", mcOneWay)
+	_, link := w.addLink("a", mcOneWay+mcDownLag)
 	dc, pc := w.open(w.peer(w.hubCarrier("h0", 0), link), rendr.DialOptions{Mode: rendr.ModeBond})
 	waitFor(t, 2*time.Second, "two members on both ends", func() bool {
 		return len(liveOf(dc.Status())) == 2 && len(liveOf(pc.Status())) == 2
