@@ -113,11 +113,26 @@ type duplexResult struct {
 // chunk's serialization each way (a PING waits behind the chunk being
 // written). k is each side's largest estimate over the window; with an
 // exact estimate (k = 1) this is 3·minRTT + 4·PingBusy + 200 ms.
+//
+// The write-lag allowance (PA-84, M5-D63: while the peer reports BUSY the
+// cap also adds min(rate·write lag, one batch), duplexLocked) adds at most
+// one batch, the BatchBudget sched.CapacityDuplex is given, to each side's
+// cap. Those bytes stand in that side's own direction, so each side adds
+// at most one batch's serialization at the link rate, BatchBudget/rate, to
+// the round trip: 2·BatchBudget/rate in all (125 ms at 4 MiB/s with the
+// 256-KiB batch), whatever k reads, since the term is bounded in bytes and
+// not priced at the estimate's overestimate. Where Writes never block (the
+// deep Links) wlag stays 0 and this part is unused headroom. The bound
+// without it predates PA-84: on a rare path of
+// TestDuplexPeerClockSkew_L15/drift1%/4MiBps whose rate peaks came out
+// low the passive's cap carried the allowance and its srtt passed that
+// bound (TestLatencyBoundCoversWriteLag_PA84 has the figures).
 func latencyBound(r duplexResult, i int, rate float64) time.Duration {
 	k := (r.peak[0] + r.peak[1]) / rate
 	m := r.minRTT[i]
 	chunks := time.Duration(2 * float64(ChunkSize) / rate * float64(time.Second))
-	return time.Duration(2*k*float64(m+hTiming().PingBusy+50*time.Millisecond)) - m + chunks
+	batches := time.Duration(2 * float64(hTiming().BatchBudget) / rate * float64(time.Second))
+	return time.Duration(2*k*float64(m+hTiming().PingBusy+50*time.Millisecond)) - m + chunks + batches
 }
 
 // duplexRun runs c and returns its window's measurements once both flows
@@ -312,7 +327,8 @@ func requireShares(t *testing.T, r duplexResult) {
 // direction carries ≥ 0.85 of the link; the price of the allowance is
 // bounded: neither side's srtt exceeds latencyBound (the amendment's
 // standing-queue bound, 2·(k₁ + k₂)·(minRTT + PingBusy + 50 ms) − minRTT
-// plus a chunk each way, k the rate overestimate measured in the run); and
+// plus a chunk and a batch (PA-84's write-lag allowance) each way, k the
+// rate overestimate measured in the run); and
 // with no clock error neither side's one-way floor rises more than one
 // 64-KiB chunk's serialization plus 50 ms above the true one (noteOWD may
 // lift it only for an excess its own round trip does not show; a bound
@@ -328,7 +344,7 @@ func TestDuplexKeepsBothDirections_L15(t *testing.T) {
 				requireShares(t, r)
 				for i, who := range []string{"dialer", "passive"} {
 					if bound := latencyBound(r, i, tc.rate); r.srttMax[i] > bound {
-						t.Errorf("%s: srtt reached %v with bulk both ways, want ≤ %v (2·(k₁ + k₂)·(minRTT + PingBusy + 50 ms) − minRTT + 2 chunks, k₁ + k₂ = %.2f)",
+						t.Errorf("%s: srtt reached %v with bulk both ways, want ≤ %v (2·(k₁ + k₂)·(minRTT + PingBusy + 50 ms) − minRTT + 2 chunks + 2 batches, k₁ + k₂ = %.2f)",
 							who, r.srttMax[i], bound, (r.peak[0]+r.peak[1])/tc.rate)
 					}
 					if bound := time.Duration(float64(ChunkSize)/tc.rate*float64(time.Second)) + 50*time.Millisecond; r.lift[i] > bound {
@@ -435,8 +451,11 @@ func duplexBothWaysCases() []duplexBothWaysCase {
 // the truth reads as reverse queue, so the dialer's allowance and its
 // standing queue grow by it (at most its forward queue, noteOWD's bound).
 // Steps, a 0.05 % drift and a 1 % drift at 4 MiB/s stay within the
-// no-error bound (latencyBound); a 0.5 % drift at 2 MiB/s exceeds it by
-// about a quarter (srtt 1.28 s against 1.02 s, the floor 0.21 s short).
+// no-error bound (latencyBound); a 0.5 % drift at 2 MiB/s exceeds it
+// (srtt 1.28 s against 1.27 s, the floor 0.21 s short). Its slack of 1.5
+// dates from the bound without PA-84's two batches (1.02 s, a quarter
+// short): on its deep Link Writes never block, so wlag stays 0 and those
+// 250 ms are headroom it does not use.
 //
 // Under -race (R1-23 lever 1, I3: the rows took 90 s of the Linux race
 // lane's carrier package) the 0.5 % drift and the 1-s step run, both at
@@ -489,6 +508,82 @@ func TestDuplexPeerClockSkew_L15(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestLatencyBoundCoversWriteLag_PA84 (rc2fix; PA-84, M5-D63): latencyBound
+// prices PA-84's write-lag allowance as one batch at the link rate per side
+// and changes nothing else. The figures are those of the run of
+// TestDuplexPeerClockSkew_L15/drift1%/4MiBps that failed at the first RC
+// cut (b180101; 1 of 480 host runs, the harness transport at MaxBatch 1),
+// logged as rate peaks 6.2 and 6.9 MiB/s, minRTT 33 and 20 ms, srtt max
+// 747 ms and 821.598008 ms against the passive's bound 798.6056 ms; the
+// passive's cap was 2,677 KiB (2,075 on the usual path). A rerun of b180101
+// with the exact values logged met that path again, 1 of 480, with the same
+// srtt and bound; the values below are its. The usual path (the other 479)
+// has about the same passive srtt (820 ms), but its higher peaks (9.3 and
+// 8.2 MiB/s) put the bound without PA-84's term at 1.06 s, so that bound
+// failed only where the peaks came out low; with the term, the largest
+// passive srtt over the 480 runs is 0.89 of the bound.
+//
+//   - Premise: PA-84's term (sched.CapacityDuplex with the BatchBudget the
+//     carrier passes it, trunk.capacityLocked) adds at most one batch to a
+//     cap, whatever the write lag.
+//   - The bound without that term, from the run's figures, is the recorded
+//     798.6056 ms and rejects the passive's srtt.
+//   - latencyBound is that bound plus 2·BatchBudget/rate exactly on either
+//     side, and accepts the srtt.
+//   - A srtt one batch-time (BatchBudget/rate) above that is rejected.
+func TestLatencyBoundCoversWriteLag_PA84(t *testing.T) {
+	const (
+		mib     = 1 << 20
+		rate    = 4 * mib
+		ms      = time.Millisecond
+		passive = 1
+	)
+	tm := hTiming()
+	batch := int64(tm.BatchBudget)
+	for _, est := range []float64{rate, 6.9 * mib} {
+		noLag := sched.CapacityDuplex(est, 20*ms, tm.PingBusy, est, 0, 0, batch, tm.CapFloor, tm.Window)
+		for _, lag := range []time.Duration{time.Second, time.Hour} {
+			if got := sched.CapacityDuplex(est, 20*ms, tm.PingBusy, est, 0, lag, batch, tm.CapFloor, tm.Window) - noLag; got != batch {
+				t.Fatalf("premise: the write-lag term at %.1f MiB/s, lag %v adds %d bytes, want one batch, %d", est/mib, lag, got, batch)
+			}
+		}
+	}
+	// noPA84 is latencyBound without PA-84's term: the judge at b180101.
+	noPA84 := func(r duplexResult, i int) time.Duration {
+		k := (r.peak[0] + r.peak[1]) / rate
+		m := r.minRTT[i]
+		chunks := time.Duration(2 * float64(ChunkSize) / rate * float64(time.Second))
+		return time.Duration(2*k*float64(m+tm.PingBusy+50*time.Millisecond)) - m + chunks
+	}
+	r := duplexResult{
+		peak:    [2]float64{6.548404365008716e+06, 7.209917687674413e+06}, // B/s
+		srttMax: [2]time.Duration{747298757, 821598008},
+		minRTT:  [2]time.Duration{32576767, 20017642},
+	}
+	const recorded = 798605600 * time.Nanosecond // the failure's "want ≤ 798.6056ms"
+	old := noPA84(r, passive)
+	if old != recorded {
+		t.Fatalf("the bound without PA-84's term from the run's figures is %v, want the recorded %v", old, recorded)
+	}
+	if r.srttMax[passive] <= old {
+		t.Fatalf("premise: the bound without PA-84's term (%v) accepts the failing srtt %v", old, r.srttMax[passive])
+	}
+	batchTime := time.Duration(float64(batch) / rate * float64(time.Second))
+	for i, who := range []string{"dialer", "passive"} {
+		if got, want := latencyBound(r, i, rate), noPA84(r, i)+2*batchTime; got != want {
+			t.Errorf("%s: latencyBound %v, want %v (the bound without PA-84's term, %v, plus 2·BatchBudget/rate)", who, got, want, noPA84(r, i))
+		}
+	}
+	want := old + 2*batchTime
+	if r.srttMax[passive] > latencyBound(r, passive, rate) {
+		t.Errorf("latencyBound %v rejects the failing run's srtt %v (the bound without PA-84's term: %v)", latencyBound(r, passive, rate), r.srttMax[passive], old)
+	}
+	if over := want + batchTime; over <= latencyBound(r, passive, rate) {
+		t.Errorf("latencyBound %v accepts a srtt of %v, one batch-time above %v", latencyBound(r, passive, rate), over, want)
+	}
+	t.Logf("passive: srtt %v; bound without PA-84's term %v, with it %v (+2 × %v)", r.srttMax[passive], old, latencyBound(r, passive, rate), batchTime)
 }
 
 // TestReverseQueueAllowance (M3 estimator amendment; sched.CapacityDuplex):
