@@ -107,6 +107,69 @@ func raceRows() func(ss []setup) []setup {
 	}
 }
 
+// raceOneRow returns the setups function of a family of rows whose race
+// lane runs one setup per row (R1-23 lever 1; the race-unit target of
+// 270 s per pass, m5's prerc decision): it returns all of ss, and in the
+// race lane the one setup j with (k + j) % len(ss) == 0 for the k-th call,
+// so that len(ss) consecutive rows run every setup of ss once. Each row
+// keeps its criteria; the non-race lane and the pool's sweep lane run
+// every setup of every row.
+func raceOneRow() func(ss []setup) []setup {
+	row := 0
+	return func(ss []setup) []setup {
+		row++
+		if !raceEnabled {
+			return ss
+		}
+		for j, s := range ss {
+			if (row+j)%len(ss) == 0 {
+				return []setup{s}
+			}
+		}
+		return nil // unreachable: one j in [0, len(ss)) meets the rule
+	}
+}
+
+// raceNamed returns ss, or in the race lane the setups of ss that names
+// names, in ss's order: a row's fixed race subset (R1-23 lever 1; the
+// race-unit target of 270 s per pass, m5's prerc decision). Each row keeps
+// its criteria; the non-race lane and the pool's sweep lane run every
+// setup.
+func raceNamed(ss []setup, names ...string) []setup {
+	if !raceEnabled {
+		return ss
+	}
+	var out []setup
+	for _, s := range ss {
+		if slices.Contains(names, s.name) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// setupRow is a subtest of a row and the setups it runs in the binary's
+// lane.
+type setupRow struct {
+	name   string
+	setups []setup
+}
+
+// rowSetups returns the setups of the row of rows named name: a row's
+// subtest finds its setups by name, never by position, so that reordering
+// either table cannot run another subtest's race subset. It fails t when
+// rows has no such row.
+func rowSetups(t *testing.T, rows []setupRow, name string) []setup {
+	t.Helper()
+	for _, r := range rows {
+		if r.name == name {
+			return r.setups
+		}
+	}
+	t.Fatalf("no row %q among %d", name, len(rows))
+	return nil
+}
+
 // eachSetup runs body once per setup, each in a bubble of its own.
 func eachSetup(t *testing.T, body func(t *testing.T, s setup)) {
 	t.Helper()

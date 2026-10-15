@@ -86,6 +86,56 @@ func TestPeerInstanceUnpublishedUntilBound(t *testing.T) {
 	})
 }
 
+// TestPeerInstanceAfterBoundIsThePeer (F-8; the order openOKLocked keeps,
+// a -race row): PeerInstance's gate is sound only because the actor
+// writes s.peer before it stores bound, so that a reader that saw bound
+// set also sees the write (the atomic store releases it). The reader here
+// synchronises with the open only through PeerBound — it polls it, in the
+// bubble's virtual time, from before the trigger until it reports the
+// binding — and then reads PeerInstance once: it must be the passive's
+// instance. With the store moved above the write the reader's load of
+// bound no longer orders the write before its read, and the race detector
+// reports the pair on the first run whichever happened first in real time
+// (deterministic in the happens-before sense, as
+// TestEarlyReturnPeerInstanceDuringOpen); without -race the row checks
+// the value.
+func TestPeerInstanceAfterBoundIsThePeer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := eaNewWorld(t, nil)
+		defer w.teardown()
+		l := w.eaLink("a")
+		s := w.eaDial(w.eaSpec(ModeSelector, 64<<10, l))
+		want := w.b.cenv.Local
+		got := make(chan [16]byte, 1)
+		go func() {
+			for !s.PeerBound() {
+				time.Sleep(10 * time.Microsecond)
+			}
+			got <- s.PeerInstance()
+		}()
+		msg := stPattern(0, 1000)
+		if _, err := s.Write(msg); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+		p := w.eaPending()
+		if err := p.Confirm(); err != nil {
+			t.Fatal(err)
+		}
+		var inst [16]byte
+		select {
+		case inst = <-got:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the reader never saw the dialer bound")
+		}
+		if inst != want {
+			t.Fatalf("PeerInstance once PeerBound reported the binding: %x, want the passive's %x", inst, want)
+		}
+		if got := stReadN(t, p, len(msg)); !bytes.Equal(got, msg) {
+			t.Fatal("the passive read other bytes")
+		}
+	})
+}
+
 // TestStatusSnapshotCarriesPeer (F-8; white-box unit row): Status takes
 // the peer instance from the published snapshot. A passive session's first
 // snapshot (initialSnapLocked, NewPending) carries the dialer's instance,

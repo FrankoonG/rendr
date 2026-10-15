@@ -66,8 +66,40 @@ var regions = []region{
 // clean end kills the trunk at the passive (its four busy sessions
 // migrate); on a datagram trunk the REL that carries the first session's
 // DETACH is dropped, counted and retransmitted.
+//
+// Under -race each subtest runs one setup (bitFlipRows), with the same
+// criteria.
 func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
-	setupsOf := raceRows() // a rotating third of each row's setups in the race lane
+	for _, row := range bitFlipRows() {
+		t.Run(row.name, func(t *testing.T) { eachSetupOf(t, row.setups, row.body) })
+	}
+}
+
+// flipRow is one subtest of TestAdvBitFlipRegions_L41_L43: a frame kind,
+// a region, the setups it runs in the binary's lane and its body.
+type flipRow struct {
+	setupRow
+	kind   string // "stream/DATA", …, "datagram/DETACH"
+	region region
+	body   func(t *testing.T, s setup)
+}
+
+// bitFlipRows are the subtests of TestAdvBitFlipRegions_L41_L43: each
+// region of each frame kind, against every setup of the kind (setups(), or
+// muxSetups() for DETACH). Under -race each subtest runs one setup,
+// rotating (raceOneRow; a rotating third, two setups, until m5's prerc
+// decision), so that a kind's eight regions run each of its setups at
+// least once and every (frame kind, region) runs once: the row's rules are
+// the region's check on the kind's frame, and the handle regions'
+// different expectation on a MUX trunk (region.mux) runs on a dedicated
+// carrier and on a MUX trunk among the stream kinds. TestRaceLaneSubtests
+// checks that coverage.
+func bitFlipRows() []flipRow {
+	setupsOf := raceOneRow()
+	var rows []flipRow
+	add := func(kind string, r region, ss []setup, body func(t *testing.T, s setup)) {
+		rows = append(rows, flipRow{setupRow{kind + "/" + r.name, setupsOf(ss)}, kind, r, body})
+	}
 	stream := []struct {
 		name string
 		dir  rendrtest.Dir
@@ -79,32 +111,26 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 	}
 	for _, f := range stream {
 		for _, r := range regions {
-			t.Run("stream/"+f.name+"/"+r.name, func(t *testing.T) {
-				eachSetupOf(t, setupsOf(setups()), func(t *testing.T, s setup) {
-					runStream(t, s, streamAttack{dir: f.dir, typ: f.typ, sch: f.typ == rendrtest.FrameSched,
-						arm:  func(tm *rendrtest.Tamper, _ *pair) { tm.FlipBit(f.dir, rendrtest.NextOfType(f.typ), r.bit) },
-						ops:  stat(func(st rendrtest.TamperStats) int { return st.Flipped }),
-						want: r.want, muxWant: r.mux})
-				})
+			add("stream/"+f.name, r, setups(), func(t *testing.T, s setup) {
+				runStream(t, s, streamAttack{dir: f.dir, typ: f.typ, sch: f.typ == rendrtest.FrameSched,
+					arm:  func(tm *rendrtest.Tamper, _ *pair) { tm.FlipBit(f.dir, rendrtest.NextOfType(f.typ), r.bit) },
+					ops:  stat(func(st rendrtest.TamperStats) int { return st.Flipped }),
+					want: r.want, muxWant: r.mux})
 			})
 		}
 	}
 	for _, r := range regions {
-		t.Run("stream/DETACH/"+r.name, func(t *testing.T) {
-			eachSetupOf(t, setupsOf(muxSetups()), func(t *testing.T, s setup) {
-				runStream(t, s, streamAttack{dir: rendrtest.Up, typ: rendrtest.FrameDetach, detach: true,
-					arm: func(tm *rendrtest.Tamper, _ *pair) {
-						tm.FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameDetach), r.bit)
-					},
-					ops:  stat(func(st rendrtest.TamperStats) int { return st.Flipped }),
-					want: r.want, muxWant: r.mux})
-			})
+		add("stream/DETACH", r, muxSetups(), func(t *testing.T, s setup) {
+			runStream(t, s, streamAttack{dir: rendrtest.Up, typ: rendrtest.FrameDetach, detach: true,
+				arm: func(tm *rendrtest.Tamper, _ *pair) {
+					tm.FlipBit(rendrtest.Up, rendrtest.NextOfType(rendrtest.FrameDetach), r.bit)
+				},
+				ops:  stat(func(st rendrtest.TamperStats) int { return st.Flipped }),
+				want: r.want, muxWant: r.mux})
 		})
 	}
 	for _, r := range regions {
-		t.Run("stream/DGRAM/"+r.name, func(t *testing.T) {
-			eachSetupOf(t, setupsOf(setups()), func(t *testing.T, s setup) { flipStreamDgram(t, s, r) })
-		})
+		add("stream/DGRAM", r, setups(), func(t *testing.T, s setup) { flipStreamDgram(t, s, r) })
 	}
 	for _, typ := range []wire.Type{wire.TypeDgram, wire.TypeRel, wire.TypeDetach} {
 		ss := setups()
@@ -112,11 +138,10 @@ func TestAdvBitFlipRegions_L41_L43(t *testing.T) {
 			ss = muxSetups()
 		}
 		for _, r := range regions {
-			t.Run("datagram/"+typ.String()+"/"+r.name, func(t *testing.T) {
-				eachSetupOf(t, setupsOf(ss), func(t *testing.T, s setup) { flipDatagram(t, s, typ, r) })
-			})
+			add("datagram/"+typ.String(), r, ss, func(t *testing.T, s setup) { flipDatagram(t, s, typ, r) })
 		}
 	}
+	return rows
 }
 
 // packetRate is the rows' packet rate (datagrams per second, 1000 bytes).

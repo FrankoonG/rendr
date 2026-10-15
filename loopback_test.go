@@ -442,7 +442,8 @@ func TestLoopbackRSTNeverEOF_L02(t *testing.T) {
 
 // TestLoopbackCloseWithUnreadNoReset_L05: closing never resets a TCP
 // carrier that still holds unread bytes (L05 teardown order, R19; Linux
-// and Windows). 200 times: the dialer writes 1 MiB and Closes at once,
+// and Windows). 200 times (50 under -race: loopCloseRounds): the dialer
+// writes 1 MiB and Closes at once,
 // while the passive application has not read any of it; then the passive
 // reads exactly the 1 MiB and EOF and closes. Every session ends cleanly
 // (io.EOF) on both ends without a carrier death, migration or redial, and
@@ -463,7 +464,8 @@ func TestLoopbackCloseWithUnreadNoReset_L05(t *testing.T) {
 func loopCloseWithUnread(t *testing.T, dedicated bool, opts ...func(*rendr.StreamCarrier)) {
 	check := rendrtest.AssertNoLeak(t)
 	lp := newLoopPair(t, rendr.Config{}, opts...)
-	const rounds, size = 200, 1 << 20
+	const size = 1 << 20
+	rounds := loopCloseRounds()
 	msg := make([]byte, size)
 	if _, err := io.ReadFull(rendrtest.PRNG(5), msg); err != nil {
 		t.Fatal(err)
@@ -508,6 +510,21 @@ func loopCloseWithUnread(t *testing.T, dedicated bool, opts ...func(*rendr.Strea
 	t.Logf("%d sessions on %d relayed connections", rounds, c)
 	lp.close(t)
 	check()
+}
+
+// loopCloseRounds is how many sessions each variant of
+// TestLoopbackCloseWithUnreadNoReset_L05 closes with unread bytes: 200, or
+// under -race (R1-23 lever 1; the race-unit target of 270 s per pass, m5's
+// prerc decision) 50 — each round repeats the same rule and its checks
+// (both ends io.EOF, no carrier death, every relayed connection a FIN on
+// both sides), as TestIdleSessionsPark_CR's sessions do (250 of 1,000
+// under -race); the non-race lanes close 200. TestRaceLaneSubtests checks
+// the counts.
+func loopCloseRounds() int64 {
+	if loopbackRace {
+		return 50
+	}
+	return 200
 }
 
 // TestLoopbackDrainBoundNoReset_L05: a carrier whose CLOSE the peer has

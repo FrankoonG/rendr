@@ -128,8 +128,9 @@ func g2(t *testing.T) {
 		t.Fatalf("the baseline migrated: dialer %+v, passive %+v", ds0.Migrations, ps0.Migrations)
 	}
 	type kill struct {
-		at time.Time
-		id rendr.CarrierID
+		at   time.Time
+		id   rendr.CarrierID
+		pair bool // killPairTrunk at the kill
 	}
 	var ks []kill
 	for k := 0; ; k++ {
@@ -154,7 +155,9 @@ func g2(t *testing.T) {
 			t.Fatalf("kill %d: no request within 1 s", k)
 		}
 		sleepUntil(at.Add(g2KillLag))
-		m, _ := liveNamed(dc.Status(), name)
+		ds = dc.Status()
+		m, _ := liveNamed(ds, name)
+		pair := w.killPairTrunk(ds, name)
 		l := w.link(name)
 		before := l.Stats().Session.Killed
 		kt := time.Now()
@@ -162,7 +165,7 @@ func g2(t *testing.T) {
 		if l.Stats().Session.Killed == before {
 			t.Fatalf("stimulus: kill %d of %s ended no session carrier", k, name)
 		}
-		ks = append(ks, kill{kt, m.ID})
+		ks = append(ks, kill{kt, m.ID, pair})
 	}
 	select {
 	case err := <-cerr:
@@ -208,7 +211,7 @@ func g2(t *testing.T) {
 			}
 			evs[j] = ev
 		}
-		if bad := killedCause(evs); bad != "" {
+		if bad := killedCause(evs, k.pair); bad != "" {
 			t.Fatalf("kill %d of %d: %s", i, k.id, bad)
 		}
 	}
