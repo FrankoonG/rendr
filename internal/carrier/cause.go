@@ -16,11 +16,15 @@ const (
 	CauseLocalClose        Cause = 7 // closed by this side (session end, Runtime/Peer close, lost race)
 	CauseRetired           Cause = 8 // planned CLOSE exchange completed (or a peer CLOSE); not a death
 	CauseQuality           Cause = 9 // never a carrier end: the cause of a quality migration event
+	// CausePeerDown: the peer reported the MUX trunk dead at its end with a
+	// DOWN on another trunk of the pair (PA-86); a death like a local
+	// transport error, and one that sends no DOWN of its own.
+	CausePeerDown Cause = 10
 )
 
 // String returns the plan §3.6 name: "ping_timeout", "write_stall",
 // "transport_error", "protocol_violation", "instance_mismatch", "goaway",
-// "local_close", "retired", "quality", or "none".
+// "local_close", "retired", "quality", "peer_down" (PA-86), or "none".
 func (c Cause) String() string {
 	switch c {
 	case CausePingTimeout:
@@ -41,6 +45,8 @@ func (c Cause) String() string {
 		return "retired"
 	case CauseQuality:
 		return "quality"
+	case CausePeerDown:
+		return "peer_down"
 	}
 	return "none"
 }
@@ -51,3 +57,11 @@ func (c Cause) String() string {
 // migration. Losing a selector's active lane to it is still a routing loss
 // that the session repairs by fallback or race (design §7.3).
 func (c Cause) Death() bool { return c != CauseNone && c != CauseRetired && c != CauseQuality }
+
+// sendsDown reports whether a MUX trunk's death with cause c is reported to
+// the peer with DOWN on the pair's other trunks (PA-86): every death but
+// goaway and peer_down, whose cause the peer knows already; retired (and
+// quality, none) is no death.
+func (c Cause) sendsDown() bool {
+	return c.Death() && c != CauseGoAway && c != CausePeerDown
+}

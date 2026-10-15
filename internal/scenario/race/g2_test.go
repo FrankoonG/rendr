@@ -35,9 +35,10 @@ import (
 // the dialer per kill (every kill is effective: the dialer's request was
 // in flight on the killed member, M3-D34) and Rejoins + 1 per kill; each
 // killed carrier recorded dead with transport_error on both ends within
-// 2 s (E42); no migration in the baseline; a clean end with io.EOF on both
-// ends and nothing left after Runtime.Close. No quality event: race has no
-// quality switching (plan:741).
+// 2 s (E42; PA-86: or, on one end, peer_down no earlier than the other
+// end's: killedCause); no migration in the baseline; a clean end with
+// io.EOF on both ends and nothing left after Runtime.Close. No quality
+// event: race has no quality switching (plan:741).
 func TestG2RaceMiniature(t *testing.T) {
 	synctest.Test(t, g2)
 }
@@ -127,8 +128,9 @@ func g2(t *testing.T) {
 		t.Fatalf("the baseline migrated: dialer %+v, passive %+v", ds0.Migrations, ps0.Migrations)
 	}
 	type kill struct {
-		at time.Time
-		id rendr.CarrierID
+		at   time.Time
+		id   rendr.CarrierID
+		pair bool // killPairTrunk at the kill
 	}
 	var ks []kill
 	for k := 0; ; k++ {
@@ -153,7 +155,9 @@ func g2(t *testing.T) {
 			t.Fatalf("kill %d: no request within 1 s", k)
 		}
 		sleepUntil(at.Add(g2KillLag))
-		m, _ := liveNamed(dc.Status(), name)
+		ds = dc.Status()
+		m, _ := liveNamed(ds, name)
+		pair := w.killPairTrunk(ds, name)
 		l := w.link(name)
 		before := l.Stats().Session.Killed
 		kt := time.Now()
@@ -161,7 +165,7 @@ func g2(t *testing.T) {
 		if l.Stats().Session.Killed == before {
 			t.Fatalf("stimulus: kill %d of %s ended no session carrier", k, name)
 		}
-		ks = append(ks, kill{kt, m.ID})
+		ks = append(ks, kill{kt, m.ID, pair})
 	}
 	select {
 	case err := <-cerr:
@@ -199,11 +203,16 @@ func g2(t *testing.T) {
 		t.Fatalf("Rejoins rose by %d for %d kills", r, len(ks))
 	}
 	for i, k := range ks {
+		var evs [2]rendr.Event
 		for j, l := range []*eventLog{w.dev, w.pev} {
 			ev, ok := l.downOf(k.id)
-			if !ok || ev.Cause != rendr.CauseTransportError || ev.Time.Sub(k.at) > 2*time.Second {
-				t.Fatalf("kill %d: the %s's death record of %d: %+v (found %v), want transport_error within 2 s", i, side(j), k.id, ev, ok)
+			if !ok || ev.Time.Sub(k.at) > 2*time.Second {
+				t.Fatalf("kill %d: the %s's death record of %d: %+v (found %v), want one within 2 s", i, side(j), k.id, ev, ok)
 			}
+			evs[j] = ev
+		}
+		if bad := killedCause(evs, k.pair); bad != "" {
+			t.Fatalf("kill %d of %d: %s", i, k.id, bad)
 		}
 	}
 	t.Logf("%d kills; migrations: dialer %+v, passive %+v; Rejoins +%d", len(ks), ds.Migrations, ps.Migrations, ds.Rejoins-ds0.Rejoins)

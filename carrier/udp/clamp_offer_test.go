@@ -271,6 +271,24 @@ func liveCarriers(t *testing.T, side string, c *rendr.PacketConn, n int) []int {
 	}
 }
 
+// streamMember waits (at most 10 s) until a stream carrier of c is a data
+// member.
+func streamMember(t *testing.T, side string, c *rendr.PacketConn) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		for _, cs := range c.Status().Carriers {
+			if cs.Kind == rendr.KindStream && cs.State == rendr.CarrierMember {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: no stream carrier is a member after 10 s: %+v", side, c.Status().Carriers)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // TestUDPClampedBondStreamOffer (wave-4 review G3; M3-D32 for race): a
 // bond or race session — every member carries data — on a Peer that has a
 // stream factory offers its configured Packet.MaxPayload
@@ -280,7 +298,8 @@ func liveCarriers(t *testing.T, side string, c *rendr.PacketConn, n int) []int {
 // lowers the OPEN's pmtu to the carrier's budget. The stream factory's
 // Dial is held until the session opened, so the OPEN goes on the udp
 // carrier (stimulus: the passive's first carrier is the clamped udp one).
-// Both ends then fix MaxPayload 2,000; once the TCP carrier joined,
+// Both ends then fix MaxPayload 2,000; once the TCP carrier is a member
+// on both ends,
 // datagrams of 2,000 bytes go over it and arrive intact both ways, none
 // refused as too large (load and integrity).
 func TestUDPClampedBondStreamOffer(t *testing.T) {
@@ -386,6 +405,11 @@ func clampedStreamOffer(t *testing.T, mode rendr.Mode) {
 			t.Fatalf("%s: MaxPayload %d, want the configured %d (a %v session with a stream factory)", s.side, mp, maxPayload, mode)
 		}
 		liveCarriers(t, s.side, s.c, 2)
+		// Live is not yet carrying: a joining TCP carrier carries no data,
+		// and every datagram placed before it is a member is refused by
+		// the clamped udp member alone (DropTooLarge, the designed outcome
+		// of a datagram no member can carry; once in the race lane).
+		streamMember(t, s.side, s.c)
 	}
 	exchangeMax(t, "dialer → passive", dc, pc, 8)
 	exchangeMax(t, "passive → dialer", pc, dc, 8)

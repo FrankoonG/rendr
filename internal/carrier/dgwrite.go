@@ -2,10 +2,12 @@ package carrier
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/sched"
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -44,6 +46,9 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 		room = 0 // nothing new follows our CLOSE
 	}
 	b.SetDatagram(int(dg.budget.Load()), room)
+	if c.mux && !w.held && !closing {
+		b.downs = &c.downs // a reliable session frame goes behind the pending DOWNs (PA-86)
+	}
 	h2 := dg.hs.repeatH2
 	dg.hs.repeatH2 = false
 	chal, cand, nonce := c.chalSendLocked(now)
@@ -62,9 +67,13 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 		if w.held && epFrames {
 			// The first response released the hold (R1-8); the first
 			// PING may follow it (the dialer keeps the response
-			// datagram's tail, R1-1).
+			// datagram's tail, R1-1), and so may a MUX trunk's pending
+			// DOWNs, behind the response in the REL order (PA-86).
 			w.held = false
 			dg.held.Store(false)
+			if c.mux {
+				c.downs.place(b)
+			}
 			if !retiring {
 				c.mu.Lock()
 				kill = c.dgPingLocked(w, b, now)
@@ -106,9 +115,10 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 // dgControlLocked appends the round's carrier control (§A5.8): the RACK
 // when one is due (latest state wins); in closing rounds only the REL
 // retransmission besides it; otherwise the PONG (its pad clamped to this
-// side's budget, M2-D24), the challenge PONG, the REL retransmission, a due
-// PING (never while held or retiring) and GOAWAY. kill reports a fourth
-// unanswered MTU probe.
+// side's budget, M2-D24), the challenge PONG, a MUX trunk's pending DOWNs
+// (never while held; PA-86: their RELs precede the round's session RELs),
+// the REL retransmission, a due PING (never while held or retiring) and
+// GOAWAY. kill reports a fourth unanswered MTU probe.
 func (c *Conn) dgControlLocked(w *writer, b *Batch, now time.Time, closing bool) (kill bool) {
 	dg := c.dg
 	st := &c.st
@@ -132,6 +142,9 @@ func (c *Conn) dgControlLocked(w *writer, b *Batch, now time.Time, closing bool)
 	}
 	if ch := &dg.chal; ch.pongDue && b.addPong(&ch.pong) {
 		ch.pongDue = false
+	}
+	if c.mux && !w.held {
+		c.downs.place(b)
 	}
 	c.dgRetxLocked(w, b, now)
 	if !st.retiring && !w.held {
@@ -173,16 +186,23 @@ func (c *Conn) dgPingLocked(w *writer, b *Batch, now time.Time) (kill bool) {
 
 // dgWriteBatch writes the round's datagrams (§A5.8): the stored H2 first and
 // alone, the challenge alone to its candidate, then the sealed frames packed
-// into datagrams under the budget (M2-D12), each built once in the writer's
-// scratch after Headroom() bytes and handed to WriteDatagram with
+// into datagrams under the budget (M2-D12) — through the transport's
+// BatchIO in flushes of up to MaxBatch datagrams (dgWriteFlushes, M5 design
+// §A4.3), or, on a transport without one, each built once in the writer's
+// scratch after Headroom() bytes and handed to WriteDatagram, with
 // Hooks.BeforeWrite before it (M2-D29). One stall window and one
 // SetWriteDeadline cover the round. Per datagram: written; refused as too
 // large — the budget shrinks (M2-D25), its DGRAM counts Refused and its
 // PING record goes; lost to noise — Dropped; any other error ends the
-// carrier (an invalid count included: never retried, L42). The PING is
-// committed when the write that carried it returns (L23); the rest of the
-// commit follows under Conn.mu: the REL timer per R1-2, the CLOSE and the
-// retirement checks (R1-4).
+// carrier (an invalid count included: never retried, L42), and so does a
+// death record found before a write: nothing more is written, and the
+// DGRAMs of the datagrams no write carried go back to their sessions
+// after the death (dgReturnUnsent). After an invalid count none of the
+// datagrams the misreporting call was given goes back — which of them
+// left is unknown — but the round's later ones, which no call was given,
+// do. The PING is committed when the write that carried it returns (L23);
+// the rest of the commit follows under Conn.mu: the REL timer per R1-2,
+// the CLOSE and the retirement checks (R1-4).
 func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, cand PeerKey, nonce uint64) bool {
 	dg := c.dg
 	io := dg.io
@@ -190,15 +210,18 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	srtt := c.st.srtt
 	check := dg.chal.check
 	c.mu.Unlock()
+	// One arm per round, as in M2 (M5 design A4.3 item 5 as decided at
+	// R3-21): the stall window and the write deadline cover the whole
+	// round's bytes (wireLen), however many WriteDatagrams calls its
+	// flushes take. The watchdog guards against a stalled socket, not
+	// against latency, and a round's bytes are bounded by the queue budget.
 	stall := sched.StallWindow(srtt, b.wireLen(), 0, c.tm.WriteStall, c.tm.DeadMax)
 	gen := c.wstate.Load() >> 1
 	c.armWatchdog(gen, now, stall)
 	_ = io.SetWriteDeadline(now.Add(stall)) // a transport without deadlines still has the watchdog's stage 2
 	hr := io.Headroom()
 	hook := c.env.Hooks
-	var fatal error
-	var txb uint64
-	rackWritten := false
+	rs := dgRound{budget: int(dg.budget.Load()), pinged: w.ping, unsent: -1}
 	if h2 {
 		d := append(w.dscratch.B[:hr], dg.hs.h2()...)
 		if check != 0 {
@@ -215,9 +238,9 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		if hook != nil && hook.BeforeWrite != nil {
 			hook.BeforeWrite(c.id, 1, len(d))
 		}
-		fatal = c.dgControlWritten(io.WriteDatagram(d))
+		rs.fatal = c.dgControlWritten(io.WriteDatagram(d))
 	}
-	if fatal == nil && chal {
+	if rs.fatal == nil && chal {
 		var pp [wire.PingFixedLen]byte
 		wire.PutPing(pp[:], &wire.Ping{ID: 0, TS: uint64(now.Sub(c.base)), Nonce: nonce})
 		d := wire.AppendFrame(w.dscratch.B[:hr], wire.Header{Type: wire.TypePing, Fseq: w.fseq}, pp[:])
@@ -225,87 +248,46 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 		if hook != nil && hook.BeforeWrite != nil {
 			hook.BeforeWrite(c.id, 1, len(d))
 		}
-		fatal = c.dgControlWritten(io.WriteDatagramTo(d, cand))
+		rs.fatal = c.dgControlWritten(io.WriteDatagramTo(d, cand))
 	}
-	budget := int(dg.budget.Load())
-	pinged, pingT := w.ping, time.Time{}
-	for i := 0; fatal == nil && i < b.Len(); {
-		end, _ := b.nextDatagram(i, budget)
-		d := b.appendDatagram(w.dscratch.B[:hr], i, end)
-		if hook != nil && hook.BeforeWrite != nil {
-			hook.BeforeWrite(c.id, end-i, len(d))
-		}
-		err := io.WriteDatagram(d)
-		n, hasDgram := b.datagramDgram(end)
-		if w.ping && w.pingAt >= i && w.pingAt < end && (err == nil || errors.Is(err, ErrNoise)) {
-			// The PING is committed at the return of the write that carried
-			// it (L23), not at the end of the round: the rest of the round's
-			// writes neither stretch its RTT sample nor let its PONG arrive
-			// before the commit.
-			pingT = time.Now()
-			c.mu.Lock()
-			c.commitPingLocked(w, pingT)
-			c.mu.Unlock()
-			w.ping = false
-		}
-		switch {
-		case err == nil:
-			dg.ctr.datagrams.Add(1)
-			if hasDgram {
-				dg.lastDgram.Store(c.dgSince(now))
-				txb += uint64(n)
+	if rs.fatal != nil {
+		rs.unsent = 0 // none of the round's frames was written
+	}
+	if w.bio != nil {
+		c.dgWriteFlushes(w, b, &rs, now)
+	} else {
+		for i := 0; rs.fatal == nil && i < b.Len(); {
+			end, _ := b.nextDatagram(i, rs.budget)
+			d := b.appendDatagram(w.dscratch.B[:hr], i, end)
+			if hook != nil && hook.BeforeWrite != nil {
+				hook.BeforeWrite(c.id, end-i, len(d))
 			}
-			if w.rackAt >= i && w.rackAt < end {
-				rackWritten = true
-			}
-		case errors.Is(err, wire.ErrDatagramTooLarge):
-			if hasDgram {
-				dg.ctr.refused.Add(1)
-			}
-			if w.ping && w.pingAt >= i && w.pingAt < end {
-				c.mu.Lock()
-				c.dgUnsentPingLocked(w) // it never left; a probe counts unanswered
-				c.mu.Unlock()
-				pinged = false
-			}
-			if c.dgShrink(err) {
-				fatal = errBudgetFloor
+			if c.death.Load() != nil {
+				rs.fatal, rs.unsent = errWriteDead, i // nothing more is written on a dead carrier
 				break
 			}
-			budget = int(dg.budget.Load())
-		case errors.Is(err, ErrNoise):
-			c.dgDropped(1) // this datagram is lost; the carrier lives
-		default:
-			fatal = err
+			err := io.WriteDatagram(d)
+			c.dgOutcome(w, b, &rs, i, end, end, err, now, time.Now()) // the call carried this datagram alone
+			i = end
 		}
-		i = end
 	}
 	end := time.Now()
 	c.disarmWatchdog(gen)
-	b.ReleaseRefs() // the writes returned: the chunk references go
-	if fatal != nil {
-		if fatal == errBudgetFloor {
-			c.killCarrier(CauseTransportError, fatal.Error())
-			return false
-		}
-		if c.endIfPeerClosed("write ended (" + fatal.Error() + ")") {
-			return false
-		}
-		cause := CauseTransportError
-		if errors.Is(fatal, os.ErrDeadlineExceeded) {
-			cause = CauseWriteStall
-		}
-		c.killCarrier(cause, "write: "+fatal.Error())
+	if fatal := rs.fatal; fatal != nil {
+		c.dgWriteFailed(fatal)
+		c.dgReturnUnsent(b, rs.unsent) // after the death: the session re-routes them
+		b.ReleaseRefs()
 		return false
 	}
+	b.ReleaseRefs() // the writes returned: the chunk references go
 	if w.close {
 		c.closeSent.Store(true) // attempted: REL{CLOSE} is retransmitted until RACKed
 	}
 	c.mu.Lock()
-	c.commitLocked(w, b, end) // w.ping is false here: the PING was committed with its datagram
-	c.st.txBytes += txb
+	c.commitLocked(w, b, end, end) // w.ping is false here: the PING was committed with its datagram
+	c.st.txBytes += rs.txb
 	c.relAttemptedLocked(w.retx, w.retxCseq, end)
-	if rackWritten && dg.peerCloseSeen && !wire.SeqLess(w.rackCum, dg.peerCloseCseq) {
+	if rs.rackWritten && dg.peerCloseSeen && !wire.SeqLess(w.rackCum, dg.peerCloseCseq) {
 		dg.peerCloseRacked = true
 	}
 	finish := c.dgRetireDoneLocked()
@@ -316,9 +298,9 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 			hook.RelRetransmit(c.id, w.retxCseq)
 		}
 	}
-	if pinged {
+	if rs.pinged {
 		if o := c.opts.Observer; o != nil {
-			o.PingCommitted(c, w.pingID, pingT)
+			o.PingCommitted(c, w.pingID, rs.pingT)
 		}
 	}
 	if finish {
@@ -330,6 +312,293 @@ func (c *Conn) dgWriteBatch(w *writer, b *Batch, now time.Time, h2, chal bool, c
 	}
 	return c.death.Load() == nil
 }
+
+// dgWriteFailed ends the carrier after a fatal outcome of its round: a
+// budget below the control floor and any other write error kill it
+// (write_stall for a deadline, else transport_error), unless the peer's
+// CLOSE already arrived (the retirement completes). On a carrier that is
+// already dead (errWriteDead) it changes nothing: the first death record
+// stays.
+func (c *Conn) dgWriteFailed(fatal error) {
+	if fatal == errBudgetFloor {
+		c.killCarrier(CauseTransportError, fatal.Error())
+		return
+	}
+	if c.endIfPeerClosed("write ended (" + fatal.Error() + ")") {
+		return
+	}
+	cause := CauseTransportError
+	if errors.Is(fatal, os.ErrDeadlineExceeded) {
+		cause = CauseWriteStall
+	}
+	c.killCarrier(cause, "write: "+fatal.Error())
+}
+
+// DgramReturner is implemented by a PacketEndpoint that takes back the
+// DGRAMs its datagram carrier placed and never wrote (M5 pktloss; L39:
+// only data in flight on a dead carrier may be lost). The writer of a
+// round that ends the carrier hands back every DGRAM of the round's
+// unwritten datagrams: after a fatal write error, the datagram the
+// transport refused that way and every later one (never given to it);
+// after a death record found before a write, that write's and every later
+// one. It does so after the carrier's death record is set, so the session
+// places them again on a live carrier (or counts them where its queue
+// would): a datagram rendr knows never left is neither lost uncounted nor
+// sent twice. A write that returned an invalid count (L42: an error
+// matching ErrWriteCount or udpsocket.ErrInvalidCount, or a batched count
+// of a shape it cannot have) is the exception: which of the datagrams that
+// call was given left is unknown — a transport that misreports its count
+// may have sent them — so none of them goes back, while the round's
+// datagrams after that call, which no call was given, do.
+type DgramReturner interface {
+	// Unsent hands back the DGRAM of session seq seq: p aliases buf.B and
+	// the reference on buf moves to the endpoint (kept or released). It is
+	// called on the carrier's writer goroutine, in seq order per endpoint,
+	// with no carrier lock held, and must not block.
+	Unsent(c *Conn, seq uint64, p []byte, buf *Buf)
+}
+
+// dgReturnUnsent hands the DGRAMs of the round's sealed frames [from,
+// b.Len()) back to their views' endpoints (DgramReturner), each with a
+// reference of its own on its chunk, before ReleaseRefs drops the batch's
+// (from < 0: nothing). A DGRAM without a chunk (component tests), of a
+// handle no view holds any more, or of an endpoint that takes nothing back
+// is dropped as before.
+func (c *Conn) dgReturnUnsent(b *Batch, from int) {
+	if from < 0 {
+		return
+	}
+	for k := from; k < b.n; k++ {
+		f := &b.frames[k]
+		if f.hdr.Type != wire.TypeDgram || f.chunk == nil {
+			continue
+		}
+		v := c.trunk.route(f.hdr.Handle)
+		if v == nil {
+			continue
+		}
+		r, ok := v.pep.(DgramReturner)
+		if !ok {
+			continue
+		}
+		f.chunk.Ref()
+		r.Unsent(v, f.off, f.body, f.chunk)
+	}
+}
+
+// errWriteDead: the round found the carrier's death record before a write
+// (another goroutine killed it while the round was built or written):
+// nothing more is written on it.
+var errWriteDead = errors.New("rendr/carrier: carrier died during the write round")
+
+// ErrWriteCount is the identity of an invalid write count (L42, PA-19): a
+// datagram write that reported another count than the datagram's length,
+// or a batched write whose count has a shape it cannot have. errors.Is
+// matches it for every such error of the datagram transports — the
+// embedder adapter's (a *countError of a WriteTo), rendr's own sockets'
+// (errUDPWriteCount), a batched write's (errBatchCount) and udpflow's
+// foreign-conn writes — and the batch calls' own udpsocket.ErrInvalidCount
+// stands beside it (isWriteCount). The carrier dies, and the writer hands
+// back none of the datagrams the misreporting call was given: the count
+// lied, so they may have left (dgOutcome, DgramReturner).
+var ErrWriteCount = errors.New("rendr/carrier: datagram write returned an invalid count")
+
+// isWriteCount reports whether err is an invalid write count (L42):
+// ErrWriteCount, or udpsocket.ErrInvalidCount from a batch call.
+func isWriteCount(err error) bool {
+	return errors.Is(err, ErrWriteCount) || errors.Is(err, udpsocket.ErrInvalidCount)
+}
+
+// dgRound is what a round's datagram writes build up for its commit.
+type dgRound struct {
+	budget      int       // the send budget the round packs under (lowered by a refusal)
+	txb         uint64    // DGRAM bytes written (Stats.TxBytes)
+	rackWritten bool      // a written datagram carried the round's RACK
+	pinged      bool      // the round's PING left: PingCommitted is reported
+	pingT       time.Time // its commit time
+	fatal       error     // the error that ends the carrier
+	unsent      int       // with fatal: the first sealed frame whose DGRAM goes back (dgReturnUnsent; -1: none)
+}
+
+// dgOutcome applies the result err of the write of the datagram of sealed
+// frames [i, end), which returned at ret, to the round (§A5.8): the PING
+// it carried is committed at ret, written or lost to noise (L23);
+// written — counted, the DGRAM's bytes and the RACK mark; too large —
+// Refused, the PING record goes, the budget shrinks (M2-D25); noise —
+// Dropped; else the error ends the carrier: this datagram and the round's
+// rest never left — unless err is an invalid count (isWriteCount, L42):
+// then which of the datagrams of the call that carried this one left is
+// unknown, and only those after that call, from callEnd (the first sealed
+// frame after it: its flush's end, or end for a call of this datagram
+// alone), go back. It reports whether the budget changed: the datagrams
+// packed after this one under the old budget are then packed again.
+func (c *Conn) dgOutcome(w *writer, b *Batch, rs *dgRound, i, end, callEnd int, err error, now, ret time.Time) (shrank bool) {
+	dg := c.dg
+	n, hasDgram := b.datagramDgram(end)
+	ping := w.ping && w.pingAt >= i && w.pingAt < end
+	if ping && (err == nil || errors.Is(err, ErrNoise)) {
+		// The PING is committed at the return of the write that carried it
+		// (L23), not at the end of the round: the rest of the round's
+		// writes neither stretch its RTT sample nor let its PONG arrive
+		// before the commit.
+		rs.pingT = ret
+		c.mu.Lock()
+		c.commitPingLocked(w, ret)
+		c.mu.Unlock()
+		w.ping = false
+	}
+	switch {
+	case err == nil:
+		dg.ctr.datagrams.Add(1)
+		if hasDgram {
+			dg.lastDgram.Store(c.dgSince(now))
+			rs.txb += uint64(n)
+		}
+		if w.rackAt >= i && w.rackAt < end {
+			rs.rackWritten = true
+		}
+	case errors.Is(err, wire.ErrDatagramTooLarge):
+		if hasDgram {
+			dg.ctr.refused.Add(1)
+		}
+		if ping {
+			c.mu.Lock()
+			c.dgUnsentPingLocked(w) // it never left; a probe counts unanswered
+			c.mu.Unlock()
+			rs.pinged = false
+		}
+		if c.dgShrink(err) {
+			rs.fatal, rs.unsent = errBudgetFloor, end // this one counted Refused; the rest never left
+			return false
+		}
+		before := rs.budget
+		rs.budget = int(dg.budget.Load())
+		return rs.budget != before
+	case errors.Is(err, ErrNoise):
+		c.dgDropped(1) // this datagram is lost; the carrier lives
+	case isWriteCount(err):
+		// L42: the call that carried this datagram misreported its count —
+		// a transport that sent a datagram and returned (len+1, nil) or
+		// (0, nil), a sendmmsg count beyond its call — so its datagrams may
+		// have left, and one handed back would be sent twice. Those after
+		// the call were given to no call.
+		rs.fatal, rs.unsent = err, callEnd
+	default:
+		rs.fatal, rs.unsent = err, i // this datagram and the round's rest never left
+	}
+	return false
+}
+
+// dgArenaSize is the size requested for a round's arena: the 64 KiB class
+// of DBufs, which holds the largest datagram (wire.MaxDatagram with its
+// flow header) (M5-D11).
+const dgArenaSize = 64 << 10
+
+// dgWriteFlushes writes the round's sealed frames through the transport's
+// BatchIO (M5 design §A4.3; L55, L23, M2-D25, M2-D29): the datagrams are
+// packed in order into the round's arena (one DBufs buffer of the 64 KiB
+// class, charged to the stage account, taken here and released at the
+// end; it holds copies, never a chunk reference) and flushed with one
+// WriteDatagrams call when the flush holds MaxBatch datagrams, the arena
+// cannot hold the next one, the datagram carrying the round's PING was
+// just added — so that PING commits at the return of the call that wrote
+// it (L23) — or the round's frames are exhausted: batching never waits for
+// frames (L55). Hooks.BeforeWrite runs for each datagram, in order, before
+// the call that carries it. The result is mapped datagram by datagram
+// (dgOutcome): ds[:n] written; ds[n] refused — the rest of the round is
+// packed again from the frame after it if the budget shrank, else the
+// flush goes on with ds[n+1:] — lost to noise (the flush goes on with
+// ds[n+1:]) or fatal (the round's unsent datagrams are never written:
+// dgReturnUnsent hands their DGRAMs back). A death record found before a
+// call is fatal for that call's datagrams. A count outside [0, len], a
+// short count without an error, or a full count with one, is fatal
+// (errBatchCount, L42), and so is an invalid count the transport reports
+// as ds[n]'s error (isWriteCount): which of the call's datagrams left is
+// unknown, so none of ds[n:] goes back — only the datagrams of the flushes
+// after it, which no call was given. Counters move only for the written
+// indexes, at the call's return (L55).
+func (c *Conn) dgWriteFlushes(w *writer, b *Batch, rs *dgRound, now time.Time) {
+	if b.Len() == 0 {
+		return
+	}
+	bio := w.bio
+	hr := c.dg.io.Headroom()
+	hook := c.env.Hooks
+	maxB := min(max(bio.MaxBatch(), 1), MaxBatchFrames)
+	w.arena = c.dbufs().Get(dgArenaSize, c.env.stageBudget())
+	var ends [MaxBatchFrames]int // the frame end of each datagram of the flush
+	for i := 0; rs.fatal == nil && i < b.Len(); {
+		first := i
+		arena := w.arena.B[:0]
+		var ds [][]byte
+		nd := 0
+		for i < b.Len() && nd < maxB {
+			end, n := b.nextDatagram(i, rs.budget)
+			if nd > 0 && len(arena)+hr+n > cap(arena) {
+				break // the arena is full: flush, then go on
+			}
+			var ln int
+			ds, ln = b.appendDatagramArena(i, end, arena[:len(arena)+hr])
+			arena = arena[:ln]
+			if hook != nil && hook.BeforeWrite != nil {
+				hook.BeforeWrite(c.id, end-i, len(ds[nd]))
+			}
+			ends[nd] = end
+			nd++
+			ping := w.ping && w.pingAt >= i && w.pingAt < end
+			i = end
+			if ping {
+				break // the PING's datagram ends its flush (L23)
+			}
+		}
+		for sent := 0; sent < nd && rs.fatal == nil; {
+			if c.death.Load() != nil {
+				rs.fatal, rs.unsent = errWriteDead, dgStart(first, ends[:], sent) // nothing more is written on a dead carrier
+				break
+			}
+			k, err := bio.WriteDatagrams(ds[sent:nd])
+			ret := time.Now()
+			if k < 0 || k > nd-sent || (err == nil) != (k == nd-sent) {
+				// Out of range, short without an error, or an error for a
+				// datagram past the last (L42): which of the call's
+				// datagrams left is unknown, so none of them is handed
+				// back; the flushes after it were given to no call.
+				rs.fatal, rs.unsent = errBatchCount, ends[nd-1]
+				break
+			}
+			for j := sent; j < sent+k; j++ {
+				c.dgOutcome(w, b, rs, dgStart(first, ends[:], j), ends[j], ends[nd-1], nil, now, ret)
+			}
+			sent += k
+			if err == nil {
+				break
+			}
+			j := sent
+			sent++
+			if c.dgOutcome(w, b, rs, dgStart(first, ends[:], j), ends[j], ends[nd-1], err, now, ret) && sent < nd {
+				i = ends[j] // packed under the old budget: pack the rest again
+				break
+			}
+		}
+		b.resetFlush()
+	}
+	w.arena.Release()
+	w.arena = nil
+}
+
+// dgStart returns the first sealed frame of the flush's j-th datagram: the
+// end of the one before it, or first.
+func dgStart(first int, ends []int, j int) int {
+	if j == 0 {
+		return first
+	}
+	return ends[j-1]
+}
+
+// errBatchCount: a batched write reported a count outside the datagrams it
+// was given, fewer without an error, or all of them with an error (L42:
+// the carrier dies, never retried). It matches ErrWriteCount.
+var errBatchCount = fmt.Errorf("%w (a batched write's count of a shape it cannot have)", ErrWriteCount)
 
 // errBudgetFloor: a refusal lowered the budget below wire.ControlFloor.
 var errBudgetFloor = errors.New("datagram budget below the control floor")

@@ -42,12 +42,15 @@ import (
 //
 // A dialer still in its opening phase takes the pending branch (M4): no
 // rule below applies before the verdict; earlyCloseLocked runs the
-// deadline of a Close called before it (M4-D12; a no-op until M4's WP9a).
+// deadline of a Close called before it (M4-D12), and earlyIdleLocked the
+// IdleTimeout of an EarlyReturn session that was never triggered (K21: the
+// application holds that session, so it idles like any other, from Dial).
 func (a *actor) terminationLocked(now time.Time) {
 	s := a.s
 	st := &s.st
 	if a.d != nil && !a.d.opened {
 		a.earlyCloseLocked(now)
+		a.earlyIdleLocked(now)
 		return
 	}
 	idle := a.idleTimeout()

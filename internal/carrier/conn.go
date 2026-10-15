@@ -431,6 +431,11 @@ func (c *Conn) Start(ep Endpoint, bell Doorbell, o StartOptions) {
 		c.startMux() // view 1 of a MUX trunk gets its own Done (mux.go)
 	}
 	c.jmu.Unlock()
+	if c.mux {
+		// Established: its death is reported with DOWN on the other trunks
+		// of its pair, and a DOWN from the peer may name it (PA-86).
+		c.env.Trunks.add(c.trunk)
+	}
 
 	if bell != nil {
 		c.bell.Store(&ringer{bell})
@@ -514,12 +519,26 @@ func (c *Conn) killCarrier(cause Cause, detail string) bool {
 // announces it: the writer's dying channel closes (an idle writer exits),
 // the self-load contribution is withdrawn and the owner's bell rings. The
 // caller that won starts the closer.
+//
+// An established MUX trunk that dies with a cause its peer does not know
+// first queues DOWN(its CarrierID) on the other trunks of its pair (PA-86,
+// down.go): before the record is visible, so before any session on the
+// trunk can learn of the death and publish a death SCHED. A caller that
+// then loses the CAS to another cause leaves a DOWN that still reports the
+// truth (the trunk ended at this end); a peer whose end is retiring or
+// dead ignores it.
 func (c *Conn) setDeath(cause Cause, detail string) bool {
 	if c.death.Load() != nil {
 		return false
 	}
+	if c.mux && cause.sendsDown() {
+		c.env.Trunks.down(c.trunk)
+	}
 	if !c.death.CompareAndSwap(nil, &deathRecord{cause: cause, detail: detail, at: time.Now()}) {
 		return false
+	}
+	if c.mux {
+		c.env.Trunks.remove(c.trunk)
 	}
 	close(c.dying)
 	c.wakeWriter()
@@ -651,7 +670,9 @@ func (c *Conn) Inflight() int64 {
 	return c.st.inflight()
 }
 
-// Capacity returns the current in-flight cap (sched.Capacity).
+// Capacity returns the current in-flight cap (sched.CapacityDuplex: the
+// plan section 4 cap, plus the duplex allowance while the peer reports
+// BUSY: its reverse queue and this side's write lag, duplexLocked).
 func (c *Conn) Capacity() int64 {
 	if c.trunk == nil {
 		return 0
@@ -662,7 +683,8 @@ func (c *Conn) Capacity() int64 {
 }
 
 func (t *trunk) capacityLocked() int64 {
-	return sched.CapacityDuplex(t.st.rate, t.st.minRTT, t.tm.PingBusy, t.st.dlvRate, t.st.revDelayLocked(), t.tm.CapFloor, t.tm.Window)
+	rev, lag := t.st.duplexLocked()
+	return sched.CapacityDuplex(t.st.rate, t.st.minRTT, t.tm.PingBusy, t.st.dlvRate, rev, lag, int64(t.tm.BatchBudget), t.tm.CapFloor, t.tm.Window)
 }
 
 // Stats returns a point-in-time copy of the estimator and counters.

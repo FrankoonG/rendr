@@ -317,6 +317,14 @@ func (c *Conn) dispatch(v *Conn, h wire.Header, p []byte, now time.Time) bool {
 			c.violation("%s", why)
 			return false
 		}
+	case wire.TypeDown:
+		// Another trunk of the pair died at the peer's end (PA-86;
+		// down.go); a violation on a dedicated carrier and when it names
+		// this trunk.
+		if why := c.onDown(p); why != "" {
+			c.violation("%s", why)
+			return false
+		}
 	case wire.TypeData:
 		off, err := wire.ParseDataOffset(p)
 		if err != nil {

@@ -1,7 +1,9 @@
 # rendr wire format v2 golden vectors (design §5.5): one "name hex" per line.
 # Regenerate only with: go test ./internal/wire -run TestGolden -update
-# Any change before v2.0.0 is deliberate and recorded in the milestone report;
-# after v2.0.0 it needs a version bump.
+# Before v2.0.0 a change is deliberate and recorded in the milestone report.
+# After v2.0.0 a frozen vector changes only with a new wire minor version, an
+# optional PREFACE feature bit, or a new version of a versioned payload format
+# such as L4 metadata (TestWireGoldenFrozen, testdata/frozen.sha256).
 preface 524e44320200010100000000000000000102030405060708090a0b0c0d0e0f10010203041c09cf4e
 preface_datagram_optional_bits 524e44320207020100000000800000010102030405060708090a0b0c0d0e0f10ffffffffad70affd
 preface_ack_ok 524e44320200000200000000000000002122232425262728292a2b2c2d2e2f300102030421d564d1
@@ -139,3 +141,5 @@ open_flags_2 01000000200000000100000001c0c1c2c3c4c5c6c7c8c9cacbcccdcecf010100020
 preface_optendcode 524e44320200010100000000000000020102030405060708090a0b0c0d0e0f1001020304061d3494
 preface_ack_optendcode 524e44320200000200000000000000022122232425262728292a2b2c2d2e2f30010203043bc19f0b
 join_ack_unknown_session_endcode 0400000009000000010000000101000000000000500098576659
+down 37000000040000001300000000010203054db33569
+rel_down 340000000e00000010000000000000000937000000000001020305e7f5e680

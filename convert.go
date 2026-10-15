@@ -45,6 +45,7 @@ var (
 	_ [0]struct{} = [int(CauseLocalClose) - int(carrier.CauseLocalClose)]struct{}{}
 	_ [0]struct{} = [int(CauseRetired) - int(carrier.CauseRetired)]struct{}{}
 	_ [0]struct{} = [int(CauseQuality) - int(carrier.CauseQuality)]struct{}{}
+	_ [0]struct{} = [int(CausePeerDown) - int(carrier.CausePeerDown)]struct{}{}
 	_ [0]struct{} = [int(EvidenceUnknown) - int(sched.EvUnknown)]struct{}{}
 	_ [0]struct{} = [int(EvidenceFresh) - int(sched.EvFresh)]struct{}{}
 	_ [0]struct{} = [int(EvidenceHeld) - int(sched.EvHeld)]struct{}{}

@@ -606,7 +606,11 @@ func finish(t testing.TB, dc, pc *rendr.Conn) {
 // The test blackholes the link in BlackholeCloses mode, as an nft DROP:
 // the close of the end whose verdict comes first does not cross, so the
 // other end must reach a verdict of its own too — a transport_error there
-// would be the Link's close, not the end's detection.
+// would be the Link's close, not the end's detection. PA-86: that first
+// verdict's DOWN does cross, on the surviving member's trunk, so the other
+// end may instead end the carrier with peer_down when it arrives (after
+// the first end's ping_timeout or write_stall), as the first end's
+// detection reported to it.
 func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID, drop time.Time) {
 	t.Helper()
 	var evs [2]rendr.Event
@@ -617,10 +621,17 @@ func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID
 			return ok
 		})
 	}
+	silent := func(ev rendr.Event) bool {
+		return (ev.Cause == rendr.CausePingTimeout || ev.Cause == rendr.CauseWriteStall) && !ev.Time.Before(drop)
+	}
 	for i, c := range []*rendr.Conn{dc, pc} {
-		ev := evs[i]
-		if ev.Cause != rendr.CausePingTimeout && ev.Cause != rendr.CauseWriteStall || ev.Time.Before(drop) {
-			t.Errorf("the %s's death record of the dropped carrier %d at DROP %+v: %+v, want ping_timeout or write_stall after the DROP",
+		ev, other := evs[i], evs[1-i]
+		// PA-86: the end that detects the DROP first reports it with DOWN
+		// on the surviving member's trunk, and the other end then ends the
+		// carrier with peer_down at that DOWN's arrival, unless its own
+		// detection came first.
+		if !silent(ev) && !(ev.Cause == rendr.CausePeerDown && silent(other) && !ev.Time.Before(other.Time)) {
+			t.Errorf("the %s's death record of the dropped carrier %d at DROP %+v: %+v, want ping_timeout or write_stall after the DROP (or peer_down after the other end's)",
 				side(i), id, ev.Time.Sub(drop), ev)
 		}
 		if cs, ok := carrierOf(c.Status(), id); !ok || cs.State != rendr.CarrierDead || cs.DeathCause != ev.Cause {
@@ -631,6 +642,51 @@ func droppedCause(t testing.TB, w *world, dc, pc *rendr.Conn, id rendr.CarrierID
 	if t.Failed() {
 		t.FailNow()
 	}
+}
+
+// killedCause checks the death records of a member killed with Link.Kill
+// (evs: the dialer's and the passive's EventCarrierDown of it) and returns
+// "" or what is wrong. The Link closes both ends at once and each records
+// transport_error. PA-86 relaxes that only when pairTrunk holds — the
+// member's carrier is a MUX trunk and another trunk of the pair survives
+// the kill (killPairTrunk) —: an end may then learn of the other end's
+// death first from its DOWN and record peer_down, dated no earlier than
+// the other end's transport_error (at least one end records
+// transport_error). A dedicated carrier, or a trunk without a surviving
+// trunk of its pair, has no DOWN to learn from and stays strict.
+func killedCause(evs [2]rendr.Event, pairTrunk bool) string {
+	for i, ev := range evs {
+		other := evs[1-i]
+		learned := pairTrunk && ev.Cause == rendr.CausePeerDown && other.Cause == rendr.CauseTransportError && !ev.Time.Before(other.Time)
+		if ev.Cause != rendr.CauseTransportError && !learned {
+			want := "transport_error (a dedicated carrier or no surviving trunk of the pair: no DOWN)"
+			if pairTrunk {
+				want = "transport_error (or peer_down no earlier than the other end's)"
+			}
+			return fmt.Sprintf("the %s's death record %+v (the %s's: %v at %v), want %s",
+				side(i), ev, side(1-i), other.Cause, other.Time, want)
+		}
+	}
+	return ""
+}
+
+// killPairTrunk reports, just before a Link.Kill of link name, whether the
+// session's live member on it is a MUX trunk with a surviving trunk of its
+// pair (killedCause's PA-86 premise): the link's factory shares its
+// carriers (no Props.CheapSubflow), the dialer Runtime counts at least two
+// live MUX carriers (the member's and another), and the session (ds, the
+// dialer's Status) holds a live member on another link, whose trunk the
+// kill leaves alive.
+func (w *world) killPairTrunk(ds rendr.SessionStatus, name string) bool {
+	if w.spec(name).props.CheapSubflow || w.d.Status().Mux.Carriers < 2 {
+		return false
+	}
+	for _, c := range liveOf(ds) {
+		if c.Name != name {
+			return true
+		}
+	}
+	return false
 }
 
 // dropTarget returns the Seq of the link's one open session carrier just

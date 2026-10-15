@@ -36,7 +36,7 @@ func newUDPPair(tb testing.TB, ov testhooks.Overrides) *udpPair {
 	dov, pov := ov, ov
 	u := &udpPair{d: newRuntime(tb, rendr.Config{}, &dov), p: newRuntime(tb, rendr.Config{}, &pov)}
 	tb.Cleanup(func() { u.d.Close(); u.p.Close() })
-	sock, err := udp.Listen("udp4", "127.0.0.1:0", udp.Options{})
+	sock, err := udp.Listen("udp4", "127.0.0.1:0", udpOpts())
 	if err != nil {
 		tb.Fatalf("udp.Listen: %v", err)
 	}
@@ -49,7 +49,7 @@ func newUDPPair(tb testing.TB, ov testhooks.Overrides) *udpPair {
 	// CarrierStatus counts every frame it writes (PINGs and PONGs included):
 	// dedicated (M3-D2; a MUX trunk's view counts its own frames only, and
 	// the mux steady state is TestMuxSteadyStateZeroAllocs_L41_L54's).
-	uc := udp.Carrier("udp", "udp4", sock.LocalAddr().String(), udp.Options{})
+	uc := udp.Carrier("udp", "udp4", sock.LocalAddr().String(), udpOpts())
 	uc.Props.CheapSubflow = true
 	peer, err := u.d.NewPeer(rendr.PeerConfig{Carriers: []rendr.Carrier{uc}})
 	if err != nil {

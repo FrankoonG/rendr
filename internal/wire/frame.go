@@ -43,15 +43,16 @@ func PutHeader(b []byte, h *Header) {
 // HeaderLen bytes are ErrShort; bytes after the header are ignored.
 //
 // The handle rule (Type.CarrierLevel): 0 for a carrier-level type (REL,
-// RACK and DETACH included), any non-zero handle for a session type (DGRAM
+// RACK, DETACH and DOWN included), any non-zero handle for a session type (DGRAM
 // and PACK included; M3-D4). Which session handles a carrier carries is
 // the carrier's check, not the codec's: a dedicated carrier carries
 // SessionHandle only, a MUX trunk the handles it opened or admitted (M3
 // design §A3.2, §A3.3). Whether a carrier accepts a frame at all (session
 // frames on probe and sessionless carriers, DATA on a packet session, REL
 // on a stream carrier, a bare control frame on a datagram carrier, DETACH
-// on a dedicated carrier: M2 design §A3.6, M3 design §A3.4) is not a
-// header property either; the code reading the carrier decides it.
+// or DOWN on a dedicated carrier: M2 design §A3.6, M3 design §A3.4,
+// PA-86) is not a header property either; the code reading the carrier
+// decides it.
 func ParseHeader(b []byte) (Header, error) {
 	if len(b) < HeaderLen {
 		return Header{}, ErrShort
@@ -95,8 +96,8 @@ func handleOK(t Type, handle uint32) bool {
 // ACK 16, FIN 8, RST 5..260, SCHED 33..93, PING/PONG 20..20+MaxPingPad, CLOSE 1,
 // GOAWAY 1, DGRAM 8..MaxFramePayload (an empty datagram is legal), PACK 20,
 // REL 10..MaxFramePayload (ParseRel bounds the inner payload by its own
-// type), RACK 8, DETACH 5, extensions 0..MaxFramePayload. ok is false for
-// unknown core types.
+// type), RACK 8, DETACH 5, DOWN 4, extensions 0..MaxFramePayload. ok is
+// false for unknown core types.
 func PayloadBounds(t Type) (min, max int, ok bool) {
 	if t.Extension() {
 		return 0, MaxFramePayload, true
@@ -134,6 +135,8 @@ func PayloadBounds(t Type) (min, max int, ok bool) {
 		return RackLen, RackLen, true
 	case TypeDetach:
 		return DetachLen, DetachLen, true
+	case TypeDown:
+		return DownLen, DownLen, true
 	}
 	return 0, 0, false
 }

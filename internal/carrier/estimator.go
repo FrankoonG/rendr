@@ -84,7 +84,7 @@ type carrierState struct {
 	lastBusy      bool // the latest judged backlog state, carried by every PING sent since (Stats.Backlogged)
 	peerBusy      bool // the BUSY flag of the latest PING received (Stats.PeerBusy)
 
-	// The reverse path (revDelayLocked): the one-way delay of the peer's
+	// The reverse path (duplexLocked): the one-way delay of the peer's
 	// PINGs, read against their TS (the peer's clock, so with an unknown
 	// offset), its floor owdBase, and revQ, the smoothed excess over the
 	// floor: the queueing our PONGs meet behind the peer's DATA.
@@ -97,6 +97,10 @@ type carrierState struct {
 	dlvRate float64
 	dlvMark uint64
 	dlvAt   time.Time
+	// wlag is the write lag (duplexLocked): how long the conn took to
+	// take a batch whose PING led its DATA, followed at once when it rises
+	// and with gain 1/8 when it falls, as revQ.
+	wlag time.Duration
 
 	// Carrier-level control.
 	pong       wire.Ping // latest PING received: answered by the next PONG (latest wins, L08)
@@ -308,16 +312,18 @@ func (t *trunk) clockStepLocked() int64 {
 	return step
 }
 
-// commitLocked accounts a batch whose write returned at at: DATA becomes
-// submitted, and the batch's PING is committed (RTT counts from here, L23;
-// a new backlog interval starts when the PING judged the previous one,
-// X4). A batch that ended cap-blocked after writing DATA asks for a cap-hit
-// PING, so the cap is released one RTT later rather than at the next PING
-// timer (msess, R13), unless a PING ended the batch (endPing) and so proves
-// all of its DATA already. A PONG that raced this write proved the bytes
-// before its PING; those of the batch itself count from here, now that
-// they are submitted (onPongLocked).
-func (t *trunk) commitLocked(w *writer, b *Batch, at time.Time) {
+// commitLocked accounts a batch whose write began at start and returned
+// at at: DATA becomes submitted, and the batch's PING is committed (RTT
+// counts from here, L23; a new backlog interval starts when the PING
+// judged the previous one, X4); a PING that led the batch's DATA gives a
+// write-lag sample (duplexLocked). A batch that ended cap-blocked after
+// writing DATA asks for a cap-hit PING, so the cap is released one RTT
+// later rather than at the next PING timer (msess, R13), unless a PING
+// ended the batch (endPing) and so proves all of its DATA already. A PONG
+// that raced this write proved the bytes before its PING; those of the
+// batch itself count from here, now that they are submitted
+// (onPongLocked).
+func (t *trunk) commitLocked(w *writer, b *Batch, start, at time.Time) {
 	st := &t.st
 	data := uint64(b.dataBytes())
 	st.submitted += data
@@ -326,6 +332,9 @@ func (t *trunk) commitLocked(w *writer, b *Batch, at time.Time) {
 	st.frames += uint64(b.Len())
 	if w.ping {
 		t.commitPingLocked(w, at)
+		if data > 0 && !w.pingAtEnd {
+			st.noteWriteLag(at.Sub(start))
+		}
 	}
 	if data > 0 && b.CapBlocked() && !w.pingAtEnd {
 		st.pingReq = true
@@ -607,20 +616,57 @@ func (st *carrierState) noteDelivered(now time.Time) {
 	}
 }
 
-// revDelayLocked is the reverse-path allowance of the capacity
-// (sched.CapacityDuplex): the smoothed queueing delay of the peer's PINGs
-// (noteOWD) while the peer reports BUSY, and nothing otherwise — a peer
-// without a backlog queues no DATA in front of our PONGs. It never exceeds
-// srtt − minRTT, the queueing that the round trips of our own PINGs measured
-// in both directions together: the reverse queue is part of it, so a wrong
-// TS (a peer clock that drifts or steps, a peer that lies) adds at most
-// what the round trip already shows, and noteOWD's floor rule ends such an
-// error as the round trip's queueing falls.
-func (st *carrierState) revDelayLocked() time.Duration {
-	if !st.peerBusy || !st.rttSeen {
-		return 0
+// noteWriteLag takes a write-lag sample d (commitLocked): wlag follows a
+// rising lag at once and a falling one with gain 1/8, as revQ.
+func (st *carrierState) noteWriteLag(d time.Duration) {
+	if d > st.wlag {
+		st.wlag = d
+	} else {
+		st.wlag += (d - st.wlag) / owdGain
 	}
-	return max(0, min(st.revQ, st.srtt-st.minRTT))
+}
+
+// duplexLocked returns the two parts of the capacity's duplex allowance
+// (sched.CapacityDuplex, M3-D68 and M5-D63): rev, the reverse queue, and
+// lag, the write lag. Both are 0 unless the peer reports BUSY and an RTT
+// was measured: a peer without a backlog queues no DATA in front of our
+// PONGs, and one way the base term's headroom absorbs the write lag.
+//
+// rev is the smoothed queueing delay of the peer's PINGs (noteOWD). It
+// never exceeds srtt − minRTT, the queueing that the round trips of our
+// own PINGs measured in both directions together: the reverse queue is
+// part of it, so a wrong TS (a peer clock that drifts or steps, a peer
+// that lies) adds at most what the round trip already shows, and
+// noteOWD's floor rule ends such an error as the round trip's queueing
+// falls.
+//
+// lag is wlag: the time a conn whose Write blocks takes to take a batch,
+// which the round trip never shows. A PING that leads its batch (every
+// PING while the byte clock is off) proves the DATA submitted before the
+// batch, and its RTT counts from the batch's commit, when the Write
+// returned (L23); the bytes it proves were counted in flight since the
+// previous commit, when the PING went into the conn. Where the conn's
+// buffer (a socket buffer, a shallow bottleneck queue) is smaller than a
+// batch the Write blocks while the buffer drains, so those bytes stay in
+// flight the write lag plus the RTT (the RTT then reads short: KL-17 (d)),
+// and a capacity sized from the RTT caps the flow below the path. One way
+// the base term's headroom absorbs it above a rate of BatchBudget/(minRTT
+// + 2·PingBusy + 100 ms) (with the defaults, 256 KiB / 220 ms ≈ 1.14
+// MiB/s, 1.19 MB/s, at a 20-ms minRTT); with bulk both ways the
+// headroom goes to the reverse queue and to our PONG's wait behind the
+// peer's Write in progress, and the side that lost the phase of the two
+// writers carried 0.75–0.85 of the link (KL-20; the late, dlate and stalls
+// rows of TestDuplexKeepsBothDirections_L15). A PING that ends its batch
+// (endPing) proves the batch itself from its commit and gives no sample,
+// nor does a batch without DATA (TestWriteLagAllowance). The lag is
+// measured on this side's clock and needs nothing from the peer;
+// sched.CapacityDuplex prices it at the rate estimate and caps it at one
+// batch.
+func (st *carrierState) duplexLocked() (rev, lag time.Duration) {
+	if !st.peerBusy || !st.rttSeen {
+		return 0, 0
+	}
+	return max(0, min(st.revQ, st.srtt-st.minRTT)), st.wlag
 }
 
 // onPing records a PING received at now: the next PONG answers it (latest

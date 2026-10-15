@@ -92,7 +92,36 @@ type Options struct {
 	// ReadBuffer and WriteBuffer size the socket buffers, best effort: 0
 	// selects 4 MiB and 1 MiB (on Linux raised past rmem_max/wmem_max with
 	// the FORCE options when the process may).
+	//
+	// A Listen socket's ReadBuffer also sizes what each carrier it serves
+	// may queue in rendr: the datagrams that arrived for the carrier and
+	// were not delivered yet. Each is held in a rendr buffer of the size
+	// class of the socket's MaxDatagram whatever its length (2,112 bytes
+	// at the default MaxDatagram, 16,448 at 9,000, 65,600 at 65,507; a
+	// smaller one only while the memory budget refuses that class), and a
+	// carrier queues a datagram while it holds fewer than 512 or its
+	// buffers come to less than ReadBuffer bytes: it holds the larger of
+	// 512 and ReadBuffer divided by the class, rounded up. The queue thus
+	// follows the socket buffer the embedder sized, and a carrier whose
+	// reader falls behind loses nothing while its queue holds less. The
+	// default 4 MiB holds 1,986 datagrams at the default MaxDatagram (about
+	// 20 ms at 100,000 a second) but only 512 at a MaxDatagram of 9,000 or
+	// 65,507: with a large MaxDatagram, size ReadBuffer by its class. Queued
+	// datagrams count in rendr.Status.BufferedBytes and stay within
+	// Config.MaxBufferedBytes; one that finds its carrier's queue full, or
+	// the budget used up, is dropped and counted in
+	// rendr.Status.Datagram.InboxDrops. Any other net.PacketConn given to
+	// rendr.FromPacketConn queues at most 512 datagrams per carrier.
 	ReadBuffer, WriteBuffer int
+	// MaxBatch is the most datagrams one send or receive system call moves
+	// on Linux amd64/arm64 (sendmmsg, recvmmsg): 0 or a negative value
+	// selects 32, 1 moves one datagram per call, values above 64 become 64;
+	// a listening socket reads at most 32 per call. Batching never delays
+	// a datagram: a writer sends what it has when it wakes. Other
+	// platforms always move one datagram per call. rendr.Status.Datagram
+	// counts the calls and the datagrams they moved (SendCalls,
+	// SentDatagrams, RecvCalls, RecvDatagrams).
+	MaxBatch int
 }
 
 // Listen opens a rendr-owned UDP socket on network ("udp", "udp4", "udp6")
@@ -100,6 +129,31 @@ type Options struct {
 // address must be a loopback IP or a host name whose every address is
 // loopback, checked before and after binding (ErrNonLoopback); an empty
 // host (wildcard) requires AllowNonLoopback.
+//
+// A wildcard socket is single-homed: replies leave from the source address
+// the routing table chooses, not necessarily the address a datagram
+// arrived at (rendr does not use IP_PKTINFO). Bind a specific address on a
+// multi-homed host.
+//
+// Each carrier the socket serves queues the datagrams its reader has not
+// taken yet: at least 512, and as many as fit Options.ReadBuffer in
+// buffers of the MaxDatagram size class. The per-carrier queue follows the
+// read buffer, so size it for the longest pause of a carrier's reader as
+// well as for the socket (see Options.ReadBuffer). The queued datagrams,
+// and the queue's entries beyond its first 8, count in
+// rendr.Status.BufferedBytes while they are held.
+//
+// Where the socket reads several datagrams per call (Linux amd64 and
+// arm64, Options.MaxBatch other than 1: the default 0 selects 32), its
+// source holds up to min(MaxBatch, 32) − 1 read buffers beyond its first,
+// and a message header per read buffer, from its first read on and while
+// datagrams arrive, counted in rendr.Status.BufferedBytes. Once its read
+// has waited one to two seconds without a datagram it returns them and
+// reads one datagram per call until the next arrives; the first read
+// buffer holds no data while it waits and is not counted, so a listening
+// socket adds nothing to BufferedBytes from two seconds after its last
+// datagram, or after it began to read if none arrived, with or without
+// sessions.
 func Listen(network, address string, o Options) (net.PacketConn, error) {
 	return listen(context.Background(), network, address, o)
 }

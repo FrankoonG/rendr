@@ -505,7 +505,7 @@ func newDgMuxSide(t testing.TB, env *Env, io *fakeIO, cmtu int, dialer bool) *mu
 // dgMuxPair returns a started datagram MUX trunk pair over a lossless
 // in-memory link with frame budget cmtu.
 func dgMuxPair(t testing.TB, cmtu int, mod func(*Env)) (d, p *muxSide, ia, ib *fakeIO) {
-	ia, ib = newFakeIOPair(cmtu)
+	ia, ib = newFakeIOPair(t, cmtu)
 	d = newDgMuxSide(t, muxEnv(mod), ia, cmtu, true)
 	p = newDgMuxSide(t, muxEnv(mod), ib, cmtu, false)
 	d.start()
@@ -516,7 +516,7 @@ func dgMuxPair(t testing.TB, cmtu int, mod func(*Env)) (d, p *muxSide, ia, ib *f
 // dgMuxRaw returns a started datagram MUX trunk (dialer or passive) and a
 // raw peer on the other end of its link.
 func dgMuxRaw(t testing.TB, cmtu int, dialer bool, mod func(*Env)) (*muxSide, *rawPeer) {
-	ia, ib := newFakeIOPair(cmtu)
+	ia, ib := newFakeIOPair(t, cmtu)
 	s := newDgMuxSide(t, muxEnv(mod), ia, cmtu, dialer)
 	p := &rawPeer{io: ib, fseq: s.env.Presets.firstFseq()}
 	s.start()

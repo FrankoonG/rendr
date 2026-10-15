@@ -467,7 +467,8 @@ func waitDone(t *testing.T, done <-chan struct{}, what string) {
 }
 
 // TestPacketSmoke_CA is the in-memory half: DatagramLink and DatagramHub,
-// selector and bond, 60 virtual seconds each (30 under -race).
+// selector and bond, 60 virtual seconds each (30 under -race, and there two
+// of the four subtests: smokeCACases).
 func TestPacketSmoke_CA(t *testing.T) {
 	rate, back, duration := 10000, 1000, 60*time.Second
 	if loopbackRace {
@@ -479,21 +480,58 @@ func TestPacketSmoke_CA(t *testing.T) {
 		// exceeded 300 s).
 		rate, back, duration = 400, 400, 30*time.Second
 	}
-	for _, tr := range []struct {
-		name string
-		net  func() *smokeNet
-	}{{"DatagramLink", smokeLinkNet}, {"DatagramHub", smokeHubNet}} {
-		for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
-			t.Run(tr.name+"/"+mode.String(), func(t *testing.T) {
-				synctest.Test(t, func(t *testing.T) {
-					n := tr.net()
-					defer n.close()
-					runSmoke(t, n, smokeRun{mode: mode, duration: duration, every: 10 * time.Second,
-						rate: rate, back: back, lossWin: 200 * time.Millisecond}, rendr.Config{})
-				})
+	for _, c := range smokeCACases() {
+		t.Run(c.name(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				n := c.net()
+				defer n.close()
+				runSmoke(t, n, smokeRun{mode: c.mode, duration: duration, every: 10 * time.Second,
+					rate: rate, back: back, lossWin: 200 * time.Millisecond}, rendr.Config{})
 			})
+		})
+	}
+}
+
+// smokeCACase is one subtest of TestPacketSmoke_CA: a transport and a mode.
+type smokeCACase struct {
+	tr   smokeTransport
+	mode rendr.Mode
+}
+
+func (c smokeCACase) name() string { return c.tr.name + "/" + c.mode.String() }
+
+func (c smokeCACase) net() *smokeNet { return c.tr.net() }
+
+// smokeCACases are TestPacketSmoke_CA's subtests: each transport in each
+// mode. Under -race (R1-23 lever 1; the race-unit target of 270 s per
+// pass, m5's prerc decision) DatagramLink/selector and DatagramHub/bond
+// run, with the same criteria: each transport and each mode once (the
+// row's rules are runSmoke's, the same for every pair). The non-race unit
+// and sweep lanes run all four; TestRaceLaneSubtests checks the lists.
+func smokeCACases() []smokeCACase {
+	var all []smokeCACase
+	for _, tr := range smokeTransports() {
+		for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
+			all = append(all, smokeCACase{tr, mode})
 		}
 	}
+	if !loopbackRace {
+		return all
+	}
+	return []smokeCACase{all[0], all[3]}
+}
+
+// smokeTransport is one in-memory transport of the packet smokes.
+type smokeTransport struct {
+	name string
+	net  func() *smokeNet
+}
+
+// smokeTransports are the in-memory transports of the packet smokes: the
+// DatagramLink (one datagram carrier per conn) and the DatagramHub (raw-UDP
+// flows into the passive's FromPacketConn source).
+func smokeTransports() []smokeTransport {
+	return []smokeTransport{{"DatagramLink", smokeLinkNet}, {"DatagramHub", smokeHubNet}}
 }
 
 // TestPacketSmokeUDP_CA is the real-socket half over carrier/udp on

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -48,6 +49,13 @@ type Env struct {
 	// response as the view's first frame) or Conn.Refuse. nil: no passive
 	// mux (an OPEN or JOIN on a live trunk is then refused).
 	Admit func(v *Conn, h wire.Header, p []byte)
+
+	// Trunks is the Runtime's index of its established MUX trunks by pair
+	// (PA-86, down.go): the hook through which a dying trunk queues DOWN on
+	// the other trunks of its pair and a received DOWN finds the trunk it
+	// names. NewRuntime sets it; nil (component tests): no DOWN is sent, and
+	// one received names no trunk.
+	Trunks *TrunkSet
 }
 
 // stageBudget returns the account a carrier's reader stage is charged to
@@ -322,4 +330,88 @@ func (p *AbandonPool) Len() int {
 // passive answers PREFACE_ACK(CAPACITY).
 func (p *AbandonPool) Full() bool {
 	return p.n.Load() >= p.limit
+}
+
+// ioHdr is a pooled batch header (M5 design Revision 1, R1-5 rule 1): the
+// udpsocket.Batch of one capacity class (2, 4, … 64 messages) with the
+// message array of one batched call and, for a reader, its slots. A
+// rendr-owned socket's WriteDatagrams holds one for a call of two or more
+// datagrams; a dialer carrier's reader holds one while it reads at depth
+// two or more (kept across short parks, returned at its idle release,
+// dgread.go). Nobody holds one while idle, and none is allocated per call:
+// the headers live in one pool per class, shared by the Runtimes of the
+// process as sync.Pool shares DBufs' classes; each Runtime is charged for
+// the headers it holds, to Env.Stages (forced: visible in BufferedBytes),
+// so the per-Runtime accounts of plan:221 stay separate.
+type ioHdr struct {
+	b      *udpsocket.Batch
+	ms     []udpsocket.Msg // len = the class capacity; cleared when pooled
+	slots  []*Buf          // a reader's slots 1 … k−1 (DBufs, charged to Env.Budget); slot 0 is the reader's own buffer
+	k      int             // a reader's depth (2 … capacity)
+	gen    uint64          // a reader's lend generation (dgread.go)
+	class  uint8
+	stages *Budget // the account charged while held; nil: uncharged
+}
+
+// The header classes and their charge. hdrPerMsg estimates one message's
+// share of a header: a kernel header, an iovec and a socket address
+// (≈ 108 bytes on the batching targets), a udpsocket.Msg (72) and a slot
+// pointer.
+const (
+	hdrClasses = 6 // capacities 2 << c: 2 … 64 = udpsocket.MaxMsgs
+	hdrPerMsg  = 192
+)
+
+var hdrPools [hdrClasses]sync.Pool
+
+// hdrClass returns the smallest class whose capacity holds n messages
+// (2 ≤ n ≤ 64).
+func hdrClass(n int) int {
+	c := 0
+	for 2<<c < n {
+		c++
+	}
+	return c
+}
+
+// getHdr returns a header for n messages (2 ≤ n ≤ udpsocket.MaxMsgs) of the
+// smallest class that holds them, charged to stages (nil: uncharged).
+func getHdr(n int, stages *Budget) *ioHdr {
+	if n < 2 || n > udpsocket.MaxMsgs {
+		panic("rendr/carrier: batch header size out of range")
+	}
+	c := hdrClass(n)
+	h, _ := hdrPools[c].Get().(*ioHdr)
+	if h == nil {
+		cp := 2 << c
+		h = &ioHdr{b: udpsocket.NewBatch(cp), ms: make([]udpsocket.Msg, cp), slots: make([]*Buf, cp), class: uint8(c)}
+	}
+	if stages != nil {
+		stages.Acquire(h.charge())
+		h.stages = stages
+	}
+	return h
+}
+
+// cap returns the header's capacity in messages.
+func (h *ioHdr) cap() int { return len(h.ms) }
+
+// charge returns the bytes a held header is charged.
+func (h *ioHdr) charge() int64 { return int64(len(h.ms) * hdrPerMsg) }
+
+// uncharge returns the header's charge (idempotent).
+func (h *ioHdr) uncharge() {
+	if s := h.stages; s != nil {
+		h.stages = nil
+		s.Release(h.charge())
+	}
+}
+
+// put returns h to its pool: uncharged, with no reference to a call's
+// buffers. Its slots must have been released (nil).
+func (h *ioHdr) put() {
+	h.uncharge()
+	clear(h.ms)
+	h.k, h.gen = 0, 0
+	hdrPools[h.class].Put(h)
 }

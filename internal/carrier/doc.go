@@ -3,7 +3,10 @@
 // goroutine, fseq + CRC32C verification of every frame, the per-carrier
 // estimator (srtt, minRTT, PONG-watermark rate, receive rate, capacity cap,
 // death deadline, write-stall watchdog, backlog), carrier-level control
-// (PING/PONG, CLOSE, GOAWAY), dialer-side establishment, passive-side
+// (PING/PONG, CLOSE, GOAWAY; on MUX trunks DETACH, and DOWN, the report of
+// another trunk's death in the same pair — the same two Runtimes, the same
+// dialing direction —, down.go),
+// dialer-side establishment, passive-side
 // handshake reading, the guarded embedder-call wrappers, the receive/send
 // buffer pool and memory budget, and the Peer health layer (probe carriers,
 // evidence publication, the self-load gauges).

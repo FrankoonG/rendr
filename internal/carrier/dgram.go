@@ -49,10 +49,15 @@ type dgState struct {
 	// with its response is lost (M2 design Revision 1, R1-1). Nil after.
 	tail []byte
 
-	rwin          wire.FseqWindow // (R) receive anti-replay window (M2-D13)
+	rwin          wire.FseqWindow // (R) receive anti-replay window (M2-D13; wire.FseqWindowBits frames, m5 PA-85)
 	peerClosed    bool            // (R) the peer's CLOSE was dispatched (M2-D30)
 	peerCloseFseq uint32          // (R) its fseq: later non-RACK frames are dropped
-	jumpPing      time.Time       // (M) when a frame ahead of rwin last asked for a PING (dgJumpClaim)
+
+	// The claim of a forward jump rwin did not take (dgJumpPingLocked; m3
+	// FSEQJUMP, m5 PA-85), all (R): when it began (zero: none; a jump the
+	// window took ends it), when its latest unproven frame arrived and when
+	// it last asked for a PING of the carrier.
+	jumpAt, jumpLast, jumpPing time.Time
 
 	// The datagram retirement (M2-D31, R1-4): it completes when our CLOSE
 	// was RACKed, the peer's CLOSE was dispatched and a datagram carrying a

@@ -708,10 +708,10 @@ type Counts struct {
 // Stats are a link's counters: over all carriers, session carriers only,
 // and probe carriers only.
 type Stats struct {
-	All, Session, Probe Counts
-	Throttled           int64 // bytes that passed the rate limiter
-	Dials               int64 // factory calls
-	DialFailures        int64 // factory calls that failed (refused, scripted, ...)
+	All, Session, Probe Counts // over all carriers, session carriers, probe carriers
+	Throttled           int64  // bytes that passed the rate limiter
+	Dials               int64  // factory calls
+	DialFailures        int64  // factory calls that failed (refused, scripted, ...)
 }
 
 // CarrierInfo is a snapshot of one carrier for per-carrier assertions.
@@ -721,8 +721,8 @@ type CarrierInfo struct {
 	Session   bool      // First is OPEN or JOIN
 	Up, Down  int64     // bytes the far end has read in each direction (as Counts.Bytes)
 	Held      int64     // chunks held by a stall
-	Closed    bool
-	CloseHeld bool // a BlackholeCloses blackhole held its close back (as Counts.ClosesHeld)
+	Closed    bool      // the carrier was shut: both of its conns read EOF and fail writes
+	CloseHeld bool      // a BlackholeCloses blackhole held its close back (as Counts.ClosesHeld)
 }
 
 // index maps a direction to its array index (Up 0, Down 1).

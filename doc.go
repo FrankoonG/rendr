@@ -31,15 +31,24 @@
 // WriteTo sends one datagram of at most MaxPayload bytes (fixed at OPEN;
 // larger ones fail with ErrPacketTooLarge) and whose ReadFrom returns one.
 // Datagrams are delivered at most once, possibly reordered, never
-// retransmitted; they are lost only in flight on a carrier that dies or
-// when a bounded queue drops them (counted). Their carriers are datagram
-// carriers — the built-in raw UDP carrier (package carrier/udp, with a
-// listening socket served through FromPacketConn), the QUIC carriers of
-// the nested module github.com/FrankoonG/rendr/v2/quic, or an embedder's
-// net.PacketConn (DatagramCarrier, Listener.HandlePacket) — and stream
-// carriers too. ReadFrom returns io.EOF only after the peer closed its end
-// and the datagrams this side holds were read; a carrier change is as
-// invisible as for a stream session.
+// retransmitted; they are lost only in flight (dropped by the network, or
+// on a carrier that dies) or when a bounded queue or budget drops them. A
+// packet session counts its own drops in the Drop* counters of
+// SessionStatus.Packet; a datagram a carrier or a raw-UDP flow drops
+// counts in Status.Datagram, CarrierStatus.Dropped or a QUIC carrier's
+// Counters and, like a loss in flight, in the sender's Sent − PeerReceived
+// (see PacketCounters). Their carriers are datagram carriers — the
+// built-in raw UDP carrier (package carrier/udp, with a listening socket
+// served through FromPacketConn), the QUIC carriers of the nested module
+// github.com/FrankoonG/rendr/quic/v2, or an embedder's net.PacketConn
+// (DatagramCarrier, Listener.HandlePacket) — and stream carriers too.
+// ReadFrom returns io.EOF only after the peer closed its end and the
+// datagrams this side holds were read; a carrier change is as invisible
+// as for a stream session. On Linux amd64 and arm64 the sockets package
+// carrier/udp creates move up to its Options.MaxBatch datagrams per
+// system call (sendmmsg, recvmmsg), with a one-way fallback to one call
+// per datagram where the kernel refuses them; Status.Datagram counts the
+// calls and the datagrams they moved.
 //
 // Race sessions (ModeRace) take their member carriers as bond sessions do
 // and send every byte or datagram on each of them; the receiver keeps the
@@ -66,11 +75,16 @@
 // uses a live carrier of its kind instead of dialling one, and a carrier
 // closes when its last session ends; there is no idle retention.
 // Sessions on one carrier share its head-of-line blocking and its fate: its
-// death migrates each of them, as it would a session of its own. On a
-// carrier that was already live, the passive's first bytes for a session
-// leave about one round trip later than on a fresh carrier (the passive
-// waits for the dialer's first frame for that session). CheapSubflow
-// factories give every session its own carriers.
+// death migrates each of them, as it would a session of its own. A shared
+// carrier that dies at one end for a reason the other end cannot see (a
+// transport error, a PING timeout, a local close) is reported on the
+// other shared carriers between the two Runtimes that were dialled in the
+// same direction, and the other end ends it when the report arrives
+// (CausePeerDown) instead of at its own death deadline. On a carrier that
+// was already live, the passive's first bytes for a session leave about
+// one round trip later than on a fresh carrier (the passive waits for the
+// dialer's first frame for that session). CheapSubflow factories give
+// every session its own carriers.
 //
 // Early return (DialOptions.EarlyReturn) gives Dial the semantics of TCP
 // Fast Open: Dial returns before any network I/O, the session opens with

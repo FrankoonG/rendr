@@ -15,15 +15,19 @@ import (
 
 // update rewrites testdata/golden.txt from the encoders. Use it only for a
 // deliberate wire change (design §5.5): before v2.0.0 the change is recorded
-// in the milestone report, after v2.0.0 it needs a version bump.
+// in the milestone report; after v2.0.0 a frozen vector changes only under
+// frozenRule (a new wire minor version, an optional PREFACE feature bit, or
+// a new version of a versioned payload format).
 var update = flag.Bool("update", false, "rewrite testdata/golden.txt from the encoders (deliberate wire changes only)")
 
 const goldenPath = "testdata/golden.txt"
 
 const goldenHeader = `# rendr wire format v2 golden vectors (design §5.5): one "name hex" per line.
 # Regenerate only with: go test ./internal/wire -run TestGolden -update
-# Any change before v2.0.0 is deliberate and recorded in the milestone report;
-# after v2.0.0 it needs a version bump.
+# Before v2.0.0 a change is deliberate and recorded in the milestone report.
+# After v2.0.0 a frozen vector changes only with a new wire minor version, an
+# optional PREFACE feature bit, or a new version of a versioned payload format
+# such as L4 metadata (TestWireGoldenFrozen, testdata/frozen.sha256).
 `
 
 // Fixed field values of the golden vectors.
@@ -194,7 +198,8 @@ func goldenVectors() []vector {
 
 	vs = append(vs, goldenVectorsM2()...)
 	vs = append(vs, goldenVectorsM3()...)
-	return append(vs, goldenVectorsM4()...)
+	vs = append(vs, goldenVectorsM4()...)
+	return append(vs, goldenVectorsM5()...)
 }
 
 // goldenVectorsM2 builds the vectors M2 adds (M2 design §A3.10), after
@@ -332,6 +337,9 @@ func decodeTyped(t Type, p []byte) (any, error) {
 		return ParseRack(p)
 	case TypeDetach:
 		return ParseDetach(p)
+	case TypeDown:
+		id, err := ParseDown(p)
+		return downVal(id), err
 	case TypeRel:
 		h, inner, err := ParseRel(p)
 		if err != nil {
@@ -410,6 +418,8 @@ func encodeTyped(t Type, v any) []byte {
 		n = PutRack(b, &v)
 	case Detach:
 		n = PutDetach(b, &v)
+	case downVal:
+		n = PutDown(b, uint32(v))
 	case extVal:
 		n = copy(b, v)
 	default:
@@ -614,29 +624,34 @@ func TestGolden_L44(t *testing.T) {
 		"open_early", "open_early_packet", "open_flags_2",
 		// M4 WP13 B-1 (OptEndCode).
 		"preface_optendcode", "preface_ack_optendcode", "join_ack_unknown_session_endcode",
+		// M5 PA-86 (DOWN).
+		"down", "rel_down",
 	} {
 		if _, ok := enc[want]; !ok {
 			t.Errorf("golden file lacks %q", want)
 		}
 	}
-	// M1's, M2's and M3's vectors keep their positions and bytes (M3
-	// design §A3, M4 design §A3: no existing encoding changes); the resent
-	// H1 is byte-identical to the first (PA-21).
-	if names[0] != "preface" || names[len(names)-1] != "join_ack_unknown_session_endcode" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
+	// M1's to M4's vectors keep their positions and bytes (M3 design §A3,
+	// M4 design §A3, PA-86: no existing encoding changes); the resent H1 is
+	// byte-identical to the first (PA-21).
+	if names[0] != "preface" || names[len(names)-1] != "rel_down" || !bytes.Equal(enc["h1_resend"], enc["h1_open"]) {
 		t.Errorf("golden order or H1 resend: first %q, last %q", names[0], names[len(names)-1])
 	}
-	m1, m12, m123 := 0, 0, 0
+	m1, m12, m123, m1234 := 0, 0, 0, 0
 	for _, v := range vs {
 		if v.name == "dgram_empty" {
-			m1 = m123
+			m1 = m1234
 		}
 		if v.name == "preface_optmux" {
-			m12 = m123
+			m12 = m1234
 		}
 		if v.name == "open_early" {
+			m123 = m1234
+		}
+		if v.name == "down" {
 			break
 		}
-		m123++
+		m1234++
 	}
 	if m1 != 73-4 { // the M1 file: 73 lines, four of them comments
 		t.Errorf("%d vectors precede the M2 ones, want the 69 of M1", m1)
@@ -646,6 +661,9 @@ func TestGolden_L44(t *testing.T) {
 	}
 	if m123 != 135-4 || vs[m123-1].name != "join_ack_mux_capacity_muxfull" { // the M3 file: 135 lines, four of them comments
 		t.Errorf("%d vectors precede the M4 ones, want the 131 of M1–M3 ending with join_ack_mux_capacity_muxfull", m123)
+	}
+	if m1234 != 141-4 || vs[m1234-1].name != "join_ack_unknown_session_endcode" { // the M4 file: 141 lines, four of them comments
+		t.Errorf("%d vectors precede the M5 ones, want the 137 of M1–M4 ending with join_ack_unknown_session_endcode", m1234)
 	}
 }
 

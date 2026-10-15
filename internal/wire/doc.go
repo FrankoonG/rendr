@@ -3,8 +3,8 @@
 // CRC32C trailer, the payload codec of every frame type (the stream-session
 // frames of M1; DGRAM and PACK of packet sessions, REL and RACK of the
 // reliable control sublayer of datagram carriers in M2; DETACH of rendr
-// mux in M3), the raw-UDP flow header, and the two receive windows of M2
-// (FseqWindow, SeqWindow).
+// mux in M3; DOWN, the trunk death notice, in M5), the raw-UDP flow
+// header, and the two receive windows of M2 (FseqWindow, SeqWindow).
 //
 // M3 (rendr mux, race) adds no new encoding of an existing structure: the
 // optional PREFACE bit OptMux (EchoOpt, MuxNegotiated), the carrier-level
@@ -12,6 +12,12 @@
 // CodeDuplicateView, CodeMuxFull and CodeListenerClosed, and the handle
 // rule "any non-zero handle on a session frame" (the carrier decides which
 // handles it carries: SessionHandle only on a dedicated carrier).
+//
+// M5 adds the carrier-level type DOWN 0x37 (PA-86): payload carrierID u32,
+// never 0 — "the carrier with this dialer-assigned CarrierID, between the
+// same two Runtimes as the trunk the DOWN arrives on, is dead at the
+// sender's end". Like DETACH it is legal on an established MUX trunk only,
+// REL-wrapped on datagram trunks; no existing encoding changes.
 //
 // Contracts shared by every function in this package:
 //   - Put* functions write into caller memory and never allocate.
@@ -38,7 +44,7 @@
 //
 // The package does no I/O and holds no global state (the windows are
 // values their owner keeps). Golden vectors live in testdata/; fuzz targets
-// cover the preface, the header, every payload (DETACH included), REL
-// nesting, the flow header, whole datagrams, a frame stream and both
+// cover the preface, the header, every payload (DETACH and DOWN included),
+// REL nesting, the flow header, whole datagrams, a frame stream and both
 // windows.
 package wire

@@ -59,7 +59,7 @@ func wbReadHello(env *Env, io PacketIO, gate Gate) <-chan wbHelloRes {
 func TestRelBeforePrefaceNoState_L44_L48(t *testing.T) {
 	wbBubble(t, func(t *testing.T) {
 		denv, penv := wbEnvs()
-		a, b := newFakeIOPair(1500)
+		a, b := newFakeIOPair(t, 1500)
 		defer a.Close()
 		ch := wbReadHello(penv, b, nil)
 		F := denv.Presets.firstCseq()
@@ -177,7 +177,7 @@ func TestDatagramRefusalsStateless_L44(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			wbBubble(t, func(t *testing.T) {
 				denv, penv := wbEnvs()
-				a, b := newFakeIOPair(1500)
+				a, b := newFakeIOPair(t, 1500)
 				defer a.Close()
 				var gate Gate
 				if tc.gate != wire.PrefaceOK {
@@ -307,7 +307,7 @@ func TestDatagramVerdictReliable(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			wbBubble(t, func(t *testing.T) {
 				denv, penv := wbEnvs()
-				a, b := newFakeIOPair(1500)
+				a, b := newFakeIOPair(t, 1500)
 				defer a.Close()
 				h, fs := wbVerdictHello(t, penv, denv, a, b)
 				var lost atomic.Int32
@@ -384,7 +384,7 @@ func TestDatagramVerdictReliable(t *testing.T) {
 	t.Run("read ignores its deadline", func(t *testing.T) {
 		wbBubble(t, func(t *testing.T) {
 			denv, penv := wbEnvs()
-			a, b := newFakeIOPair(1500)
+			a, b := newFakeIOPair(t, 1500)
 			defer a.Close()
 			deaf := &wbDeafIO{fakeIO: b}
 			h, _ := wbVerdictHello(t, penv, denv, a, deaf)

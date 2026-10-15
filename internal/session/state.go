@@ -44,11 +44,15 @@ type Session struct {
 	meta []byte   // immutable: the OPEN metadata, owned by the session
 
 	// peer is the bound peer instance. Passive: set at NewPending (the
-	// dialer's InstanceID). Dialer: written once by the actor at the first
-	// OPEN_ACK(OK), right before bound is set.
+	// dialer's InstanceID). Dialer: written once by the actor, under mu,
+	// at the first OPEN_ACK(OK), right before bound is set — with
+	// EarlyReturn after Dial returned. Only the actor and the check
+	// closures of its dial attempts (after bound) read it directly; every
+	// other reader goes through PeerInstance (after bound) or the status
+	// snapshot (statusSnap.peer) (F-8).
 	peer [16]byte
-	// bound (A) dialer: set right after peer; attempt check closures read
-	// peer only after observing bound (design §6.6).
+	// bound (A) dialer: set right after peer; attempt check closures and
+	// PeerInstance read peer only after observing bound (design §6.6).
 	bound atomic.Bool
 
 	mu sync.Mutex
@@ -137,6 +141,11 @@ type lane struct {
 	retireEchoAt time.Time // (A) planned switch: when the epoch that removed the lane was echoed (M2-D42)
 	retireEpoch  uint32    // (A) planned switch: the SCHED epoch that removed the lane (M2-D42)
 	awaitSched   bool      // (A) sets it: passive packet bond, a JOIN member confirmed and not yet routed by a SCHED; (A, S) the routing summary (pktRouteLocked, also run by Fill) clears it once the lane routes: txBig waits for it (C4-F2)
+
+	// Datagram lanes of packet sessions (M5; pkt_unsent.go): the placement
+	// record a dying carrier's hand-back is found in.
+	rec  []pplace // (S) the last recLen DGRAM placements, a ring allocated at the first
+	recN uint64   // (S) the DGRAM placements recorded: the next goes to rec[recN % recLen]
 }
 
 // stream is the session's data-path state (design §4.2–§4.12): (S) as a

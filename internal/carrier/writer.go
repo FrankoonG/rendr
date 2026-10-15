@@ -67,6 +67,13 @@ type writer struct {
 	rackCum  uint32 //
 	rackAt   int    // frame index of the RACK (−1: none)
 	pingAt   int    // frame index of the round's PING (−1: none)
+
+	// bio is the transport's BatchIO (dgBatchOf; nil: one WriteDatagram
+	// per datagram, M2), and arena the round's arena of the batched path:
+	// one DBufs buffer of the 64 KiB class, charged to the stage account,
+	// taken at a round's first datagram and released at its end (M5-D11).
+	bio   BatchIO
+	arena *Buf
 }
 
 // backlogged reports whether the writer was busy for at least 25% of the
@@ -112,6 +119,10 @@ func (c *Conn) writerInit() {
 	if dg := c.dg; dg != nil {
 		n := max(int(dg.budget.Load()), wire.MinFrameBudget) + dg.io.Headroom()
 		w.dscratch = c.dbufs().Get(n, c.env.stageBudget())
+		if o, ok := dg.io.(*OwnedUDP); ok {
+			o.bind(c.env) // the batched I/O and its counters (M5 design §A4.3)
+		}
+		w.bio = dgBatchOf(dg.io)
 	}
 }
 
@@ -137,6 +148,13 @@ func (c *Conn) writeLoop() {
 		if w.dscratch != nil {
 			w.dscratch.Release()
 			w.dscratch = nil
+		}
+		if w.arena != nil { // a round that unwound: its arena and slots go (L55)
+			if w.b != nil {
+				w.b.resetFlush()
+			}
+			w.arena.Release()
+			w.arena = nil
 		}
 		if w.timer != nil {
 			w.timer.Stop()
@@ -170,6 +188,9 @@ func (c *Conn) writeRound(w *writer) bool {
 	}
 	b := w.b
 	b.Reset(now)
+	if c.mux && !w.held {
+		b.downs = &c.downs // a reliable session frame goes behind the pending DOWNs (PA-86)
+	}
 	w.ping, w.pingJudged, w.pingAtEnd, w.pingEnd, w.close = false, false, false, false, false
 	// The cap-blocked flag is published before Fill and corrected after it
 	// (§3.5: set the waiting flag, then evaluate). A PONG that frees
@@ -249,17 +270,21 @@ func (c *Conn) checkDeadlines(now time.Time) bool {
 }
 
 // appendCarrierControl appends carrier-level frames under Conn.mu: the
-// pending PONG (latest wins), a due PING (none once retiring) and GOAWAY.
-// It takes the byte clock's step for the round first: while the clock runs,
-// a due cadence or requested PING is left to endPing, which places it after
-// the round's DATA (design §0.13 A7b). It returns the retirement state read
-// in the same section.
+// pending PONG (latest wins), a MUX trunk's pending DOWNs once its hold
+// ended (PA-86: ahead of the round's session frames), a due PING (none
+// once retiring) and GOAWAY. It takes the byte clock's step for the round
+// first: while the clock runs, a due cadence or requested PING is left to
+// endPing, which places it after the round's DATA (design §0.13 A7b). It
+// returns the retirement state read in the same section.
 func (c *Conn) appendCarrierControl(w *writer, b *Batch, now time.Time) (retiring bool, reason wire.CloseReason) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	st := &c.st
 	if st.pongDue && b.addPong(&st.pong) {
 		st.pongDue = false
+	}
+	if c.mux && !w.held {
+		c.downs.place(b)
 	}
 	w.step = c.clockStepLocked()
 	if !st.retiring {
@@ -391,7 +416,7 @@ func (c *Conn) writeBatch(w *writer, b *Batch, now time.Time) bool {
 		}
 	}
 	c.mu.Lock()
-	c.commitLocked(w, b, end)
+	c.commitLocked(w, b, start, end)
 	c.mu.Unlock()
 	if w.ping {
 		if w.pingJudged {

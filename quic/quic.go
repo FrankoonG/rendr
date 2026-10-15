@@ -14,11 +14,15 @@ import (
 )
 
 // ALPN is the only application protocol a rendr QUIC carrier negotiates.
-const ALPN = "rendr/2"
+// It versions the carrier's encapsulation: "rendr/2-q1" puts a sequence
+// number before every DATAGRAM (KL-19); a peer of the earlier "rendr/2"
+// encapsulation fails the TLS handshake instead of being misparsed.
+const ALPN = "rendr/2-q1"
 
 // DatagramBudget is the frame budget of a QUIC DATAGRAM carrier — the bytes
-// rendr passes to one SendDatagram — and its DatagramCarrier.MTU: the
-// largest payload quic-go admits and packs at the 1200-byte minimum QUIC
+// rendr passes to one WriteTo — and its DatagramCarrier.MTU. With the
+// carrier's 4-byte sequence number it is the largest DATAGRAM payload
+// (1156 bytes) quic-go admits and packs at the 1200-byte minimum QUIC
 // packet size even with a 20-byte connection ID, a 4-byte packet number,
 // the 16-byte tag and the DATAGRAM frame header.
 const DatagramBudget = 1152
@@ -92,7 +96,24 @@ type Options struct {
 // design §A6.3, Revision 1, R1-9). A drop here is a transport loss, like a
 // kernel socket's: rendr counted the datagram as sent.
 type Counters struct {
-	// IngressDrops: received DATAGRAMs a full ingress queue dropped (L46).
+	// IngressDrops: received DATAGRAMs dropped before rendr read them —
+	// by a full ingress queue (L46), or by quic-go, which drops received
+	// DATAGRAM frames beyond 128 per connection (a fixed limit rendr cannot
+	// prevent from overflowing when the receiving process stalls; KL-19).
+	// The carrier counts the latter from the gaps in its per-DATAGRAM
+	// sequence numbers, when the next datagram arrives. When DATAGRAMs
+	// arrive in order that count is exact, except that a datagram lost in
+	// the network during such an overflow counts too. On a path that
+	// reorders it is no bound: it can be too high (a datagram reordered
+	// during an overflow counts and is still delivered) or too low (a late
+	// datagram the full queue dropped after a later one was queued is
+	// missed, and once the queue has drained, a late datagram numbered
+	// above every one received hides the overflow's drops numbered above
+	// it). The carrier cannot tell a drop by quic-go's 256-packet queue of
+	// unprocessed packets from a loss in the network: such a drop counts
+	// during an overflow, as a network loss does, and not otherwise. A
+	// datagram lost while the carrier keeps up is not counted (a transport
+	// loss). Nothing is counted once the carrier was closed.
 	IngressDrops atomic.Uint64
 	// EgressDrops: DATAGRAMs the egress queue dropped — one older than
 	// 250 ms (when its turn came, or when a newer one was queued), the
@@ -124,7 +145,8 @@ func StreamCarrier(name, address string, o Options) (rendr.StreamCarrier, error)
 // DatagramCarrier returns a datagram carrier factory named name that dials
 // address over QUIC: one connection per carrier, DATAGRAM frames only, MTU
 // DatagramBudget. Dial refuses a connection whose peer does not support
-// DATAGRAM or whose current limit is below DatagramBudget. The conn's
+// DATAGRAM or whose current limit cannot carry DatagramBudget after the
+// carrier's 4-byte sequence number. The conn's
 // WriteTo never blocks on QUIC's congestion control: it queues the datagram
 // in a bounded egress queue that one sender goroutine per connection
 // drains into quic-go (drops counted in Options.Counters); an error of an
@@ -222,10 +244,10 @@ type ListenerStats struct {
 	Refused          uint64
 	Evicted          uint64 // pending connections evicted (oldest first)
 	ClassifyTimeouts uint64 // connections that neither opened a stream nor sent a DATAGRAM in time
-	BadKind          uint64 // connections that did both, or negotiated another ALPN
-	BudgetRefused    uint64 // datagram connections whose DATAGRAM limit was below DatagramBudget
+	BadKind          uint64 // connections that did both, negotiated another ALPN, or sent a first DATAGRAM shorter than its sequence number
+	BudgetRefused    uint64 // datagram connections whose DATAGRAM limit could not carry DatagramBudget and the sequence number
 	Streams          uint64 // stream carriers handed to rendr
 	Datagrams        uint64 // datagram carriers handed to rendr
-	DatagramDrops    uint64 // DATAGRAMs the ingress queues dropped (L46)
+	DatagramDrops    uint64 // received DATAGRAMs dropped before rendr read them: Counters.IngressDrops of the handed carriers (L46, KL-19)
 	EgressDrops      uint64 // DATAGRAMs the egress queues of handed carriers dropped (R1-9)
 }

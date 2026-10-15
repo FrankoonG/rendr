@@ -100,7 +100,7 @@ func bcLongPath(t *testing.T, tc bcPath) bcRun {
 			return n, err
 		}}
 	}
-	dc, pc := lrLinkPairWrap(t, envD, envP, rate, rtt/2, buf, ep, timed)
+	dc, pc := lrLinkPairWrap(t, envD, envP, rate, rtt/2, buf, ep, timed, nil)
 	src := newSource(envD, ChunkSize, true)
 	defer src.chunk.Release()
 	src.offer(total)

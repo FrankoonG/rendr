@@ -85,6 +85,23 @@ func untouched(t testing.TB, what string, x *pair) {
 // spliced counts the Splice operations that started on a tamper.
 func spliced(tm *rendrtest.Tamper) int { return tm.Stats().Spliced }
 
+// downOf waits (at most 10 s) for session sid's EventCarrierDown of
+// carrier id in l and returns it.
+func downOf(t testing.TB, l *eventLog, sid rendr.SessionID, id rendr.CarrierID) rendr.Event {
+	t.Helper()
+	var ev rendr.Event
+	waitFor(t, 10*time.Second, fmt.Sprintf("session %v's CarrierDown of %d", sid, id), func() bool {
+		for _, e := range l.of(rendr.EventCarrierDown) {
+			if e.Session == sid && e.Carrier == id {
+				ev = e
+				return true
+			}
+		}
+		return false
+	})
+	return ev
+}
+
 // TestAdvSpliceTwoSessions_L41_L43: the dialer → passive bytes of session
 // X's carrier are spliced into session Y's carrier (a dedicated pair; on
 // MUX trunks, X's trunk into Y's): "boundary" from Y's next frame boundary
@@ -95,16 +112,32 @@ func spliced(tm *rendrtest.Tamper) int { return tm.Stats().Spliced }
 // sequence), CRC or header check in the middle of a frame — and Y's
 // verifier proves that none of X's payload reached Y's application; X's
 // carrier lives on untouched (it only lent its frames), Y redials or
-// carries on with its other member, and both streams arrive intact.
+// carries on with its other member, and both streams arrive intact. Under
+// -race each cut runs one dedicated and one MUX setup (spliceRows).
 func TestAdvSpliceTwoSessions_L41_L43(t *testing.T) {
-	for _, mid := range []bool{false, true} {
-		name := "boundary"
-		if mid {
-			name = "midframe"
+	for _, row := range spliceRows() {
+		mid := row.name == "midframe"
+		if !mid && row.name != "boundary" {
+			t.Fatalf("spliceRows: no cut %q", row.name)
 		}
-		t.Run(name, func(t *testing.T) {
-			eachSetup(t, func(t *testing.T, s setup) { spliceRow(t, s, mid, s.sessions, s.sessions) })
+		t.Run(row.name, func(t *testing.T) {
+			eachSetupOf(t, row.setups, func(t *testing.T, s setup) { spliceRow(t, s, mid, s.sessions, s.sessions) })
 		})
+	}
+}
+
+// spliceRows are TestAdvSpliceTwoSessions_L41_L43's subtests (boundary,
+// midframe) with their setups in the binary's lane: every setup, or under
+// -race (R1-23 lever 1; the race-unit target of 270 s per pass, m5's
+// prerc decision) one dedicated and one MUX setup per cut, so that each
+// cut's check (fseq at a boundary, CRC or header in a frame) meets both
+// carrier kinds and Y's two recoveries both run (a selector's redial, a
+// member that carries on): boundary selector and mux-bond, midframe race
+// and mux-selector. TestRaceLaneSubtests checks the lists.
+func spliceRows() []setupRow {
+	return []setupRow{
+		{"boundary", raceNamed(setups(), "selector", "mux-bond")},
+		{"midframe", raceNamed(setups(), "race", "mux-selector")},
 	}
 }
 
@@ -205,8 +238,10 @@ func spliceRow(t *testing.T, s setup, mid bool, nx, ny int) {
 //     the passive's handshake slot closes it without answering, before any
 //     session state (L48) —; the carrier the relay spliced dies on both
 //     ends (the old upstream was closed, the dialer's relay connection
-//     ends), the session continues on another or a redialled carrier, and
-//     the stream arrives intact.
+//     ends) with transport_error — on a MUX trunk the dialer may learn of
+//     the passive's death first from its DOWN, peer_down (PA-86) —, the
+//     session continues on another or a redialled carrier, and the stream
+//     arrives intact.
 //   - "reverse": the dialer is fed another carrier's bytes: session X's
 //     passive → dialer frames are spliced into session Y's carrier; Y's
 //     dialer kills it (protocol_violation "fseq") and X is untouched.
@@ -237,10 +272,26 @@ func TestAdvRelaySplice_L43_L69(t *testing.T) {
 			if st := tm.Stats(); st.Switched != 1 {
 				t.Fatalf("stimulus: %+v, want one upstream switch", st)
 			}
-			for i, get := range []func() rendr.SessionStatus{x.d.Status, x.p.Status} {
-				if c := endDead(t, side(i), get, id); c.DeathCause != rendr.CauseTransportError {
-					t.Fatalf("%s: the spliced carrier died of %v %q, want transport_error", side(i), c.DeathCause, c.DeathDetail)
+			// The relay closed the old upstream at the switch: the passive
+			// saw the reset and records transport_error. The dialer's relay
+			// connection ends only after the passive refused the fresh one;
+			// on a MUX trunk the passive's DOWN on another trunk of the pair
+			// (a bond or race member's) may reach the dialer first, which
+			// then records peer_down, dated no earlier than the passive's
+			// death (PA-86). A dedicated carrier sends no DOWN: both ends
+			// record transport_error.
+			if pd := endDead(t, "passive", x.p.Status, id); pd.DeathCause != rendr.CauseTransportError {
+				t.Fatalf("passive: the spliced carrier died of %v %q, want transport_error", pd.DeathCause, pd.DeathDetail)
+			}
+			if dd := endDead(t, "dialer", x.d.Status, id); dd.DeathCause != rendr.CauseTransportError {
+				if !s.mux || dd.DeathCause != rendr.CausePeerDown {
+					t.Fatalf("dialer: the spliced carrier died of %v %q, want transport_error (on a MUX trunk, or peer_down)", dd.DeathCause, dd.DeathDetail)
 				}
+				pe, de := downOf(t, w.pev, x.p.ID(), id), downOf(t, w.dev, x.d.ID(), id)
+				if pe.Cause != rendr.CauseTransportError || de.Cause != rendr.CausePeerDown || de.Time.Before(pe.Time) {
+					t.Fatalf("dialer: the spliced carrier's CarrierDown %+v, the passive's %+v: want peer_down no earlier than the passive's transport_error", de, pe)
+				}
+				t.Logf("dialer: peer_down %v after the passive's transport_error (its DOWN came first)", de.Time.Sub(pe.Time))
 			}
 			// The fresh connection: closed by the passive, which never
 			// answered on it and kept no state for it.

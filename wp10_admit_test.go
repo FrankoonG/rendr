@@ -23,10 +23,14 @@ import (
 // usable rule would not place, more OPENs at once than any session would
 // make (mxInject: a fresh session key per call, no check).
 
-// mxSessKey is a session key no session has (the pool's one-view rule).
+// mxSessKey is a session key no session has (the pool's one-view rule): a
+// session's key is its address (a Go heap object), and the keys handed
+// out count up from 1 MiB below the top of the address space: above any Go
+// heap address on the supported targets, and within a 32-bit uintptr. The
+// row only needs a key no live session has.
 var mxSessKey atomic.Uintptr
 
-func init() { mxSessKey.Store(1 << 40) }
+func init() { mxSessKey.Store(^uintptr(0) - 1<<20) }
 
 // mxInject places one OPEN or JOIN with payload on a live trunk of factory
 // f of p (the pool's fast path, or a dial when none is usable) and returns

@@ -7,6 +7,8 @@ import (
 	"net/netip"
 	"sync/atomic"
 	"time"
+
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 )
 
 // PacketIO is the transport of one datagram carrier (M2-D4): exactly one
@@ -70,7 +72,11 @@ type PacketIO interface {
 	// matching wire.ErrDatagramTooLarge refuses this datagram only (the
 	// carrier lives, M2-D25); ErrNoise loses this datagram only; any other
 	// error, and an invalid count, ends the carrier (L42: never retried on
-	// it).
+	// it). An invalid count — the socket or conn reported another count
+	// than the datagram's — is returned as an error matching ErrWriteCount
+	// (or udpsocket.ErrInvalidCount): the datagram may have left, so the
+	// writer hands it back to no session (DgramReturner), while after any
+	// other death it goes back, as never sent.
 	WriteDatagram(b []byte) error
 	// WriteDatagramTo sends b to dst instead of the current peer (a rebind
 	// challenge, M2-D27); ErrNoRebind (or an error wrapping it) on
@@ -166,6 +172,86 @@ type DgramStats struct {
 	InboxDrops atomic.Uint64 // datagrams a full or refused flow inbox dropped
 	ReadErrors atomic.Uint64 // transient read errors (noise) of sources and datagram carriers
 	Rebinds    atomic.Uint64 // committed rebinds of raw-UDP flows
+
+	// IO counts the system calls on rendr's own UDP sockets and the
+	// datagrams they moved, and the sockets that stopped batching
+	// (rendr.DatagramStatus SendCalls, SentDatagrams, RecvCalls,
+	// RecvDatagrams, BatchFallbacks; M5-D17, R1-2): every udpsocket.Conn
+	// of the Runtime — OwnedUDP's and an owned Source's — is created with
+	// &IO.
+	IO udpsocket.Counters
+	// ChargeRefused counts the receive slots beyond the first that the
+	// memory budget refused to a batched reader (R1-4; one unit on every
+	// reader, M5 design R3-23): a dialer carrier's refused growth counts
+	// the slots it would have added and keeps its depth; an owned Source
+	// counts each extra slot whose refill was refused. A flow's
+	// held-entry slice is charged to Stages and never refused (R3-28).
+	ChargeRefused atomic.Uint64
+}
+
+// BatchIO is implemented only by rendr-owned transports (OwnedUDP and the
+// flows of a Source over rendr's own socket; L57, M5-D10): a datagram
+// carrier whose PacketIO also implements it writes a round's datagrams and
+// reads its datagrams through it, several per system call where the
+// socket batches. Its writer half belongs to the writer goroutine and its
+// reader half to the reader goroutine, as PacketIO's.
+type BatchIO interface {
+	// WriteDatagrams writes ds in order, each with Headroom bytes in front
+	// that the transport fills, as WriteDatagram writes one: ds[:n] were
+	// sent; err, if any, is ds[n]'s, classified as WriteDatagram's error
+	// would be (wire.ErrDatagramTooLarge, ErrNoise, or death). A count
+	// outside [0, len(ds)], n < len(ds) without an error, or n == len(ds)
+	// with one (an error of no datagram), is death (L42). So is an invalid
+	// count the transport finds itself — a datagram write or a system call
+	// that reported another count than it was given — which it returns as
+	// ds[n]'s error, matching ErrWriteCount or udpsocket.ErrInvalidCount.
+	// After either, which of the call's datagrams left is unknown: the
+	// writer hands back none of ds, only the round's datagrams that no call
+	// was given (DgramReturner). The writer never passes more than
+	// MaxBatch() datagrams.
+	WriteDatagrams(ds [][]byte) (n int, err error)
+	// ReadDatagrams fills rs[:n], n ≥ 1, in arrival order, each what
+	// ReadDatagram would have returned for that datagram, or returns n = 0
+	// and the error ReadDatagram would have returned. It moves at most
+	// MaxBatch() datagrams. A transport with ReadSize() > 0 reads into the
+	// slots the caller set in rs[i].buf (each at least ReadSize() bytes);
+	// one with ReadSize() 0 (a flow) hands out buffers of its own, which
+	// stay valid until the reader's next ReadDatagrams or Release — as
+	// PacketIO.Release returns those of the latest call, the reader calls
+	// it after handling a call's results.
+	//
+	// A call ends at its first ReadCandidate result (it is rs[n-1]): the
+	// reader handles it — its challenge answer may commit a rebind (SetPeer)
+	// — before the transport classifies a later datagram, and the
+	// transport's latest candidate is that result's source, exactly as with
+	// one ReadDatagram per datagram (L55: batching on and off behave the
+	// same). A transport that cannot rebind never returns one.
+	ReadDatagrams(rs []ReadResult) (n int, err error)
+	// MaxBatch is the most datagrams one call moves now (carrier/udp
+	// Options.MaxBatch while the socket batches; 1 = one per call).
+	MaxBatch() int
+}
+
+// ReadResult is one datagram of a BatchIO.ReadDatagrams call: what
+// PacketIO.ReadDatagram returns for it. Data aliases the slot it was read
+// into (buf, the caller's, for a transport with ReadSize() > 0) until the
+// reader reuses or releases it.
+type ReadResult struct {
+	Data []byte
+	Src  PeerKey
+	Ev   ReadEvent
+	buf  *Buf
+}
+
+// dgBatchOf returns the BatchIO of a datagram carrier's transport, or nil:
+// only rendr-owned transports implement it (L57, M5-D10), so an embedder
+// conn, a wrapper around an *OwnedUDP and the quic facade keep one call
+// per datagram. Tests replace it to drive in-memory transports through
+// the batched paths (the M2/M3 rows in both MaxBatch settings);
+// production code never does.
+var dgBatchOf = func(io PacketIO) BatchIO {
+	b, _ := io.(BatchIO)
+	return b
 }
 
 // NewPacketIO adapts an embedder net.PacketConn whose datagrams come from

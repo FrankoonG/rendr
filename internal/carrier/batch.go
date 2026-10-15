@@ -100,6 +100,18 @@ type Batch struct {
 	holdH  uint32
 	holdOn bool
 
+	// The current flush of a datagram writer's arena (appendDatagramArena,
+	// resetFlush; M5 design §A4.3): its datagrams, each with the
+	// transport's Headroom in front, aliasing the round's arena. Allocated
+	// at a datagram writer's first flush, never on a stream batch.
+	fl [][]byte
+
+	// downs are the pending DOWNs of the MUX trunk whose writer fills the
+	// batch, set for a round that may place them (not held; PA-86): a
+	// reliable session frame reserved this round goes behind every DOWN
+	// queued before it (addSessionRel). nil otherwise; Reset clears it.
+	downs *downQueue
+
 	frames [MaxBatchFrames]bframe
 	arena  []byte
 }
@@ -125,6 +137,7 @@ func (b *Batch) Reset(now time.Time) {
 	b.dgram, b.frameBudget, b.relRoom, b.nrel, b.relStamped, b.relBlocked = false, 0, 0, 0, 0, false
 	b.quota, b.ctlOnly, b.qEnd, b.taken = false, false, 0, 0
 	b.holdH, b.holdOn = 0, false
+	b.downs = nil
 }
 
 // ReleaseRefs releases the chunk references taken by AddData and AddDgram.
@@ -467,13 +480,19 @@ func (b *Batch) addSession(t wire.Type, flags uint8, handle uint32, n int) (p []
 }
 
 // addSessionRel is addSession for a reliable session frame: REL-wrapped on
-// a datagram batch (addReliable).
+// a datagram batch (addReliable). On a MUX trunk's round it first places
+// the DOWNs queued since the round's carrier control (PA-86): a trunk that
+// died while this round ran queued them before any of its sessions could
+// learn of the death, so they precede the death SCHEDs in the REL order.
 func (b *Batch) addSessionRel(t wire.Type, flags uint8, handle uint32, n int) (p []byte, ok bool) {
 	if handle == 0 {
 		panic("rendr/carrier: session frame with handle 0")
 	}
 	if b.heldOut(handle) {
 		return nil, false
+	}
+	if q := b.downs; q != nil && q.pend.Load() != 0 {
+		q.place(b)
 	}
 	return b.addReliable(t, flags, handle, n)
 }
@@ -572,6 +591,16 @@ func (b *Batch) addGoAway(r wire.GoAwayReason) bool {
 	p, ok := b.addReliable(wire.TypeGoAway, 0, 0, wire.ReasonLen)
 	if ok {
 		wire.PutReason(p, uint8(r))
+	}
+	return ok
+}
+
+// addDown appends DOWN(id) (carrier level, PA-86; REL on a datagram
+// batch); false if the batch is full or no REL room is left.
+func (b *Batch) addDown(id uint32) bool {
+	p, ok := b.addReliable(wire.TypeDown, 0, 0, wire.DownLen)
+	if ok {
+		wire.PutDown(p, id)
 	}
 	return ok
 }

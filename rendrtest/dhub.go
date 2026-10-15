@@ -16,8 +16,8 @@ import (
 
 // DatagramHubConfig configures a DatagramHub.
 type DatagramHubConfig struct {
-	Name string
-	MTU  int // largest datagram (default 65,507)
+	Name string // seeds the hub's randomness (hubs with one Name behave alike)
+	MTU  int    // largest datagram (default 65,507)
 	// Queue bounds the datagrams of each client and direction (default
 	// 1024) from WriteTo until a reader takes them, transit included, and
 	// the foreign datagrams (Spoof, Replay, Flood) the passive socket holds
@@ -371,7 +371,7 @@ func (h *DatagramHub) foreignIn(now time.Time, b []byte, src *net.UDPAddr, cls i
 // (random session and flow IDs; R1-21: JOIN and probe flows have their own
 // per-source quota).
 type FloodMix struct {
-	Random, BadCRC, Preface, Join int
+	Random, BadCRC, Preface, Join int // weights: random bytes, a bad frame CRC, a valid OPEN, a valid JOIN first datagram
 }
 
 // Flood sends rate datagrams per second to the passive socket from

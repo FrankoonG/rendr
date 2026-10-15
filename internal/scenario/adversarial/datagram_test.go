@@ -179,9 +179,10 @@ func (w *world) noNewState(p0 rendr.Status) {
 // seconds): every damaged datagram is dropped and counted by the carrier
 // that received it (the receivers' Dropped equal the flips), no carrier
 // dies, and every verifier sees no damaged, foreign or duplicated
-// datagram; at most the damaged datagrams are missing.
+// datagram; at most the damaged datagrams are missing. Under -race the row
+// runs the dedicated setups and mux-selector (flipsAreLossSetups).
 func TestAdvDatagramFlipsAreLoss_L43(t *testing.T) {
-	eachSetup(t, func(t *testing.T, s setup) {
+	eachSetupOf(t, flipsAreLossSetups(), func(t *testing.T, s setup) {
 		w := newWorld(t, s, worldOpts{})
 		xs := w.openPacketN(w.datagramPeer())
 		var ups, downs []*pflow
@@ -223,6 +224,28 @@ func TestAdvDatagramFlipsAreLoss_L43(t *testing.T) {
 	})
 }
 
+// datagramReplaySetups are TestAdvDatagramReplay_L43_L39's setups in the
+// binary's lane: every setup, or under -race (R1-23 lever 1; the race-unit
+// target of 270 s per pass, m5's prerc decision) the three dedicated
+// setups — each mode once — and mux-bond, a MUX trunk whose first
+// datagrams carry the other sessions' OPENs and SCHEDs (replayFrom's
+// path), with the same criteria; mux-selector and mux-race run in the
+// non-race lanes. TestRaceLaneSubtests checks the lists.
+func datagramReplaySetups() []setup {
+	return raceNamed(setups(), "selector", "bond", "race", "mux-bond")
+}
+
+// flipsAreLossSetups are TestAdvDatagramFlipsAreLoss_L43's setups in the
+// binary's lane: every setup, or under -race (R1-23 lever 1; the race-unit
+// target of 270 s per pass, m5's prerc decision) the three dedicated
+// setups and mux-selector — each mode once, and a datagram MUX trunk whose
+// four sessions draw four times the flips — with the same criteria;
+// mux-bond and mux-race (6.2 s of a Linux race pass) run in the non-race
+// lanes. TestRaceLaneSubtests checks the lists.
+func flipsAreLossSetups() []setup {
+	return raceNamed(setups(), "selector", "bond", "race", "mux-selector")
+}
+
 // TestAdvDatagramReplay_L43_L39: a path replays datagrams of a carrier into
 // that same carrier (DatagramLink.ReplayInto; the latest carrier on the
 // first session's link): its handshake datagram (H1, PREFACE ‖ REL{OPEN or
@@ -237,8 +260,10 @@ func TestAdvDatagramFlipsAreLoss_L43(t *testing.T) {
 // nothing dies. (A MUX trunk's first datagrams carry the other sessions'
 // OPENs and SCHEDs: its first DGRAM may come after the 16 the link keeps
 // for ReplayInto; replayFrom re-sends it from the conn's own record.)
+// Under -race the row runs the dedicated setups and mux-bond
+// (datagramReplaySetups).
 func TestAdvDatagramReplay_L43_L39(t *testing.T) {
-	eachSetup(t, func(t *testing.T, s setup) {
+	eachSetupOf(t, datagramReplaySetups(), func(t *testing.T, s setup) {
 		w := newWorld(t, s, worldOpts{record: true})
 		xs := w.openPacketN(w.datagramPeer())
 		ups := startPacketFlows(t, xs, 4340, packetRate)

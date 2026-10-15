@@ -237,6 +237,8 @@ func parseTyped(t Type, p []byte) error {
 		sinkRack, err = ParseRack(p)
 	case TypeDetach:
 		sinkDetach, err = ParseDetach(p)
+	case TypeDown:
+		sinkDownID, err = ParseDown(p)
 	case TypeRel:
 		var inner []byte
 		if sinkRelHead, inner, err = ParseRel(p); err == nil {
@@ -287,6 +289,8 @@ func validInner(t Type) []byte {
 		return encodeTyped(t, Pack{HighestSeq: 3, Received: 2, EpochEcho: 1})
 	case TypeDetach:
 		return encodeTyped(t, Detach{Handle: 5, Reason: DetachEnded})
+	case TypeDown:
+		return encodeTyped(t, downVal(5))
 	}
 	return nil
 }
@@ -466,8 +470,8 @@ func TestRelRackCodec_L44(t *testing.T) {
 			}
 		}
 	}
-	if wrapped != (11+2)*4 { // eleven types (DETACH since M3), two of them (SCHED, PACK) with flags
-		t.Fatalf("%d REL round trips, want %d", wrapped, (11+2)*4)
+	if wrapped != (12+2)*4 { // twelve types (DETACH since M3, DOWN since M5), two of them (SCHED, PACK) with flags
+		t.Fatalf("%d REL round trips, want %d", wrapped, (12+2)*4)
 	}
 
 	// Check order: each seed is valid up to its step and damaged at the
@@ -589,16 +593,17 @@ func TestRelRackCodec_L44(t *testing.T) {
 	}
 }
 
-// TestRelNestingImpossible_L44: a REL carries exactly the ten wrappable
-// types — plan:356's nine control frames and PACK — and every other type
-// byte is ErrType whatever its flags, handle and length: REL inside REL,
-// RACK, DGRAM, DATA, ACK, PING, PONG, extensions and unassigned types can
-// never be wrapped (plan:363 "REL 嵌套"; M2-D7).
+// TestRelNestingImpossible_L44: a REL carries exactly the twelve wrappable
+// types — plan:356's nine control frames, PACK, DETACH (M3) and DOWN (M5)
+// — and every other type byte is ErrType whatever its flags, handle and
+// length: REL inside REL, RACK, DGRAM, DATA, ACK, PING, PONG, extensions
+// and unassigned types can never be wrapped (plan:363 "REL 嵌套"; M2-D7).
 func TestRelNestingImpossible_L44(t *testing.T) {
 	want := map[Type]bool{
 		TypeOpen: true, TypeOpenAck: true, TypeJoin: true, TypeJoinAck: true, TypeFin: true,
 		TypeRst: true, TypeSched: true, TypeClose: true, TypeGoAway: true, TypePack: true,
 		TypeDetach: true, // M3-D6
+		TypeDown:   true, // PA-86
 	}
 	lengths := []int{0, 1, 8, 20, RelMaxPayload, 1 << 16}
 	bufs := make([][]byte, len(lengths))
@@ -612,7 +617,7 @@ func TestRelNestingImpossible_L44(t *testing.T) {
 			t.Errorf("Wrappable(%v) = %v", ty, Wrappable(ty))
 		}
 		if want[ty] {
-			if !ty.Known() || ty.Extension() || (ty.CarrierLevel() && ty != TypeClose && ty != TypeGoAway && ty != TypeDetach) {
+			if !ty.Known() || ty.Extension() || (ty.CarrierLevel() && ty != TypeClose && ty != TypeGoAway && ty != TypeDetach && ty != TypeDown) {
 				t.Errorf("wrappable %v: known %v, carrier level %v", ty, ty.Known(), ty.CarrierLevel())
 			}
 			if _, _, err := ParseRel(relPayload(RelHead{Cseq: 1, Type: ty, Handle: relHandle(ty)}, validInner(ty))); err != nil {
@@ -633,7 +638,7 @@ func TestRelNestingImpossible_L44(t *testing.T) {
 			}
 		}
 	}
-	if checked != (256-11)*3*3*6 {
+	if checked != (256-12)*3*3*6 {
 		t.Fatalf("%d non-wrappable REL payloads checked", checked)
 	}
 	// A valid REL payload wrapped again, and a whole valid REL frame as the
@@ -761,8 +766,8 @@ func TestPrefaceTypeReserved_L44(t *testing.T) {
 			}
 		}
 	}
-	if known != 18 {
-		t.Fatalf("%d known core types, want 13 (M1) + 4 (M2) + 1 (M3)", known)
+	if known != 19 {
+		t.Fatalf("%d known core types, want 13 (M1) + 4 (M2) + 1 (M3) + 1 (M5)", known)
 	}
 	pre, ack := validPrefaces()
 	for _, c := range []struct {
@@ -1015,6 +1020,9 @@ func TestControlFrameSizes_L37(t *testing.T) {
 		// M3 (design §A3.6).
 		{"DETACH (stream)", size(TypeDetach, Detach{Handle: 2, Reason: DetachEnded}), 22},
 		{"REL{DETACH} (datagram)", rel(TypeDetach, 0, Detach{Handle: 2, Reason: DetachRetired}), 32},
+		// M5 (PA-86).
+		{"DOWN (stream)", size(TypeDown, downVal(2)), 21},
+		{"REL{DOWN} (datagram)", rel(TypeDown, 0, downVal(2)), 31},
 		{"OPEN on a live stream trunk, no metadata", size(TypeOpen, Open{SID: gSID, Kind: KindStream, Mode: ModeRace}), 49},
 		{"OPEN on a live stream trunk, 100 bytes of metadata", size(TypeOpen, Open{SID: gSID, Kind: KindStream, Mode: 1, Metadata: make([]byte, 100)}), 49 + 100},
 		{"REL{OPEN} on a live datagram trunk, no metadata", rel(TypeOpen, 0, withMeta(0)), 59},

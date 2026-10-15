@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
@@ -24,6 +25,7 @@ func loopback4() *net.UDPAddr {
 }
 
 // realSource is a Source over an OwnedUDPSocket with a client socket.
+// admitted holds up to 128 flows not taken yet.
 type realSource struct {
 	t        *testing.T
 	env      *carrier.Env
@@ -43,6 +45,27 @@ func newRealSource(t *testing.T, maxDatagram int) *realSource {
 
 func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits) *realSource {
 	t.Helper()
+	rs := newRealSourceIO(t, maxDatagram, env, lim, defaultMaxBatch)
+	rs.start()
+	return rs
+}
+
+// newRealSourceIO returns a realSource, without starting Run (start),
+// whose Source reads and writes the socket through: NewSource's own
+// construction for maxBatch 0, and for a maxBatch that construction
+// already gives (the production path once the token exposes its socket,
+// M5 WP3); else a udpsocket.Conn of maxBatch counted in env.Dgram.IO; or,
+// for maxBatch < 0, the token's single-datagram tokenIO.
+func newRealSourceIO(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits, maxBatch int) *realSource {
+	t.Helper()
+	return newRealSourceTok(t, maxDatagram, env, lim, maxBatch, 0)
+}
+
+// newRealSourceTok is newRealSourceIO over a token built with
+// carrier/udp's Options.MaxBatch tokBatch (NewOwnedUDPSocketBatch; 0: the
+// default).
+func newRealSourceTok(t *testing.T, maxDatagram int, env *carrier.Env, lim Limits, maxBatch, tokBatch int) *realSource {
+	t.Helper()
 	u, err := net.ListenUDP("udp4", loopback4())
 	if err != nil {
 		t.Fatal(err)
@@ -52,15 +75,23 @@ func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limit
 		u.Close()
 		t.Fatal(err)
 	}
-	rs := &realSource{t: t, env: env, u: u, cl: cl, admitted: make(chan *Flow, 16),
+	rs := &realSource{t: t, env: env, u: u, cl: cl, admitted: make(chan *Flow, 128),
 		dst: u.LocalAddr().(*net.UDPAddr).AddrPort()}
-	rs.s = NewSource(rs.env, carrier.NewOwnedUDPSocket(u, maxDatagram), lim)
-	go rs.s.Run(func(f *Flow) {
-		rs.mu.Lock()
-		rs.all = append(rs.all, f)
-		rs.mu.Unlock()
-		rs.admitted <- f
-	})
+	own := carrier.NewOwnedUDPSocketBatch(u, maxDatagram, tokBatch)
+	rs.s = NewSource(rs.env, own, lim)
+	c, built := rs.s.bio.(*udpsocket.Conn)
+	switch {
+	case maxBatch < 0:
+		rs.s.setIO(tokenIO{own})
+	case maxBatch > 0 && !(built && c.MaxBatch() == maxBatch):
+		c, err := udpsocket.New(u, maxBatch, &env.Dgram.IO)
+		if err != nil {
+			u.Close()
+			cl.Close()
+			t.Fatal(err)
+		}
+		rs.s.setIO(c)
+	}
 	t.Cleanup(func() {
 		rs.s.Abort()
 		rs.mu.Lock()
@@ -78,6 +109,16 @@ func newRealSourceEnv(t *testing.T, maxDatagram int, env *carrier.Env, lim Limit
 		cl.Close()
 	})
 	return rs
+}
+
+// start runs the Source's demux.
+func (rs *realSource) start() {
+	go rs.s.Run(func(f *Flow) {
+		rs.mu.Lock()
+		rs.all = append(rs.all, f)
+		rs.mu.Unlock()
+		rs.admitted <- f
+	})
 }
 
 func (rs *realSource) send(b []byte) {
@@ -234,30 +275,56 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
-// TestFlowOwnedSocketCharge (R-C3-2; plan:774): the read buffer of rendr's
-// own socket is charged to nothing while the source waits — an idle source
-// whose reader runs (it read and dropped junk) holds 0 bytes in the Budget
-// and in Stages — and a datagram read into it is charged to the Budget from
-// the moment it is queued for a flow until the flow's reader releases it.
-// When the Budget refuses that charge, a datagram without a DGRAM still
-// reaches its flow through the control reserve (Stages, L16) and a DGRAM is
-// dropped as an inbox drop; nothing stays charged. When the flow's inbox is
+// idleCharge is what rs's Source holds while it waits with nothing queued
+// between datagrams (its slot 0 is uncharged, R-C3-2): nothing on a plain
+// socket; on a socket in ModeBatch at depth D ≥ 2 (Linux amd64/arm64) its
+// extra slots 1 … D−1 on the Budget — none where the Budget refuses every
+// buffer — and its Batch in Stages (M5 design R1-4 rule 2, R1-5, R3-24),
+// until its read stayed parked for a whole batchIdleRelease: the idle
+// release then returns them, and it holds nothing (srcidle;
+// TestFlowOwnedSocketIdleRelease_plan774).
+func (rs *realSource) idleCharge(maxDatagram int, budgetRefuses bool) (budget, stages int64) {
+	d := rs.s.readDepth()
+	if d < 2 {
+		return 0, 0
+	}
+	if !budgetRefuses {
+		budget = int64(d-1) * slotBytes(rs.env, maxDatagram)
+	}
+	return budget, int64(d) * batchMsgBytes
+}
+
+// TestFlowOwnedSocketCharge (R-C3-2; plan:774, as M5's R1-4 amends it for
+// a batching socket): the read buffer of rendr's own socket is charged to
+// nothing while the source waits — an idle source whose reader runs (it
+// read and dropped junk) holds exactly its idle charge (idleCharge: 0
+// bytes on a plain socket) in the Budget and in Stages — and a datagram
+// read into it is charged to the Budget from the moment it is queued for a
+// flow until the flow's reader releases it. When the Budget refuses that
+// charge, a datagram without a DGRAM still reaches its flow through the
+// control reserve (Stages, L16) and a DGRAM is dropped as an inbox drop;
+// nothing stays charged beyond the idle charge. When the flow's inbox is
 // full, the read buffer the Budget took (TryCharge) is returned uncharged
 // for the next read: after the overflow and the drain, the idle source
-// again holds 0 bytes.
+// again holds exactly its idle charge. The row pins the charges between
+// datagrams, so its sources keep their extras for an hour of parked reads
+// (batchIdleRelease): a stalled host cannot let the idle release return
+// them mid-row; the release itself has its own rows (srcidle).
 func TestFlowOwnedSocketCharge(t *testing.T) {
+	idlePeriod(t, time.Hour)
 	t.Run("budget", func(t *testing.T) {
 		rs := newRealSource(t, 1232)
 		used := func() int64 { return rs.env.Budget.Used() + rs.env.Stages.Used() }
 		rs.send([]byte("junk"))
 		waitFor(t, "the junk datagram's drop", func() bool { return rs.s.Stats().Dropped == 1 })
-		if u := used(); u != 0 {
-			t.Fatalf("an idle source whose reader runs: %d bytes charged, want 0", u)
+		ib, is := rs.idleCharge(1232, false)
+		if b, s := rs.env.Budget.Used(), rs.env.Stages.Used(); b != ib || s != is {
+			t.Fatalf("an idle source whose reader runs: Budget %d, Stages %d charged, want %d and %d", b, s, ib, is)
 		}
 		const id = 0x77
 		rs.send(h1(id, wire.TypeOpen, 1))
 		f := rs.flow()
-		if rs.env.Budget.Used() == 0 {
+		if rs.env.Budget.Used() == ib {
 			t.Fatal("the H1 queued in its flow's inbox is charged to no Budget")
 		}
 		if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || len(b) == 0 {
@@ -266,12 +333,12 @@ func TestFlowOwnedSocketCharge(t *testing.T) {
 		f.Admitted()
 		for i := range 3 {
 			rs.send(dg(id, dgramFrame(uint32(2+i), 900)))
-			waitFor(t, "the DGRAM's charge", func() bool { return rs.env.Budget.Used() > 0 })
+			waitFor(t, "the DGRAM's charge", func() bool { return rs.env.Budget.Used() > ib })
 			if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || len(b) < 900 {
 				t.Fatalf("DGRAM %d: event %d, %d bytes", i, ev, len(b))
 			}
-			if u := used(); u != 0 {
-				t.Fatalf("after reading DGRAM %d: %d bytes charged, want 0", i, u)
+			if u := used(); u != ib+is {
+				t.Fatalf("after reading DGRAM %d: %d bytes charged, want the idle %d", i, u, ib+is)
 			}
 		}
 		if st := rs.s.Stats(); st.InboxDrops != 0 || st.Flows != 1 {
@@ -294,13 +361,28 @@ func TestFlowOwnedSocketCharge(t *testing.T) {
 		if st := rs.s.Stats(); st.InboxDrops != 1 {
 			t.Fatalf("Stats %+v, want 1 inbox drop (the DGRAM)", st)
 		}
-		if b, s := rs.env.Budget.Used(), rs.env.Stages.Used(); b != 0 || s != 0 {
-			t.Fatalf("charged: Budget %d, Stages %d, want 0 and 0", b, s)
+		if ib, is := rs.idleCharge(1232, true); rs.env.Budget.Used() != ib || rs.env.Stages.Used() != is {
+			t.Fatalf("charged: Budget %d, Stages %d, want the idle %d and %d", rs.env.Budget.Used(), rs.env.Stages.Used(), ib, is)
 		}
 	})
 	t.Run("overflow", func(t *testing.T) {
 		rs := newRealSourceEnv(t, 1232, testEnv(1<<30), Limits{Inbox: 2})
 		used := func() int64 { return rs.env.Budget.Used() + rs.env.Stages.Used() }
+		ib, is := rs.idleCharge(1232, false)
+		// idle waits for the idle charge: after a batched read the reader
+		// refills its extra slots (TryGet) when it next reads, which may
+		// follow the event the test saw.
+		idle := func(what string) {
+			t.Helper()
+			deadline := time.Now().Add(realWait)
+			for used() != ib+is {
+				if time.Now().After(deadline) {
+					t.Fatalf("%s: %d bytes charged (Budget %d, Stages %d), want the idle %d (%d and %d)",
+						what, used(), rs.env.Budget.Used(), rs.env.Stages.Used(), ib+is, ib, is)
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
 		const id = 0x79
 		rs.send(h1(id, wire.TypeOpen, 1))
 		f := rs.flow()
@@ -313,7 +395,7 @@ func TestFlowOwnedSocketCharge(t *testing.T) {
 			rs.send(dg(id, dgramFrame(uint32(2+i), 900)))
 		}
 		waitFor(t, "the overflow's inbox drops", func() bool { return rs.s.Stats().InboxDrops == sent-inbox })
-		if rs.env.Budget.Used() == 0 {
+		if rs.env.Budget.Used() <= ib {
 			t.Fatal("stimulus: the queued DGRAMs are charged to no Budget")
 		}
 		for i := range inbox {
@@ -321,17 +403,12 @@ func TestFlowOwnedSocketCharge(t *testing.T) {
 				t.Fatalf("queued DGRAM %d: event %d, %d bytes", i, ev, len(b))
 			}
 		}
-		if u := used(); u != 0 {
-			t.Fatalf("after the overflow and the drain: %d bytes charged (Budget %d, Stages %d), want 0",
-				u, rs.env.Budget.Used(), rs.env.Stages.Used())
-		}
+		idle("after the overflow and the drain")
 		rs.send(dg(id, dgramFrame(uint32(2+sent), 900))) // the read buffer works on
 		if b, _, ev := readOne(t, f, realWait); ev != carrier.ReadOK || len(b) < 900 {
 			t.Fatalf("a DGRAM after the overflow: event %d, %d bytes", ev, len(b))
 		}
-		if u := used(); u != 0 {
-			t.Fatalf("after the last DGRAM: %d bytes charged, want 0", u)
-		}
+		idle("after the last DGRAM")
 		if st := rs.s.Stats(); st.InboxDrops != sent-inbox || st.Flows != 1 {
 			t.Fatalf("Stats %+v", st)
 		}

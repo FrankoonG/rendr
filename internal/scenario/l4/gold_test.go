@@ -356,18 +356,26 @@ func closeHeld(t testing.TB, l *rendrtest.Link, seq int) {
 }
 
 // droppedCause requires each end's death record of the blackholed carrier
-// id with ping_timeout or write_stall, after the DROP.
+// id with ping_timeout or write_stall, after the DROP — or, on the end
+// whose peer reached its verdict first, peer_down after that verdict
+// (PA-86: the first end's DOWN crosses on another trunk of the pair).
 func droppedCause(t testing.TB, w *world, id rendr.CarrierID, drop time.Time) {
 	t.Helper()
+	var ends [2][]rendr.Event
 	for i, l := range []*eventLog{w.dev, w.pev} {
-		var evs []rendr.Event
 		waitFor(t, 10*time.Second, side(i)+"'s death record of the dropped carrier", func() bool {
-			evs = l.downOf(id)
-			return len(evs) > 0
+			ends[i] = l.downOf(id)
+			return len(ends[i]) > 0
 		})
+	}
+	silent := func(ev rendr.Event) bool {
+		return (ev.Cause == rendr.CausePingTimeout || ev.Cause == rendr.CauseWriteStall) && !ev.Time.Before(drop)
+	}
+	for i, evs := range ends {
+		other := ends[1-i][0]
 		for _, ev := range evs {
-			if ev.Cause != rendr.CausePingTimeout && ev.Cause != rendr.CauseWriteStall || ev.Time.Before(drop) {
-				t.Fatalf("the %s's death record of the dropped carrier %d: %+v at DROP %+v, want ping_timeout or write_stall after the DROP",
+			if !silent(ev) && !(ev.Cause == rendr.CausePeerDown && silent(other) && !ev.Time.Before(other.Time)) {
+				t.Fatalf("the %s's death record of the dropped carrier %d: %+v at DROP %+v, want ping_timeout or write_stall after the DROP (or peer_down after the other end's)",
 					side(i), id, ev, ev.Time.Sub(drop))
 			}
 		}

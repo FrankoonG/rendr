@@ -1,33 +1,36 @@
 package packet
 
 import (
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
 // TestPacketFseqJumpRecovery_L43: a genuine fseq jump of a window or more
 // inside a real packet session (m3 FSEQJUMP; m3 design §A9.1, R1-35). One
 // DatagramLink of 20 ms RTT and the zero Config (DeadMin 3 s); 1000-byte
-// datagrams at 2,000 per second B → A, and 200 (down) or 2,000 (both) per
-// second A → B. After 2 s, the B → A direction (down) or both directions
-// (both) are blackholed for 1 s, so the blackholed senders hand at least
-// FseqWindowBits datagrams to the carrier, each a frame of its own whose
-// fseq the receiver never sees, and the link heals. Every frame that
-// arrives after the heal is then a window or more ahead of the receiver's
-// fseq window: it is dropped until the datagram proves the jump with a PONG
-// of the receiver's own PING (dgJumpProof), which takes about one round
-// trip.
+// datagrams at 10,000 per second B → A (jumpRateBA: M3 ran 2,000, which
+// handed its 1,024-frame window over in 1 s, but not m5 PA-85's 8,192), and
+// 1,000 (down) or 10,000 (both) per second A → B. After 2 s, the B → A
+// direction (down) or both directions (both) are blackholed for 1 s, so the
+// blackholed senders hand at least wire.FseqWindowBits datagrams to the
+// carrier, each a frame of its own whose fseq the receiver never sees, and
+// the link heals. Every frame that arrives after the heal is then a window
+// or more ahead of the receiver's fseq window: it is dropped until the
+// datagram proves the jump with a PONG of the receiver's own PING
+// (dgJumpProof), which takes about one round trip.
 //
-// Stimulus: the blackholed senders handed ≥ 1,024 datagrams to the session's
-// one carrier while the blackhole lasted (Packet.Sent), so the receiver's
-// window can deliver again only by the jump; the frames each receiving
-// carrier dropped after the heal (CarrierStatus.Dropped) are logged (none
-// when the first datagram after the heal carries the PONG of a PING the
-// receiver sent during the blackhole). PASS: the session keeps its one
+// Stimulus: the blackholed senders handed ≥ wire.FseqWindowBits datagrams
+// to the session's one carrier while the blackhole lasted (Packet.Sent),
+// so the receiver's window can deliver again only by the jump; the frames
+// each receiving carrier dropped after the heal (CarrierStatus.Dropped)
+// are logged (none when the first datagram after the heal carries the PONG
+// of a PING the receiver sent during the blackhole). PASS: the session keeps its one
 // carrier on both ends (same CarrierID, the only live one, no CarrierDown)
 // and its traffic: a datagram written after the heal arrives within 2·RTT + a
 // send slot, and no datagram written later than that is lost; the datagrams
@@ -36,18 +39,67 @@ import (
 // jump at once and lost nothing after the heal); integrity, NonBlockingWrite,
 // the attribution of every loss to the link and a clean end with io.EOF.
 // The post-heal loss is logged for the pool follow-up.
+//
+// Lanes (fseqJumpCases): the non-race lanes run all four subtests; under
+// -race a fixed two of them cover each of the row's rules once, with the
+// same bounds.
 func TestPacketFseqJumpRecovery_L43(t *testing.T) {
+	for _, c := range fseqJumpCases() {
+		t.Run(c.name(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { fseqJumpRecovery(t, c.mode, c.both) })
+		})
+	}
+}
+
+// fseqJumpCase is one subtest of TestPacketFseqJumpRecovery_L43: the
+// session's mode, and whether both directions are blackholed (both) or
+// B → A alone (down).
+type fseqJumpCase struct {
+	mode rendr.Mode
+	both bool
+}
+
+func (c fseqJumpCase) name() string {
+	if c.both {
+		return c.mode.String() + "/both"
+	}
+	return c.mode.String() + "/down"
+}
+
+// fseqJumpCases returns the subtests TestPacketFseqJumpRecovery_L43 runs in
+// this lane. The non-race unit and sweep lanes run all four: selector and
+// bond, each down and both. Under -race (racebudget: the C-P round 2
+// decision applies the 21:50 lever as a fixed subset, every bound
+// unchanged) selector/both and bond/down run, and between them they cover
+// each of the row's rules once:
+//   - selector (selector/both): the jumped carrier is the selector's
+//     active carrier, and the session keeps it;
+//   - bond (bond/down): the jumped carrier is the bond's only member, and
+//     the session keeps it;
+//   - down (bond/down): one direction jumps; the dialer's proof PING
+//     crosses the open direction inside the passive's window, and the
+//     PONG in the first frames after the heal proves the jump;
+//   - both (selector/both): both directions jump at the full rate, so the
+//     passive's window jumps too, and each side's proof PING arrives in a
+//     frame a window ahead of the peer's window, which drops the frame and
+//     answers the PING from it (dgJumpClaim).
+//
+// A selector's one-way jump also runs under -race, with its first proof
+// PING lost, in TestPacketFseqJumpProofLost_L43. TestRaceLaneSubtests
+// checks the list against the binary's build.
+func fseqJumpCases() []fseqJumpCase {
+	var cs []fseqJumpCase
 	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
 		for _, both := range []bool{false, true} {
-			name := mode.String() + "/down"
-			if both {
-				name = mode.String() + "/both"
-			}
-			t.Run(name, func(t *testing.T) {
-				synctest.Test(t, func(t *testing.T) { fseqJumpRecovery(t, mode, both) })
-			})
+			cs = append(cs, fseqJumpCase{mode, both})
 		}
 	}
+	if raceEnabled {
+		cs = slices.DeleteFunc(cs, func(c fseqJumpCase) bool {
+			return c.name() != "selector/both" && c.name() != "bond/down"
+		})
+	}
+	return cs
 }
 
 func fseqJumpRecovery(t *testing.T, mode rendr.Mode, both bool) {
@@ -56,14 +108,14 @@ func fseqJumpRecovery(t *testing.T, mode rendr.Mode, both bool) {
 		hole  = time.Second + sendSlot/2 // the heal falls between two send slots
 		warm  = 2 * time.Second
 		after = 3 * time.Second
-		win   = 1024 // wire.FseqWindowBits
+		win   = wire.FseqWindowBits
 	)
 	bound := 2*rtt + sendSlot
 	// The full rate in both lanes (not goldRateBA, which the race lane
 	// halves): 1 s of blackhole must hand the carrier a window of datagrams.
-	rateDown, rateUp := fullRateBA, fullRateBA/10
+	rateDown, rateUp := jumpRateBA, jumpRateBA/10
 	if both {
-		rateUp = fullRateBA
+		rateUp = jumpRateBA
 	}
 	w := newWorld(t, worldOpts{oneWay: goldOneWay}, "u1")
 	l := w.link("u1")

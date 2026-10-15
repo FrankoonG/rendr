@@ -221,11 +221,18 @@ const (
 	CauseLocalClose        Cause = 7 // closed by this side
 	CauseRetired           Cause = 8 // ended by a CLOSE (planned or the peer's); not a death; explicit in EventMigration
 	CauseQuality           Cause = 9 // only in EventMigration: a selector quality switch
+	// CausePeerDown: a carrier shared by several sessions (rendr mux) that
+	// the peer reported dead at its end, on another shared carrier between
+	// the same two instances dialled in the same direction; it ends here
+	// when the report arrives, as by a transport error, instead of at this
+	// side's death deadline.
+	CausePeerDown Cause = 10
 )
 
 // String returns "ping_timeout", "write_stall", "transport_error",
 // "protocol_violation", "instance_mismatch", "goaway", "local_close",
-// "retired", "quality", or "none" for CauseNone and unknown values.
+// "retired", "quality", "peer_down", or "none" for CauseNone and unknown
+// values.
 func (c Cause) String() string {
 	switch c {
 	case CausePingTimeout:
@@ -246,6 +253,8 @@ func (c Cause) String() string {
 		return "retired"
 	case CauseQuality:
 		return "quality"
+	case CausePeerDown:
+		return "peer_down"
 	}
 	return "none"
 }
@@ -311,7 +320,7 @@ func (e Evidence) String() string {
 // across migrations and never reveals carrier addresses.
 type Addr struct {
 	Instance InstanceID // the Runtime at this end
-	Session  SessionID
+	Session  SessionID  // the session, the same at both ends
 }
 
 // Network returns "rendr".

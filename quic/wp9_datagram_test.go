@@ -20,8 +20,9 @@ import (
 // TestDatagramLimitProbe_L37 pins the upstream behaviour the attach-time
 // budget probe relies on (A12 risk 14): quic-go refuses an oversize
 // DATAGRAM before queueing it and reports its current limit — 1163 at the
-// 1200-byte packet floor, at least DatagramBudget — and refuses every
-// DATAGRAM when the peer did not enable them.
+// 1200-byte packet floor, room for DatagramBudget after the carrier's
+// sequence number — and refuses every DATAGRAM when the peer did not
+// enable them.
 func TestDatagramLimitProbe_L37(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	noPMTUD := func(server bool) *qgo.Config {
@@ -30,7 +31,7 @@ func TestDatagramLimitProbe_L37(t *testing.T) {
 	cli, srv := rawPair(t, noPMTUD(false), noPMTUD(true))
 	for name, qc := range map[string]*qgo.Conn{"dialer": cli, "passive": srv} {
 		n, err := datagramLimit(qc)
-		if err != nil || n != 1200-37 || n < DatagramBudget {
+		if err != nil || n != 1200-37 || carrierLimit(n) < DatagramBudget {
 			t.Errorf("%s: limit %d, %v; want quic-go's 1163 at the 1200-byte floor", name, n, err)
 		}
 	}

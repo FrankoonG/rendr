@@ -162,19 +162,32 @@ func pickDataCarrier(t *testing.T, dc, pc *rendr.PacketConn, mode rendr.Mode) re
 
 // droppedCause requires that the carrier whose path was dropped at drop
 // ended on both ends with ping_timeout or write_stall (E17), each by its
-// own death rule within the recovery bound.
+// own death rule within the recovery bound — except that the end whose
+// peer reached its verdict first may end it with peer_down after that
+// verdict (PA-86: the first end's DOWN crosses on another trunk of the
+// pair).
 func droppedCause(t *testing.T, w *world, dc, pc *rendr.PacketConn, id rendr.CarrierID, drop time.Time) {
 	t.Helper()
+	silent := func(c rendr.Cause) bool { return c == rendr.CausePingTimeout || c == rendr.CauseWriteStall }
+	var css [2]rendr.CarrierStatus
+	var evs [2]rendr.Event
 	for i, c := range []*rendr.PacketConn{dc, pc} {
 		cs, ok := carrierOf(c.Status(), id)
-		if !ok || cs.State != rendr.CarrierDead || (cs.DeathCause != rendr.CausePingTimeout && cs.DeathCause != rendr.CauseWriteStall) {
-			t.Fatalf("%s: the dropped carrier %d is %+v (found %v), want dead of ping_timeout or write_stall", side(i), id, cs, ok)
+		if !ok || cs.State != rendr.CarrierDead {
+			t.Fatalf("%s: the dropped carrier %d is %+v (found %v), want dead", side(i), id, cs, ok)
 		}
 		ev, ok := [2]*eventLog{w.dev, w.pev}[i].downOf(id)
 		if !ok || ev.Cause != cs.DeathCause || ev.Time.Sub(drop) > recoveryBound {
 			t.Fatalf("%s: CarrierDown of %d: %+v (found %v), want %v within %v of the drop", side(i), id, ev, ok, cs.DeathCause, recoveryBound)
 		}
-		t.Logf("%s: dropped carrier %d dead +%v: %v %q", side(i), id, ev.Time.Sub(drop), cs.DeathCause, cs.DeathDetail)
+		css[i], evs[i] = cs, ev
+	}
+	for i, cs := range css {
+		o := 1 - i
+		if !silent(cs.DeathCause) && !(cs.DeathCause == rendr.CausePeerDown && silent(css[o].DeathCause) && !evs[i].Time.Before(evs[o].Time)) {
+			t.Fatalf("%s: the dropped carrier %d is %+v, want dead of ping_timeout or write_stall (or peer_down after the other end's)", side(i), id, cs)
+		}
+		t.Logf("%s: dropped carrier %d dead +%v: %v %q", side(i), id, evs[i].Time.Sub(drop), cs.DeathCause, cs.DeathDetail)
 	}
 }
 

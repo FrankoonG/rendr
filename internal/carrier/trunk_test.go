@@ -464,7 +464,7 @@ func muxDatagram(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			wbBubble(t, func(t *testing.T) {
 				denv, penv := wbEnvs()
-				a, b := newFakeIOPair(1500)
+				a, b := newFakeIOPair(t, 1500)
 				defer a.Close()
 				ch := wbReadHello(penv, b, nil)
 				pre := make([]byte, wire.PrefaceLen)

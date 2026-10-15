@@ -21,7 +21,8 @@ import (
 // WriteTo and ReadFrom; pkt_fill.go Fill, the wake policy and the routing
 // helpers; pkt_recv.go the DGRAM hand-over; pkt_pack.go PACK placement,
 // cadence and receipt; pkt_end.go Close, the peer's FIN, the end and
-// ageing.
+// ageing; pkt_unsent.go the DGRAMs a dying carrier never wrote (M5
+// pktloss).
 
 // packet is a packet session's data-plane state.
 type packet struct {
@@ -42,12 +43,17 @@ type packet struct {
 	finWaitAt time.Time    // EOF straggler bound after the peer's FIN (M2-D40)
 	noPathEnd time.Time    // end of the latest no-path episode: DropNoPath vs DropAge (M2-D35)
 	finPlaced bool         // our FIN was placed once: st.fin.off holds the final seq
+	peerFirst bool         // the peer's FIN came before ours was requested: PA-6 released the send queues, and a DGRAM a dying carrier hands back afterwards is DropQueue (pkt_unsent.go)
 	dgMax     int          // the largest DgramMax over live datagram data lanes (0: none; routing, M2-D43, M2-D45)
 	dgMin     int          // the smallest DgramMax over live datagram data lanes (0: none): pdesc.wide (W4-REL-5)
 	mixed     bool         // bond with live datagram data lanes and a stream member (a data lane, or one awaiting its SCHED): WriteTo puts datagrams above dgMax in txBig
 	bigHeld   bool         // mixed by stream members awaiting their SCHED only: txBig waits for one, aged by the actor (C4-F2)
 	rcopy     *carrier.Buf // a datagram ReadFrom detached and copies outside the lock (L07: released at its commit)
-	copies    uint64       // race sender: extra placements of datagrams another lane already placed (Race.Copies, M3-D35)
+	copies    uint64       // race sender: placements beyond the first of datagrams with a placement that may have left (Race.Copies, M3-D35; a hand-back lowers it, pkt_unsent.go)
+	redo      []predo      // DGRAMs a dying carrier handed back unwritten: a ring (power-of-two length ≤ maxRedo) of redoLen entries from redoHead, oldest enqueue time first (pkt_unsent.go)
+	redoHead  int          // the ring index of the first waiting entry of redo
+	redoLen   int          // the waiting entries of redo
+	dying     [][]pplace   // race: the placement records of dead datagram lanes that keep their cells, oldest first (≤ maxDying; pkt_unsent.go)
 
 	base        time.Time // immutable: the origin of pdesc.at (monotonic)
 	stale       *lane     // bond minimum share (R1-19): the lane found stale, remembered until it places a DGRAM
@@ -76,9 +82,14 @@ type pring struct {
 	// descriptor (the descriptors popped so far), the frame of the lanes'
 	// cursors; seq, parallel to desc and allocated by a race session's
 	// first Fill only, holds 1 + the seq a descriptor got at its first
-	// placement (0: never placed), which its copies reuse.
-	pos uint64
-	seq []uint64
+	// placement (0: never placed), which its copies reuse. cell, parallel
+	// too, holds the descriptor's placement-count cell (0: never placed),
+	// from the pool cells with its free list cfree (pkt_unsent.go).
+	pos   uint64
+	seq   []uint64
+	cell  []int32
+	cells []pcell
+	cfree []int32
 
 	charge int64 // Σ max(len, 64) of queued descriptors
 	bytes  int64 // Σ len of queued descriptors (pendingBytes)

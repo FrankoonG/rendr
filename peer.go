@@ -26,6 +26,13 @@ type Carrier interface{ isCarrier() }
 // a conn returned late is closed exactly once, byte counts are validated,
 // and conns are only ever used through the net.Conn interface, except the
 // connections package carrier/tcp creates (see that package).
+//
+// Limitation: probe round trips are measured from a PING's write commit,
+// so a conn whose Write returns only after the far end read the bytes (a
+// net.Pipe-like conn, such as an in-process tunnel) may yield no probe
+// evidence at GOMAXPROCS=1. Its factory then stays EvidenceUnknown: a
+// cold-start Dial waits the whole Probe.DialWait, and ranking falls back to
+// the configured order.
 type StreamCarrier struct {
 	// Name identifies the factory in Status, PeerStatus and ranking ties;
 	// unique and non-empty within a Peer.
@@ -50,7 +57,7 @@ func (StreamCarrier) isCarrier() {}
 // order breaks ranking ties). Every session snapshots it at Dial; a later
 // change of the Peer does not affect existing sessions.
 type PeerConfig struct {
-	Carriers []Carrier
+	Carriers []Carrier // 1–16 StreamCarrier and DatagramCarrier factories
 }
 
 // DialOptions configure one session.
@@ -78,15 +85,18 @@ type DialOptions struct {
 	// on both sides and Done is closed. Close keeps its meaning: what was
 	// written is delivered once the peer accepts, within Linger; Abort
 	// withdraws. A Close before the first Write, Read or CloseWrite sends
-	// nothing. The cold-start wait for probe samples is skipped. PeerInstance
-	// and RemoteAddr report the zero InstanceID until the peer accepted. A
-	// session that opens on a carrier it shares with other sessions (rendr
-	// mux) sends its bytes after the answer, which costs the same as early
-	// data on a carrier of its own. Do not use it when the peer's answer must
-	// precede your first byte (a SOCKS5 reply, for example). Write before you
-	// Read: a Read that comes first opens the session without early bytes.
-	// DialPacket refuses it with ErrProtocol. SessionStatus.EarlyBytes
-	// reports how many bytes travelled as early data.
+	// nothing; neither does an idle limit (Config.IdleTimeout,
+	// Conn.SetIdleTimeout) that expires before them, counted from Dial: the
+	// session then ends with ErrIdleTimeout. The cold-start wait for probe
+	// samples is skipped. PeerInstance and RemoteAddr report the zero
+	// InstanceID until the peer accepted. A session that opens on a carrier
+	// it shares with other sessions (rendr mux) sends its bytes after the
+	// answer, which costs the same as early data on a carrier of its own. Do
+	// not use it when the peer's answer must precede your first byte (a
+	// SOCKS5 reply, for example). Write before you Read: a Read that comes
+	// first opens the session without early bytes. DialPacket refuses it
+	// with ErrProtocol. SessionStatus.EarlyBytes reports how many bytes
+	// travelled as early data.
 	EarlyReturn bool
 }
 
@@ -293,7 +303,7 @@ type PeerStatus struct {
 // FactoryStatus is one factory's probe state (see ProbePolicy, Evidence
 // and SelectorPolicy).
 type FactoryStatus struct {
-	Name          string
+	Name          string        // the factory's Name
 	Evidence      Evidence      // at the time of the call
 	RTT           time.Duration // aggregated probe RTT (fresh or held), else 0
 	Samples       uint64        // probe samples accepted, loaded ones included

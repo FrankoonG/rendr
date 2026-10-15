@@ -328,6 +328,68 @@ func (b *Batch) appendDatagram(dst []byte, i, end int) []byte {
 	return append(dst, b.arena[seg:stop]...)
 }
 
+// appendDatagramArena packs the datagram of the sealed frames [i, end) —
+// the range nextDatagram returned — into arena, the round's arena (one
+// DBufs buffer of the 64-KiB class), as appendDatagram packs it: arena
+// holds the flush's earlier slots and then the new datagram's Headroom
+// bytes, which the caller appended; the new slot runs from the end of the
+// flush's previous slot (0 for its first) to the end of the datagram. It
+// records that slot as the flush's next one and returns the flush's slots,
+// the new one last, each with its Headroom in front (the argument of
+// BatchIO.WriteDatagrams), and arena's new length. It allocates nothing,
+// runs before ReleaseRefs and panics unless 0 ≤ i < end ≤ Len() and the
+// datagram fits cap(arena) (M5 design §A4.3; WP2).
+func (b *Batch) appendDatagramArena(i, end int, arena []byte) ([][]byte, int) {
+	if i < 0 || end > b.n || i >= end {
+		panic("rendr/carrier: appendDatagramArena range out of bounds")
+	}
+	start := 0
+	if k := len(b.fl); k > 0 {
+		// The slots alias arena (two-index slices), so the previous one ends
+		// at cap(arena) − cap(prev) + len(prev).
+		prev := b.fl[k-1]
+		start = cap(arena) - cap(prev) + len(prev)
+	}
+	if len(arena) < start {
+		panic("rendr/carrier: appendDatagramArena arena shorter than its flush")
+	}
+	n := 0
+	for k := i; k < end; k++ {
+		n += wire.FrameOverhead + int(b.frames[k].hdr.Len)
+	}
+	if len(arena)+n > cap(arena) {
+		panic("rendr/carrier: appendDatagramArena datagram beyond the arena")
+	}
+	arena = b.appendDatagram(arena, i, end)
+	if b.fl == nil {
+		b.fl = make([][]byte, 0, MaxBatchFrames) // a datagram writer's first flush; reused for its life
+	}
+	b.fl = append(b.fl, arena[start:len(arena)])
+	return b.fl, len(arena)
+}
+
+// resetFlush ends the current flush of appendDatagramArena: the batch keeps
+// no reference to the arena's slots (L55: a reset clears the scratch's
+// references). The writer calls it after every flush and at the end of
+// its round.
+func (b *Batch) resetFlush() {
+	clear(b.fl)
+	b.fl = b.fl[:0]
+}
+
+// flushLen returns the datagrams of the current flush (tests).
+func (b *Batch) flushLen() int {
+	return len(b.fl)
+}
+
+// datagramIsDgramOnly reports whether the datagram that starts at sealed
+// frame i consists of DGRAM frames only — its one frame is a DGRAM, since
+// a DGRAM always ends its datagram (M2-D12) — the run rule of a GSO send
+// (M5-D23; used only if GSO ships).
+func (b *Batch) datagramIsDgramOnly(i int) bool {
+	return b.frames[i].hdr.Type == wire.TypeDgram
+}
+
 // Writer-side helpers added to the WP3c ↔ WP3a contract at integration 1
 // (M2 design §A11.5): datagramDgram gives each datagram's TxBytes and
 // Refused, dgramBytes the round's DGRAM bytes in both modes, and relRefused

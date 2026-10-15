@@ -104,8 +104,12 @@ const (
 	ControlFloor = 300
 
 	// FseqWindowBits is the anti-replay window of a datagram carrier
-	// direction (plan:333).
-	FseqWindowBits = 1024
+	// direction (plan:333 as amended by m5 PA-85): 8,192 frames, a 1-KiB
+	// bitmap per carrier and direction. It covers the frames legitimately
+	// in flight at the design maximum (L39): 82 ms at 100,000 frames per
+	// second, four times the about 2,000 in flight over a 20-ms round
+	// trip, so a burst loss of fewer frames is no forward jump to prove.
+	FseqWindowBits = 8192
 	// DefaultSeqWindowBits is a packet session's receive dedup window (L39).
 	DefaultSeqWindowBits = 16384
 )
@@ -227,7 +231,7 @@ type RelHead struct {
 	Cseq   uint32 // per carrier direction, serial arithmetic (L14)
 	Type   Type   // a Wrappable type
 	Flags  uint8  // ⊆ AllowedFlags(Type)
-	Handle uint32 // 0 for CLOSE, GOAWAY and DETACH; non-zero (the session's handle) otherwise
+	Handle uint32 // 0 for CLOSE, GOAWAY, DETACH and DOWN; non-zero (the session's handle) otherwise
 }
 
 // PutRelHead writes h into dst[:RelHeadLen]; the inner payload follows it.
@@ -245,7 +249,7 @@ func PutRelHead(dst []byte, h *RelHead) {
 // ParseRel decodes a REL payload: the head and the inner payload (aliasing
 // p). Check order: length ≥ RelHeadLen (ErrShort); Wrappable(type)
 // (ErrType: REL in REL is impossible); flags (ErrFlags); handle (ErrHandle:
-// ParseHeader's rule, 0 for CLOSE, GOAWAY and DETACH, non-zero for a
+// ParseHeader's rule, 0 for CLOSE, GOAWAY, DETACH and DOWN, non-zero for a
 // session type); inner length within PayloadBounds(type) (ErrLength). The
 // inner payload is decoded by its own parser at dispatch. Every cseq
 // decodes (the receiver's window decides). inner's capacity ends at its
@@ -316,13 +320,14 @@ func ParseRack(p []byte) (Rack, error) {
 }
 
 // Wrappable reports whether a REL may carry type t: OPEN, OPEN_ACK, JOIN,
-// JOIN_ACK, FIN, RST, SCHED, CLOSE, GOAWAY (plan:356), PACK (M2-D39) and
-// DETACH (M3-D6). REL, RACK, DGRAM, DATA, ACK, PING, PONG, extensions and
-// unknown types are not: REL inside REL is impossible by construction.
+// JOIN_ACK, FIN, RST, SCHED, CLOSE, GOAWAY (plan:356), PACK (M2-D39),
+// DETACH (M3-D6) and DOWN (PA-86). REL, RACK, DGRAM, DATA, ACK, PING, PONG,
+// extensions and unknown types are not: REL inside REL is impossible by
+// construction.
 func Wrappable(t Type) bool {
 	switch t {
 	case TypeOpen, TypeOpenAck, TypeJoin, TypeJoinAck, TypeFin, TypeRst, TypeSched,
-		TypeClose, TypeGoAway, TypePack, TypeDetach:
+		TypeClose, TypeGoAway, TypePack, TypeDetach, TypeDown:
 		return true
 	}
 	return false

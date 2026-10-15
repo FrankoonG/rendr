@@ -451,7 +451,7 @@ func TestDatagramHelloMetaTooLarge(t *testing.T) {
 		t.Run(fmt.Sprint(tc.meta), func(t *testing.T) {
 			wbBubble(t, func(t *testing.T) {
 				denv, penv := wbEnvs()
-				a, b := newFakeIOPair(1500)
+				a, b := newFakeIOPair(t, 1500)
 				defer a.Close()
 				ch := wbReadHello(penv, b, nil) // maxMeta 255
 				open := make([]byte, wire.OpenFixedLen+tc.meta)

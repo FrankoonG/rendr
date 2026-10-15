@@ -86,8 +86,11 @@ func (packetSource) isSource() {}
 // counted, and nothing is allocated for it. Flows are bounded: at most 32
 // admitting flows per source IP address for OPENs and 32 for JOINs and
 // probes, and MaxSessions × MaxCarriersPerSession + Sessionless.Total +
-// Handshake.MaxConcurrent flows in all (at most 65,536); every flow's
-// inbox holds at most 512 datagrams (see Status.Datagram). A flow is
+// Handshake.MaxConcurrent flows in all (at most 65,536); a flow's inbox
+// holds the datagrams its reader has not taken yet: up to 512 on any
+// net.PacketConn, and on a socket from carrier/udp's Listen up to as many
+// as fit the socket's read buffer when that is more (see its
+// Options.ReadBuffer; drops are counted in Status.Datagram). A flow is
 // admitting from its first datagram until a positive verdict was written
 // for it or, for an OPEN, until its dialer answered the address check of
 // the passive's first answer, which proves that the source receives the
@@ -101,7 +104,8 @@ func (packetSource) isSource() {}
 // AcceptBacklog per session kind, MaxSessions and the flow bound above —
 // so one such address can hold the whole packet backlog, and further
 // OPENs, from any address, are then answered CAPACITY. A datagram beyond a
-// quota is dropped silently.
+// quota is dropped silently. The defence against such a source is the
+// embedder's: authentication in front of the socket and its Accept policy.
 //
 // Ownership of pc moves to the Listener: Listener.Close stops admitting new
 // flows (a new carrier is refused with CAPACITY) and closes pc once its

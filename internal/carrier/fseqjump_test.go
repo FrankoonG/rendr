@@ -16,6 +16,10 @@ import (
 // sender (dgJumpProof); otherwise it is dropped and counted, and its claim
 // is kept moving (dgJumpClaim).
 
+// fjOutage is the frames an outage cost the scripted peer's direction in
+// the jump rows: a window (wire.FseqWindowBits, m5 PA-85) and 5000 more.
+const fjOutage = wire.FseqWindowBits + 5000
+
 // fjDelivered returns the session seqs of the DGRAMs an endpoint received.
 func fjDelivered(e *dEP) (seqs []uint64) {
 	for _, d := range e.datagrams() {
@@ -103,14 +107,15 @@ func TestDatagramForeignJumpDropped_L43(t *testing.T) {
 }
 
 // TestDatagramJumpProvedByPong_L43: the peer's own direction jumps after
-// an outage cost it 5000 frames. The first jumped datagram is dropped and
-// counted (a DGRAM and a PING), but its PING is answered — the peer may
-// wait for the same proof — and the carrier asks for a PING of its own,
-// once per RTO however many jumped datagrams follow. The PONG to it proves
-// the jump: the frames of its datagram (a DGRAM before it included) and
-// everything after are accepted; jumped frames reordered behind the PONG
-// are new once. While a genuine answer is due, a jumped PING never
-// displaces it.
+// an outage cost it a window and 5000 frames. The first jumped datagram is
+// dropped and counted (a DGRAM and a PING), but its PING is answered — the
+// peer may wait for the same proof — and the carrier asks for a PING of its
+// own at once, then at most once per round trip however many jumped
+// datagrams follow (m5 PA-85; TestDatagramJumpProofPacedByRTT_L43 has the
+// pace). The PONG to it proves the jump: the frames of its datagram (a
+// DGRAM before it included) and everything after are accepted; jumped
+// frames reordered behind the PONG are new once. While a genuine answer is
+// due, a jumped PING never displaces it.
 func TestDatagramJumpProvedByPong_L43(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, p := rawPair(t, 1200, true)
@@ -118,7 +123,7 @@ func TestDatagramJumpProvedByPong_L43(t *testing.T) {
 		synctest.Wait()
 		fjSettle(p)
 		d0 := s.c.Stats().Dropped
-		p.fseq += 5000 // lost in the outage
+		p.fseq += fjOutage // lost in the outage
 		p.send(pingFrame(wire.TypePing, wire.Ping{ID: 20, Nonce: 3}), dgramFrame(10, 100))
 		synctest.Wait()
 		if d := s.c.Stats().Dropped - d0; d != 2 || len(fjDelivered(s.ep)) != 0 {
@@ -131,12 +136,12 @@ func TestDatagramJumpProvedByPong_L43(t *testing.T) {
 			t.Fatalf("PONGs %v, PINGs %v: want the jumped PING 20 answered and one PING of the carrier", pongs, pingIDs)
 		}
 		ours := pings[0]
-		// More jumped datagrams within the RTO ask for no second PING.
+		// More jumped datagrams within the round trip ask for no second PING.
 		p.send(dgramFrame(11, 100))
 		p.send(dgramFrame(12, 100))
 		synctest.Wait()
 		if ids, _ := fjPings(p.read(), false); len(ids) != 0 {
-			t.Fatalf("PINGs %v within the RTO of the first request", ids)
+			t.Fatalf("PINGs %v within the round trip of the first request", ids)
 		}
 		// The proof: a DGRAM, the PONG to our PING and a DGRAM in one
 		// datagram, then a reordered jumped frame and the next in order.
@@ -180,11 +185,11 @@ func TestDatagramJumpProvedByPong_L43(t *testing.T) {
 
 // TestDatagramJumpWithRebind_L59: an outage that also moved the dialer's
 // NAT mapping: the passive raw-UDP flow's peer sends from a new source with
-// its fseqs 5000 ahead. Its datagram is dropped (no proof: the passive's
-// replies go to the old address and are lost) but starts a rebind
-// challenge; a jumped datagram from a third source does not retarget it;
-// the challenge's answer from the candidate proves the jump and commits
-// the rebind, and replies follow the new address (M2-D27).
+// its fseqs a window and 5000 ahead. Its datagram is dropped (no proof:
+// the passive's replies go to the old address and are lost) but starts a
+// rebind challenge; a jumped datagram from a third source does not
+// retarget it; the challenge's answer from the candidate proves the jump
+// and commits the rebind, and replies follow the new address (M2-D27).
 func TestDatagramJumpWithRebind_L59(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		s, p := rawPair(t, 1200, false)
@@ -193,7 +198,7 @@ func TestDatagramJumpWithRebind_L59(t *testing.T) {
 		synctest.Wait()
 		fjSettle(p)
 		p.io.moveTo(fakeAddr(9))
-		p.fseq += 5000
+		p.fseq += fjOutage
 		p.send(pingFrame(wire.TypePing, wire.Ping{ID: 5, Nonce: 1}))
 		synctest.Wait()
 		third := &rawPeer{io: p.io, fseq: p.fseq + 1<<24}
@@ -284,13 +289,14 @@ func TestDatagramJumpChallengePing_L59(t *testing.T) {
 }
 
 // TestDatagramJumpBothWaysWithRebind_L59: an outage costs both directions
-// of a raw-UDP flow 1500 frames and moves the dialer's NAT mapping. The
-// dialer's next DGRAM reaches the passive a window ahead from a new
-// source: it is dropped and starts a rebind challenge, whose PING reaches
-// the dialer a window ahead too. The dialer answers it (dgJumpClaim), the
-// answer proves the jump to the passive and commits the rebind, and the
-// passive's PONG to the dialer's PING, now sent to the new address, proves
-// the jump to the dialer: DGRAMs flow both ways again, nothing dies.
+// of a raw-UDP flow a window and 500 frames and moves the dialer's NAT
+// mapping. The dialer's next DGRAM reaches the passive a window ahead from
+// a new source: it is dropped and starts a rebind challenge, whose PING
+// reaches the dialer a window ahead too. The dialer answers it
+// (dgJumpClaim), the answer proves the jump to the passive and commits the
+// rebind, and the passive's PONG to the dialer's PING, now sent to the new
+// address, proves the jump to the dialer: DGRAMs flow both ways again,
+// nothing dies.
 func TestDatagramJumpBothWaysWithRebind_L59(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		a, b := dgPair(t, 1200)
@@ -310,11 +316,12 @@ func TestDatagramJumpBothWaysWithRebind_L59(t *testing.T) {
 		if na, nb := len(b.ep.datagrams()), len(a.ep.datagrams()); na != 1 || nb != 1 {
 			t.Fatalf("before the outage: %d and %d DGRAMs delivered, want 1 each", na, nb)
 		}
-		// The outage: 1500 DGRAMs each way are lost, then the dialer moves.
+		// The outage: a window and 500 DGRAMs each way are lost, then the
+		// dialer moves.
 		drop := func([]byte) bool { return false }
 		a.io.setFilter(drop)
 		b.io.setFilter(drop)
-		const lost = 1500
+		const lost = wire.FseqWindowBits + 500
 		wantA.Store(lost)
 		wantB.Store(lost)
 		for wantA.Load() > 0 || wantB.Load() > 0 {
@@ -377,7 +384,7 @@ func TestDatagramJumpChallengeProof_L59(t *testing.T) {
 			close(gate)
 		}()
 		p.io.moveTo(fakeAddr(9))
-		p.fseq += 5000
+		p.fseq += fjOutage
 		p.send(pingFrame(wire.TypePing, wire.Ping{ID: 5, Nonce: 1}))
 		synctest.Wait()
 		s.c.mu.Lock()

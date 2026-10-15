@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -18,15 +19,18 @@ import (
 // lrLinkPair is ltLinkPair with a link buffer of buf bytes per direction.
 func lrLinkPair(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint) (dialer, passive *Conn) {
 	t.Helper()
-	return lrLinkPairWrap(t, envD, envP, rate, delay, buf, sink, nil)
+	return lrLinkPairWrap(t, envD, envP, rate, delay, buf, sink, nil, nil)
 }
 
-// lrLinkPairWrap is lrLinkPair whose dialer conn is wrapped by wrap (nil:
-// none).
-func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint, wrap func(net.Conn) net.Conn) (dialer, passive *Conn) {
+// lrLinkPairWrap is lrLinkPair whose dialer conn is wrapped by wrap and
+// whose passive conn by wrapP, before its handshake (nil: none).
+func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Duration, buf int, sink Endpoint, wrap, wrapP func(net.Conn) net.Conn) (dialer, passive *Conn) {
 	t.Helper()
 	pass := make(chan *Conn, 1)
 	link := rendrtest.NewLink(rendrtest.LinkConfig{Name: "wan", Buffer: buf, Accept: func(nc net.Conn) error {
+		if wrapP != nil {
+			nc = wrapP(nc)
+		}
 		h, err := ReadHello(envP, nc, time.Now().Add(10*time.Second), 4096, nil)
 		if err != nil {
 			pass <- nil
@@ -69,17 +73,91 @@ func lrLinkPairWrap(t *testing.T, envD, envP *Env, rate float64, delay time.Dura
 	return est.Conn, pc
 }
 
+// longRTTCase is one subtest of TestCapLimitedFlowLongRTT_L15_L32.
+type longRTTCase struct {
+	rtt    time.Duration
+	rate   float64 // bytes/s per direction; 0: unlimited (the window limits)
+	window int64
+	total  uint64
+	duplex bool // the passive sends total bytes back at the same time
+	race   bool // runs under -race too
+}
+
+func (tc longRTTCase) name() string {
+	name := fmt.Sprintf("rtt%v/unlimited", tc.rtt)
+	if tc.rate > 0 {
+		name = fmt.Sprintf("rtt%v/%dMiBps", tc.rtt, int(tc.rate)>>20)
+	}
+	if tc.duplex {
+		name += "/duplex"
+	}
+	return name
+}
+
+// longRTTCases are the subtests of TestCapLimitedFlowLongRTT_L15_L32 in the
+// binary's lane: all eleven, or under -race the five marked race (R1-23
+// lever 1; the race-unit target of 270 s per pass, m5's prerc decision;
+// TestRaceLaneSubtests checks the lists), which cover each of the row's
+// rules once, with the same criteria:
+//
+//   - the window limit (no rate limit; the capacity reaches the window
+//     within a dozen round trips): rtt100ms (a multiple of PingBusy: the
+//     young proof every round trip), rtt102ms (2 ms off a multiple: still
+//     within the 5-ms sampling floor) and rtt105ms (5 ms off: the edge);
+//   - a rate-limited link one way (the estimate reaches the link rate
+//     within the sampling slack, the capacity the matching cap):
+//     rtt100ms/16MiBps;
+//   - a rate-limited link both ways at once (the slack of ACK
+//     compression, the passive's estimate too): rtt400ms/8MiBps/duplex, the
+//     longest RTT of the row.
+//
+// The other six repeat these rules at other RTTs; the non-race lanes run
+// them.
+func longRTTCases() []longRTTCase {
+	const ms = time.Millisecond
+	all := []longRTTCase{
+		{50 * ms, 0, 4 << 20, 96 << 20, false, false},
+		{100 * ms, 0, 4 << 20, 64 << 20, false, true},
+		{102 * ms, 0, 4 << 20, 64 << 20, false, true},
+		{105 * ms, 0, 4 << 20, 64 << 20, false, true},
+		{200 * ms, 0, 4 << 20, 48 << 20, false, false},
+		{400 * ms, 0, 4 << 20, 32 << 20, false, false},
+		{100 * ms, 16 << 20, 8 << 20, 48 << 20, false, true},
+		{105 * ms, 16 << 20, 8 << 20, 48 << 20, false, false},
+		{400 * ms, 8 << 20, 8 << 20, 32 << 20, false, false},
+		{100 * ms, 16 << 20, 8 << 20, 48 << 20, true, false},
+		{400 * ms, 8 << 20, 8 << 20, 32 << 20, true, true},
+	}
+	if !carrierRace {
+		return all
+	}
+	var out []longRTTCase
+	for _, tc := range all {
+		if tc.race {
+			out = append(out, tc)
+		}
+	}
+	return out
+}
+
 // lrDuplex is the passive endpoint of a duplex flow: its first Fill places
 // OPEN_ACK(OK) (ltSink), later ones bulk DATA from src; DATA it receives is
-// checked like ltSink's.
+// checked like ltSink's. With gate set, no DATA goes out until the time it
+// holds (Unix ns; 0: not yet).
 type lrDuplex struct {
 	*ltSink
-	src *hSource
+	src  *hSource
+	gate *atomic.Int64
 }
 
 func (d *lrDuplex) Fill(c *Conn, b *Batch) {
 	if !d.placed {
 		if d.ltSink.Fill(c, b); !d.placed {
+			return
+		}
+	}
+	if g := d.gate; g != nil {
+		if at := g.Load(); at == 0 || time.Now().UnixNano() < at {
 			return
 		}
 	}
@@ -103,36 +181,12 @@ func (d *lrDuplex) Fill(c *Conn, b *Batch) {
 // a rate-limited path is judged by TestByteClockFillsLongPath_L15_L32: the
 // capacity cycle design §0.13 A1 records — a cap-blocked writer's proof was
 // its cap-hit PING, queued behind the whole burst — is what byte-clocked
-// PINGs remove; the floor this fixes is far below either.)
+// PINGs remove; the floor this fixes is far below either.) Under -race
+// five of the eleven rows run (longRTTCases).
 func TestCapLimitedFlowLongRTT_L15_L32(t *testing.T) {
-	for _, tc := range []struct {
-		rtt    time.Duration
-		rate   float64 // bytes/s per direction; 0: unlimited (the window limits)
-		window int64
-		total  uint64
-		duplex bool // the passive sends total bytes back at the same time
-	}{
-		{50 * time.Millisecond, 0, 4 << 20, 96 << 20, false},
-		{100 * time.Millisecond, 0, 4 << 20, 64 << 20, false},
-		{102 * time.Millisecond, 0, 4 << 20, 64 << 20, false},
-		{105 * time.Millisecond, 0, 4 << 20, 64 << 20, false},
-		{200 * time.Millisecond, 0, 4 << 20, 48 << 20, false},
-		{400 * time.Millisecond, 0, 4 << 20, 32 << 20, false},
-		{100 * time.Millisecond, 16 << 20, 8 << 20, 48 << 20, false},
-		{105 * time.Millisecond, 16 << 20, 8 << 20, 48 << 20, false},
-		{400 * time.Millisecond, 8 << 20, 8 << 20, 32 << 20, false},
-		{100 * time.Millisecond, 16 << 20, 8 << 20, 48 << 20, true},
-		{400 * time.Millisecond, 8 << 20, 8 << 20, 32 << 20, true},
-	} {
+	for _, tc := range longRTTCases() {
 		rtt, rate, window, total := tc.rtt, tc.rate, tc.window, tc.total
-		name := fmt.Sprintf("rtt%v/unlimited", rtt)
-		if rate > 0 {
-			name = fmt.Sprintf("rtt%v/%dMiBps", rtt, int(rate)>>20)
-		}
-		if tc.duplex {
-			name += "/duplex"
-		}
-		t.Run(name, func(t *testing.T) {
+		t.Run(tc.name(), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				envD, envP := phEnvs()
 				envD.Timing.Window, envP.Timing.Window = window, window

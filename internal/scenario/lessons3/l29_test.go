@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"slices"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -291,7 +292,7 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 	}{
 		{"start-at-probe-ping", 0, false},
 		{"restart-at-probe-ping", 1750 * time.Millisecond, false},
-		{"restart-short-pause", 1970 * time.Millisecond, false},
+		{"restart-short-pause", edgeShortLead, false},
 		{"restart-with-keepalives", 1500 * time.Millisecond, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,29 +303,13 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 			// and varies by about one RTT (20 ms) — about as much as the
 			// short pause's whole window — or, with GOMAXPROCS=1, by about
 			// 190 ms in every run. A run whose pause misses the window is
-			// repeated, at most edgeAttempts times, with the short pause's
-			// first transfer corrected by the smallest overshoot measured so
-			// far (edgeRetryLead); the assertions below apply to the run
-			// whose stimulus holds.
-			var r guardResult
-			over := time.Duration(math.MaxInt64) // the smallest ramp overshoot seen
-			for attempt := 1; ; attempt++ {
-				r = runGuardBulk(t, gb)
-				over = min(over, r.leadDur-gb.lead)
-				if tc.lead > 0 {
-					t.Logf("first transfer of %v took %v; pause between the transfers %v", gb.lead, r.leadDur, r.pause)
-				}
-				miss := edgeStimulus(tc.name, gb, r.pause)
-				if miss == "" {
-					break
-				}
-				if attempt == edgeAttempts {
-					t.Fatalf("stimulus: %s (attempt %d of %d)", miss, attempt, edgeAttempts)
-				}
-				if tc.name == "restart-short-pause" {
-					gb.lead = edgeRetryLead(gb, over)
-				}
-				t.Logf("stimulus missed in attempt %d: %s; the run is repeated with a first transfer of %v", attempt, miss, gb.lead)
+			// repeated (edgeRuns), at most edgeAttempts times, with the short
+			// pause's first transfer corrected by the smallest of the latest
+			// overshoots (edgeRetryLead); the assertions below apply to the
+			// run whose stimulus holds.
+			r, _, miss := edgeRuns(tc.name, gb, func(gb guardBulk) guardResult { return runGuardBulk(t, gb) }, t.Logf)
+			if miss != "" {
+				t.Fatalf("stimulus: %s", miss)
 			}
 			checkGuarded(t, gb, r)
 			if !r.onsetLoaded {
@@ -334,14 +319,69 @@ func TestDownloadGuardEdges_L29(t *testing.T) {
 	}
 }
 
+// edgeShortLead is restart-short-pause's first transfer in its first run:
+// with the ramp's most frequent overshoot (about 12 ms) it ends about 18 ms
+// before the next probe PING.
+const edgeShortLead = 1970 * time.Millisecond
+
+// edgeRuns runs case name of TestDownloadGuardEdges_L29 (run executes one
+// run of gb) until the run's stimulus holds (edgeStimulus), at most
+// edgeAttempts times; between two runs of restart-short-pause the first
+// transfer is set by edgeRetryLead from the ramp overshoots measured so far
+// (each run's first transfer took its length plus its overshoot). It
+// returns the last run, the number of runs and "" when that run's stimulus
+// held, else why it missed. TestEdgeRetryConvergesOnRecordedOvershoots_L29
+// drives the same loop with recorded overshoots.
+func edgeRuns(name string, gb guardBulk, run func(guardBulk) guardResult, logf func(string, ...any)) (r guardResult, runs int, miss string) {
+	return edgeRunsWith(name, gb, edgeAttempts, edgeRetryLead, run, logf)
+}
+
+// edgeRunsWith is edgeRuns with the retry policy as parameters: at most
+// attempts runs, each later first transfer of restart-short-pause set by
+// lead (TestEdgeRetryResidualMissRate_L29 also prices e3ab461's policy).
+func edgeRunsWith(name string, gb guardBulk, attempts int, lead func(guardBulk, []time.Duration) time.Duration,
+	run func(guardBulk) guardResult, logf func(string, ...any)) (r guardResult, runs int, miss string) {
+	var overs []time.Duration
+	for runs = 1; ; runs++ {
+		r = run(gb)
+		overs = append(overs, r.leadDur-gb.lead)
+		if gb.lead > 0 {
+			logf("first transfer of %v took %v; pause between the transfers %v", gb.lead, r.leadDur, r.pause)
+		}
+		if miss = edgeStimulus(name, gb, r.pause); miss == "" {
+			return r, runs, ""
+		}
+		if runs == attempts {
+			return r, runs, fmt.Sprintf("%s (attempt %d of %d)", miss, runs, attempts)
+		}
+		if name == "restart-short-pause" {
+			gb.lead = lead(gb, overs)
+		}
+		logf("stimulus missed in attempt %d: %s; the run is repeated with a first transfer of %v", runs, miss, gb.lead)
+	}
+}
+
 // edgeAttempts bounds the runs of one TestDownloadGuardEdges_L29 case whose
-// stimulus misses its window (a miss happened in about 1 of 10 runs of
-// restart-short-pause; with GOMAXPROCS=1 its first run always misses, and
-// the corrected second one hits). Under -race on Linux the overshoot takes
-// one of about three values per run (13, 33 or 171 ms), independent of the
-// first transfer's length; a length set for the smallest hits with the
-// first two and misses with the third, so up to six runs are allowed.
-const edgeAttempts = 6
+// stimulus misses its window (with GOMAXPROCS=1 restart-short-pause's first
+// run always misses, and the corrected second one hits). The overshoot
+// takes one of about three values per run, independent of the first
+// transfer's length: 13, 33 or 171 ms under -race on Linux, whose window
+// (1 MiB/s: [12, 62.5) ms) holds the first two with one length; 12, 32 or
+// 191 ms without it, whose window (2 MiB/s: [12, 31.25) ms) holds only one
+// of them, so a run hits only when its overshoot is the one its length was
+// set for: on a loaded Linux worker 10 to 14 of 20 cases missed at least
+// once. TestEdgeRetryResidualMissRate_L29 prices the policies with the
+// recorded runs as independent draws (about 64 % at 12 ms, 30 % at
+// 32 ms): e3ab461's six runs corrected by the smallest overshoot ever seen
+// left about 0.49 % of the cases without a hit (0.008 % at ten), but the
+// unit-lane FAIL was a regime that model does not hold — the ramp took
+// 32 ms three times in a row after one 12-ms run, which that rule never
+// forgets (TestEdgeRetryConvergesOnRecordedOvershoots_L29). The latest
+// three, which rides that regime out, costs about 3.5 times as many misses
+// at equal attempts under the independence model (0.85 % at six), so ten
+// runs are allowed: about 0.03 %, against e3ab461's 0.49 %. A run costs
+// about 0.4 s (2 s under -race).
+const edgeAttempts = 10
 
 // guardProbeInterval is the Probe.Interval of the guard scenarios (the
 // default): a's probe PINGs commit that far apart.
@@ -355,19 +395,115 @@ func edgeShortPause(gb guardBulk) (lo, hi time.Duration) {
 }
 
 // edgeRetryLead returns restart-short-pause's first transfer for the run
-// after one that missed the window, given over, the smallest overshoot of
-// a first transfer's duration over its nominal length measured so far. The
-// transfer starts at one of a's probe PINGs and the bulk at the next one,
-// so it should end the middle of the window before that PING:
-// guardProbeInterval − (lo+hi)/2 after its start. The ramp's extra time
-// mostly repeats from run to run (the bubble is deterministic for a given
-// GOMAXPROCS) but under -race takes one of a few values; correcting by the
-// latest one alternated between a length too long for the small values and
-// one too short for the large one (L29 on the Linux race lane), so the
-// length is corrected by the smallest.
-func edgeRetryLead(gb guardBulk, over time.Duration) time.Duration {
+// after one that missed the window, given overs, the overshoots of the
+// first transfer's duration over its nominal length in the runs so far
+// (oldest first). The transfer starts at one of a's probe PINGs and the
+// bulk at the next one, so it should end the middle of the window before
+// that PING: guardProbeInterval − (lo+hi)/2 after its start, less the
+// overshoot expected next: the smallest of the latest edgeOverMemory.
+//
+// The ramp's extra time mostly repeats from run to run (the bubble is
+// deterministic for a given GOMAXPROCS) but takes one of a few values.
+// Correcting by the latest one alternated between a length too long for
+// the small values and one too short for the large one (L29 on the Linux
+// race lane: 171, 13, 171, 13 ms). Correcting by the smallest one ever seen
+// kept every later length set for a value seen once while the ramp
+// settled on another (the unit lane: 191, 12, 191, 32, 32, 32 ms); the
+// smallest of the latest three forgets it after three runs and still
+// rides out an alternation (TestEdgeRetryConvergesOnRecordedOvershoots_L29;
+// three is the longest memory that converges on the unit-lane sequence,
+// the latest four fail it, and two fail another recorded sequence). The
+// price of forgetting: with independent overshoots it misses about 3.5
+// times as often as the smallest ever seen at equal attempts, which
+// edgeAttempts pays for (TestEdgeRetryResidualMissRate_L29).
+func edgeRetryLead(gb guardBulk, overs []time.Duration) time.Duration {
 	lo, hi := edgeShortPause(gb)
-	return guardProbeInterval - (lo+hi)/2 - over
+	return guardProbeInterval - (lo+hi)/2 - slices.Min(overs[max(0, len(overs)-edgeOverMemory):])
+}
+
+// edgeOverMemory is how many of the latest runs' overshoots edgeRetryLead
+// takes the smallest of.
+const edgeOverMemory = 3
+
+// edgeModelPause is the pause that a first transfer of lead whose ramp
+// overshoots by over leaves before the bulk: the transfer starts at one of
+// a's probe PINGs, which commit guardProbeInterval apart, and the bulk
+// starts at the first PING after the transfer's last byte (runGuardBulk).
+func edgeModelPause(lead, over time.Duration) time.Duration {
+	end := lead + over
+	return (end/guardProbeInterval+1)*guardProbeInterval - end
+}
+
+// TestEdgeRetryConvergesOnRecordedOvershoots_L29: restart-short-pause's
+// retry (edgeRuns, edgeRetryLead) replayed on the ramp overshoots that runs
+// of TestDownloadGuardEdges_L29 recorded on Linux workers, in their order,
+// each run's pause given by edgeModelPause. The overshoot does not follow
+// the first transfer's length (one length showed each of the values and
+// different lengths the same ones), so a recorded sequence stands for the
+// runs whatever lengths the retry picks. Each sequence must reach a run
+// inside the window of its lane (2 MiB/s without -race, 1 MiB/s with it)
+// within edgeAttempts runs and within the runs it recorded.
+//
+//   - unit-cpu0: the unit-lane failure at e3ab461 (6 of 6 runs missed): the
+//     smallest overshoot so far (12 ms, seen once) set every later length
+//     while the ramp kept taking 32 ms. This subtest FAILS with that rule.
+//   - repro-*: the other sequences of that binary's reruns at -count 20 on
+//     two workers (each hit within its runs at e3ab461).
+//   - race-alternating: the M2 race-lane failure that the smallest
+//     overshoot fixed (the latest one, then the rule, alternated between
+//     171 and 13 ms); race-*: the other sequences of that race lane.
+//
+// The model subtest checks edgeModelPause against recorded runs.
+func TestEdgeRetryConvergesOnRecordedOvershoots_L29(t *testing.T) {
+	t.Run("model", func(t *testing.T) {
+		for _, m := range []struct{ lead, took, pause time.Duration }{
+			{edgeShortLead, 2161087902, 1838912098},
+			{1787287098, 1799283661, 200716339},
+			{1966378437, 1998528649, 1471351},
+			{edgeShortLead, 2002162148, 1997837852},
+			{1946212852, 1958463336, 41536664},
+		} {
+			if got := edgeModelPause(m.lead, m.took-m.lead); got != m.pause {
+				t.Errorf("first transfer of %v took %v: model pause %v, recorded %v", m.lead, m.took, got, m.pause)
+			}
+		}
+	})
+	for _, c := range []struct {
+		name  string
+		rate  float64 // the lane's guardRate
+		overs []time.Duration
+	}{
+		{"unit-cpu0", 2 * mib, []time.Duration{191087902, 11996563, 191075966, 32150212, 32150212, 32150212}},
+		{"repro-191-12-32", 2 * mib, []time.Duration{191087902, 11996563, 32150212, 32150212, 12250342}},
+		{"repro-32-12-32", 2 * mib, []time.Duration{32162148, 12250484, 32149979, 12250109}},
+		{"repro-191-32-12", 2 * mib, []time.Duration{191087902, 31967000, 12250362, 12250464}},
+		{"repro-32-12", 2 * mib, []time.Duration{32162148, 12250484, 12250109}},
+		{"repro-32-32", 2 * mib, []time.Duration{32162148, 32150354}},
+		{"repro-12", 2 * mib, []time.Duration{12262278}},
+		{"race-alternating", mib, []time.Duration{171388798, 13161004, 171389266, 13160519}},
+		{"race-33-171-33", mib, []time.Duration{33137779, 171365582, 32960411, 13208989}},
+		{"race-171-33", mib, []time.Duration{171388798, 32960738, 33008097}},
+		{"race-171-171", mib, []time.Duration{171388799, 171317614}},
+		{"race-33-13", mib, []time.Duration{33137779, 13208974}},
+		{"race-13", mib, []time.Duration{13338045}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			gb := guardBulk{download: true, rate: c.rate, dur: 30 * time.Second, atProbePing: true, lead: edgeShortLead}
+			i := 0
+			_, runs, miss := edgeRuns("restart-short-pause", gb, func(gb guardBulk) guardResult {
+				if i == len(c.overs) {
+					t.Fatalf("the retry needs a run beyond the %d recorded (overshoots %v)", len(c.overs), c.overs)
+				}
+				over := c.overs[i]
+				i++
+				return guardResult{leadDur: gb.lead + over, pause: edgeModelPause(gb.lead, over)}
+			}, t.Logf)
+			if miss != "" {
+				t.Fatalf("the retry did not converge on the recorded overshoots %v: %s", c.overs, miss)
+			}
+			t.Logf("stimulus held in run %d of %d recorded", runs, len(c.overs))
+		})
+	}
 }
 
 // edgeStimulus reports why a run of case name with pause between the
@@ -387,6 +523,100 @@ func edgeStimulus(name string, gb guardBulk, pause time.Duration) string {
 		return fmt.Sprintf("pause %v, want at least %v and less than %v", pause, lo, hi)
 	}
 	return ""
+}
+
+// TestEdgeRetryResidualMissRate_L29: the chance that restart-short-pause
+// runs out of attempts without its stimulus, computed exactly
+// (edgeMissRate): every sequence of edgeAttempts overshoots drawn
+// independently from what the recorded runs of the lane without -race
+// showed (12, 32 and 191 ms in 45, 21 and 4 of the 70 runs of the e3ab461
+// unit-lane binary on two Linux workers: its failing case and two reruns
+// at -count 20, whose sequences TestEdgeRetryConvergesOnRecordedOvershoots_L29
+// replays) is replayed through edgeRunsWith with edgeRetryLead, and the
+// probabilities of the sequences that end without a hit add up to at most
+// 0.1 % (about 0.03 %).
+//
+// The row also logs the price of the policy beside the bound, under the
+// same model: the latest-three rule at six attempts (about 0.85 %) and
+// e3ab461's rule, the smallest overshoot ever seen (edgeRetryLeadSmallest),
+// at six (about 0.49 %, the state before the fix) and at edgeAttempts
+// (about 0.008 %). Run by run the latest three misses about 3.5 times as
+// often as the smallest ever, because it forgets a 12-ms run after three
+// runs; it is the rule because the independence model does not hold the
+// regime the unit-lane FAIL showed (TestEdgeRetryConvergesOnRecordedOvershoots_L29's
+// unit-cpu0, which the smallest ever never leaves), and edgeAttempts = 10
+// pays for it.
+func TestEdgeRetryResidualMissRate_L29(t *testing.T) {
+	missed, decided := edgeMissRate(edgeAttempts, edgeRetryLead)
+	t.Logf("%d decided prefixes of at most %d runs: the stimulus missed in every run of %.4f %% of the cases", decided, edgeAttempts, 100*missed)
+	for _, c := range []struct {
+		name     string
+		attempts int
+		lead     func(guardBulk, []time.Duration) time.Duration
+	}{
+		{"the smallest of the latest three", 6, edgeRetryLead},
+		{"e3ab461's smallest ever seen", 6, edgeRetryLeadSmallest},
+		{"e3ab461's smallest ever seen", edgeAttempts, edgeRetryLeadSmallest},
+	} {
+		m, _ := edgeMissRate(c.attempts, c.lead)
+		t.Logf("for comparison, %s at %d attempts: %.4f %%", c.name, c.attempts, 100*m)
+	}
+	if missed > 0.001 {
+		t.Fatalf("restart-short-pause runs out of its %d attempts in %.3f %% of the cases, want at most 0.1 %%", edgeAttempts, 100*missed)
+	}
+}
+
+// edgeRetryLeadSmallest is e3ab461's edgeRetryLead: the first transfer
+// corrected by the smallest overshoot ever seen (TestEdgeRetryResidualMissRate_L29's
+// comparison only).
+func edgeRetryLeadSmallest(gb guardBulk, overs []time.Duration) time.Duration {
+	lo, hi := edgeShortPause(gb)
+	return guardProbeInterval - (lo+hi)/2 - slices.Min(overs)
+}
+
+// edgeMissRate returns the probability that restart-short-pause, retried
+// by edgeRunsWith with attempts and lead, ends without its stimulus when
+// each run's overshoot is drawn independently from the recorded
+// distribution of the lane without -race (TestEdgeRetryResidualMissRate_L29),
+// and the number of decided prefixes it walked.
+func edgeMissRate(attempts int, lead func(guardBulk, []time.Duration) time.Duration) (missed float64, decided int) {
+	overs := []time.Duration{12250000, 32150000, 191080000}
+	weights := []float64{45, 21, 4}
+	var total float64
+	for _, w := range weights {
+		total += w
+	}
+	gb := guardBulk{download: true, rate: 2 * mib, dur: 30 * time.Second, atProbePing: true, lead: edgeShortLead}
+	// walk replays the runs of prefix (indices into overs) of probability p
+	// through edgeRunsWith. A prefix that hit, or that used all attempts
+	// runs, decides every sequence that starts with it; one that needs
+	// another run is extended by each overshoot.
+	var walk func(prefix []int, p float64)
+	walk = func(prefix []int, p float64) {
+		i, more := 0, false
+		_, _, miss := edgeRunsWith("restart-short-pause", gb, attempts, lead, func(gb guardBulk) guardResult {
+			if i == len(prefix) {
+				more = true
+				return guardResult{leadDur: gb.lead} // beyond the prefix: no pause, a miss
+			}
+			over := overs[prefix[i]]
+			i++
+			return guardResult{leadDur: gb.lead + over, pause: edgeModelPause(gb.lead, over)}
+		}, func(string, ...any) {})
+		switch {
+		case more:
+			for k := range overs {
+				walk(append(prefix[:len(prefix):len(prefix)], k), p*weights[k]/total)
+			}
+		case miss != "":
+			missed += p
+			decided++
+		default:
+			decided++
+		}
+	}
+	walk(nil, 1)
+	return missed, decided
 }
 
 // TestBulkUploadNoQualitySwitch_L29: the mirrored case (§8.3 "upload bulk
