@@ -236,8 +236,7 @@ func schedTrigger(t testing.TB, w *world, x *pair, arm func(tm *rendrtest.Tamper
 // session replays from the ACK edge and the stream arrives intact. Under
 // -race each frame runs one dedicated and one MUX setup (droppedFrameRows).
 func TestAdvDroppedFrame_L43(t *testing.T) {
-	rows := droppedFrameRows()
-	for i, c := range []struct {
+	frames := []struct {
 		name string
 		dir  rendrtest.Dir
 		typ  rendrtest.FrameType
@@ -245,9 +244,15 @@ func TestAdvDroppedFrame_L43(t *testing.T) {
 		{"DATA", rendrtest.Up, rendrtest.FrameData},
 		{"ACK", rendrtest.Down, rendrtest.FrameAck},
 		{"SCHED", rendrtest.Up, rendrtest.FrameSched},
-	} {
+	}
+	rows := droppedFrameRows()
+	if len(rows) != len(frames) {
+		t.Fatalf("droppedFrameRows has %d rows for %d frames", len(rows), len(frames))
+	}
+	for _, c := range frames {
+		ss := rowSetups(t, rows, c.name)
 		t.Run(c.name, func(t *testing.T) {
-			eachSetupOf(t, rows[i].setups, func(t *testing.T, s setup) {
+			eachSetupOf(t, ss, func(t *testing.T, s setup) {
 				runStream(t, s, streamAttack{dir: c.dir, typ: c.typ, sch: c.typ == rendrtest.FrameSched,
 					arm:  func(tm *rendrtest.Tamper, _ *pair) { tm.DropFrame(c.dir, rendrtest.NextOfType(c.typ)) },
 					ops:  stat(func(st rendrtest.TamperStats) int { return st.Dropped }),
@@ -263,17 +268,22 @@ func TestAdvDroppedFrame_L43(t *testing.T) {
 // (the verifier reads every byte once, in order). Under -race each frame
 // runs one dedicated and one MUX setup (duplicatedFrameRows).
 func TestAdvDuplicatedFrame_L43(t *testing.T) {
-	rows := duplicatedFrameRows()
-	for i, c := range []struct {
+	frames := []struct {
 		name string
 		dir  rendrtest.Dir
 		typ  rendrtest.FrameType
 	}{
 		{"DATA", rendrtest.Up, rendrtest.FrameData},
 		{"ACK", rendrtest.Down, rendrtest.FrameAck},
-	} {
+	}
+	rows := duplicatedFrameRows()
+	if len(rows) != len(frames) {
+		t.Fatalf("duplicatedFrameRows has %d rows for %d frames", len(rows), len(frames))
+	}
+	for _, c := range frames {
+		ss := rowSetups(t, rows, c.name)
 		t.Run(c.name, func(t *testing.T) {
-			eachSetupOf(t, rows[i].setups, func(t *testing.T, s setup) {
+			eachSetupOf(t, ss, func(t *testing.T, s setup) {
 				runStream(t, s, streamAttack{dir: c.dir, typ: c.typ,
 					arm:  func(tm *rendrtest.Tamper, _ *pair) { tm.DuplicateFrame(c.dir, rendrtest.NextOfType(c.typ)) },
 					ops:  stat(func(st rendrtest.TamperStats) int { return st.Duplicated }),

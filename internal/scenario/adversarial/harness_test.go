@@ -155,6 +155,21 @@ type setupRow struct {
 	setups []setup
 }
 
+// rowSetups returns the setups of the row of rows named name: a row's
+// subtest finds its setups by name, never by position, so that reordering
+// either table cannot run another subtest's race subset. It fails t when
+// rows has no such row.
+func rowSetups(t *testing.T, rows []setupRow, name string) []setup {
+	t.Helper()
+	for _, r := range rows {
+		if r.name == name {
+			return r.setups
+		}
+	}
+	t.Fatalf("no row %q among %d", name, len(rows))
+	return nil
+}
+
 // eachSetup runs body once per setup, each in a bubble of its own.
 func eachSetup(t *testing.T, body func(t *testing.T, s setup)) {
 	t.Helper()

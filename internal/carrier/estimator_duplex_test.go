@@ -377,9 +377,12 @@ func (tc duplexBothWaysCase) name() string {
 //
 // The 100-ms row (16 MiB/s, a 64-MiB buffer; 0.17 of the link before the
 // fix, 5.6 s of a Linux race pass) is the first rule's on a longer path; it
-// runs in the non-race lanes, as the other 60-s rows do, and under -race
-// TestByteClockDuplexRateBounded_L32 still drives that path with bulk both
-// ways.
+// runs in the non-race lanes, as the other 60-s rows do. Under -race the
+// share rule is judged on the 20-ms rows only: TestByteClockDuplexRateBounded_L32
+// keeps bulk both ways on the 100-ms path under the race detector, but it
+// judges the rate peak, the PING count and the ring, not the shares. (This
+// reverses M3 I3's race set, R2-40, which had kept the row among the 6-s
+// race rows.)
 func duplexBothWaysCases() []duplexBothWaysCase {
 	const ms = time.Millisecond
 	all := []duplexBothWaysCase{
@@ -438,6 +441,11 @@ func duplexBothWaysCases() []duplexBothWaysCase {
 // Under -race (R1-23 lever 1, I3: the rows took 90 s of the Linux race
 // lane's carrier package) the 0.5 % drift and the 1-s step run, both at
 // 2 MiB/s and with the same criteria; the non-race lanes run all five.
+// m5's prerc subsets left the pair whole (30 s of a Linux race pass): they
+// are the rule's failing-first rows in its two shapes, a creeping error
+// (0.71 without the rule) and a step within DeadMax (about 0.4, the flow
+// stalled), so either alone leaves one shape unjudged under the race
+// detector.
 //
 // PASS: over the last 50 s each direction carries ≥ 0.85 of the link and
 // neither side's srtt exceeds latencyBound times the row's slack (1, or

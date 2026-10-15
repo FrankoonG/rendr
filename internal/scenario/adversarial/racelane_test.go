@@ -23,7 +23,9 @@ import (
 // an inverted race switch (race_on_test.go and race_off_test.go) or an
 // inverted selection fails it in both lanes. It checks the selections, not
 // the subtests the rows start: a row whose loop stopped ranging over its
-// selection would pass here, so that link is kept by review.
+// selection would pass here, so that link is kept by review (the frame and
+// cut rows look their subtests' setups up by name, rowSetups, which fails
+// the row on a name it does not list).
 func TestRaceLaneSubtests(t *testing.T) {
 	race := raceBuild(t)
 	if raceEnabled != race {
@@ -50,18 +52,33 @@ func TestRaceLaneSubtests(t *testing.T) {
 	check("TestAdvDatagramFlipsAreLoss_L43", names(flipsAreLossSetups()), []string{"selector", "bond", "race", "mux-selector"})
 	check("TestAdvWriterBufferMutation_L43", names(writerMutationSetups()), []string{"selector", "bond", "race", "mux-race"})
 	check("TestAdvDatagramReplay_L43_L39", names(datagramReplaySetups()), []string{"selector", "bond", "race", "mux-bond"})
+	// The rows' subtests find their setups by name (rowSetups), so the
+	// lists are checked by name too: each subtest's own, and rowSetups's
+	// answer for it.
 	for _, f := range []struct {
 		row     string
 		rows    []setupRow
-		raceSet [][]string
+		raceSet map[string][]string
 	}{
-		{"TestAdvDroppedFrame_L43", droppedFrameRows(), [][]string{{"selector", "mux-bond"}, {"bond", "mux-race"}, {"race", "mux-selector"}}},
-		{"TestAdvDuplicatedFrame_L43", duplicatedFrameRows(), [][]string{{"selector", "mux-bond"}, {"race", "mux-selector"}}},
-		{"TestAdvSpliceTwoSessions_L41_L43", spliceRows(), [][]string{{"selector", "mux-bond"}, {"race", "mux-selector"}}},
+		{"TestAdvDroppedFrame_L43", droppedFrameRows(),
+			map[string][]string{"DATA": {"selector", "mux-bond"}, "ACK": {"bond", "mux-race"}, "SCHED": {"race", "mux-selector"}}},
+		{"TestAdvDuplicatedFrame_L43", duplicatedFrameRows(),
+			map[string][]string{"DATA": {"selector", "mux-bond"}, "ACK": {"race", "mux-selector"}}},
+		{"TestAdvSpliceTwoSessions_L41_L43", spliceRows(),
+			map[string][]string{"boundary": {"selector", "mux-bond"}, "midframe": {"race", "mux-selector"}}},
 	} {
 		modes := map[rendr.Mode]bool{}
-		for i, r := range f.rows {
-			check(f.row+"/"+r.name, names(r.setups), f.raceSet[i])
+		if len(f.rows) != len(f.raceSet) {
+			t.Errorf("%s has %d subtests, want %d", f.row, len(f.rows), len(f.raceSet))
+		}
+		for _, r := range f.rows {
+			raceSet, ok := f.raceSet[r.name]
+			if !ok {
+				t.Errorf("%s has an unknown subtest %q", f.row, r.name)
+				continue
+			}
+			check(f.row+"/"+r.name, names(r.setups), raceSet)
+			check(f.row+"/"+r.name+" (rowSetups)", names(rowSetups(t, f.rows, r.name)), raceSet)
 			var mux int
 			for _, s := range r.setups {
 				modes[s.mode] = true

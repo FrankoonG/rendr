@@ -512,7 +512,8 @@ func (s *churn) runRST(addr string) error {
 // churnRSTInFlight after pe (the RST still on its way); and the dialer's
 // session lost a carrier of that Link to the kill (transport_error, at or
 // after k — or peer_down dated by the passive's own record of that
-// carrier's death, peerDownAfterKill).
+// carrier's death, or by k when the passive recorded none,
+// peerDownAfterKill).
 func (s *churn) rstLostByKill(in *ingress, serr error) error {
 	if !strings.Contains(serr.Error(), "UNKNOWN_SESSION") {
 		return fmt.Errorf("the loss %q is not a JOIN's UNKNOWN_SESSION answer", serr)
@@ -534,7 +535,7 @@ func (s *churn) rstLostByKill(in *ingress, serr error) error {
 			continue
 		}
 		for _, ev := range s.w.dev.of(rendr.EventCarrierDown) {
-			if ev.Session != id || ev.Time.Before(k.at) || ev.Cause != rendr.CauseTransportError && !peerDownAfterKill(ev, s.w.pev.downOf(ev.Carrier)) {
+			if ev.Session != id || ev.Time.Before(k.at) || ev.Cause != rendr.CauseTransportError && !peerDownAfterKill(ev, s.w.pev.downOf(ev.Carrier), k.at) {
 				continue
 			}
 			if cs, ok := carrierOf(st, ev.Carrier); ok && cs.Name == k.name {
@@ -548,27 +549,39 @@ func (s *churn) rstLostByKill(in *ingress, serr error) error {
 }
 
 // peerDownAfterKill reports whether the dialer's CarrierDown ev is the
-// passive's report of a kill (PA-86): Link.Kill closes both ends of the
-// Link's trunks, and the passive's DOWN on a trunk of the other Link can
-// reach the dialer before its own detection, which then records peer_down.
-// Such a record is dated against the other end's primary cause, not the
-// kill: passive holds the passive's EventCarrierDown records of the same
-// carrier (a CarrierID is the same on both ends; there is one per passive
-// session that held a lane on the trunk — the reset connection's own
-// passive session ended before the kill, the trunk's other sessions record
-// its death), and one of them must be the kill's transport_error, no later
-// than ev. Without such a record the passive's DOWN is unproven and ev is
-// not taken for it.
-func peerDownAfterKill(ev rendr.Event, passive []rendr.Event) bool {
+// passive's report of a kill at kill (PA-86): Link.Kill closes both ends
+// of the Link's trunks, and the passive's DOWN on a trunk of the other
+// Link can reach the dialer before its own detection, which then records
+// peer_down. Such a record is dated against the other end's primary cause,
+// not the kill, whenever the passive recorded one: passive holds the
+// passive's EventCarrierDown records of the same carrier (a CarrierID is
+// the same on both ends; there is one per passive session that held a
+// lane on the trunk), and then one of them must be the kill's
+// transport_error, no later than ev. DOWN is trunk-level, though: the
+// passive queues it whenever an established trunk dies, whatever views it
+// has, and when the reset connection's passive session (which ended before
+// the kill) was the trunk's last view the passive records nothing; then ev
+// is dated against the kill itself, the instant the Link closed the
+// passive's end too.
+//
+// The judge is diagnostic while churnRSTLostMax is 0: a loss it accepts is
+// counted against that cap and fails the row as one it rejects does; it
+// only picks the failure message.
+func peerDownAfterKill(ev rendr.Event, passive []rendr.Event, kill time.Time) bool {
 	if ev.Cause != rendr.CausePeerDown {
 		return false
 	}
+	recorded := false
 	for _, p := range passive {
-		if p.Carrier == ev.Carrier && p.Cause == rendr.CauseTransportError && !ev.Time.Before(p.Time) {
+		if p.Carrier != ev.Carrier {
+			continue
+		}
+		recorded = true
+		if p.Cause == rendr.CauseTransportError && !ev.Time.Before(p.Time) {
 			return true
 		}
 	}
-	return false
+	return !recorded && !ev.Time.Before(kill)
 }
 
 // runStall (R1-3): the client writes 1 KiB, half-closes, and Closes 1 s

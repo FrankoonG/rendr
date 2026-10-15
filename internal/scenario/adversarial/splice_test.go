@@ -115,8 +115,11 @@ func downOf(t testing.TB, l *eventLog, sid rendr.SessionID, id rendr.CarrierID) 
 // carries on with its other member, and both streams arrive intact. Under
 // -race each cut runs one dedicated and one MUX setup (spliceRows).
 func TestAdvSpliceTwoSessions_L41_L43(t *testing.T) {
-	for i, row := range spliceRows() {
-		mid := i == 1
+	for _, row := range spliceRows() {
+		mid := row.name == "midframe"
+		if !mid && row.name != "boundary" {
+			t.Fatalf("spliceRows: no cut %q", row.name)
+		}
 		t.Run(row.name, func(t *testing.T) {
 			eachSetupOf(t, row.setups, func(t *testing.T, s setup) { spliceRow(t, s, mid, s.sessions, s.sessions) })
 		})
