@@ -688,12 +688,12 @@ unless its sentence counts the runs.
 `GOMAXPROCS(8)`; exactly one carrier, a loopback TCP connection; the sender
 writes a deterministic ChaCha8 stream in 64-KiB calls (1 GiB per transfer),
 the receiver reads with a 64-KiB buffer and checks a CRC-32C of the stream;
-the timer covers the transfer only; one 64-MiB warm-up and 5 measured
-transfers per run. Implementations run alternately in pairs, and the result
-is the median of the per-pair ratios; the A/A noise band is the spread of
-rendr-against-rendr pairs.
+the timer covers the transfer only; one 64-MiB warm-up, then 5 measured
+transfers per run (3 in each run of a paired comparison). Implementations
+run alternately in pairs, and the result is the median of the per-pair
+ratios; the A/A noise band is the spread of rendr-against-rendr pairs.
 
-On BENCH-E2E-1 (2026-10-16), rendr 2.0.0 reaches 3.14 × the throughput of
+On BENCH-E2E-1 (2026-10-15), rendr 2.0.0 reaches 3.14 × the throughput of
 rendr v0.3.0 (median of per-pair ratios over 5 alternating pairs of
 3-transfer runs, A/A noise band 8.4 %) and 1.42 × that of a raw TCP
 connection over the same loopback path (the ratio of the medians of one
@@ -713,7 +713,7 @@ through its listening socket to the dialer.
 
 The packet-rate ceiling is 100,000 datagrams a second from A to B and
 100,000 from B to A with the default `MaxBatch` (80,000 and 100,000 with
-`MaxBatch` 1; raw UDP on the same path: 250,000 and 250,000; 2026-10-16).
+`MaxBatch` 1; raw UDP on the same path: 250,000 and 250,000; 2026-10-15).
 At these default-`MaxBatch` ceilings each process used 18.8 µs (A) and
 12.0 µs (B) of CPU time per datagram it sent or received from A to B, and
 11.9 µs and 18.7 µs from B to A, the test application's own work
@@ -730,7 +730,7 @@ of [Datagram I/O](#datagram-io-and-batching).
 
 At 100,000 datagrams a second, selector, bond and race sessions delivered
 100 %, 99.9998 % and 100 % of the datagrams sent, with the longest switch
-gap 22.2 ms and 0 losses outside the event windows (2026-10-16).
+gap 22.2 ms and 0 losses outside the event windows (2026-10-15).
 
 **Bond aggregation (G8).** A bond session moves 2 GiB from B to A over
 three independent links between two virtual machines (50, 100 and
@@ -741,7 +741,7 @@ the links' calibrated raw rates.
 A three-path bond reached 99.8 % of the summed link rates (criterion:
 at least 85 %), with the longest zero-delivery gap 100 ms (counted in
 100-ms intervals); the 2 GiB received matched the sender's SHA-256 in
-2 of 2 runs (2026-10-16).
+2 of 2 runs (2026-10-15).
 
 **Failover with an expensive carrier dial (G4-dialcost).** Two paths of
 100 Mbit/s and 150 ms round trip, each carrier a TLS-over-TCP dial that
@@ -750,7 +750,7 @@ packet of the active path is silently dropped.
 
 Recovery took 3.88 s from the drop to the first new byte (detection
 2.98 s, dial 0.45 s, JOIN and first byte 0.45 s; criterion: at most 5 s;
-2026-10-16).
+2026-10-15).
 
 ## Testing
 
@@ -799,10 +799,11 @@ checks) or FLAKY, nothing else. The gold criteria every release passes:
 Each gold criterion runs in variants (selector, bond, race, rendr mux,
 packet sessions, `l4`, QUIC), together with the lesson cases.
 
-At the 2.0.0 release candidate, 74 gate rows passed, with 0 FAIL,
-16 INVALID and 0 FLAKY attempts, not counting two attempts that failed
-through defects of the test harness itself and were waived once it was
-fixed (2026-10-16).
+At the 2.0.0 release candidate, all 74 gate rows passed; their attempts
+gave 0 FAIL, 16 INVALID and 0 FLAKY results, not counting two failed
+attempts that were waived with their fixes, one caused by a defect of the
+test harness and one by a race in Go's fuzzing engine that the harness
+misjudged (2026-10-15).
 
 ## Known limitations and what is not in 2.0.0
 
