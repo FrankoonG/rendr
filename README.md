@@ -693,11 +693,11 @@ transfers per run. Implementations run alternately in pairs, and the result
 is the median of the per-pair ratios; the A/A noise band is the spread of
 rendr-against-rendr pairs.
 
-<!-- FIGURE: BENCH-E2E-1 median of per-pair ratios, rendr 2.0.0 / rendr v0.3.0 and rendr 2.0.0 / raw TCP, with the A/A noise band, the pair count and the date; method: BENCH-E2E-1 as described, at least 5 alternating pairs per comparison on an idle Linux VM; aggregation: of the gate's 2 G7 runs (step 3), the one with the lower rendr 2.0.0 / v0.3.0 median, every token from that run; source case: G7 (BENCH-E2E-1) at the M5 gate -->
-On BENCH-E2E-1, rendr 2.0.0 reaches {ratio-v030} × the throughput of rendr
-v0.3.0 and {ratio-raw} × that of a raw TCP connection over the same
-loopback path (median of per-pair ratios over {pairs} alternating pairs,
-A/A noise band {noise} %, {date}).
+On BENCH-E2E-1 (2026-10-16), rendr 2.0.0 reaches 3.14 × the throughput of
+rendr v0.3.0 (median of per-pair ratios over 5 alternating pairs of
+3-transfer runs, A/A noise band 8.4 %) and 1.42 × that of a raw TCP
+connection over the same loopback path (the ratio of the medians of one
+5-transfer run of each, back to back).
 
 **Packet rate.** A packet session over `carrier/udp` with one carrier,
 1,000-byte datagrams, one direction at a time, on a single path through a
@@ -711,14 +711,13 @@ stops after two failed steps. "A → B" is the dialer sending on its own
 socket to the passive's listening socket; "B → A" the passive sending
 through its listening socket to the dialer.
 
-<!-- FIGURE: packet-rate ceiling per direction (A → B, B → A) with MaxBatch default (32) and MaxBatch 1, plus the raw-UDP reference ceiling, the CPU microseconds per datagram per direction and role (A, B; the role process's CPU time divided by the datagrams it sent and received, at the default arm's ceiling step of that direction), and the date; method: the ramp described above on an idle Linux VM; aggregation: of the gate's 2 runs, per direction the one with the lower default-arm ceiling (on a tie, the one with the higher CPU microseconds per datagram summed over A and B), every token of that direction from that run; source case: perf/pps-ceiling at the M5 gate -->
-The packet-rate ceiling is {ceiling-ab} datagrams a second from A to B and
-{ceiling-ba} from B to A with the default `MaxBatch` ({ceiling-ab-1} and
-{ceiling-ba-1} with `MaxBatch` 1; raw UDP on the same path: {raw-ab} and
-{raw-ba}; {date}). At these default-`MaxBatch` ceilings each process used
-{cpu-ab-a} µs (A) and {cpu-ab-b} µs (B) of CPU time per datagram it sent
-or received from A to B, and {cpu-ba-a} µs and {cpu-ba-b} µs from B to A,
-the test application's own work included.
+The packet-rate ceiling is 100,000 datagrams a second from A to B and
+100,000 from B to A with the default `MaxBatch` (80,000 and 100,000 with
+`MaxBatch` 1; raw UDP on the same path: 250,000 and 250,000; 2026-10-16).
+At these default-`MaxBatch` ceilings each process used 18.8 µs (A) and
+12.0 µs (B) of CPU time per datagram it sent or received from A to B, and
+11.9 µs and 18.7 µs from B to A, the test application's own work
+included.
 
 **100,000 datagrams a second with failover (G3).** A packet session sends
 1,000-byte datagrams at 100,000 a second for 5 minutes over two paths while
@@ -729,11 +728,9 @@ duplicate datagram, losses only within 200 ms of a switching event, and
 every arrival gap caused by a switch under 200 ms. Sessions use the sizing
 of [Datagram I/O](#datagram-io-and-batching).
 
-<!-- FIGURE: G3 at 100 kpps, A → B: the delivered fraction per mode (selector, bond, race), and over the three modes the longest switch gap and the losses outside the event windows, and the date; method: G3 as described, 2 runs per mode; aggregation: per mode the lower delivered fraction of its 2 runs, and over the 6 runs the longest switch gap and the largest count of losses outside the event windows; source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
 At 100,000 datagrams a second, selector, bond and race sessions delivered
-{g3-sel}, {g3-bond} and {g3-race} of the datagrams sent, with the longest
-switch gap {g3-gap} ms and {g3-out} losses outside the event windows
-({date}).
+100 %, 99.9998 % and 100 % of the datagrams sent, with the longest switch
+gap 22.2 ms and 0 losses outside the event windows (2026-10-16).
 
 **Bond aggregation (G8).** A bond session moves 2 GiB from B to A over
 three independent links between two virtual machines (50, 100 and
@@ -741,20 +738,19 @@ three independent links between two virtual machines (50, 100 and
 link; steady goodput (the first 2 s excluded) is compared with the sum of
 the links' calibrated raw rates.
 
-<!-- FIGURE: G8 3-path steady goodput as a fraction of the summed calibrated link rates, the SHA-256 match (the runs whose received 2 GiB matched the sender's SHA-256), the longest zero-delivery gap, and the date; method: G8 as described, 2 runs; aggregation: the lower fraction and the longest gap of the 2 runs; source case: gold/G8-3path at the M5 gate -->
-A three-path bond reached {g8-ratio} of the summed link rates (criterion:
-at least 85 %), with the longest zero-delivery gap {g8-gap} ms; the 2 GiB
-received matched the sender's SHA-256 in {g8-sha} of 2 runs ({date}).
+A three-path bond reached 99.8 % of the summed link rates (criterion:
+at least 85 %), with the longest zero-delivery gap 100 ms (counted in
+100-ms intervals); the 2 GiB received matched the sender's SHA-256 in
+2 of 2 runs (2026-10-16).
 
 **Failover with an expensive carrier dial (G4-dialcost).** Two paths of
 100 Mbit/s and 150 ms round trip, each carrier a TLS-over-TCP dial that
 takes about three round trips; a stream transfer is in flight when every
 packet of the active path is silently dropped.
 
-<!-- FIGURE: G4-dialcost recovery from the DROP to the first new byte at the receiver, split into detection, dial, JOIN and first byte, and the date; method: G4-dialcost as described, 2 runs; aggregation: of the 2 runs, the one with the longer recovery, its split from the same run; source case: gold/G4-dialcost at the M5 gate -->
-Recovery took {g4dc-total} s from the drop to the first new byte
-(detection {g4dc-detect} s, dial {g4dc-dial} s, JOIN and first byte
-{g4dc-join} s; criterion: at most 5 s; {date}).
+Recovery took 3.88 s from the drop to the first new byte (detection
+2.98 s, dial 0.45 s, JOIN and first byte 0.45 s; criterion: at most 5 s;
+2026-10-16).
 
 ## Testing
 
@@ -803,9 +799,10 @@ checks) or FLAKY, nothing else. The gold criteria every release passes:
 Each gold criterion runs in variants (selector, bond, race, rendr mux,
 packet sessions, `l4`, QUIC), together with the lesson cases.
 
-<!-- FIGURE: the M5 gate's result counts (rows PASS, FAIL, INVALID, FLAKY) on the release candidate commit, and the date; method: the cumulative M5 gate, every gold variant and lesson case of M1c-M5; source: the M5 gate run -->
-At the 2.0.0 release candidate, {gate-pass} gate rows passed, with
-{gate-fail} FAIL, {gate-invalid} INVALID and {gate-flaky} FLAKY ({date}).
+At the 2.0.0 release candidate, 74 gate rows passed, with 0 FAIL,
+16 INVALID and 0 FLAKY attempts, not counting two attempts that failed
+through defects of the test harness itself and were waived once it was
+fixed (2026-10-16).
 
 ## Known limitations and what is not in 2.0.0
 

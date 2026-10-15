@@ -1,7 +1,6 @@
 # Changelog
 
-<!-- FIGURE: the release date (YYYY-MM-DD) of the v2.0.0 tag; source: the release commit F (Part R step R6) -->
-## v2.0.0 — {date}
+## v2.0.0 — 2026-10-16
 
 rendr 2.0 is a Go library that keeps one application connection alive
 across many underlying carriers between two rendr instances: a userspace
@@ -152,28 +151,21 @@ Measured on idle Linux virtual machines, each figure from the less
 favourable of the release gate's two runs; the methods are in the
 README's "Performance" section.
 
-<!-- FIGURE: BENCH-E2E-1 ratios rendr 2.0.0 / v0.3.0 and rendr 2.0.0 / raw TCP (median of per-pair ratios, pair count, A/A noise band); aggregation as README's BENCH-E2E-1 spec (the G7 run with the lower rendr 2.0.0 / v0.3.0 median, every token from that run); source case: G7 (BENCH-E2E-1) at the M5 gate -->
 - Stream throughput (BENCH-E2E-1, one loopback TCP carrier, 1-GiB
-  transfers, {pairs} alternating pairs): {ratio-v030} × rendr v0.3.0 and
-  {ratio-raw} × raw TCP (A/A noise band {noise} %).
-
-<!-- FIGURE: packet-rate ceiling per direction with MaxBatch default and 1, and the default arm's ceilings relative to the raw-UDP reference on the same path (the default-arm ceiling divided by the raw-UDP reference ceiling of the same run); aggregation as README's packet-rate spec (per direction the run with the lower default-arm ceiling, every token of that direction from that run); source case: perf/pps-ceiling at the M5 gate -->
+  transfers): 3.14 × rendr v0.3.0 (median of per-pair ratios over 5
+  alternating pairs, A/A noise band 8.4 %) and 1.42 × raw TCP (one run
+  of each, back to back).
 - Packet rate (1,000-byte datagrams, one `carrier/udp` carrier, a 12-s
   step ramp per direction; a step passes when 99 % of its datagrams
   arrive and 98 % were sent; capped at the raw-UDP reference): a ceiling
-  of {ceiling-ab} datagrams a second from dialer to passive and
-  {ceiling-ba} back with the default `MaxBatch`, {raw-share-ab} and
-  {raw-share-ba} of raw UDP on the same path ({ceiling-ab-1} and
-  {ceiling-ba-1} with `MaxBatch` 1).
-
-<!-- FIGURE: G3 at 100 kpps: the delivered fraction per mode and the longest switch gap over the three modes; aggregation as README's G3 spec (per mode the lower delivered fraction of its 2 runs, the longest switch gap of the 6 runs); source cases: gold/G3-sel-100k, gold/G3-bond-100k, gold/G3-race-100k at the M5 gate -->
+  of 100,000 datagrams a second from dialer to passive and 100,000 back
+  with the default `MaxBatch`, 40 % and 40 % of raw UDP on the same path
+  (80,000 and 100,000 with `MaxBatch` 1).
 - 100,000 datagrams a second across ten switching events (G3): selector,
-  bond and race delivered {g3-sel}, {g3-bond} and {g3-race} of the
-  datagrams sent; the longest switch gap was {g3-gap} ms.
-
-<!-- FIGURE: G8 3-path bond goodput as a fraction of the summed calibrated link rates; aggregation as README's G8 spec (the lower of the 2 runs); source case: gold/G8-3path at the M5 gate -->
+  bond and race delivered 100 %, 99.9998 % and 100 % of the datagrams
+  sent; the longest switch gap was 22.2 ms.
 - Bond aggregation over three independent links between two machines
-  (G8): {g8-ratio} of the summed link rates.
+  (G8): 99.8 % of the summed link rates.
 
 ### Wire format notes
 
@@ -355,7 +347,8 @@ Scheduling and estimation:
   PingBusy), a flow reaches about 0.6–0.8 of the link; low rates with deep
   buffers vary between 0.62 and 0.98 of the link per run; a one-way flow
   at 1 MiB/s and 100 ms reaches about 0.8 of the link; a peer clock drift
-  of 0.2–0.5 % at 2 MiB/s exceeds the latency bound by up to 25 %.
+  of 0.5 % at 2 MiB/s raises the smoothed RTT to about 1.3 s, about 1 %
+  over the test's latency bound.
 - A shared carrier that is write-blocked is not used for new sessions, so
   a session that opens during a short stall pays a fresh dial.
 - When no JOIN waits, OPEN waiters still dial beside a slow OPEN claimant,
