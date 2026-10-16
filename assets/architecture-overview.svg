@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" width="1200" height="690" viewBox="0 0 1200 690" role="img" aria-labelledby="title desc">
+  <title id="title">rendr 2.0 architecture overview</title>
+  <desc id="desc">Architecture of rendr 2.0. An embedder application holds one stable net.Conn for a stream session or net.PacketConn for a packet session. The local rendr runtime is the dialer: it opens sessions through a Peer and dials every carrier. Its session layer keeps session identity, byte offsets, acknowledgement only on delivery, bounded retransmission and reordering; its scheduler runs each session in selector, bond or race mode; rendr mux lets the sessions of a Peer share live carriers. Carriers are parallel rendr-to-rendr connections: TCP, an embedder L7 tunnel given as net.Conn or net.PacketConn, QUIC stream or DATAGRAM from an optional module, and UDP. The TCP carrier dies and the session continues on the L7 tunnel; bytes not yet acknowledged are resent on a live carrier. The destination rendr runtime is the passive side: a Listener accepts each session, which the destination application confirms or rejects, or package l4 forwards it to a TCP target. A carrier error never becomes application EOF and migration is transparent.</desc>
+
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .h1 { font: 700 26px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; fill: #0f172a; }
+      .sub { font: 400 13.5px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+      .pt { font: 600 14px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .st { font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #475569; letter-spacing: 0.14em; }
+      .body { font: 400 13px ui-sans-serif, system-ui, sans-serif; fill: #334155; }
+      .mu { font: 400 12px ui-sans-serif, system-ui, sans-serif; fill: #64748b; }
+      .mono { font: 500 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1e293b; }
+      .lane { font: 600 12px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .pill { fill: #ffffff; stroke: #cbd5e1; }
+      .pillt { font: 500 12px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1; }
+      .panel-strong { fill: #ffffff; stroke: #1f2937; stroke-width: 1.2; }
+      .runtime { fill: #f8fafc; stroke: #1f2937; stroke-width: 1.2; }
+      .acc { fill: #0f172a; }
+      .div { stroke: #e2e8f0; stroke-width: 1; }
+      .data { stroke: #334155; stroke-width: 1.75; fill: none; }
+      .data-hot { stroke: #0f172a; stroke-width: 2.75; fill: none; }
+      .ctl { stroke: #64748b; stroke-width: 1.5; fill: none; stroke-dasharray: 6 4; }
+      .fail { stroke: #b91c1c; stroke-width: 1.75; fill: none; }
+      .dead { stroke: #b91c1c; stroke-width: 1.5; fill: none; stroke-dasharray: 2 5; opacity: 0.55; }
+      .xmark { stroke: #b91c1c; stroke-width: 2.25; stroke-linecap: round; }
+      .port { fill: #ffffff; stroke: #334155; stroke-width: 1.5; }
+      .port-bad { fill: #ffffff; stroke: #b91c1c; stroke-width: 1.5; }
+      .badt { font: 600 12px ui-sans-serif, system-ui, sans-serif; fill: #b91c1c; }
+      .hott { font: 600 12px ui-sans-serif, system-ui, sans-serif; fill: #0f172a; }
+      .lg { font: 400 12px ui-sans-serif, system-ui, sans-serif; fill: #475569; }
+    </style>
+    <marker id="ah" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 4 L0 8 z" fill="#334155" />
+    </marker>
+    <marker id="ahc" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L10 4 L0 8 z" fill="#64748b" />
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1200" height="690" />
+
+  <!-- HEADER -->
+  <text class="h1" x="40" y="46">rendr 2.0 architecture</text>
+  <text class="sub" x="40" y="70">One application connection across many carriers between two rendr instances. A carrier may die or change; the application never notices.</text>
+  <line x1="40" y1="92" x2="1160" y2="92" stroke="#e2e8f0" stroke-width="1" />
+
+  <!-- LEGEND -->
+  <g transform="translate(828,46)">
+    <line x1="0" y1="0" x2="26" y2="0" class="data" />
+    <text class="lg" x="34" y="4">data</text>
+    <line x1="84" y1="0" x2="110" y2="0" class="ctl" />
+    <text class="lg" x="118" y="4">failover</text>
+    <line x1="186" y1="-6" x2="198" y2="6" class="xmark" />
+    <line x1="186" y1="6" x2="198" y2="-6" class="xmark" />
+    <text class="lg" x="206" y="4">carrier dies</text>
+  </g>
+
+  <!-- ROW 1: applications -->
+
+  <rect class="panel-strong" x="40" y="112" width="300" height="84" rx="6" />
+  <text class="pt" x="56" y="136">Embedder application</text>
+  <text class="mu" x="56" y="154">one stable connection per session</text>
+  <g transform="translate(56,164)">
+    <rect class="pill" x="0" y="0" width="96" height="22" rx="11" />
+    <text class="pillt" x="48" y="15" text-anchor="middle">net.Conn</text>
+    <rect class="pill" x="106" y="0" width="138" height="22" rx="11" />
+    <text class="pillt" x="175" y="15" text-anchor="middle">net.PacketConn</text>
+  </g>
+
+  <rect class="panel-strong" x="860" y="112" width="300" height="84" rx="6" />
+  <text class="pt" x="876" y="136">Destination application</text>
+  <text class="mu" x="876" y="154">or a TCP target reached through l4</text>
+  <g transform="translate(876,164)">
+    <rect class="pill" x="0" y="0" width="96" height="22" rx="11" />
+    <text class="pillt" x="48" y="15" text-anchor="middle">net.Conn</text>
+    <rect class="pill" x="106" y="0" width="138" height="22" rx="11" />
+    <text class="pillt" x="175" y="15" text-anchor="middle">net.PacketConn</text>
+  </g>
+
+  <!-- vertical data connectors between row 1 and row 2 -->
+  <line x1="190" y1="196" x2="190" y2="214" class="data" marker-end="url(#ah)" />
+  <line x1="1010" y1="216" x2="1010" y2="198" class="data" marker-end="url(#ah)" />
+
+  <!-- ROW 2: runtimes and carriers -->
+
+  <!-- Local rendr runtime (dialer) -->
+  <rect class="runtime" x="40" y="216" width="300" height="272" rx="6" />
+  <rect class="acc" x="40" y="216" width="4" height="272" />
+  <text class="pt" x="56" y="240">Local rendr runtime</text>
+  <text class="mu" x="56" y="258">dialer: dials every carrier</text>
+  <text class="mono" x="56" y="277">Peer.Dial · Peer.DialPacket</text>
+
+  <line x1="56" y1="289" x2="324" y2="289" class="div" />
+
+  <text class="st" x="56" y="307">SESSION LAYER</text>
+  <text class="body" x="56" y="326">identity · byte offsets</text>
+  <text class="body" x="56" y="344">ACK = delivered · reorder</text>
+  <text class="body" x="56" y="362">bounded retransmission</text>
+
+  <line x1="56" y1="375" x2="324" y2="375" class="div" />
+
+  <text class="st" x="56" y="393">SCHEDULER</text>
+  <g transform="translate(56,401)">
+    <rect class="pill" x="0" y="0" width="80" height="24" rx="12" />
+    <text class="pillt" x="40" y="16" text-anchor="middle">selector</text>
+    <rect class="pill" x="90" y="0" width="60" height="24" rx="12" />
+    <text class="pillt" x="120" y="16" text-anchor="middle">bond</text>
+    <rect class="pill" x="160" y="0" width="60" height="24" rx="12" />
+    <text class="pillt" x="190" y="16" text-anchor="middle">race</text>
+  </g>
+
+  <line x1="56" y1="437" x2="324" y2="437" class="div" />
+
+  <text class="st" x="56" y="455">RENDR MUX</text>
+  <text class="body" x="56" y="474">sessions share live carriers</text>
+
+  <!-- Destination rendr runtime (passive) -->
+  <rect class="runtime" x="860" y="216" width="300" height="272" rx="6" />
+  <rect class="acc" x="860" y="216" width="4" height="272" />
+  <text class="pt" x="876" y="240">Destination rendr runtime</text>
+  <text class="mu" x="876" y="258">passive: never dials a carrier</text>
+  <text class="mono" x="876" y="277">Listener.Accept · AcceptPacket</text>
+
+  <line x1="876" y1="289" x2="1144" y2="289" class="div" />
+
+  <text class="st" x="876" y="307">SESSION LAYER</text>
+  <text class="body" x="876" y="326">same identity, same offsets</text>
+  <text class="body" x="876" y="344">in-order delivery, then ACK</text>
+  <text class="body" x="876" y="362">only the peer's FIN → io.EOF</text>
+
+  <line x1="876" y1="375" x2="1144" y2="375" class="div" />
+
+  <text class="st" x="876" y="393">ACCEPT</text>
+  <g transform="translate(876,401)">
+    <rect class="pill" x="0" y="0" width="80" height="24" rx="12" />
+    <text class="pillt" x="40" y="16" text-anchor="middle">Confirm</text>
+    <rect class="pill" x="90" y="0" width="70" height="24" rx="12" />
+    <text class="pillt" x="125" y="16" text-anchor="middle">Reject</text>
+  </g>
+
+  <line x1="876" y1="437" x2="1144" y2="437" class="div" />
+
+  <text class="st" x="876" y="455">BOUNDED</text>
+  <text class="body" x="876" y="474">admission · windows · queues</text>
+
+  <!-- CARRIERS -->
+  <text class="st" x="600" y="240" text-anchor="middle">CARRIERS</text>
+  <text class="mu" x="600" y="258" text-anchor="middle">rendr-to-rendr connections, all dialled by the dialer</text>
+
+  <!-- lane 1: TCP, dies -->
+  <text x="392" y="292"><tspan class="lane">TCP</tspan><tspan class="mu" dx="8">carrier/tcp · stream</tspan></text>
+  <text class="badt" x="844" y="292" text-anchor="end">carrier dies</text>
+  <line x1="340" y1="300" x2="728" y2="300" class="fail" />
+  <line x1="752" y1="300" x2="860" y2="300" class="dead" />
+  <line x1="734" y1="294" x2="746" y2="306" class="xmark" />
+  <line x1="734" y1="306" x2="746" y2="294" class="xmark" />
+  <circle class="port" cx="340" cy="300" r="3.5" />
+  <circle class="port-bad" cx="860" cy="300" r="3.5" />
+
+  <!-- failover: the sender moves the session to a live carrier -->
+  <line x1="368" y1="305" x2="368" y2="342" class="ctl" marker-end="url(#ahc)" />
+
+  <!-- lane 2: embedder L7 tunnel, takes over -->
+  <text x="392" y="340"><tspan class="lane">L7 tunnel</tspan><tspan class="mu" dx="8">embedder's net.Conn / net.PacketConn</tspan></text>
+  <text class="hott" x="844" y="340" text-anchor="end">takes over</text>
+  <line x1="340" y1="348" x2="860" y2="348" class="data-hot" />
+  <circle class="port" cx="340" cy="348" r="3.5" />
+  <circle class="port" cx="860" cy="348" r="3.5" />
+
+  <!-- lane 3: QUIC -->
+  <text x="392" y="388"><tspan class="lane">QUIC</tspan><tspan class="mu" dx="8">stream or DATAGRAM · optional module</tspan></text>
+  <line x1="340" y1="396" x2="860" y2="396" class="data" />
+  <circle class="port" cx="340" cy="396" r="3.5" />
+  <circle class="port" cx="860" cy="396" r="3.5" />
+
+  <!-- lane 4: UDP -->
+  <text x="392" y="436"><tspan class="lane">UDP</tspan><tspan class="mu" dx="8">carrier/udp · datagram</tspan></text>
+  <line x1="340" y1="444" x2="860" y2="444" class="data" />
+  <circle class="port" cx="340" cy="444" r="3.5" />
+  <circle class="port" cx="860" cy="444" r="3.5" />
+
+  <text class="mu" x="600" y="474" text-anchor="middle">unacknowledged bytes are resent on a live carrier</text>
+
+  <!-- ROW 3: concepts -->
+
+  <rect class="panel" x="40" y="508" width="300" height="112" rx="6" />
+  <text class="pt" x="56" y="532">Session kinds</text>
+  <text class="mu" x="56" y="552">stream: ordered bytes, lossless</text>
+  <text class="mu" x="56" y="570">packet: datagrams, at most once</text>
+  <text class="mu" x="56" y="588">both survive carrier changes</text>
+
+  <rect class="panel" x="360" y="508" width="480" height="112" rx="6" />
+  <text class="pt" x="376" y="532">Scheduling modes</text>
+  <text class="mu" x="824" y="532" text-anchor="end">chosen per session at Dial</text>
+  <g transform="translate(376,0)">
+    <text class="mono" x="0" y="554">selector · default</text>
+    <text class="mu" x="0" y="574">one active carrier</text>
+    <text class="mu" x="0" y="591">fails over on death</text>
+    <text class="mu" x="0" y="608">switches on probes</text>
+  </g>
+  <g transform="translate(528,0)">
+    <text class="mono" x="0" y="554">bond</text>
+    <text class="mu" x="0" y="574">every member sends,</text>
+    <text class="mu" x="0" y="591">in proportion to its</text>
+    <text class="mu" x="0" y="608">measured drain rate</text>
+  </g>
+  <g transform="translate(680,0)">
+    <text class="mono" x="0" y="554">race</text>
+    <text class="mu" x="0" y="574">every byte on every</text>
+    <text class="mu" x="0" y="591">member; receiver</text>
+    <text class="mu" x="0" y="608">keeps the first copy</text>
+  </g>
+
+  <rect class="panel" x="860" y="508" width="300" height="112" rx="6" />
+  <text class="pt" x="876" y="532">L4 forwarding (package l4)</text>
+  <text class="mu" x="876" y="552">l4.Dial names a TCP target</text>
+  <text class="mu" x="876" y="570">l4.Server dials it, then confirms</text>
+  <text class="mu" x="876" y="588">FIN and reset cross both ways</text>
+
+  <!-- FOOTER -->
+  <text class="mu" x="40" y="652">Invariants: a carrier error never becomes application EOF · migration is transparent · every resource is bounded · the wire is versioned.</text>
+  <text class="mu" x="40" y="670">Encryption, authentication, relays and discovery belong to the embedder; rendr is the session layer between two rendr instances.</text>
+
+</svg>
