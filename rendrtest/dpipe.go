@@ -1,9 +1,176 @@
 package rendrtest
 
 import (
+	"math/rand/v2"
 	"net"
+	"net/netip"
+	"os"
+	"sync"
 	"time"
 )
+
+// Connected-datagram fakes for package l4's UDP flows and their scenario
+// tests (M6 design §A2.3, M6-D36): DatagramPipe, an in-memory connected
+// datagram conn pair, stands in for the passive's egress socket and for a
+// local conn of ForwardPacket; UDPSocketHub (udphub.go) is an in-memory
+// unconnected socket with many clients, structurally an l4.UDPSocket.
+//
+// Both are built from one mutex per pipe or hub, one sync.Cond per reader
+// queue on that mutex, and timers created and re-armed by the reader, so a
+// goroutine blocked in them is durably blocked inside a testing/synctest
+// bubble (use a pipe or hub inside one bubble, or outside every bubble).
+// Neither starts a goroutine: a datagram's arrival time is computed when
+// it is written. A datagram is copied once, at the Write, into a recycled
+// buffer, so steady-state I/O allocates nothing (the allocation gates of
+// l4's forwarding run on them). Their own errors are *net.OpError values
+// wrapping net.ErrClosed, os.ErrDeadlineExceeded or ErrMsgSize, as a real
+// socket's; injected errors are returned as given.
+
+// Defaults and bounds of the datagram fakes.
+const (
+	defaultDpQueue = 256     // datagrams per queue
+	dpMinCap       = 2 << 10 // smallest datagram buffer: every datagram of ≤ 2 KiB reuses any recycled one
+	dpRecycleCap   = 16 << 10
+	dpRecycleMax   = 256
+)
+
+// dpNet is what a DatagramPipe or a UDPSocketHub shares: the lock over all
+// of its state and the recycled datagram buffers.
+type dpNet struct {
+	mu   sync.Mutex
+	free [][]byte
+}
+
+// clone returns a copy of b in a recycled buffer when one is large enough.
+// n.mu held.
+func (n *dpNet) clone(b []byte) []byte {
+	if k := len(n.free); k > 0 && cap(n.free[k-1]) >= len(b) {
+		c := n.free[k-1][:len(b)]
+		n.free[k-1] = nil
+		n.free = n.free[:k-1]
+		copy(c, b)
+		return c
+	}
+	c := make([]byte, len(b), max(len(b), dpMinCap))
+	copy(c, b)
+	return c
+}
+
+// recycle keeps b for a later datagram. n.mu held.
+func (n *dpNet) recycle(b []byte) {
+	if cap(b) <= dpRecycleCap && len(n.free) < dpRecycleMax {
+		n.free = append(n.free, b[:0])
+	}
+}
+
+// dpItem is one datagram in a queue.
+type dpItem struct {
+	b    []byte
+	due  time.Time      // its arrival; zero: at once
+	src  netip.AddrPort // a hub socket's queue: the client's source
+	from *DatagramConn  // a hub socket's queue: the client whose bound it counts against
+}
+
+// dpQueue is the datagrams toward one reader in arrival order (a ring),
+// with the reader's wake-ups: a condition on the net's lock and timers for
+// the head's arrival and for the read deadline. Every method runs with the
+// net's lock held, except wakeup, which takes it.
+type dpQueue struct {
+	ring    []dpItem
+	head, n int
+	cond    sync.Cond
+	rdl     time.Time
+	dueTm   *time.Timer
+	dlTm    *time.Timer
+}
+
+func (q *dpQueue) push(it dpItem) {
+	if q.n == len(q.ring) {
+		r := make([]dpItem, max(8, 2*len(q.ring)))
+		for i := range q.n {
+			r[i] = q.ring[(q.head+i)%len(q.ring)]
+		}
+		q.ring, q.head = r, 0
+	}
+	q.ring[(q.head+q.n)%len(q.ring)] = it
+	q.n++
+}
+
+func (q *dpQueue) pop() dpItem {
+	it := q.ring[q.head]
+	q.ring[q.head] = dpItem{}
+	q.head = (q.head + 1) % len(q.ring)
+	q.n--
+	return it
+}
+
+// ready reports whether the head has arrived by now.
+func (q *dpQueue) ready(now time.Time) bool {
+	return q.n > 0 && !q.ring[q.head].due.After(now)
+}
+
+// expired reports whether the read deadline has passed at now.
+func (q *dpQueue) expired(now time.Time) bool {
+	return !q.rdl.IsZero() && !now.Before(q.rdl)
+}
+
+// wait blocks until something may have changed for the reader: a datagram
+// or an injection, the head's arrival, the read deadline, a Close.
+func (q *dpQueue) wait(now time.Time) {
+	if q.n > 0 {
+		if d := q.ring[q.head].due.Sub(now); d > 0 {
+			q.arm(&q.dueTm, d)
+		}
+	}
+	q.cond.Wait()
+}
+
+// setDeadline sets the read deadline and wakes the readers, so that a
+// waiting read honours it at once.
+func (q *dpQueue) setDeadline(t time.Time) {
+	q.rdl = t
+	stopTimer(q.dlTm)
+	if !t.IsZero() {
+		if d := time.Until(t); d > 0 {
+			q.arm(&q.dlTm, d)
+		}
+	}
+	q.cond.Broadcast()
+}
+
+// arm makes *tm wake the readers after d; the timer is created once and
+// re-armed afterwards.
+func (q *dpQueue) arm(tm **time.Timer, d time.Duration) {
+	if *tm == nil {
+		*tm = time.AfterFunc(d, q.wakeup)
+		return
+	}
+	(*tm).Reset(d)
+}
+
+func (q *dpQueue) wakeup() {
+	q.cond.L.Lock()
+	q.cond.Broadcast()
+	q.cond.L.Unlock()
+}
+
+// drain discards every queued datagram and returns how many there were;
+// it stops the timers and wakes the readers (the queue's owner ended).
+func (q *dpQueue) drain(n *dpNet) uint64 {
+	k := uint64(q.n)
+	for q.n > 0 {
+		it := q.pop()
+		if it.from != nil {
+			it.from.up--
+		}
+		n.recycle(it.b)
+	}
+	q.ring, q.head = nil, 0
+	stopTimer(q.dueTm)
+	stopTimer(q.dlTm)
+	q.cond.Broadcast()
+	return k
+}
 
 // DatagramPipeConfig configures NewDatagramPipe; zero values take defaults.
 type DatagramPipeConfig struct {
@@ -34,66 +201,294 @@ var ErrMsgSize error = errMsgSize
 type DatagramConnCounts struct {
 	In        uint64 // datagrams this end's Reads returned
 	Out       uint64 // datagrams this end's Writes sent
-	Dropped   uint64 // datagrams toward this end dropped: a full queue, Loss
+	Dropped   uint64 // datagrams toward this end dropped: a full queue, Loss, still queued at a Close
 	Truncated uint64 // Reads that returned a datagram longer than their buffer
 	Injected  uint64 // Reads and Writes that returned an injected error
 }
+
+func (a DatagramConnCounts) plus(b DatagramConnCounts) DatagramConnCounts {
+	return DatagramConnCounts{In: a.In + b.In, Out: a.Out + b.Out, Dropped: a.Dropped + b.Dropped,
+		Truncated: a.Truncated + b.Truncated, Injected: a.Injected + b.Injected}
+}
+
+// dpPipe is the shared state of a DatagramPipe's two ends.
+type dpPipe struct {
+	dpNet
+	queue     int
+	delay     time.Duration
+	loss, dup float64
+	shut      bool // an end was closed: every later call of both ends fails
+	ends      [2]*DatagramConn
+}
+
+// Default LocalAddrs of a DatagramPipe's ends: documentation addresses.
+var (
+	dpAddrA = netip.MustParseAddrPort("192.0.2.1:40000")
+	dpAddrB = netip.MustParseAddrPort("198.51.100.1:50000")
+)
 
 // NewDatagramPipe returns the two ends of an in-memory connected datagram
 // conn: each Write is one datagram delivered whole to the other end's next
 // Read; deadlines as net.Conn; Close makes both ends' later calls return
 // net.ErrClosed.
 //
-// Skeleton (M6 wave 0): not implemented yet; it panics.
+// A Write never blocks. Each datagram is copied (the caller may reuse its
+// buffer at once), then passes seeded loss and duplication (a duplicate
+// arrives right behind its original), the receiving direction's Queue
+// bound (a full queue drops it) and Delay; datagrams arrive in the order
+// they were written. Every datagram toward an end is either read, counted
+// Dropped at that end, or still queued. A Read into an empty buffer
+// returns (0, nil) at once and consumes nothing, as the net package's
+// does on Unix; zero-length datagrams are delivered as such. Loss and Dup are
+// drawn from two PCG streams seeded by Seed, one per direction: equal
+// configurations give equal fates for equal write sequences. The default
+// addresses are *net.UDPAddr values (192.0.2.1:40000 for a, 198.51.100.1:
+// 50000 for b), so a check for a "udp" LocalAddr accepts the ends; each
+// end's RemoteAddr is the other's LocalAddr.
 func NewDatagramPipe(cfg DatagramPipeConfig) (a, b *DatagramConn) {
-	panic("rendrtest: NewDatagramPipe not implemented")
+	p := &dpPipe{queue: cfg.Queue, delay: max(cfg.Delay, 0), loss: cfg.Loss, dup: cfg.Dup}
+	if p.queue <= 0 {
+		p.queue = defaultDpQueue
+	}
+	la, lb := cfg.AddrA, cfg.AddrB
+	if la == nil {
+		la = net.UDPAddrFromAddrPort(dpAddrA)
+	}
+	if lb == nil {
+		lb = net.UDPAddrFromAddrPort(dpAddrB)
+	}
+	s := cfg.Seed
+	a = &DatagramConn{n: &p.dpNet, pipe: p, laddr: la, raddr: lb, trunc: cfg.Trunc,
+		rng: rand.New(rand.NewPCG(s, s^0x9e3779b97f4a7c15))}
+	b = &DatagramConn{n: &p.dpNet, pipe: p, laddr: lb, raddr: la, trunc: cfg.Trunc,
+		rng: rand.New(rand.NewPCG(s^1, s^0x7f4a7c159e3779b9))}
+	a.peer, b.peer = b, a
+	a.rx.cond.L, b.rx.cond.L = &p.mu, &p.mu
+	p.ends = [2]*DatagramConn{a, b}
+	return a, b
+}
+
+// send delivers one datagram written by end c to its peer. p.mu held.
+func (p *dpPipe) send(c *DatagramConn, b []byte, now time.Time) {
+	dst := c.peer
+	if p.loss > 0 && c.rng.Float64() < p.loss {
+		dst.ctr.Dropped++
+		return
+	}
+	copies := 1
+	if p.dup > 0 && c.rng.Float64() < p.dup {
+		copies = 2
+	}
+	due := now.Add(p.delay)
+	for i := range copies {
+		if dst.rx.n >= p.queue { // tail drop; a duplicate that does not fit is never made
+			if i == 0 {
+				dst.ctr.Dropped++
+			}
+			break
+		}
+		dst.rx.push(dpItem{b: p.clone(b), due: due})
+	}
+	dst.rx.cond.Broadcast()
+}
+
+// close shuts both ends: their queued datagrams are dropped and counted,
+// their readers woken. p.mu held.
+func (p *dpPipe) close() {
+	if p.shut {
+		return
+	}
+	p.shut = true
+	for _, e := range p.ends {
+		e.ctr.Dropped += e.rx.drain(&p.dpNet)
+	}
+	p.free = nil
 }
 
 // DatagramConn is one end of a DatagramPipe, or a UDPSocketHub client: a
 // connected datagram net.Conn.
-type DatagramConn struct{}
+type DatagramConn struct {
+	n            *dpNet
+	rx           dpQueue // datagrams toward this end
+	laddr, raddr net.Addr
+	trunc        TruncMode
+	closed       bool // this end's Close was called
+	wdl          time.Time
+	rerr         error // the injected read error, if any
+	rpersist     bool
+	werr         error // the injected write error, for the next wleft Writes
+	wleft        int
+	ctr          DatagramConnCounts
+
+	// A pipe end.
+	pipe *dpPipe
+	peer *DatagramConn
+	rng  *rand.Rand // the fates of this end's datagrams
+
+	// A hub client.
+	hub *UDPSocketHub
+	src netip.AddrPort
+	up  int // its datagrams queued toward the hub's socket
+}
 
 var _ net.Conn = (*DatagramConn)(nil)
 
+// ended reports whether the conn's calls fail with net.ErrClosed. n.mu
+// held.
+func (c *DatagramConn) ended() bool {
+	return c.closed || c.pipe != nil && c.pipe.shut
+}
+
+func (c *DatagramConn) opErr(op string, err error) error {
+	return &net.OpError{Op: op, Net: "udp", Source: c.laddr, Addr: c.raddr, Err: err}
+}
+
 // Read returns the next datagram (TruncMode decides a shorter buffer).
-func (c *DatagramConn) Read(b []byte) (int, error) { panic("rendrtest: DatagramConn not implemented") }
+// It checks, in order: Close, an empty b (0, nil at once), the read
+// deadline (also when a datagram is waiting, as net.Conn), an injected
+// error (which consumes no datagram), then the next arrived datagram;
+// otherwise it waits for one of them.
+func (c *DatagramConn) Read(b []byte) (int, error) {
+	c.n.mu.Lock()
+	defer c.n.mu.Unlock()
+	q := &c.rx
+	for {
+		now := time.Now()
+		switch {
+		case c.ended():
+			return 0, c.opErr("read", net.ErrClosed)
+		case len(b) == 0:
+			return 0, nil
+		case q.expired(now):
+			return 0, c.opErr("read", os.ErrDeadlineExceeded)
+		case c.rerr != nil:
+			err := c.rerr
+			if !c.rpersist {
+				c.rerr = nil
+			}
+			c.ctr.Injected++
+			return 0, err
+		case q.ready(now):
+			it := q.pop()
+			k := copy(b, it.b)
+			c.ctr.In++
+			var err error
+			if len(it.b) > len(b) {
+				c.ctr.Truncated++
+				if c.trunc == TruncWindows {
+					err = c.opErr("read", os.NewSyscallError("wsarecv", ErrMsgSize))
+				}
+			}
+			c.n.recycle(it.b)
+			return k, err
+		}
+		q.wait(now)
+	}
+}
 
-// Write sends b as one datagram.
-func (c *DatagramConn) Write(b []byte) (int, error) { panic("rendrtest: DatagramConn not implemented") }
+// Write sends b as one datagram. It never blocks; it fails after Close,
+// past the write deadline, or with an injected error (sending nothing).
+func (c *DatagramConn) Write(b []byte) (int, error) {
+	c.n.mu.Lock()
+	defer c.n.mu.Unlock()
+	now := time.Now()
+	switch {
+	case c.ended():
+		return 0, c.opErr("write", net.ErrClosed)
+	case !c.wdl.IsZero() && !now.Before(c.wdl):
+		return 0, c.opErr("write", os.ErrDeadlineExceeded)
+	case c.wleft > 0:
+		err := c.werr
+		if c.wleft--; c.wleft == 0 {
+			c.werr = nil
+		}
+		c.ctr.Injected++
+		return 0, err
+	}
+	c.ctr.Out++
+	if c.hub != nil {
+		c.hub.fromClient(c, b)
+	} else {
+		c.pipe.send(c, b, now)
+	}
+	return len(b), nil
+}
 
-// Close closes the conn; later calls of both ends return net.ErrClosed.
-func (c *DatagramConn) Close() error { panic("rendrtest: DatagramConn not implemented") }
+// Close closes the conn; later calls of both ends return net.ErrClosed. A
+// pipe end's Close shuts the pipe (the other end's own first Close still
+// returns nil); a hub client's Close frees its source for a later Client
+// call. The datagrams still queued toward the closed ends are counted
+// Dropped. A second Close of the same end returns net.ErrClosed.
+func (c *DatagramConn) Close() error {
+	c.n.mu.Lock()
+	defer c.n.mu.Unlock()
+	if c.closed {
+		return c.opErr("close", net.ErrClosed)
+	}
+	c.closed = true
+	if c.hub != nil {
+		c.hub.leave(c)
+	} else {
+		c.pipe.close()
+	}
+	return nil
+}
 
 // LocalAddr returns this end's address.
-func (c *DatagramConn) LocalAddr() net.Addr { panic("rendrtest: DatagramConn not implemented") }
+func (c *DatagramConn) LocalAddr() net.Addr { return c.laddr }
 
 // RemoteAddr returns the other end's address.
-func (c *DatagramConn) RemoteAddr() net.Addr { panic("rendrtest: DatagramConn not implemented") }
+func (c *DatagramConn) RemoteAddr() net.Addr { return c.raddr }
 
 // SetDeadline sets both deadlines, as net.Conn.
-func (c *DatagramConn) SetDeadline(t time.Time) error {
-	panic("rendrtest: DatagramConn not implemented")
-}
+func (c *DatagramConn) SetDeadline(t time.Time) error { return c.setDeadline(t, true, true) }
 
-// SetReadDeadline sets the read deadline, as net.Conn.
-func (c *DatagramConn) SetReadDeadline(t time.Time) error {
-	panic("rendrtest: DatagramConn not implemented")
-}
+// SetReadDeadline sets the read deadline, as net.Conn; a waiting Read
+// honours a new deadline at once.
+func (c *DatagramConn) SetReadDeadline(t time.Time) error { return c.setDeadline(t, true, false) }
 
 // SetWriteDeadline sets the write deadline, as net.Conn.
-func (c *DatagramConn) SetWriteDeadline(t time.Time) error {
-	panic("rendrtest: DatagramConn not implemented")
+func (c *DatagramConn) SetWriteDeadline(t time.Time) error { return c.setDeadline(t, false, true) }
+
+func (c *DatagramConn) setDeadline(t time.Time, read, write bool) error {
+	c.n.mu.Lock()
+	defer c.n.mu.Unlock()
+	if c.ended() {
+		return c.opErr("set", net.ErrClosed)
+	}
+	if write {
+		c.wdl = t
+	}
+	if read {
+		c.rx.setDeadline(t)
+	}
+	return nil
 }
 
 // Inject makes the next Read (every later one if persistent) return err.
+// The error is returned as given, consumes no datagram and wakes a
+// waiting Read; a nil err clears an earlier injection.
 func (c *DatagramConn) Inject(err error, persistent bool) {
-	panic("rendrtest: DatagramConn not implemented")
+	c.n.mu.Lock()
+	defer c.n.mu.Unlock()
+	c.rerr, c.rpersist = err, persistent && err != nil
+	c.rx.cond.Broadcast()
 }
 
-// InjectWrite makes the next n Writes return err and send nothing.
+// InjectWrite makes the next n Writes return err and send nothing. A nil
+// err or an n below 1 clears an earlier injection.
 func (c *DatagramConn) InjectWrite(err error, n int) {
-	panic("rendrtest: DatagramConn not implemented")
+	c.n.mu.Lock()
+	defer c.n.mu.Unlock()
+	if err == nil || n < 1 {
+		err, n = nil, 0
+	}
+	c.werr, c.wleft = err, n
 }
 
 // Counts returns the conn's counters.
-func (c *DatagramConn) Counts() DatagramConnCounts { panic("rendrtest: DatagramConn not implemented") }
+func (c *DatagramConn) Counts() DatagramConnCounts {
+	c.n.mu.Lock()
+	defer c.n.mu.Unlock()
+	return c.ctr
+}
