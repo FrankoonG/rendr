@@ -290,6 +290,14 @@ func (c *PacketConn) Status() SessionStatus { return c.props.status(c.s.Status()
 // joined (or abandoned and counted).
 func (c *PacketConn) Done() <-chan struct{} { return c.s.Done() }
 
+// SetIdleTimeout overrides Config.IdleTimeout for this packet session from
+// now on, with Conn.SetIdleTimeout's meaning and clamp: 0 or a negative
+// value turns idle expiry off; other values are clamped to 10 s–24 h. The
+// idle clock (moved by every accepted WriteTo, every datagram accepted from
+// a carrier and every datagram ReadFrom returns) is not restarted. Both
+// roles. It returns net.ErrClosed once the session has ended.
+func (c *PacketConn) SetIdleTimeout(d time.Duration) error { return c.s.SetIdleTimeout(d) }
+
 // DialPacket opens a packet session (see PacketConn). It is Dial for
 // datagrams: the same race, ranking, waiting and errors, with datagram
 // factories ranked before stream factories. The session's MaxPayload is
@@ -363,3 +371,11 @@ func (p *PendingPacket) Confirm() (*PacketConn, error) {
 func (p *PendingPacket) Reject(code uint32, msg string) error {
 	return decisionErr(p.it, p.s.Reject(code, msg))
 }
+
+// Context returns a context that is done once this pending packet session
+// can no longer be confirmed: at Confirm, Reject, AcceptTimeout, the
+// dialer's withdrawal, Listener.Close or Runtime.Close. Its Deadline is the
+// AcceptTimeout instant; Err is context.DeadlineExceeded when AcceptTimeout
+// ended it, else context.Canceled. No goroutine waits on it, also under
+// context.AfterFunc (it has an AfterFunc method), as PendingConn.Context.
+func (p *PendingPacket) Context() context.Context { return pendingPacketCtx{pendingCtx{s: p.s}} }

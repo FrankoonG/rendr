@@ -15,6 +15,10 @@ const errWSAEMSGSIZE = syscall.Errno(10040)
 // design §A2.4: ErrReset matches syscall.ECONNRESET).
 var errConnReset error = syscall.ECONNRESET
 
+// errMsgSize is ErrMsgSize: the number the net package returns on Windows
+// (WSAEMSGSIZE), this OS's EMSGSIZE elsewhere.
+var errMsgSize = dialErrno(10040, syscall.EMSGSIZE)
+
 // The errnos of ScriptedDial's failures: the numbers the net package
 // returns on Windows (WSAECONNREFUSED, WSAENETUNREACH, WSAEHOSTUNREACH),
 // this OS's symbols elsewhere.

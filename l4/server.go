@@ -83,6 +83,16 @@ type Server struct {
 	// returned without an error belongs to the Server, which forwards it
 	// (or resets it, when the session was decided while it dialled), and
 	// must not panic.
+	//
+	// With UDP set, r.Cmd may be CmdUDP: return a connected datagram conn
+	// (each Read one datagram from the target, each Write one datagram to
+	// it; nil Dial: a net.Dialer's DialContext on "udp"). The conn must
+	// report a non-nil RemoteAddr and either implement net.PacketConn (a
+	// connected *net.UDPConn does) or report a LocalAddr whose Network is
+	// "udp", "udp4" or "udp6" (an embedder's own datagram tunnel reports
+	// "udp"); any other conn is closed and answered CodeDialFailed. A hook
+	// used with UDP must check r.Cmd. Every other rule above holds for both
+	// commands; at most 192 calls of each kind run at once.
 	Dial func(ctx context.Context, r Request) (net.Conn, error)
 	// DialTimeout bounds one target dial (0: DefaultDialTimeout; clamped to
 	// 0.5–30 s) and never runs past the pending session's AcceptTimeout
@@ -96,6 +106,22 @@ type Server struct {
 	// (0 or less: DefaultMaxConns); a session beyond it is rejected
 	// CodeCapacity at once.
 	MaxConns int
+
+	// UDP enables L4 UDP flows: Serve also accepts packet sessions, and
+	// HandleUDP serves them. False (the zero value): Serve never calls
+	// AcceptPacket, as in v2.0.0.
+	UDP bool
+	// UDPIdle is the FlowIdle of every served flow (zero: the defaults).
+	UDPIdle FlowIdle
+	// MaxFlows bounds the UDP flows this Server dials for or forwards at once
+	// (0 or less: DefaultMaxFlows); a flow beyond it is rejected CodeCapacity
+	// at once. MaxConns bounds TCP connections only.
+	MaxFlows int
+	// UDPBuffer is the receive and send buffer size the default UDP dialer
+	// requests for each target socket (0 or less: 1 MiB; the kernel caps it
+	// at rmem_max and wmem_max). Bursts from the target wait there until the
+	// flow's pump reads them: size it for the largest burst.
+	UDPBuffer int
 
 	conns     atomic.Int64 // handlers admitted under MaxConns: dialling or forwarding
 	hooks     atomic.Int64 // custom hook calls running, abandoned ones included
@@ -424,4 +450,8 @@ type ServerStatus struct {
 	ByCode              map[RejectCode]uint64 // Rejected by code
 	Panics              uint64                // recovered hook panics and Goexits
 	LastErr             error                 // the last raw dial error (never sent to the dialer)
+	// UDP counts the UDP flows (Server.UDP). The fields above count TCP
+	// connections, except Hooks, Abandoned, Panics and LastErr, which count
+	// both kinds.
+	UDP UDPServerStatus
 }

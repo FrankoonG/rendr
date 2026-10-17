@@ -8,15 +8,21 @@ import (
 	"strconv"
 )
 
-// CmdConnect is Request.Cmd for a TCP connection, the only command of
-// metadata version 1.
-const CmdConnect = 1
+// Commands of Request.Cmd (L4 metadata version 1).
+const (
+	CmdConnect = 1    // a TCP connection over a stream session
+	CmdUDP     = 0x11 // one UDP flow over a packet session (17, UDP's IP protocol number)
+)
 
 // Request is what an OPEN's L4 metadata carries.
 type Request struct {
-	Cmd  uint8  // CmdConnect
+	Cmd  uint8  // CmdConnect or CmdUDP
 	Addr string // "host:port"; an IPv6 host in brackets; a host name is resolved by the passive
 	App  []byte // the application's own metadata (aliases the decoded input)
+	// First is, for CmdUDP, the flow's first datagram when it rode the OPEN
+	// (aliases the decoded input; nil otherwise, always nil for CmdConnect).
+	// A Dial hook may read it and must not retain it.
+	First []byte
 }
 
 // ErrBadAddress reports a malformed or non-canonical target address.
@@ -177,6 +183,19 @@ func ParseMetadata(md []byte) (Request, error) {
 		r.App = md[end:]
 	}
 	return r, nil
+}
+
+// ParseUDPMetadata decodes the L4 metadata of a UDP flow strictly, with
+// ParseMetadata's check order and canonical rules: the command must be
+// CmdUDP (CmdConnect and every other command: CodeBadCommand); after the
+// port, a two-byte length and that many bytes of first datagram must be
+// present (else CodeBadRequest); First and App alias md. Every input it
+// accepts is the canonical encoding of its Request.
+//
+// Skeleton (M6 wave 0): not implemented yet; every input is refused
+// CodeBadCommand.
+func ParseUDPMetadata(md []byte) (Request, error) {
+	return Request{}, &MetadataError{Code: CodeBadCommand, Msg: "ParseUDPMetadata not implemented"}
 }
 
 // Match reports whether md starts with the L4 magic.
