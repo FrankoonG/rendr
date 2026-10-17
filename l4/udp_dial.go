@@ -27,6 +27,39 @@ type FlowIdle struct {
 	Stream time.Duration // once it is (DefaultFlowIdle)
 }
 
+// The clamp of a FlowIdle class (M6-D8: Conn.SetIdleTimeout's range).
+const (
+	minFlowIdle = 10 * time.Second
+	maxFlowIdle = 24 * time.Hour
+)
+
+// limits returns the SetIdleTimeout values of the two classes, 0 meaning
+// off: a zero field takes its default, a positive one is clamped to
+// 10 s–24 h, a negative one is off, a negative Short makes both off, and a
+// Short above a Stream that is on is lowered to it.
+func (fi FlowIdle) limits() (short, stream time.Duration) {
+	if fi.Short < 0 {
+		return 0, 0
+	}
+	short, stream = classLimit(fi.Short, DefaultFlowShortIdle), classLimit(fi.Stream, DefaultFlowIdle)
+	if stream > 0 && short > stream {
+		short = stream
+	}
+	return short, stream
+}
+
+// classLimit is one class's value: d's default when d is 0, off (0) when
+// d is negative, else d clamped to 10 s–24 h.
+func classLimit(d, def time.Duration) time.Duration {
+	switch {
+	case d == 0:
+		return def
+	case d < 0:
+		return 0
+	}
+	return min(max(d, minFlowIdle), maxFlowIdle)
+}
+
 // firstBudget is the largest whole L4 metadata of a UDP flow (header,
 // first-datagram length, first datagram and App) with which DialUDP lets
 // the first datagram ride the OPEN (M6-D4): 537, the smallest
@@ -66,7 +99,9 @@ const streamAfter = 2 * time.Second
 
 // ruleForTest, when non-zero, holds the promoteMode that replaces
 // promoteRule (tests only: the rows of the other rule, R1-7). Tests set it
-// before the forwards or PortForwards they observe start.
+// before the forwards or PortForwards they observe start. It is
+// package-global: a test that sets it must not run in parallel with
+// another l4 test (no l4 test calls t.Parallel).
 var ruleForTest atomic.Uint32
 
 // activeRule returns the rule in force: promoteRule unless a test selected
@@ -99,8 +134,45 @@ func activeRule() promoteMode {
 // Server's refusal is a *rendr.RejectError whose code CodeOf reports. A
 // Server without UDP, or a v2.0.0 passive, never serves the flow:
 // ErrCapacity after the passive's AcceptTimeout.
-//
-// Skeleton (M6 wave 0): not implemented yet.
 func DialUDP(ctx context.Context, p *rendr.Peer, addr string, first []byte, o rendr.DialOptions) (*rendr.PacketConn, error) {
-	return nil, errors.New("l4: not implemented")
+	app := o.Metadata
+	// The metadata without the first datagram: the address check, before any
+	// network I/O, and the retry's OPEN (R1-4).
+	bare, err := AppendMetadata(make([]byte, 0, maxHeader+firstLenLen+len(app)), Request{Cmd: CmdUDP, Addr: addr, App: app})
+	if err != nil {
+		return nil, err
+	}
+	o.Metadata = bare
+	rides := len(first) > 0 && len(bare)+len(first) <= firstBudget
+	if rides {
+		if o.Metadata, err = AppendMetadata(make([]byte, 0, len(bare)+len(first)), Request{Cmd: CmdUDP, Addr: addr, App: app, First: first}); err != nil {
+			return nil, err
+		}
+	}
+	pc, err := p.DialPacket(ctx, o)
+	if rides && errors.Is(err, rendr.ErrMetadataTooLarge) {
+		// This Runtime's Handshake.MaxMetadata refused it before any I/O, or
+		// the passive's answered CodeMetadataSize before admitting a session:
+		// no target received the first datagram. Once more without it, and
+		// it follows the open, so it is still sent at most once (M6-D4,
+		// R1-4).
+		o.Metadata, rides = bare, false
+		pc, err = p.DialPacket(ctx, o)
+	}
+	if err != nil {
+		return nil, err
+	}
+	// net.ErrClosed only: the session already ended, and its first ReadFrom
+	// or WriteTo reports why.
+	pc.SetIdleTimeout(DefaultFlowIdle)
+	if len(first) > 0 && !rides {
+		// WriteTo copies the datagram: first is not retained. Any other error
+		// is the session's end, which its next call reports (as Dial's
+		// SetIdleTimeout above); the datagram is lost with it.
+		if _, err := pc.WriteTo(first, nil); errors.Is(err, rendr.ErrPacketTooLarge) {
+			pc.Close() // R1-9: an error never comes with a live session
+			return nil, err
+		}
+	}
+	return pc, nil
 }
