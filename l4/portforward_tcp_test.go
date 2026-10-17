@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -133,6 +134,14 @@ func (ptTempErr) Error() string   { return "pt: too many open files" }
 func (ptTempErr) Temporary() bool { return true }
 func (ptTempErr) Timeout() bool   { return false }
 
+// ptTimeoutErr is a timeout Accept error that does not call itself
+// temporary (an embedder listener's deadline): Timeout true only.
+type ptTimeoutErr struct{}
+
+func (ptTimeoutErr) Error() string   { return "pt: accept deadline exceeded" }
+func (ptTimeoutErr) Temporary() bool { return false }
+func (ptTimeoutErr) Timeout() bool   { return true }
+
 // errPTPermanent is a permanent Accept error (neither temporary nor a
 // timeout).
 var errPTPermanent = errors.New("pt: listener broken for good")
@@ -144,6 +153,7 @@ type ptOpts struct {
 	hook      func(context.Context, Request) (net.Conn, error) // the Server's Dial (nil: the echo target)
 	ownLoop   bool                                             // no Server: the row runs its own loop on w.ln
 	pfwd      func(*PortForward)                               // sets the PortForward up (its Peer is the kit's)
+	broken    *atomic.Bool                                     // while set, the carrier's Dial reports net.ErrClosed (a tunnel that is down)
 }
 
 // ptWorld is one row's world.
@@ -180,7 +190,16 @@ func newPTWorld(t testing.TB, o ptOpts) *ptWorld {
 	l := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: ln.Handle})
 	l.SetDelay(kitOneWay, 0)
 	w.links = append(w.links, l)
-	cs := []rendr.Carrier{rendr.StreamCarrier{Name: "a", Dial: l.Dial, Props: rendr.Props{CheapSubflow: o.dedicated}}}
+	dial := l.Dial
+	if o.broken != nil {
+		dial = func(ctx context.Context) (net.Conn, error) {
+			if o.broken.Load() {
+				return nil, net.ErrClosed
+			}
+			return l.Dial(ctx)
+		}
+	}
+	cs := []rendr.Carrier{rendr.StreamCarrier{Name: "a", Dial: dial, Props: rendr.Props{CheapSubflow: o.dedicated}}}
 	if w.peer, err = w.d.NewPeer(rendr.PeerConfig{Carriers: cs}); err != nil {
 		t.Fatalf("NewPeer: %v", err)
 	}
@@ -336,10 +355,12 @@ func ptWantReset(t testing.TB, what string, c *rendrtest.TargetConn, d time.Dura
 // Request.App, EarlyReturn honoured), applies IdleTimeout as l4.Dial and
 // the Server do, resets a connection whose Dial fails (a refusal, also
 // one an EarlyReturn session meets at its open) or that is beyond
-// MaxConns, backs off temporary Accept errors (5 → 100 ms), ends on
-// ctx, a permanent Accept error or a closed Peer after resetting every
-// connection it forwards, and owns ln: closed exactly once, after every
-// connection ended; its checks run before the first Accept.
+// MaxConns, backs off temporary Accept errors (5 → 100 ms; a stop ends
+// the wait), ends on ctx, a permanent Accept error or a closed Peer after
+// resetting every connection it forwards — a carrier's net.ErrClosed is
+// one connection's failure, never the serve's end —, and owns ln: closed
+// exactly once, the return after every connection ended; its checks run
+// before the first Accept.
 func TestPortForwardTCP_L02(t *testing.T) {
 	t.Run("forward", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
@@ -516,17 +537,24 @@ func TestPortForwardTCP_L02(t *testing.T) {
 		// IdleTimeout as l4.Dial and the Server: 0 → DefaultIdleTimeout; a
 		// value is set; negative → none, so the dialer's Config applies.
 		// The passive sets no limit, so the ingress's ends the session (a
-		// reset of the client: an idle end is not a clean one).
+		// reset of the client: an idle end is not a clean one). An
+		// EarlyReturn session gets the limit too, and the idle end of a
+		// session that opened is no dial failure.
 		for _, r := range []struct {
 			pf, cfg, want time.Duration // want 0: no end
+			early         bool
 		}{
-			{30 * time.Second, 0, 30 * time.Second},
-			{0, 0, DefaultIdleTimeout},
-			{-1, 45 * time.Second, 45 * time.Second},
-			{-1, 0, 0},
+			{30 * time.Second, 0, 30 * time.Second, false},
+			{0, 0, DefaultIdleTimeout, false},
+			{-1, 45 * time.Second, 45 * time.Second, false},
+			{-1, 0, 0, false},
+			{30 * time.Second, 0, 30 * time.Second, true},
 		} {
 			synctest.Test(t, func(t *testing.T) {
-				w := newPTWorld(t, ptOpts{dialerCfg: rendr.Config{IdleTimeout: r.cfg}, pfwd: func(f *PortForward) { f.IdleTimeout = r.pf }})
+				w := newPTWorld(t, ptOpts{dialerCfg: rendr.Config{IdleTimeout: r.cfg}, pfwd: func(f *PortForward) {
+					f.IdleTimeout = r.pf
+					f.Options.EarlyReturn = r.early
+				}})
 				w.serveTCP()
 				c := w.pl.dial()
 				ptPing(t, c, 100)
@@ -541,64 +569,81 @@ func TestPortForwardTCP_L02(t *testing.T) {
 					return
 				}
 				if el := at.Sub(t0); !isReset(err) || el < r.want || el > r.want+5*time.Second {
-					t.Fatalf("IdleTimeout %v, Config %v: %v after %v, want a reset at %v", r.pf, r.cfg, err, el, r.want)
+					t.Fatalf("IdleTimeout %v, Config %v, EarlyReturn %v: %v after %v, want a reset at %v", r.pf, r.cfg, r.early, err, el, r.want)
+				}
+				waitFor(t, 10*time.Second, "Live 0", func() bool { return w.pf.Status().TCP.Live == 0 })
+				if st := w.pf.Status().TCP; st.Failed != 0 || st.LastErr != nil {
+					t.Fatalf("IdleTimeout %v, EarlyReturn %v: status %+v: the idle end of an open session counted as a dial failure", r.pf, r.early, st)
 				}
 			})
 		}
 	})
 
 	t.Run("stop", func(t *testing.T) {
+		// With EarlyReturn the fifth session is pending at the stop (its
+		// OPEN unanswered): its end is not counted as a dial failure either.
+		for _, early := range []bool{false, true} {
+			synctest.Test(t, func(t *testing.T) { ptStopRow(t, early) })
+		}
+	})
+
+	t.Run("carrier-closed", func(t *testing.T) {
+		// A carrier whose Dial reports net.ErrClosed (an embedder tunnel that
+		// is down) fails a Dial with ErrNoPath wrapping it while the Peer is
+		// open: that connection's failure (reset, counted), never the
+		// serve's end; the connection already forwarded keeps forwarding.
 		synctest.Test(t, func(t *testing.T) {
-			var dialling atomic.Int32
-			var w *ptWorld
-			w = newPTWorld(t, ptOpts{hook: func(ctx context.Context, r Request) (net.Conn, error) {
-				if dialling.Add(1) == 5 {
-					<-ctx.Done() // the fifth connection's dial never completes
-					return nil, ctx.Err()
-				}
-				return w.echo.Dial(ctx, r.Addr)
-			}})
+			var broken atomic.Bool
+			w := newPTWorld(t, ptOpts{dedicated: true, broken: &broken})
 			w.serveTCP()
-			var cs []*rendrtest.TargetConn
-			for range 4 {
-				c := w.pl.dial()
-				ptPing(t, c, 512)
-				cs = append(cs, c)
-			}
-			cs = append(cs, w.pl.dial())
-			waitFor(t, 10*time.Second, "the fifth dial at the passive", func() bool { return dialling.Load() == 5 })
-			// The sixth connection's teardown takes until release.
-			slow, release := w.pl.dialGated()
-			ptPing(t, slow, 512)
-			cs = append(cs, slow)
-			select {
-			case err := <-w.served:
-				t.Fatalf("ServeTCP returned %v before its ctx ended", err)
-			default:
-			}
-			if st := w.pf.Status().TCP; st.Live != 6 || st.Accepted != 6 {
-				t.Fatalf("status %+v: want 6 live (5 forwarding, 1 dialling)", st)
-			}
-			w.cancel()
+			c1 := w.pl.dial()
+			ptPing(t, c1, 256)
+			broken.Store(true)
+			c2 := w.pl.dial()
+			ptWantReset(t, "a Dial whose carrier is closed", c2, time.Minute)
+			waitFor(t, 10*time.Second, "the failure counted", func() bool { return w.pf.Status().TCP.Failed == 1 })
 			synctest.Wait()
 			select {
 			case err := <-w.served:
-				t.Fatalf("ServeTCP returned %v while a connection's teardown still ran", err)
+				w.served = nil
+				t.Fatalf("ServeTCP returned %v with the Peer open: a carrier's net.ErrClosed ended the serve", err)
 			default:
 			}
-			release()
-			if err := w.result(time.Minute); !errors.Is(err, context.Canceled) {
+			st := w.pf.Status().TCP
+			if !errors.Is(st.LastErr, rendr.ErrNoPath) || !errors.Is(st.LastErr, net.ErrClosed) || st.Accepted != 2 || st.Live != 1 {
+				t.Fatalf("status %+v: want 2 accepted, 1 live, LastErr ErrNoPath wrapping the carrier's net.ErrClosed", st)
+			}
+			ptPing(t, c1, 256) // still forwarding
+			broken.Store(false)
+			ptEcho(t, w.pl.dial(), 16<<10, 3) // and a new connection forwards
+			if err := w.stop(); !errors.Is(err, context.Canceled) {
 				t.Fatalf("ServeTCP = %v, want context.Canceled", err)
 			}
-			// At the return every connection has ended: each client is
-			// reset already (none waits), and ln was closed once.
-			for i, c := range cs {
-				if err := ptEndNow(c); !isReset(err) {
-					t.Fatalf("connection %d at ServeTCP's return: %v, want reset already", i, err)
-				}
+		})
+	})
+
+	t.Run("backoff-stop", func(t *testing.T) {
+		// A stop while the loop waits out a back-off returns at once, not
+		// when the wait ends, and calls Accept no more.
+		synctest.Test(t, func(t *testing.T) {
+			w := newPTWorld(t, ptOpts{})
+			for range 6 {
+				w.pl.q <- ptAccept{err: ptTempErr{}}
 			}
-			if st := w.pf.Status().TCP; st.Live != 0 || st.Failed != 0 || w.pl.closes.Load() != 1 {
-				t.Fatalf("status %+v, %d Closes: want nothing live, the cancelled dial not a failure, ln closed once", st, w.pl.closes.Load())
+			w.serveTCP()
+			// The sixth error returns at 5+10+20+40+80 = 155 ms; its 100 ms
+			// wait runs until 255 ms.
+			time.Sleep(200 * time.Millisecond)
+			if st := w.pf.Status().TCP; st.AcceptNoise != 6 {
+				t.Fatalf("status %+v: want 6 AcceptNoise, the loop in its sixth wait", st)
+			}
+			t0 := time.Now()
+			err := w.stop()
+			if el := time.Since(t0); !errors.Is(err, context.Canceled) || el != 0 || w.pl.closes.Load() != 1 {
+				t.Fatalf("ServeTCP = %v %v after the cancel, %d Closes; want context.Canceled at once, ln closed once", err, el, w.pl.closes.Load())
+			}
+			if n := len(w.pl.acceptCalls()); n != 6 {
+				t.Fatalf("%d Accept calls, want 6 (none after the stop)", n)
 			}
 		})
 	})
@@ -607,11 +652,17 @@ func TestPortForwardTCP_L02(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			w := newPTWorld(t, ptOpts{})
 			// The first error comes with a conn (a listener that breaks
-			// the contract): it is reset, not served.
+			// the contract): it is reset, not served. The fourth is a
+			// timeout that does not call itself temporary (a deadline on an
+			// embedder's listener): backed off as well.
 			both, srv := rendrtest.TargetPipe(0)
 			w.pl.q <- ptAccept{c: srv, err: ptTempErr{}}
-			for range 6 {
-				w.pl.q <- ptAccept{err: ptTempErr{}}
+			for i := range 6 {
+				var err error = ptTempErr{}
+				if i == 2 {
+					err = ptTimeoutErr{}
+				}
+				w.pl.q <- ptAccept{err: err}
 			}
 			w.pl.q <- ptAccept{} // (nil, nil): a broken listener, retried
 			c := w.pl.dial()
@@ -654,7 +705,6 @@ func TestPortForwardTCP_L02(t *testing.T) {
 			}
 		})
 	})
-
 	t.Run("listener-closed", func(t *testing.T) {
 		// net.ErrClosed from a close by someone else ends the serve.
 		synctest.Test(t, func(t *testing.T) {
@@ -753,18 +803,30 @@ func TestPortForwardTCP_L02(t *testing.T) {
 			}
 		})
 		// Real listeners: a loopback TCP one and a Unix-domain one pass the
-		// checks and are closed by ServeTCP.
+		// checks and are closed by ServeTCP. Either failing to listen fails
+		// the row; only a platform without Unix-domain sockets has no
+		// Unix-domain row.
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		pf := &PortForward{Peer: &rendr.Peer{}}
-		for _, r := range []struct{ network, addr string }{
-			{"tcp", "127.0.0.1:0"},
-			{"unix", filepath.Join(t.TempDir(), "pf.sock")},
-		} {
+		rows := []struct{ network, addr string }{{"tcp", "127.0.0.1:0"}}
+		switch runtime.GOOS {
+		case "plan9", "js", "wasip1":
+			t.Logf("no Unix-domain listener row: %s has no Unix-domain sockets", runtime.GOOS)
+		default:
+			// A short directory: a socket path holds about 100 bytes, which a
+			// t.TempDir path on darwin nearly uses up.
+			dir, err := os.MkdirTemp("", "pt")
+			if err != nil {
+				t.Fatalf("MkdirTemp: %v", err)
+			}
+			t.Cleanup(func() { os.RemoveAll(dir) })
+			rows = append(rows, struct{ network, addr string }{"unix", filepath.Join(dir, "pf.sock")})
+		}
+		for _, r := range rows {
 			ln, err := net.Listen(r.network, r.addr)
 			if err != nil {
-				t.Logf("%s listener: %v (row skipped)", r.network, err)
-				continue
+				t.Fatalf("%s listener: %v", r.network, err)
 			}
 			if err := pf.ServeTCP(ctx, ln, ptTarget); !errors.Is(err, context.Canceled) {
 				t.Errorf("real %s listener: ServeTCP = %v, want context.Canceled", r.network, err)
@@ -774,4 +836,66 @@ func TestPortForwardTCP_L02(t *testing.T) {
 			}
 		}
 	})
+}
+
+// ptStopRow is the /stop subtest (EarlyReturn early): four connections
+// forwarding, a fifth stuck in its dial (with EarlyReturn: pending, its
+// OPEN unanswered), a sixth forwarding whose server end's Close is gated.
+// After the cancel ServeTCP returns only once the gated teardown ran,
+// every client reset, nothing counted as a failure, ln closed once.
+func ptStopRow(t *testing.T, early bool) {
+	var dialling atomic.Int32
+	var w *ptWorld
+	w = newPTWorld(t, ptOpts{
+		hook: func(ctx context.Context, r Request) (net.Conn, error) {
+			if dialling.Add(1) == 5 {
+				<-ctx.Done() // the fifth connection's dial never completes
+				return nil, ctx.Err()
+			}
+			return w.echo.Dial(ctx, r.Addr)
+		},
+		pfwd: func(f *PortForward) { f.Options.EarlyReturn = early },
+	})
+	w.serveTCP()
+	var cs []*rendrtest.TargetConn
+	for range 4 {
+		c := w.pl.dial()
+		ptPing(t, c, 512)
+		cs = append(cs, c)
+	}
+	cs = append(cs, w.pl.dial())
+	waitFor(t, 10*time.Second, "the fifth dial at the passive", func() bool { return dialling.Load() == 5 })
+	// The sixth connection's teardown takes until release.
+	slow, release := w.pl.dialGated()
+	ptPing(t, slow, 512)
+	cs = append(cs, slow)
+	select {
+	case err := <-w.served:
+		t.Fatalf("EarlyReturn %v: ServeTCP returned %v before its ctx ended", early, err)
+	default:
+	}
+	if st := w.pf.Status().TCP; st.Live != 6 || st.Accepted != 6 {
+		t.Fatalf("EarlyReturn %v: status %+v: want 6 live (5 forwarding, 1 dialling)", early, st)
+	}
+	w.cancel()
+	synctest.Wait()
+	select {
+	case err := <-w.served:
+		t.Fatalf("EarlyReturn %v: ServeTCP returned %v while a connection's teardown still ran", early, err)
+	default:
+	}
+	release()
+	if err := w.result(time.Minute); !errors.Is(err, context.Canceled) {
+		t.Fatalf("EarlyReturn %v: ServeTCP = %v, want context.Canceled", early, err)
+	}
+	// At the return every connection has ended: each client is
+	// reset already (none waits), and ln was closed once.
+	for i, c := range cs {
+		if err := ptEndNow(c); !isReset(err) {
+			t.Fatalf("EarlyReturn %v: connection %d at ServeTCP's return: %v, want reset already", early, i, err)
+		}
+	}
+	if st := w.pf.Status().TCP; st.Live != 0 || st.Failed != 0 || w.pl.closes.Load() != 1 {
+		t.Fatalf("EarlyReturn %v: status %+v, %d Closes: want nothing live, the cancelled dial not a failure, ln closed once", early, st, w.pl.closes.Load())
+	}
 }

@@ -23,9 +23,9 @@ const (
 // permanently (temporary errors back off 5–100 ms) and forwards each to
 // target ("host:port", resolved by the passive; validated before the first
 // Accept: ErrBadAddress). A connection beyond MaxConns, or whose Dial
-// fails, is reset. ServeTCP owns ln from the call on and closes it when it
-// returns, after every connection it started ended. A Unix-domain listener
-// counts as loopback.
+// fails, is reset. ServeTCP owns ln from the call on: it closes it exactly
+// once when it stops accepting, and returns only after every connection it
+// started ended. A Unix-domain listener counts as loopback.
 //
 // Each accepted connection holds one MaxConns unit while its session is
 // dialled and forwarded: Peer.Dial with Options (EarlyReturn honoured: the
@@ -40,11 +40,12 @@ const (
 //
 // ServeTCP returns ctx.Err() once ctx is done, Accept's error when it fails
 // permanently (net.ErrClosed after a Close by someone else), or
-// net.ErrClosed when the Peer or its Runtime was closed. Before it returns
-// it resets every connection still forwarded (their sessions aborted with
-// AbortShutdown) and waits for each to end. Before the first Accept it
-// returns at once, ln closed: an error when Peer is nil, the metadata
-// error of an invalid target (ErrBadAddress), or ErrNonLoopback.
+// net.ErrClosed when the Peer or its Runtime was closed (a carrier's
+// net.ErrClosed inside a Dial error is that connection's failure). Before
+// it returns it resets every connection still forwarded (their sessions
+// aborted with AbortShutdown) and waits for each to end. Before the first
+// Accept it returns at once, ln closed: an error when Peer is nil, the
+// metadata error of an invalid target (ErrBadAddress), or ErrNonLoopback.
 func (f *PortForward) ServeTCP(ctx context.Context, ln net.Listener, target string) error {
 	s, err := f.newTCPServe(ctx, ln, target)
 	if err != nil {
@@ -208,7 +209,11 @@ func (s *tcpServe) handle(c net.Conn) {
 	rc, err := s.f.Peer.Dial(s.ctx, s.opts)
 	if err != nil {
 		resetConn(c)
-		if errors.Is(err, net.ErrClosed) {
+		// Peer.Dial returns the bare net.ErrClosed for a closed Peer or
+		// Runtime. A wrapped one is a carrier's (ErrNoPath's last carrier
+		// error: an embedder tunnel that is down), so it is this
+		// connection's failure and never resets the others.
+		if err == net.ErrClosed {
 			s.halt(err)
 		}
 		if s.ctx.Err() == nil {
