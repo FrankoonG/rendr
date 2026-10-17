@@ -1,14 +1,19 @@
 package rendr
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
@@ -480,4 +485,321 @@ func TestConnDone(t *testing.T) {
 			cdFinal(t, dw, sw)
 		})
 	})
+}
+
+// TestAbortDuringOutageReachesDialer_L47 (L47, plan §5; WP13 B-1): the
+// passive application aborts (code 0x5000) while the session has no
+// carrier: the dialer's only link was killed and refuses new carriers.
+// The RST has no lane, the session ends and its tombstone keeps the code.
+// A JOIN to that tombstone — here a raw one on a second link — is answered
+// JOIN_ACK(UNKNOWN_SESSION) with the code in the RxNext field when its
+// PREFACE carried OptEndCode (which the PREFACE_ACK echoes), and with the
+// canonical, code-free JOIN_ACK otherwise (a dialer that does not know the
+// bit: M3). Once the link accepts again the dialer's own rejoin ends its
+// session with *AbortError{0x5000, Remote} instead of ErrSessionLost.
+func TestAbortDuringOutageReachesDialer_L47(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const code AbortCode = 0x5000
+		e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a", "raw")
+		dc, pc := e2eOpen(t, e.peer(e.links[0]), e.ln, DialOptions{})
+		l := e.links[0]
+		l.SetRefuse(true)
+		if l.Kill() == 0 {
+			t.Fatal("stimulus: no carrier killed")
+		}
+		time.Sleep(50 * time.Millisecond)
+		pc.Abort(code, "outage")
+		select {
+		case <-pc.Done():
+		case <-time.After(time.Second):
+			t.Fatal("the passive session did not end")
+		}
+		if st := e.p.Status(); st.Sessions.Tombstones != 1 {
+			t.Fatalf("stimulus: passive %+v, want the tombstone", st.Sessions)
+		}
+		for _, offer := range []bool{true, false} {
+			opt, wantCode := uint32(0), uint32(0)
+			if offer {
+				opt, wantCode = wire.OptEndCode, uint32(code)
+			}
+			ackOpt, payload := rawJoin(t, e, opt, dc.ID())
+			want := make([]byte, wire.JoinAckLen)
+			wire.PutJoinAckMux(want, &wire.JoinAck{Status: wire.StatusUnknownSession}, wantCode)
+			if ackOpt != opt || !bytes.Equal(payload, want) {
+				t.Errorf("JOIN offering %#x: PREFACE_ACK opt %#x, JOIN_ACK % x; want opt %#x, % x", opt, ackOpt, payload, opt, want)
+			}
+		}
+		l.SetRefuse(false)
+		var ae *AbortError
+		if _, err := dc.Read(make([]byte, 1)); !errors.As(err, &ae) || ae.Code != code || !ae.Remote {
+			t.Fatalf("the dialer after the outage: %v, want *AbortError{%#x, Remote}", err, code)
+		}
+		synctest.Wait()
+		e.close()
+	})
+}
+
+// rawJoin sends PREFACE(opt) ‖ JOIN(sid) for the dialer Runtime's instance
+// on e's "raw" link and returns the PREFACE_ACK's opt and the JOIN_ACK's
+// payload.
+func rawJoin(t *testing.T, e *e2ePair, opt uint32, sid SessionID) (uint32, []byte) {
+	t.Helper()
+	nc, err := e.links[1].Dial(context.Background())
+	if err != nil {
+		t.Fatalf("raw Dial: %v", err)
+	}
+	defer nc.Close()
+	pre := make([]byte, wire.PrefaceLen)
+	wire.PutPreface(pre, &wire.Preface{Minor: wire.Minor, Kind: wire.KindStream, Opt: opt, Instance: e.d.InstanceID(), CarrierID: 0x7777})
+	jp := make([]byte, wire.JoinLen)
+	wire.PutJoin(jp, &wire.Join{SID: sid, Mode: 1})
+	hello := wire.AppendFrame(pre, wire.Header{Type: wire.TypeJoin, Fseq: wire.PrefaceFseq(pre), Handle: wire.SessionHandle}, jp)
+	if _, err := nc.Write(hello); err != nil {
+		t.Fatalf("raw hello: %v", err)
+	}
+	ab := make([]byte, wire.PrefaceLen)
+	if _, err := io.ReadFull(nc, ab); err != nil {
+		t.Fatalf("PREFACE_ACK: %v", err)
+	}
+	ack, err := wire.ParsePrefaceAck(ab)
+	if err != nil || ack.Status != wire.PrefaceOK {
+		t.Fatalf("PREFACE_ACK %+v %v", ack, err)
+	}
+	fb := make([]byte, wire.FrameOverhead+wire.JoinAckLen)
+	if _, err := io.ReadFull(nc, fb); err != nil {
+		t.Fatalf("JOIN_ACK: %v", err)
+	}
+	f, _, err := wire.DecodeFrame(fb)
+	if err != nil || f.Type != wire.TypeJoinAck || f.Handle != wire.SessionHandle {
+		t.Fatalf("response %+v %v", f.Header, err)
+	}
+	return ack.Opt, bytes.Clone(f.Payload)
+}
+
+// TestAbortDuringOutageReachesDialerOnView_L47 (L47; WP13 B-1): the same
+// outage with two sessions on one MUX trunk. The passive aborts the first
+// (code 0x5001) while the trunk is dead; the second survives. When the
+// link accepts again, the factory refuses every carrier whose first frame
+// is the aborted session's JOIN, so only the survivor's JOIN builds the new
+// trunk and the aborted session's JOIN can only take a view of it (a fast
+// path or a coalesced wait never calls the factory). That view's
+// JOIN_ACK(UNKNOWN_SESSION) carries the code, and the dialer ends with
+// *AbortError{0x5001, Remote}, not ErrSessionLost.
+func TestAbortDuringOutageReachesDialerOnView_L47(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const code AbortCode = 0x5001
+		e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a")
+		l := e.links[0]
+		var blocked atomic.Pointer[SessionID] // the session whose handle-1 JOIN the factory refuses
+		var ownJoins atomic.Int32
+		dial := func(ctx context.Context, first []byte) (net.Conn, error) {
+			if sid := blocked.Load(); sid != nil && len(first) >= wire.PrefaceLen+wire.HeaderLen+16 {
+				f, _, err := wire.DecodeFrame(first[wire.PrefaceLen:])
+				if err == nil && f.Type == wire.TypeJoin && bytes.Equal(f.Payload[:16], sid[:]) {
+					ownJoins.Add(1)
+					return nil, errors.New("refused: the aborted session must take a view")
+				}
+			}
+			return l.DialEarly(ctx, first)
+		}
+		p, err := e.d.NewPeer(PeerConfig{Carriers: []Carrier{StreamCarrier{Name: "a", Dial: l.Dial, DialEarly: dial}}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		dc, pc := e2eOpen(t, p, e.ln, DialOptions{})
+		dc2, pc2 := e2eOpen(t, p, e.ln, DialOptions{})
+		if st := e.d.Status().Mux; st.Carriers != 1 || st.Views != 2 {
+			t.Fatalf("stimulus: dialer mux %+v, want both sessions on one trunk", st)
+		}
+		sid := dc.ID()
+		blocked.Store(&sid)
+		l.SetRefuse(true)
+		if l.Kill() == 0 {
+			t.Fatal("stimulus: no carrier killed")
+		}
+		time.Sleep(50 * time.Millisecond)
+		pc.Abort(code, "outage")
+		select {
+		case <-pc.Done():
+		case <-time.After(time.Second):
+			t.Fatal("the passive session did not end")
+		}
+		w := goWrite(dc2, []byte("x"))
+		l.SetRefuse(false)
+		var ae *AbortError
+		if _, err := dc.Read(make([]byte, 1)); !errors.As(err, &ae) || ae.Code != code || !ae.Remote {
+			t.Fatalf("the aborted session's dialer after the outage: %v, want *AbortError{%#x, Remote}", err, code)
+		}
+		if err := <-w; err != nil {
+			t.Fatalf("survivor Write: %v", err)
+		}
+		b := make([]byte, 1)
+		if _, err := io.ReadFull(pc2, b); err != nil || b[0] != 'x' {
+			t.Fatalf("survivor: %q %v", b, err)
+		}
+		t.Logf("the aborted session's own JOIN dials refused: %d; dialer mux %+v", ownJoins.Load(), e.d.Status().Mux)
+		dc2.Close()
+		pc2.Close()
+		synctest.Wait()
+		p.Close()
+		e.close()
+	})
+}
+
+// goWrite writes b to c on its own goroutine.
+func goWrite(c *Conn, b []byte) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		_, err := c.Write(b)
+		ch <- err
+	}()
+	return ch
+}
+
+// M4 WP1 (m4-design §A2.1, §A5.4, §A12.1): the root side of Conn.Abort
+// and Conn.SetIdleTimeout.
+
+// TestConnAbortReservedCode (M4-D20): an Abort code below 256 is rendr's:
+// Abort returns an error and does nothing (no RST on the wire, the session
+// keeps working both ways); a code of 256 or more resets the session and
+// reaches the peer as *AbortError{code, msg, Remote}.
+func TestConnAbortReservedCode(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a")
+		defer e.close()
+		var taps mxTaps
+		defer taps.close()
+		p := e.mxPeer(mxTapCarrier(e.links[0], &taps))
+		dc, pc := mxOpen(t, p, e.ln, DialOptions{})
+		for _, code := range []AbortCode{0, AbortClosed, AbortWithdrawn, 255} {
+			if err := dc.Abort(code, "reserved"); err == nil {
+				t.Fatalf("Abort(%d): nil, want an error", code)
+			}
+		}
+		e2eExchange(t, dc, pc, 64<<10, 1)
+		e2eExchange(t, pc, dc, 64<<10, 2)
+		synctest.Wait()
+		if n := len(mxFrames(taps.tap(t, 0), rendrtest.Up, rendrtest.FrameRst, 1)); n != 0 {
+			t.Fatalf("%d RST frames after refused Aborts, want none", n)
+		}
+		if st := dc.Status(); st.State != StateOpen {
+			t.Fatalf("state %v after refused Aborts, want open", st.State)
+		}
+		if err := dc.Abort(256, "first application code"); err != nil {
+			t.Fatalf("Abort(256): %v", err)
+		}
+		var b [1]byte
+		_, err := pc.Read(b[:])
+		var ae *AbortError
+		if !errors.As(err, &ae) || ae.Code != 256 || ae.Msg != "first application code" || !ae.Remote {
+			t.Fatalf("the peer's Read: %v, want *AbortError{256, msg, Remote}", err)
+		}
+		if _, err := dc.Write(b[:]); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("Write after Abort: %v, want net.ErrClosed", err)
+		}
+		e2eDone(t, dc, 5*time.Second)
+		e2eDone(t, pc, 5*time.Second)
+		if n := len(mxFrames(taps.tap(t, 0), rendrtest.Up, rendrtest.FrameRst, 1)); n != 1 {
+			t.Fatalf("%d RST frames, want 1", n)
+		}
+	})
+}
+
+// TestConnSetIdleTimeout (M4-D21): Conn.SetIdleTimeout applies the
+// Runtime's clamp floor (testhooks.MinIdleTimeout lowers it) and expires
+// a quiet session at the new limit: ErrIdleTimeout here, AbortIdle at the
+// peer.
+func TestConnSetIdleTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ov := &testhooks.Overrides{MinIdleTimeout: time.Second}
+		e := e2eNew(t, Config{}, Config{}, ov, ListenConfig{}, "a")
+		defer e.close()
+		dc, pc := e2eOpen(t, e.peer(), e.ln, DialOptions{})
+		opened := time.Now()
+		if err := dc.SetIdleTimeout(100 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		e2eDone(t, dc, 10*time.Second)
+		if el := time.Since(opened); el < time.Second || el > 3*time.Second {
+			t.Fatalf("the session ended %v after the open, want about 1 s (the lowered floor)", el)
+		}
+		if err := dc.Status().Err; !errors.Is(err, ErrIdleTimeout) {
+			t.Fatalf("end error %v, want ErrIdleTimeout", err)
+		}
+		e2eDone(t, pc, 5*time.Second)
+		var ae *AbortError
+		if err := pc.Status().Err; !errors.As(err, &ae) || ae.Code != AbortIdle || !ae.Remote {
+			t.Fatalf("the peer's end error %v, want *AbortError{AbortIdle, Remote}", err)
+		}
+		if err := dc.SetIdleTimeout(time.Minute); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("SetIdleTimeout after the end: %v, want net.ErrClosed", err)
+		}
+	})
+}
+
+// TestConnSetIdleTimeoutNegativeIsOff (M4-D21, C-2): a negative
+// SetIdleTimeout turns idle expiry off, as 0 does (it is not raised to the
+// 10 s floor), and it overrides the Runtime's Config.IdleTimeout: a quiet
+// session is still open 25 h later (past the 24 h ceiling), and data still
+// moves both ways.
+func TestConnSetIdleTimeoutNegativeIsOff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		cfg := Config{IdleTimeout: 10 * time.Second, PingIdle: time.Minute}
+		e := e2eNew(t, cfg, Config{PingIdle: time.Minute}, nil, ListenConfig{}, "a")
+		defer e.close()
+		dc, pc := e2eOpen(t, e.peer(), e.ln, DialOptions{})
+		if err := dc.SetIdleTimeout(-1); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-dc.s.Done():
+			t.Fatalf("the session ended after SetIdleTimeout(-1): %v", dc.Status().Err)
+		case <-pc.s.Done():
+			t.Fatalf("the peer ended after SetIdleTimeout(-1): %v", pc.Status().Err)
+		case <-time.After(25 * time.Hour):
+		}
+		e2eExchange(t, dc, pc, 64<<10, 7)
+		if err := dc.Status().Err; err != nil {
+			t.Fatalf("end error %v after 25 h idle, want none", err)
+		}
+		e2eFinish(t, dc, pc)
+	})
+}
+
+// TestPacketLogicalAddr_L38 (destination check): WriteTo accepts only nil
+// or the session's remote Addr (also as a non-nil *Addr); any other
+// address — another session's Addr, a typed nil *Addr, a *net.UDPAddr, a
+// foreign net.Addr whose String panics — returns (0,
+// ErrPacketDestinationMismatch) without calling any method of it and
+// without reaching the session. (The end-to-end half — the address stable
+// across migrations, the token reaching the factory — is
+// TestPacketLogicalAddrE2E_L38.)
+func TestPacketLogicalAddr_L38(t *testing.T) {
+	remote := Addr{Instance: InstanceID(wpInst(1)), Session: SessionID(wpSID(1))}
+	c := &PacketConn{remote: remote} // no session: a mismatch never reaches it
+	other := remote
+	other.Session[15] ^= 1
+	var typedNil *Addr
+	for _, tc := range []struct {
+		name string
+		addr net.Addr
+	}{
+		{"another session", other},
+		{"another session by pointer", &other},
+		{"typed nil *Addr", typedNil},
+		{"UDP address", &net.UDPAddr{Port: 1}},
+		{"foreign address whose String panics", panicAddr{}},
+	} {
+		if n, err := c.WriteTo([]byte("x"), tc.addr); n != 0 || !errors.Is(err, ErrPacketDestinationMismatch) {
+			t.Errorf("%s: WriteTo = %d, %v", tc.name, n, err)
+		}
+	}
+	for _, a := range []net.Addr{nil, remote, &remote} {
+		if !c.isRemote(a) {
+			t.Errorf("isRemote(%v) = false", a)
+		}
+	}
+	if c.RemoteAddr() != net.Addr(remote) {
+		t.Fatal("RemoteAddr")
+	}
 }

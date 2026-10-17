@@ -754,3 +754,639 @@ func TestPackRelWrappedE2E_L12(t *testing.T) {
 		e.close()
 	})
 }
+
+// peHub is two Runtimes whose passive listens on a DatagramHub's socket
+// (wrapped by wrap, if set).
+type peHub struct {
+	t    testing.TB
+	d, p *Runtime
+	ln   *Listener
+	hub  *rendrtest.DatagramHub
+}
+
+func peNewHub(t testing.TB, cfg Config, lc ListenConfig, wrap func(net.PacketConn) net.PacketConn) *peHub {
+	t.Helper()
+	h := &peHub{t: t, d: wpTestRuntime(t, cfg, nil), p: wpTestRuntime(t, cfg, nil)}
+	h.hub = rendrtest.NewDatagramHub(rendrtest.DatagramHubConfig{Name: "hub", Queue: 8192})
+	t.Cleanup(func() { h.hub.Close() })
+	pc := h.hub.PacketConn()
+	if wrap != nil {
+		pc = wrap(pc)
+	}
+	lc.Sources = append(lc.Sources, FromPacketConn(pc))
+	h.ln = wpListen(t, h.p, lc)
+	return h
+}
+
+// carrier returns a datagram factory of client host n (wrapped by lc).
+func (h *peHub) carrier(name string, n int, lc *lastPC) DatagramCarrier {
+	dial := h.hub.DialFrom(n)
+	if lc != nil {
+		dial = lc.wrap(dial)
+	}
+	return DatagramCarrier{Name: name, Dial: dial, MTU: 1223}
+}
+
+func (h *peHub) peer(cs ...Carrier) *Peer {
+	h.t.Helper()
+	p, err := h.d.NewPeer(PeerConfig{Carriers: cs})
+	if err != nil {
+		h.t.Fatalf("NewPeer: %v", err)
+	}
+	return p
+}
+
+func (h *peHub) close() {
+	h.t.Helper()
+	h.d.Close()
+	h.p.Close()
+	h.hub.Close()
+	peNoState(h.t, h.d)
+	peNoState(h.t, h.p)
+}
+
+// lastPC records the conns a datagram factory returned, so a test can
+// close one under rendr (an embedder-closed conn) and count Close calls.
+type lastPC struct {
+	mu  sync.Mutex
+	pcs []*countPC
+}
+
+func (l *lastPC) wrap(dial func(context.Context) (net.PacketConn, net.Addr, error)) func(context.Context) (net.PacketConn, net.Addr, error) {
+	return func(ctx context.Context) (net.PacketConn, net.Addr, error) {
+		pc, a, err := dial(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		c := &countPC{PacketConn: pc}
+		l.mu.Lock()
+		l.pcs = append(l.pcs, c)
+		l.mu.Unlock()
+		return c, a, nil
+	}
+}
+
+func (l *lastPC) last() *countPC {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.pcs) == 0 {
+		return nil
+	}
+	return l.pcs[len(l.pcs)-1]
+}
+
+// End-to-end rows of a mixed packet bond whose stream member joins after
+// the OPEN (C4-F2; L37, M2-D43, M2-D45): the passive reports the joined
+// stream member as a member once its JOIN_ACK is placed, but routes data on
+// it only from the dialer's SCHED that lists it (plan:147). A datagram only
+// a stream lane can carry, written in that window, waits for the member
+// within Packet.MaxAge instead of being dropped as too large; when the
+// member dies first, it is dropped and counted (DropTooLarge, L37); when
+// the SCHED does not come within MaxAge, it ages out (DropAge). Helpers
+// start with "cf".
+
+// cfBond is a bond Peer of one raw datagram factory (MTU 1400, budget
+// 1375) and one stream factory whose dials wait for gate, with both links
+// at the given one-way delay, opened as a packet session (MaxPayload
+// 65,507: a stream factory exists). The OPEN rides the datagram carrier;
+// the stream carrier dials once gate closes and JOINs.
+type cfBond struct {
+	e      *pePair
+	sl     *rendrtest.Link
+	gate   chan struct{}
+	dc, pc *PacketConn
+}
+
+func cfOpen(t *testing.T, pcfg Config, delay time.Duration) *cfBond {
+	t.Helper()
+	b := &cfBond{gate: make(chan struct{})}
+	b.e = peNew(t, Config{}, pcfg, nil, 0, "udp")
+	b.e.links[0].SetDelay(rendrtest.Up, delay, 0)
+	b.e.links[0].SetDelay(rendrtest.Down, delay, 0)
+	b.sl = rendrtest.NewLink(rendrtest.LinkConfig{Name: "tcp", Accept: b.e.ln.Handle})
+	b.sl.SetDelay(delay, 0)
+	t.Cleanup(func() { b.sl.Close() })
+	tcp := StreamCarrier{Name: "tcp", Dial: func(ctx context.Context) (net.Conn, error) {
+		select {
+		case <-b.gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return b.sl.Dial(ctx)
+	}}
+	p := b.e.peer(peDatagramCarrier(b.e.links[0], 1400), tcp)
+	b.dc, b.pc = peOpen(t, p, b.e.ln, DialOptions{Mode: ModeBond})
+	if b.dc.MaxPayload() != 65507 || b.pc.MaxPayload() != 65507 {
+		t.Fatalf("MaxPayload %d / %d, want 65,507", b.dc.MaxPayload(), b.pc.MaxPayload())
+	}
+	if n := len(peLive(b.pc)); n != 1 {
+		t.Fatalf("the passive has %d live carriers before the stream dial, want 1 (the OPEN carrier)", n)
+	}
+	return b
+}
+
+// streamMember waits (1 ms polls, virtual) until the passive's Status lists
+// a stream carrier as a member and returns that snapshot.
+func (b *cfBond) streamMember(t *testing.T) SessionStatus {
+	t.Helper()
+	return b.streamMemberOf(t, b.pc)
+}
+
+// streamMemberOf opens the stream dial gate and waits (1 ms polls,
+// virtual) until c's Status lists a stream carrier as a member.
+func (b *cfBond) streamMemberOf(t *testing.T, c *PacketConn) SessionStatus {
+	t.Helper()
+	close(b.gate)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		st := c.Status()
+		for _, cs := range st.Carriers {
+			if cs.Kind == KindStream && cs.State == CarrierMember {
+				return st
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the passive never listed the stream member")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// write writes datagrams seq first…first+n−1 of seed on c: every even seq
+// big bytes (only a stream carrier can carry it), every odd one small.
+func cfWrite(t *testing.T, c *PacketConn, seed, first uint64, n, big, small int) {
+	t.Helper()
+	buf := make([]byte, big)
+	for i := range uint64(n) {
+		size := small
+		if (first+i)%2 == 0 {
+			size = big
+		}
+		if _, err := c.WriteTo(rendrtest.PacketPayload(buf, seed, first+i, size, time.Now()), nil); err != nil {
+			t.Fatalf("WriteTo seq %d: %v", first+i, err)
+		}
+	}
+}
+
+func (b *cfBond) end(t *testing.T) {
+	t.Helper()
+	peEnd(t, b.dc, b.pc)
+	b.sl.Close()
+	b.e.close()
+}
+
+// TestPacketBigAwaitsSchedE2E_L37 (C4-F2): right after the passive lists
+// the joined stream member, and before the dialer's SCHED that lists it is
+// applied, the passive's application writes 8 datagrams of 60,000 B
+// (above the datagram member's budget) between 8 of 1,000 B. All 16 reach
+// the dialer intact and exactly once; the big ones ride the stream member;
+// nothing is dropped as too large.
+func TestPacketBigAwaitsSchedE2E_L37(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// 10 ms RTT: the SCHED comes about 10 ms after the member is listed, and
+		// the new stream member's first capacity rounds fit in MaxAge (100 ms).
+		b := cfOpen(t, Config{}, 5*time.Millisecond)
+		st := b.streamMember(t)
+		cfWrite(t, b.pc, 7, 0, 16, 60000, 1000)
+		// Stimulus: every write happened before the SCHED that routes the
+		// stream member was applied (routing and Status change in one
+		// critical section, L27).
+		if after := b.pc.Status(); after.SchedEpoch != st.SchedEpoch {
+			t.Fatalf("INVALID: the passive applied SCHED %d → %d before the writes ended", st.SchedEpoch, after.SchedEpoch)
+		}
+		v := peRecv(t, b.dc, 7, 16, time.Second)
+		r := v.Result()
+		ps := b.pc.Status()
+		if r.Unique != 16 || r.Duplicates != 0 || r.Corrupt != 0 || r.BadSize != 0 {
+			t.Fatalf("dialer received %+v; passive counters %+v", r, *ps.Packet)
+		}
+		if ps.SchedEpoch == st.SchedEpoch {
+			t.Fatal("the passive never applied a later SCHED: the stream member was routed without one")
+		}
+		if c := ps.Packet; c.DropTooLarge != 0 || c.DropAge != 0 || c.DropQueue != 0 || c.Sent != 16 {
+			t.Fatalf("passive counters %+v; want 16 sent, nothing dropped", *c)
+		}
+		var tcpTx uint64
+		for _, cs := range ps.Carriers {
+			if cs.Kind == KindStream {
+				tcpTx += cs.TxBytes
+			}
+		}
+		if tcpTx < 8*60000 {
+			t.Fatalf("the stream member carried %d payload bytes, want the 8 big datagrams (≥ %d)", tcpTx, 8*60000)
+		}
+		b.end(t)
+	})
+}
+
+// TestPacketBigHeldMemberDiesE2E_L37: the stream member the big datagrams
+// wait for dies before any SCHED routes it (its link is killed and
+// refuses redials): no carrier can carry them any more, so they are
+// dropped and counted as too large at once (L37) while the small ones are
+// delivered; WriteTo of a big one afterwards is dropped the same way.
+func TestPacketBigHeldMemberDiesE2E_L37(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := cfOpen(t, Config{}, 20*time.Millisecond)
+		st := b.streamMember(t)
+		cfWrite(t, b.pc, 9, 0, 8, 60000, 1000)
+		if after := b.pc.Status(); after.SchedEpoch != st.SchedEpoch {
+			t.Fatalf("INVALID: the passive applied SCHED %d → %d before the writes ended", st.SchedEpoch, after.SchedEpoch)
+		}
+		b.sl.SetRefuse(true)
+		b.sl.Kill()
+		peWait(t, time.Second, "the passive's stream member died", func() bool {
+			for _, cs := range peLive(b.pc) {
+				if cs.Kind == KindStream {
+					return false
+				}
+			}
+			return true
+		})
+		cfWrite(t, b.pc, 9, 8, 2, 60000, 1000)
+		v := peRecv(t, b.dc, 9, 5, 500*time.Millisecond)
+		r := v.Result()
+		c := *b.pc.Status().Packet
+		if r.Unique != 5 || r.Duplicates != 0 || r.Corrupt != 0 || r.BadSize != 0 {
+			t.Fatalf("dialer received %+v, want the 5 small datagrams; passive counters %+v", r, c)
+		}
+		if c.DropTooLarge != 5 || c.Sent != 5 || c.DropAge != 0 || c.DropQueue != 0 || c.DropNoPath != 0 {
+			t.Fatalf("passive counters %+v; want 5 sent and the 5 big ones DropTooLarge", c)
+		}
+		b.end(t)
+	})
+}
+
+// TestPacketBigHeldAgesE2E_L37: the SCHED that would route the stream
+// member does not come (its link stalls while the JOIN_ACK is in flight):
+// the big datagrams waiting for it age out within Packet.MaxAge (DropAge,
+// M2-D35) — the wait is bounded, they are neither held longer nor counted
+// as too large — and once the link resumes the member is routed and later
+// big datagrams ride it.
+func TestPacketBigHeldAgesE2E_L37(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pcfg := Config{}
+		pcfg.Packet.MaxAge = 50 * time.Millisecond
+		b := cfOpen(t, pcfg, 20*time.Millisecond)
+		st := b.streamMember(t)
+		b.sl.SetStall(true)
+		cfWrite(t, b.pc, 11, 0, 8, 60000, 1000)
+		if after := b.pc.Status(); after.SchedEpoch != st.SchedEpoch {
+			t.Fatalf("INVALID: the passive applied SCHED %d → %d before the writes ended", st.SchedEpoch, after.SchedEpoch)
+		}
+		time.Sleep(60 * time.Millisecond) // MaxAge + 10 ms, the SCHED still held
+		ps := b.pc.Status()
+		if ps.SchedEpoch != st.SchedEpoch {
+			t.Fatalf("INVALID: SCHED %d → %d applied during the stall", st.SchedEpoch, ps.SchedEpoch)
+		}
+		if c := *ps.Packet; c.DropAge != 4 || c.DropTooLarge != 0 || c.Sent != 4 || c.DropQueue != 0 {
+			t.Fatalf("passive counters %+v at MaxAge + 10 ms; want the 4 big ones DropAge, 4 sent", c)
+		}
+		b.sl.SetStall(false)
+		peWait(t, 5*time.Second, "the passive applied the SCHED", func() bool { return b.pc.Status().SchedEpoch != st.SchedEpoch })
+		cfWrite(t, b.pc, 11, 8, 4, 60000, 1000)
+		v := peRecv(t, b.dc, 11, 8, time.Second)
+		r := v.Result()
+		c := *b.pc.Status().Packet
+		if r.Unique != 8 || r.Duplicates != 0 || r.Corrupt != 0 || r.BadSize != 0 {
+			t.Fatalf("dialer received %+v, want the first 4 small and the 4 later; passive counters %+v", r, c)
+		}
+		if c.DropAge != 4 || c.DropTooLarge != 0 || c.Sent != 8 {
+			t.Fatalf("passive counters %+v; want 8 sent, the first 4 big DropAge", c)
+		}
+		b.end(t)
+	})
+}
+
+// TestPacketBigDialerAtAttachE2E_L37: the dialer side of C4-F2. The dialer
+// decides its own data lanes: a stream member is a data lane in the same
+// step that its Status lists it (attachLocked, L27), so 8 datagrams of
+// 60,000 B written right after its Status lists the member — between 8 of
+// 1,000 B — all reach the passive intact and exactly once, the big ones on
+// the stream member, nothing dropped.
+func TestPacketBigDialerAtAttachE2E_L37(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		b := cfOpen(t, Config{}, 5*time.Millisecond)
+		b.streamMemberOf(t, b.dc)
+		cfWrite(t, b.dc, 13, 0, 16, 60000, 1000)
+		v := peRecv(t, b.pc, 13, 16, time.Second)
+		r := v.Result()
+		ds := b.dc.Status()
+		if r.Unique != 16 || r.Duplicates != 0 || r.Corrupt != 0 || r.BadSize != 0 {
+			t.Fatalf("passive received %+v; dialer counters %+v", r, *ds.Packet)
+		}
+		if c := ds.Packet; c.DropTooLarge != 0 || c.DropAge != 0 || c.DropQueue != 0 || c.Sent != 16 {
+			t.Fatalf("dialer counters %+v; want 16 sent, nothing dropped", *c)
+		}
+		var tcpTx uint64
+		for _, cs := range ds.Carriers {
+			if cs.Kind == KindStream {
+				tcpTx += cs.TxBytes
+			}
+		}
+		if tcpTx < 8*60000 {
+			t.Fatalf("the stream member carried %d payload bytes, want the 8 big datagrams (≥ %d)", tcpTx, 8*60000)
+		}
+		b.end(t)
+	})
+}
+
+// More end-to-end rows of integration 2: the selector gauge on datagram
+// lanes, misbehaving datagram factories, close joins, a conn the embedder
+// closed, probes, SCHED over REL and the passive's packet queue.
+
+// TestPacketSelectorNoGaugeE2E (M2-D26, R1-33) on started datagram lanes:
+// nothing is submitted on a datagram carrier (Inflight stays 0 under
+// load), while a packet session's stream carrier counts its DGRAM bytes in
+// flight.
+func TestPacketSelectorNoGaugeE2E(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := peNew(t, Config{}, Config{}, nil, 0, "a")
+		dc, pc := peOpen(t, e.peer(peDatagramCarrier(e.links[0], 1400)), e.ln, DialOptions{})
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				if _, _, err := pc.ReadFrom(buf); err != nil {
+					return
+				}
+			}
+		}()
+		buf := make([]byte, 1000)
+		for i := range 2000 {
+			dc.WriteTo(buf, nil)
+			if i%5 == 0 {
+				time.Sleep(time.Millisecond)
+				if cs := dc.Status().Carriers[0]; cs.Inflight != 0 {
+					t.Fatalf("a datagram carrier reports %d bytes in flight", cs.Inflight)
+				}
+			}
+		}
+		peEnd(t, dc, pc)
+
+		sl := rendrtest.NewLink(rendrtest.LinkConfig{Name: "s", Accept: e.ln.Handle})
+		defer sl.Close()
+		sl.SetDelay(20*time.Millisecond, 0)
+		dc, pc = peOpen(t, e.peer(e2eCarrier(sl)), e.ln, DialOptions{})
+		var inflight int
+		for range 200 {
+			dc.WriteTo(buf, nil)
+			inflight = max(inflight, dc.Status().Carriers[0].Inflight)
+			time.Sleep(time.Millisecond)
+		}
+		if inflight == 0 {
+			t.Fatal("a stream carrier of a packet session never had DGRAM bytes in flight")
+		}
+		peEnd(t, dc, pc)
+		sl.Close()
+		e.close()
+	})
+}
+
+// TestPacketFactoryMisbehaviour_L51: a datagram factory that errs, hangs
+// (with or without honouring ctx), returns nil conns or a nil address,
+// panics, calls runtime.Goexit or succeeds late cannot hurt the session:
+// DialPacket succeeds through the healthy factory, the session works, a
+// late conn is closed, and both Runtimes close with nothing left (the
+// bubble's end proves every goroutine exited); a call that ignores ctx
+// is abandoned and counted while it hangs (L51), and leaves the count
+// when it returns.
+func TestPacketFactoryMisbehaviour_L51(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		b    rendrtest.DialBehavior
+	}{
+		{"error", rendrtest.DialError}, {"hang", rendrtest.DialHang}, {"hang forever", rendrtest.DialHangForever},
+		{"nil, nil", rendrtest.DialNilNil}, {"panic", rendrtest.DialPanic}, {"Goexit", rendrtest.DialGoexit},
+		{"late success", rendrtest.DialLateSuccess}, {"nil address", rendrtest.DialNilAddr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := peNew(t, Config{}, Config{}, nil, 0, "bad", "good")
+				e.links[0].SetDialBehavior(tc.b)
+				p := e.peer(peDatagramCarrier(e.links[0], 1400), peDatagramCarrier(e.links[1], 1400))
+				dc, pc := peOpen(t, p, e.ln, DialOptions{})
+				peSend(t, dc, 12, 0, 20, 300)
+				if v := peRecv(t, pc, 12, 20, time.Second); v.Result().Unique != 20 {
+					t.Fatalf("%+v", v.Result())
+				}
+				time.Sleep(15 * time.Second) // dial attempts on the bad factory time out
+				abandoned := e.d.Status().Abandoned
+				e.links[0].SetDialBehavior(rendrtest.DialNormal)
+				e.links[0].Release()
+				peEnd(t, dc, pc)
+				want := 0
+				if tc.b == rendrtest.DialHangForever || tc.b == rendrtest.DialLateSuccess { // both ignore ctx
+					want = 1
+				}
+				if abandoned != want {
+					t.Fatalf("Abandoned %d while the bad factory hung, want %d", abandoned, want)
+				}
+				e.close()
+			})
+		})
+	}
+}
+
+// TestPacketCloseJoins_L52: Runtime.Close of a dialer with an open packet
+// bond under load joins every goroutine of its sessions and carriers
+// (Abandoned 0, Done closed; the bubble ends only when every goroutine
+// exited) and both Runtimes are left empty.
+func TestPacketCloseJoins_L52(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := peNew(t, Config{}, Config{}, nil, 0, "a", "b")
+		dc, pc := peOpen(t, e.peer(peDatagramCarrier(e.links[0], 1400), peDatagramCarrier(e.links[1], 1400)), e.ln, DialOptions{Mode: ModeBond})
+		peWait(t, 5*time.Second, "both members", func() bool { return len(peLive(dc)) == 2 })
+		stop := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 2048)
+			for {
+				if _, _, err := pc.ReadFrom(buf); err != nil {
+					return
+				}
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			buf := make([]byte, 700)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if _, err := dc.WriteTo(buf, nil); err != nil {
+					return
+				}
+				time.Sleep(100 * time.Microsecond)
+			}
+		}()
+		time.Sleep(time.Second)
+		e.d.Close()
+		close(stop)
+		select {
+		case <-dc.Done():
+		default:
+			t.Fatal("the dialer session's Done is open after Runtime.Close")
+		}
+		if st := e.d.Status(); st.Abandoned != 0 {
+			t.Fatalf("Runtime.Close abandoned %d goroutines", st.Abandoned)
+		}
+		<-pc.Done()
+		wg.Wait()
+		e.close()
+	})
+}
+
+// TestEmbedderClosedConnIsDeathE2E_L01: the session-level half of
+// TestEmbedderClosedConnIsDeath_L01. The embedder closes the conn its
+// factory returned while the session runs: that carrier dies at once with
+// transport_error, the session fails over once and the application sees
+// nothing; rendr's own later Close of that conn is harmless.
+func TestEmbedderClosedConnIsDeathE2E_L01(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := peNewHub(t, Config{}, ListenConfig{}, nil)
+		lc := &lastPC{}
+		dc, pc := peOpen(t, h.peer(h.carrier("h0", 0, lc)), h.ln, DialOptions{})
+		victim := lc.last()
+		victim.PacketConn.Close() // the embedder's own Close, behind rendr's back
+		peWait(t, 100*time.Millisecond, "the carrier's death", func() bool {
+			for _, cs := range dc.Status().Carriers {
+				if cs.State == CarrierDead {
+					return cs.DeathCause == CauseTransportError
+				}
+			}
+			return false
+		})
+		peWait(t, 5*time.Second, "the failover", func() bool { return len(peLive(dc)) == 1 && dc.Status().Rejoins == 1 })
+		peSend(t, dc, 17, 0, 20, 300)
+		if v := peRecv(t, pc, 17, 20, time.Second); v.Result().Unique != 20 {
+			t.Fatalf("after the failover: %+v", v.Result())
+		}
+		if st := dc.Status(); st.Err != nil || st.Migrations.Death != 1 {
+			t.Fatalf("the session after one embedder close: err %v, migrations %+v", st.Err, st.Migrations)
+		}
+		peEnd(t, dc, pc)
+		if victim.closes.Load() != 1 {
+			t.Fatalf("rendr closed the dead conn %d times, want once", victim.closes.Load())
+		}
+		h.close()
+	})
+}
+
+// TestDatagramProbesE2E: a Peer with two datagram factories probes both
+// paths with datagram probe carriers (H1p/H2p, sessionless on the
+// passive) from its first Dial on; the packet session keeps carriers of
+// its own — a probe carrier is never adopted — and the probes go on
+// beside it.
+func TestDatagramProbesE2E(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := peNew(t, Config{}, Config{}, nil, 0, "a", "b")
+		p := e.peer(peDatagramCarrier(e.links[0], 1400), peDatagramCarrier(e.links[1], 1400))
+		dc, pc := peOpen(t, p, e.ln, DialOptions{}) // the first Dial starts probing
+		time.Sleep(3 * time.Second)
+		if n := e.p.Status().Sessionless; n != 2 {
+			t.Fatalf("the passive holds %d sessionless carriers, want 2 probe carriers", n)
+		}
+		for _, l := range e.links {
+			if st := l.Stats(); st.Probe.Sent == 0 {
+				t.Fatalf("link %s: no probe datagrams: %+v", l.Name(), st)
+			}
+		}
+		if n := len(dc.Status().Carriers); n != 1 {
+			t.Fatalf("the session has %d carriers, want 1 (a probe carrier is never adopted)", n)
+		}
+		probe0 := e.links[0].Stats().Probe.Sent + e.links[1].Stats().Probe.Sent
+		time.Sleep(3 * time.Second)
+		if e.links[0].Stats().Probe.Sent+e.links[1].Stats().Probe.Sent == probe0 {
+			t.Fatal("the probes stopped once a session opened")
+		}
+		if s := e.links[0].Stats().Session.Sent + e.links[1].Stats().Session.Sent; s == 0 {
+			t.Fatal("the session took no carrier of its own")
+		}
+		peEnd(t, dc, pc)
+		e.close()
+	})
+}
+
+// TestPacketSchedOverRelE2E_L45: a packet selector's SCHED travels in REL
+// on datagram lanes: after a death migration its first copy is dropped on
+// the link, the REL sublayer resends it (the dialer carrier's Retransmits
+// rise), the passive applies and echoes it, and the epochs converge within
+// a second.
+func TestPacketSchedOverRelE2E_L45(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := peNew(t, Config{}, Config{}, nil, 0, "a", "b")
+		dc, pc := peOpen(t, e.peer(peDatagramCarrier(e.links[0], 1400), peDatagramCarrier(e.links[1], 1400)), e.ln, DialOptions{})
+		time.Sleep(3 * time.Second)
+		lost0 := e.links[1].Stats().All.Lost
+		e.links[1].DropNext(rendrtest.Up, rendrtest.FrameSched, 1)
+		e.links[0].Kill()
+		peWait(t, 3*time.Second, "the migration to b", func() bool {
+			for _, cs := range peLive(dc) {
+				if cs.Name == "b" && cs.State == CarrierActive {
+					return true
+				}
+			}
+			return false
+		})
+		start := time.Now()
+		peWait(t, time.Second, "SCHED converged", func() bool {
+			st := dc.Status()
+			return st.SchedEchoed == st.SchedEpoch && pc.Status().SchedEpoch == st.SchedEpoch
+		})
+		if e.links[1].Stats().All.Lost == lost0 {
+			t.Fatal("stimulus: the SCHED was not dropped")
+		}
+		var retx uint64
+		for _, cs := range peLive(dc) {
+			retx += cs.Retransmits
+		}
+		if retx == 0 {
+			t.Fatal("the dropped SCHED was not resent by REL")
+		}
+		t.Logf("converged %v after the migration; epoch %d", time.Since(start), dc.Status().SchedEpoch)
+		peEnd(t, dc, pc)
+		e.close()
+	})
+}
+
+// TestPacketPassiveQueueFromConfigE2E_L40 (the WP8 review's surviving
+// mutant: Params.Packet follows Config.Packet on the passive): a passive
+// whose Packet.Queue is 64 KiB and whose application does not read keeps
+// at most 64 KiB of datagrams and counts the rest DropRecvQueue; the
+// dialer's WriteTo never blocks.
+func TestPacketPassiveQueueFromConfigE2E_L40(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pcfg := Config{}
+		pcfg.Packet.Queue = 64 << 10
+		e := peNew(t, Config{}, pcfg, nil, 0, "a")
+		dc, pc := peOpen(t, e.peer(peDatagramCarrier(e.links[0], 1400)), e.ln, DialOptions{})
+		buf := make([]byte, 1000)
+		for i := range 300 {
+			start := time.Now()
+			if _, err := dc.WriteTo(rendrtest.PacketPayload(buf, 18, uint64(i), 1000, start), nil); err != nil {
+				t.Fatal(err)
+			}
+			if d := time.Since(start); d > 0 {
+				t.Fatalf("WriteTo blocked for %v", d)
+			}
+			if i%10 == 0 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+		time.Sleep(time.Second)
+		st := pc.Status().Packet
+		if st.Received != 300 || st.DropRecvQueue == 0 {
+			t.Fatalf("passive %+v, want 300 received and receive-queue drops", *st)
+		}
+		v := peRecv(t, pc, 18, 300, 100*time.Millisecond)
+		got := v.Result().Unique
+		if got+st.DropRecvQueue != 300 || got > 65 {
+			t.Fatalf("read %d after the stall, DropRecvQueue %d: want at most 64 KiB (65 datagrams) kept", got, st.DropRecvQueue)
+		}
+		peEnd(t, dc, pc)
+		e.close()
+	})
+}

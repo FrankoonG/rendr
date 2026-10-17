@@ -23,7 +23,8 @@ import (
 // Packet.MaxPayload) — and a packet session from NewPending. Packet
 // sessions ride stream carriers here (DGRAM and PACK are ordinary frames
 // on them, M2-D26); datagram carriers need the datagram handshakes (WP3b)
-// and are exercised by the root's end-to-end rows (integ2_e2e*_test.go).
+// and are exercised by the root's end-to-end rows (packet_test.go,
+// packet_admission_test.go and datagram_test.go).
 // Every package-level helper starts
 // with "wp".
 

@@ -3,7 +3,9 @@ package rendr
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,6 +14,7 @@ import (
 	"unsafe"
 
 	"github.com/FrankoonG/rendr/v2/internal/carrier"
+	"github.com/FrankoonG/rendr/v2/internal/session"
 	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
@@ -599,4 +602,1032 @@ func mxMembers(c *Conn) int {
 		}
 	}
 	return n
+}
+
+// TestMuxJoinAtPassiveViewCap_L48 (M3-D12, §A5.8, R1-4; WP16 W3): a JOIN
+// that reaches a trunk at the passive's view cap is answered JOIN_ACK
+// CAPACITY CodeMuxFull — the code rides the MUX JOIN_ACK — so the dialer's
+// pool takes it like an OPEN's: the trunk is marked full and the attempt
+// continues on a new carrier of the factory without a penalty. The passive
+// holds at most four views per trunk, the dialer its default.
+//
+//   - injected JOIN: a trunk filled to four views gets a JOIN of a live
+//     session; the attempt is answered OK on a second carrier within one
+//     DialTimeout.
+//   - bond: the trunks of both factories are filled to four views; a bond
+//     session opens (its OPEN is refused CodeMuxFull on one full trunk) and
+//     needs its second member through a JOIN on the other full trunk; both
+//     members attach within one DialTimeout of the Dial.
+func TestMuxJoinAtPassiveViewCap_L48(t *testing.T) {
+	const dialTimeout = 10 * time.Second // Config.DialTimeout's default
+	pair := func(t *testing.T, names ...string) (*e2ePair, []*mxTaps) {
+		e := &e2ePair{t: t, d: wpTestRuntime(t, Config{}, nil), p: wpTestRuntime(t, Config{}, &testhooks.Overrides{MuxMaxViews: 4})}
+		e.ln = wpListen(t, e.p, ListenConfig{AcceptBacklog: 64})
+		var taps []*mxTaps
+		for _, n := range names {
+			l := rendrtest.NewLink(rendrtest.LinkConfig{Name: n, Accept: e.ln.Handle})
+			t.Cleanup(l.Close)
+			e.links = append(e.links, l)
+			tp := &mxTaps{}
+			t.Cleanup(tp.close)
+			taps = append(taps, tp)
+		}
+		return e, taps
+	}
+	t.Run("injected JOIN", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e, taps := pair(t, "a", "b")
+			p := e.mxPeer(mxTapCarrier(e.links[0], taps[0]))
+			pb := e.mxPeer(e2eCarrier(e.links[1]))
+			s1, q1 := e2eOpen(t, p, e.ln, DialOptions{})
+			s2, q2 := e2eOpen(t, pb, e.ln, DialOptions{}) // the session that JOINs, on another Peer's carrier
+			acc := newAcceptLog(e.ln, func(pc *PendingConn) (*Conn, error) { return pc.Confirm() })
+			for i := range 3 { // views 2, 3 and 4 of the trunk: the passive's cap
+				_, st, code, err := mxInject(context.Background(), p, 0, wire.TypeOpen, wpOpen(wpSID(300+i), wire.KindStream, 1, nil))
+				if err != nil || st != wire.StatusOK {
+					t.Fatalf("filling OPEN %d: %v code %d, %v", i, st, code, err)
+				}
+			}
+			if d := taps[0].dials.Load(); d != 1 {
+				t.Fatalf("%d factory calls while filling, want the one trunk", d)
+			}
+			start := time.Now()
+			est, st, _, err := mxInject(context.Background(), p, 0, wire.TypeJoin, wpJoin(s2.ID(), 1, 0))
+			if err != nil || st != wire.StatusOK {
+				t.Fatalf("JOIN at the passive's view cap: %v, %v; want OK on another carrier", st, err)
+			}
+			if el := time.Since(start); el > dialTimeout {
+				t.Fatalf("the JOIN took %v, more than one DialTimeout", el)
+			}
+			if d, ms := taps[0].dials.Load(), p.pool.Stats().MuxFull; d != 2 || ms != 1 {
+				t.Fatalf("%d factory calls, pool MuxFull %d; want the full trunk marked and one new carrier", d, ms)
+			}
+			if pm := e.p.Status().Mux.MuxFull; pm != 1 {
+				t.Fatalf("passive MuxFull %d, want 1", pm)
+			}
+			mxDrop(est)
+			acc.stop()
+			for _, c := range append(acc.conns, s1, q1, s2, q2) {
+				c.Close()
+			}
+			e.close()
+		})
+	})
+	t.Run("bond", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e, taps := pair(t, "a", "b")
+			p := e.mxPeer(mxTapCarrier(e.links[0], taps[0]), mxTapCarrier(e.links[1], taps[1]))
+			s0, q0 := e2eOpen(t, p, e.ln, DialOptions{Mode: ModeBond})
+			mxWait(t, dialTimeout, "the first bond's members", func() bool { return mxMembers(s0) == 2 })
+			acc := newAcceptLog(e.ln, func(pc *PendingConn) (*Conn, error) { return pc.Confirm() })
+			for f := range 2 {
+				for i := range 3 {
+					_, st, code, err := mxInject(context.Background(), p, f, wire.TypeOpen, wpOpen(wpSID(400+10*f+i), wire.KindStream, 1, nil))
+					if err != nil || st != wire.StatusOK {
+						t.Fatalf("filling OPEN %d on factory %d: %v code %d, %v", i, f, st, code, err)
+					}
+				}
+			}
+			for _, tr := range mxTrunkSet(e.p) {
+				if n := tr.Views(); n != 4 {
+					t.Fatalf("a passive trunk holds %d views, want its cap 4", n)
+				}
+			}
+			start := time.Now()
+			ch := e2eDialAsync(context.Background(), p, DialOptions{Mode: ModeBond})
+			r := <-ch
+			if r.err != nil {
+				t.Fatalf("Dial: %v", r.err)
+			}
+			s := r.c
+			mxWait(t, dialTimeout, "the second member through a JOIN", func() bool { return mxMembers(s) == 2 })
+			if el := time.Since(start); el > dialTimeout {
+				t.Fatalf("the members attached after %v, more than one DialTimeout", el)
+			}
+			if ms := p.pool.Stats().MuxFull; ms < 2 {
+				t.Fatalf("pool MuxFull %d, want the OPEN's and the JOIN's", ms)
+			}
+			acc.stop()
+			for _, c := range append(acc.conns, s, s0, q0) {
+				c.Close()
+			}
+			e.close()
+		})
+	})
+}
+
+// TestMuxWithdrawAtAsyncAttach_R1_5 (R1-5, §A3.3; WP16 W1): a Dial whose
+// opening race placed its second OPEN as a view on another live trunk —
+// which the passive admits through AttachOpen, attached only when the
+// session's actor adopts it — is cancelled while that actor is held before
+// the adopt. The dialer withdraws both OPENs (RST(AbortWithdrawn), then
+// DETACH): no shared trunk dies (no protocol_violation), the bond session
+// that shares them keeps its members and moves data, and the withdrawn
+// session leaves no pending session once its actor runs.
+//
+// Row "only lane": the first OPEN's carrier dies (refused for good) before
+// the cancel, so the second OPEN's view is the pending session's only lane
+// and the RST recorded before the attach is the only withdrawal it can
+// get: it must reach the session at its adopt, which then ends within 1 s
+// (L49's server-side bound) — not at AcceptTimeout (R1-5 rule 3).
+func TestMuxWithdrawAtAsyncAttach_R1_5(t *testing.T) {
+	for _, onlyLane := range []bool{false, true} {
+		name := "first lane alive"
+		if onlyLane {
+			name = "only lane"
+		}
+		t.Run(name, func(t *testing.T) { testMuxWithdrawAtAsyncAttach(t, onlyLane) })
+	}
+}
+
+func testMuxWithdrawAtAsyncAttach(t *testing.T, onlyLane bool) {
+	synctest.Test(t, func(t *testing.T) {
+		var (
+			mu    sync.Mutex
+			known = map[SessionID]bool{}
+			hold  = make(chan struct{})
+			held  bool
+			// blocked closes when the dialled session's actor is held: its
+			// linger (1 s) ran out and it tried to park; the second OPEN
+			// comes at JoinStagger (3 s).
+			blocked = make(chan struct{})
+			once    sync.Once
+			relOnce sync.Once
+		)
+		release := func() {
+			mu.Lock()
+			held = false
+			mu.Unlock()
+			relOnce.Do(func() { close(hold) })
+		}
+		defer release() // a failed assertion leaves no actor held
+		hk := &testhooks.Hooks{AtPark: func(sid [16]byte) {
+			mu.Lock()
+			block := !known[SessionID(sid)] && held
+			mu.Unlock()
+			if block {
+				once.Do(func() { close(blocked) })
+				<-hold // the withdrawn session's actor: the adopt waits
+			}
+		}}
+		e := &e2ePair{t: t, d: wpTestRuntime(t, Config{JoinStagger: 3 * time.Second}, nil), p: wpTestRuntime(t, Config{}, &testhooks.Overrides{Hooks: hk})}
+		e.ln = wpListen(t, e.p, ListenConfig{})
+		var taps [2]mxTaps
+		for i, n := range []string{"a", "b"} {
+			l := rendrtest.NewLink(rendrtest.LinkConfig{Name: n, Accept: e.ln.Handle})
+			t.Cleanup(l.Close)
+			e.links = append(e.links, l)
+			t.Cleanup(taps[i].close)
+		}
+		p := e.mxPeer(mxTapCarrier(e.links[0], &taps[0]), mxTapCarrier(e.links[1], &taps[1]))
+		// A bond session puts a live trunk on each factory.
+		s0, q0 := e2eOpen(t, p, e.ln, DialOptions{Mode: ModeBond})
+		mxWait(t, 10*time.Second, "the bond's members", func() bool { return mxMembers(s0) == 2 })
+		trunks := mxTrunkSet(e.p)
+		if len(trunks) != 2 {
+			t.Fatalf("%d passive trunks, want 2", len(trunks))
+		}
+		mu.Lock()
+		known[s0.ID()] = true
+		held = true
+		mu.Unlock()
+		// The OPENs for handle 2 a factory's carriers placed (probe carriers
+		// place none).
+		opens := func(i int) int {
+			n := 0
+			for k := range taps[i].count() {
+				n += len(mxFrames(taps[i].tap(t, k), rendrtest.Up, rendrtest.FrameOpen, 2))
+			}
+			return n
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		ch := e2eDialAsync(ctx, p, DialOptions{}) // Accept stalled: no answer
+		mxWait(t, 10*time.Second, "the second OPEN on the other trunk", func() bool { return opens(0) == 1 && opens(1) == 1 })
+		synctest.Wait() // admitted: the adopt is posted to the held actor
+		select {
+		case <-blocked:
+		default:
+			t.Fatal("the dialled session's actor was not held when its second OPEN came")
+		}
+		if ps := e.p.Status(); ps.Sessions.Pending != 1 {
+			t.Fatalf("passive %+v, want the dialled session pending", ps.Sessions)
+		}
+		want := 2 // the passive trunks that must live
+		if onlyLane {
+			// The first OPEN's carrier (and the bond's member on it) dies
+			// and stays down: the second OPEN's view is the pending
+			// session's only lane.
+			e.links[0].SetRefuse(true)
+			e.links[0].Kill()
+			mxWait(t, 10*time.Second, "trunk a gone", func() bool { return len(mxTrunkSet(e.p)) == 1 })
+			trunks = mxTrunkSet(e.p)
+			want = 1
+			synctest.Wait()
+			if ps := e.p.Status(); ps.Sessions.Pending != 1 {
+				t.Fatalf("passive %+v, want the dialled session pending (it survives its lanes)", ps.Sessions)
+			}
+		}
+		cancel()
+		if r := <-ch; r.err == nil {
+			t.Fatal("the cancelled Dial returned a session")
+		}
+		time.Sleep(time.Second) // the withdrawal's RSTs and DETACHes cross
+		synctest.Wait()
+		alive := func(what string) {
+			t.Helper()
+			for _, tr := range trunks {
+				if dead, cause, detail, _ := tr.Death(); dead || tr.TrunkDying() {
+					t.Fatalf("%s: a shared trunk died: %v %s", what, cause, detail)
+				}
+			}
+			if n := len(mxTrunkSet(e.p)); n != want {
+				t.Fatalf("%s: %d passive trunks, want %d", what, n, want)
+			}
+		}
+		alive("after the withdrawal")
+		release()
+		synctest.Wait()
+		mxWait(t, time.Second, "the withdrawn session gone", func() bool { return e.p.Status().Sessions.Pending == 0 })
+		alive("after the adopt")
+		if n := mxMembers(s0); n != want {
+			t.Fatalf("the bond holds %d members, want %d", n, want)
+		}
+		e2eExchange(t, s0, q0, 64<<10, 5)
+		e2eFinish(t, s0, q0)
+		e.close()
+	})
+}
+
+// TestMuxViewDeadBeforeStartReachesSession_R2_12 (M3 design R2-12,
+// §A5.7 item 6, §A10.3; DGDOWN): a MUX trunk's death that catches a
+// session's view attached-pending — the OPEN answered OK, the attach
+// checked the view alive, the session has not started it — reaches that
+// session when it starts the view after the death. Every Start of a
+// carrier runs inside an actor step (attachLocked under handleLocked), and
+// the reapDead of that same step reads the view's Death, which reports the
+// trunk's death record whether or not the view is attached yet; the death
+// step records the carrier's end like any other (one EventCarrierDown with
+// the trunk's ID and cause, its row dead in Status), and the session
+// recovers on a new trunk. The late Start's doorbell ring
+// (Conn.startView) is defensive at this level: without it the same step
+// still reaps the view (mutant r12b passes here), and
+// TestDgTrunkDeathReachesEveryViewState pins the ring at carrier level.
+//
+// Session A is open on the stream trunk of link a. Session B's Dial takes
+// the live trunk (a new view, its OPEN answered OK); in B's attach, right
+// before the view's Start (Hooks.BeforeAttachStart), the link is killed
+// and the hook returns only once A recorded the trunk's death (premise: the
+// trunk's death record is set before B's Start). PASS: B's Dial succeeds;
+// B emits EventCarrierUp and then exactly one EventCarrierDown for the
+// trunk, with transport_error, dated at or after A's; B's Status lists the
+// trunk dead with transport_error; A records its own CarrierDown; both
+// sessions recover on another carrier within 10 s and exchange 32 KiB
+// each way, verified; a clean end. Observed with a view's Death that does
+// not report its trunk's death before the view is attached: B keeps the
+// dead view as its live carrier.
+func TestMuxViewDeadBeforeStartReachesSession_R2_12(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var (
+			armed  atomic.Bool
+			caught atomic.Uint32 // the carrier B's attach was about to start
+			a      *Conn         // session A's dialer end
+			e      *e2ePair
+			mu     sync.Mutex
+			evs    []Event
+		)
+		hooks := &testhooks.Hooks{BeforeAttachStart: func(_ [16]byte, cid uint32) {
+			if !armed.CompareAndSwap(true, false) {
+				return
+			}
+			caught.Store(cid)
+			e.links[0].Kill()
+			for deadline := time.Now().Add(5 * time.Second); !mxDeadRow(a, CarrierID(cid)); time.Sleep(time.Millisecond) {
+				if !time.Now().Before(deadline) {
+					t.Errorf("premise: session A did not record the death of trunk %d within 5 s of the kill", cid)
+					return
+				}
+			}
+		}}
+		dcfg := Config{OnEvent: func(ev Event) {
+			mu.Lock()
+			evs = append(evs, ev)
+			mu.Unlock()
+		}}
+		e = e2eNew(t, dcfg, Config{}, &testhooks.Overrides{Hooks: hooks}, ListenConfig{}, "a")
+		p := e.mxPeer(e2eCarrier(e.links[0]))
+		var ap *Conn
+		a, ap = e2eOpen(t, p, e.ln, DialOptions{})
+		e2eExchange(t, a, ap, 32<<10, 1)
+		trunk := mxCarrier(t, a, "a").ID
+
+		armed.Store(true)
+		b, bp := e2eOpen(t, p, e.ln, DialOptions{})
+		if armed.Load() || CarrierID(caught.Load()) != trunk {
+			t.Fatalf("stimulus: B's attach started carrier %d, want a view of A's trunk %d caught before its Start", caught.Load(), trunk)
+		}
+		onOther := func(c *Conn) bool {
+			live := liveCarriers(c.Status())
+			return len(live) == 1 && live[0].ID != trunk
+		}
+		for deadline := time.Now().Add(10 * time.Second); !onOther(a) || !onOther(b); time.Sleep(time.Millisecond) {
+			if !time.Now().Before(deadline) {
+				t.Fatalf("10 s after the kill: A lists %+v, B lists %+v; want both on one live carrier other than trunk %d (B's view, started after the trunk's death, did not reach B)",
+					liveCarriers(a.Status()), liveCarriers(b.Status()), trunk)
+			}
+		}
+		e2eExchange(t, a, ap, 32<<10, 2)
+		e2eExchange(t, b, bp, 32<<10, 3)
+		synctest.Wait()
+
+		mu.Lock()
+		var aDown, bUp, bDown []Event
+		for _, ev := range evs {
+			if ev.Carrier != trunk {
+				continue
+			}
+			switch {
+			case ev.Session == a.ID() && ev.Kind == EventCarrierDown:
+				aDown = append(aDown, ev)
+			case ev.Session == b.ID() && ev.Kind == EventCarrierUp:
+				bUp = append(bUp, ev)
+			case ev.Session == b.ID() && ev.Kind == EventCarrierDown:
+				bDown = append(bDown, ev)
+			}
+		}
+		mu.Unlock()
+		if len(aDown) != 1 {
+			t.Fatalf("session A: %d EventCarrierDown for trunk %d, want 1", len(aDown), trunk)
+		}
+		if len(bUp) != 1 || len(bDown) != 1 {
+			t.Fatalf("session B: %d EventCarrierUp and %d EventCarrierDown for trunk %d, want 1 each: the view started after the trunk's death did not reach its session", len(bUp), len(bDown), trunk)
+		}
+		if d := bDown[0]; d.Cause != CauseTransportError || d.Seq < bUp[0].Seq || d.Time.Before(aDown[0].Time) {
+			t.Fatalf("session B's EventCarrierDown %+v (up %+v, A's down %+v), want transport_error after its EventCarrierUp, dated at or after A's", d, bUp[0], aDown[0])
+		}
+		var row *CarrierStatus
+		for _, cs := range b.Status().Carriers {
+			if cs.ID == trunk {
+				row = &cs
+			}
+		}
+		if row == nil || row.State != CarrierDead || row.DeathCause != CauseTransportError {
+			t.Fatalf("session B's Status row of trunk %d: %+v, want dead with transport_error", trunk, row)
+		}
+		e2eFinish(t, a, ap)
+		e2eFinish(t, b, bp)
+		e.close()
+	})
+}
+
+// mxDeadRow reports whether c lists carrier id dead.
+func mxDeadRow(c *Conn, id CarrierID) bool {
+	for _, cs := range c.Status().Carriers {
+		if cs.ID == id && cs.State == CarrierDead {
+			return true
+		}
+	}
+	return false
+}
+
+// pkMembers returns the frame budgets of c's live member carriers.
+func pkMembers(c *PacketConn) []int {
+	var mtus []int
+	for _, cs := range c.Status().Carriers {
+		if cs.DeathCause == CauseNone && cs.State == CarrierMember {
+			mtus = append(mtus, cs.MTU)
+		}
+	}
+	return mtus
+}
+
+// pkExchange writes n datagrams of exactly MaxPayload bytes, each with its
+// own pattern, from a to b and requires each to arrive intact, then a's
+// counters to show n sent and none refused as too large.
+func pkExchange(t *testing.T, side string, a, b *PacketConn, n int) {
+	t.Helper()
+	size := a.MaxPayload()
+	msg := make([]byte, size)
+	buf := make([]byte, size+1)
+	for i := range n {
+		for j := range msg {
+			msg[j] = byte(i*31 + j)
+		}
+		if w, err := a.WriteTo(msg, nil); err != nil || w != size {
+			t.Fatalf("%s: WriteTo(%d bytes) #%d: %d, %v", side, size, i, w, err)
+		}
+		b.SetReadDeadline(time.Now().Add(time.Second))
+		r, _, err := b.ReadFrom(buf)
+		if err != nil || r != size || string(buf[:r]) != string(msg) {
+			t.Fatalf("%s: datagram #%d of %d bytes: %d bytes, %v", side, i, size, r, err)
+		}
+	}
+	if c := *a.Status().Packet; c.Sent != uint64(n) || c.DropTooLarge != 0 {
+		t.Fatalf("%s: sender counters %+v, want %d sent and no DropTooLarge", side, c, n)
+	}
+}
+
+// TestMuxDatagramJoinBudget_L37 (M3-D24, §A3.3; L37): a packet JOIN placed
+// on a live datagram trunk offers the trunk's current budget in
+// JOIN.rxNext (patchViewOffer), and neither end calls SetBudget on that
+// view (the trunk's budget is fixed once it started). Two bond packet
+// sessions on one Peer of two datagram factories: the second session's
+// OPEN and JOIN both ride the first session's trunks (two fast paths, no
+// factory call: stimulus). Both of its members run at the trunks' budget
+// on both ends, and datagrams of its MaxPayload cross both ways intact.
+func TestMuxDatagramJoinBudget_L37(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := peNewHub(t, Config{}, ListenConfig{}, nil)
+		p := h.peer(h.carrier("h1", 1, nil), h.carrier("h2", 2, nil))
+		d1, p1 := peOpen(t, p, h.ln, DialOptions{Mode: ModeBond})
+		mxWait(t, 5*time.Second, "session 1's two members", func() bool { return len(pkMembers(d1)) == 2 && len(pkMembers(p1)) == 2 })
+		d2, p2 := peOpen(t, p, h.ln, DialOptions{Mode: ModeBond})
+		mxWait(t, 5*time.Second, "session 2's two members", func() bool { return len(pkMembers(d2)) == 2 && len(pkMembers(p2)) == 2 })
+		if m := h.d.Status().Mux; m.Carriers != 2 || m.Views != 4 || m.FastPaths != 2 {
+			t.Fatalf("dialer Mux %+v, want session 2's OPEN and JOIN on session 1's two trunks", m)
+		}
+		budget := pkMembers(d1)[0]
+		for _, s := range []struct {
+			side string
+			c    *PacketConn
+		}{{"dialer 1", d1}, {"passive 1", p1}, {"dialer 2", d2}, {"passive 2", p2}} {
+			for _, mtu := range pkMembers(s.c) {
+				if mtu != budget {
+					t.Fatalf("%s: member budgets %v, want %d (the trunks')", s.side, pkMembers(s.c), budget)
+				}
+			}
+		}
+		if mp := d2.MaxPayload(); mp <= 0 || mp > budget-25 || mp != p2.MaxPayload() || mp != d1.MaxPayload() {
+			t.Fatalf("MaxPayload %d/%d (session 1 %d) on trunks of budget %d", mp, p2.MaxPayload(), d1.MaxPayload(), budget)
+		}
+		pkExchange(t, "dialer 2 → passive 2", d2, p2, 16)
+		pkExchange(t, "passive 2 → dialer 2", p2, d2, 16)
+		for _, c := range []*PacketConn{d1, p1, d2, p2} {
+			c.Close()
+		}
+		h.close()
+	})
+}
+
+// TestMuxDatagramOpenBudget_L37 (M3-D24, §A3.3; L37): a packet session that
+// opens on a live datagram trunk offers the trunk's current budget in its
+// OPEN (a REL{OPEN} with the next cseq, no new handshake): the passive
+// accepts it, the session's MaxPayload fits the trunk's frame budget, and a
+// datagram of that size crosses the shared trunk both ways.
+func TestMuxDatagramOpenBudget_L37(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := peNewHub(t, Config{}, ListenConfig{}, nil)
+		p := h.peer(h.carrier("h1", 1, nil))
+		d1, p1 := mxPeOpen(t, p, h.ln, DialOptions{}, 10*time.Second)
+		d2, p2 := mxPeOpen(t, p, h.ln, DialOptions{}, 10*time.Second)
+		if m := h.d.Status().Mux; m.Carriers != 1 || m.Views != 2 || m.FastPaths != 1 {
+			t.Fatalf("dialer Mux %+v, want the second session on the live datagram trunk", m)
+		}
+		budget := d1.Status().Carriers[0].MTU
+		if budget == 0 || d2.Status().Carriers[0].MTU != budget {
+			t.Fatalf("budgets %d and %d", budget, d2.Status().Carriers[0].MTU)
+		}
+		mp := d2.Status().MaxPayload
+		if mp <= 0 || mp > budget-wire.DgramOverhead || mp != p2.Status().MaxPayload {
+			t.Fatalf("MaxPayload %d / %d on a trunk of budget %d", mp, p2.Status().MaxPayload, budget)
+		}
+		big := make([]byte, mp)
+		for i := range big {
+			big[i] = byte(i)
+		}
+		buf := make([]byte, 65536)
+		for _, c := range [][2]*PacketConn{{d2, p2}, {p2, d2}} {
+			if _, err := c[0].WriteTo(big, nil); err != nil {
+				t.Fatal(err)
+			}
+			c[1].SetReadDeadline(time.Now().Add(time.Second))
+			n, _, err := c[1].ReadFrom(buf)
+			if err != nil || n != mp || string(buf[:n]) != string(big) {
+				t.Fatalf("a %d-byte datagram: %d bytes, %v", mp, n, err)
+			}
+		}
+		for _, c := range []*PacketConn{d1, p1, d2, p2} {
+			c.Close()
+		}
+		h.close()
+	})
+}
+
+// CAPACITY CodeBacklog means one thing (wire.CodeBacklog, plan §4): the
+// Listener's AcceptBacklog of the OPEN's session kind is full. A dialer
+// takes it for a terminal answer, so a session that is pending — admitted,
+// its backlog slot held, the application about to decide — must never be
+// answered with it: the application's verdict reaches the dialer, or, when
+// the view that carried the OPEN ends first, the dialer retries on another
+// carrier and the verdict reaches it there (m3 BACKLOG, FINDING C of the
+// G6 mixed-NAT case: rejected sessions on live MUX trunks were answered
+// CAPACITY code 2 while the passive's backlog held 13 to 28 of 128).
+// The session never answers CodeBacklog in place of a verdict, and neither
+// does the carrier: its fallback refusal of a view killed with its verdict
+// still unplaced (abandonLocked at the close bound) carries CodeCarriers,
+// which the dialer retries (TestPendingVerdictUnplacedAtCloseBy_L48).
+// Helpers of these tests start with "bk".
+
+// bkGate holds the passive's MUX writer in its AfterViewFill hook at the
+// first DRR Fill of a view above handle 1 once armed: the call has
+// returned (the pending session placed nothing, it has no verdict yet) and
+// the writer has not yet decided what that empty call means.
+type bkGate struct {
+	armed   atomic.Bool
+	once    sync.Once
+	fired   chan uint32   // the held handle
+	release chan struct{} // closed by the test
+}
+
+func newBKGate() *bkGate {
+	return &bkGate{fired: make(chan uint32, 1), release: make(chan struct{})}
+}
+
+func (g *bkGate) hook(_, h uint32) {
+	if h <= wire.SessionHandle || !g.armed.Load() {
+		return
+	}
+	held := false
+	g.once.Do(func() { held = true })
+	if !held {
+		return
+	}
+	g.fired <- h
+	<-g.release
+}
+
+// bkOverrides returns the dialer's and the passive's overrides: identical
+// presets (L14), the gate on the passive only.
+func bkOverrides(g *bkGate) (d, p *testhooks.Overrides) {
+	return &testhooks.Overrides{}, &testhooks.Overrides{Hooks: &testhooks.Hooks{AfterViewFill: g.hook}}
+}
+
+// bkWantReject requires err to be the application's rejection with code.
+func bkWantReject(t testing.TB, err error, code uint32) {
+	t.Helper()
+	var re *RejectError
+	if !errors.As(err, &re) || re.Code != code {
+		t.Fatalf("Dial: %v; want *RejectError{Code: %d} (CodeBacklog is %d)", err, code, wire.CodeBacklog)
+	}
+}
+
+// TestPassiveBacklogCodeOnlyWhenFull_L48 (m3 BACKLOG; L48, R1-9): the
+// application rejects a session pending on a view of a live MUX trunk
+// while the trunk's writer is between that view's DRR Fill — which placed
+// nothing, the session had no verdict yet — and the writer's decision on
+// the empty call. The stimulus is the AfterViewFill hook holding the
+// writer exactly there while Accept and Reject complete. The dialer must
+// get the application's RejectError; before the fix the writer read the
+// retirement that Reject had queued meanwhile as "the session set no
+// verdict", abandoned the view and answered CAPACITY CodeBacklog with a
+// backlog of one pending session out of 128. The same rows on a datagram
+// trunk (packet sessions), and the one legitimate CodeBacklog: a full
+// backlog.
+func TestPassiveBacklogCodeOnlyWhenFull_L48(t *testing.T) {
+	t.Run("stream trunk", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			g := newBKGate()
+			ovD, ovP := bkOverrides(g)
+			e := &e2ePair{t: t, d: wpTestRuntime(t, Config{}, ovD), p: wpTestRuntime(t, Config{}, ovP)}
+			e.ln = wpListen(t, e.p, ListenConfig{})
+			l := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: e.ln.Handle})
+			t.Cleanup(l.Close)
+			p := e.mxPeer(e2eCarrier(l))
+			dc, pc := e2eOpen(t, p, e.ln, DialOptions{}) // the trunk, its view 1 live
+
+			g.armed.Store(true)
+			res := e2eDialAsync(context.Background(), p, DialOptions{})
+			var h uint32
+			select {
+			case h = <-g.fired:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the passive writer never called the pending view's Fill")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			pend, err := e.ln.Accept(ctx)
+			if err != nil {
+				t.Fatalf("Accept: %v", err)
+			}
+			if err := pend.Reject(4242, "rejected while the writer was in the view's Fill"); err != nil {
+				t.Fatalf("Reject: %v", err)
+			}
+			close(g.release)
+			var r dialResult
+			select {
+			case r = <-res:
+			case <-time.After(10 * time.Second):
+				t.Fatal("Dial did not return")
+			}
+			if r.err == nil {
+				r.c.Close()
+			}
+			bkWantReject(t, r.err, 4242)
+			if h <= wire.SessionHandle {
+				t.Fatalf("held handle %d: not a view of the live trunk", h)
+			}
+			// Integrity: the first session never noticed (one trunk, both
+			// ends exchange in full).
+			e2eExchange(t, dc, pc, 64<<10, 7)
+			dc.Close()
+			pc.Close()
+		})
+	})
+	t.Run("datagram trunk", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			g := newBKGate()
+			ovD, ovP := bkOverrides(g)
+			e := &pePair{t: t, d: wpTestRuntime(t, Config{}, ovD), p: wpTestRuntime(t, Config{}, ovP)}
+			e.ln = wpListen(t, e.p, ListenConfig{})
+			l := rendrtest.NewDatagramLink(rendrtest.DatagramLinkConfig{Name: "u", Queue: 8192, Accept: e.accept(0)})
+			e.links = append(e.links, l)
+			t.Cleanup(func() { l.Close() })
+			p := e.peer(peDatagramCarrier(l, 1400))
+			dc, pc := peOpen(t, p, e.ln, DialOptions{}) // the trunk, its view 1 live
+
+			g.armed.Store(true)
+			ch := peDial(p, DialOptions{})
+			select {
+			case <-g.fired:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the passive writer never called the pending view's Fill")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			pend, err := e.ln.AcceptPacket(ctx)
+			if err != nil {
+				t.Fatalf("AcceptPacket: %v", err)
+			}
+			if err := pend.Reject(4243, "rejected while the writer was in the view's Fill"); err != nil {
+				t.Fatalf("Reject: %v", err)
+			}
+			close(g.release)
+			var r peDialed
+			select {
+			case r = <-ch:
+			case <-time.After(10 * time.Second):
+				t.Fatal("DialPacket did not return")
+			}
+			if r.err == nil {
+				r.c.Close()
+			}
+			bkWantReject(t, r.err, 4243)
+			peSend(t, dc, 11, 0, 8, 200)
+			peRecv(t, pc, 11, 8, 5*time.Second)
+			dc.Close()
+			pc.Close()
+		})
+	})
+	t.Run("rejects under a bulk transfer", func(t *testing.T) {
+		// The G6 load shape without a gate: a session on the same trunk
+		// moves 16 MiB each way at 16 MiB/s while 24 sessions are dialed
+		// and rejected one after another on that trunk. Every Dial gets the
+		// application's RejectError, and the bulk arrives intact. (A guard
+		// of the load shape: it fails when the pending view is not woken
+		// for its verdict; the narrow writer races of the gated rows above
+		// it does not reach reliably.)
+		synctest.Test(t, func(t *testing.T) {
+			e := &e2ePair{t: t, d: wpTestRuntime(t, Config{}, nil), p: wpTestRuntime(t, Config{}, nil)}
+			e.ln = wpListen(t, e.p, ListenConfig{})
+			// A short link queue: the control frames wait behind at most
+			// 64 KiB of bulk, so the rejects keep pace with the transfer.
+			l := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: e.ln.Handle, Buffer: 64 << 10})
+			t.Cleanup(l.Close)
+			p := e.mxPeer(e2eCarrier(l))
+			dc, pc := e2eOpen(t, p, e.ln, DialOptions{})
+			l.SetDelay(2*time.Millisecond, 0)
+			l.SetRate(16 << 20)
+			bulk := make(chan error, 1)
+			go func() { bulk <- e2eExchangeErr(dc, pc, 16<<20, 13) }()
+			for i := range 24 {
+				res := e2eDialAsync(context.Background(), p, DialOptions{})
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				pend, err := e.ln.Accept(ctx)
+				cancel()
+				if err != nil {
+					t.Fatalf("Accept %d: %v", i, err)
+				}
+				if err := pend.Reject(4242, "rejected under load"); err != nil {
+					t.Fatalf("Reject %d: %v", i, err)
+				}
+				r := <-res
+				if r.err == nil {
+					r.c.Close()
+				}
+				var re *RejectError
+				if !errors.As(r.err, &re) || re.Code != 4242 {
+					t.Fatalf("Dial %d: %v; want *RejectError{Code: 4242} (CodeBacklog is %d)", i, r.err, wire.CodeBacklog)
+				}
+			}
+			select {
+			case err := <-bulk:
+				t.Fatalf("the bulk exchange ended (%v) before the last reject: no load", err)
+			default:
+			}
+			if err := <-bulk; err != nil {
+				t.Fatalf("bulk exchange: %v", err)
+			}
+			dc.Close()
+			pc.Close()
+		})
+	})
+	t.Run("confirmed, then Runtime.Close", func(t *testing.T) {
+		// The application confirms while the writer is held after the
+		// view's empty Fill, and the passive Runtime closes before the OK
+		// is placed. The OK must still be the view's first frame — never
+		// CAPACITY CodeBacklog in its place —, and the view must not wait
+		// for the close bound's kill: the dialer, which saw the trunk's
+		// GOAWAY, drops the OK with its DETACH, which ends the held view
+		// (R1-9), so Runtime.Close returns well within closeBound.
+		synctest.Test(t, func(t *testing.T) {
+			g := newBKGate()
+			ovD, ovP := bkOverrides(g)
+			e := &e2ePair{t: t, d: wpTestRuntime(t, Config{}, ovD), p: wpTestRuntime(t, Config{}, ovP)}
+			e.ln = wpListen(t, e.p, ListenConfig{})
+			l := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: e.ln.Handle})
+			t.Cleanup(l.Close)
+			p := e.mxPeer(e2eCarrier(l))
+			e2eOpen(t, p, e.ln, DialOptions{}) // the trunk, its view 1 live
+			g.armed.Store(true)
+			res := e2eDialAsync(context.Background(), p, DialOptions{})
+			select {
+			case <-g.fired:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the passive writer never called the pending view's Fill")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			pend, err := e.ln.Accept(ctx)
+			if err != nil {
+				t.Fatalf("Accept: %v", err)
+			}
+			if _, err := pend.Confirm(); err != nil {
+				t.Fatalf("Confirm: %v", err)
+			}
+			start := time.Now()
+			closed := make(chan struct{})
+			go func() {
+				e.p.Close()
+				close(closed)
+			}()
+			mxWait(t, 100*time.Millisecond, "the confirmed session shut down", func() bool {
+				return pend.s.State() == session.StateEnded
+			})
+			close(g.release)
+			select {
+			case <-closed:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Runtime.Close did not return")
+			}
+			if d := time.Since(start); d >= 500*time.Millisecond {
+				t.Fatalf("Runtime.Close took %v: the confirmed view waited for the close bound's kill", d)
+			}
+			// The dialer may take the OK (a Conn) or, having seen the
+			// trunk's GOAWAY first, drop it and fail elsewhere; never the
+			// backlog answer.
+			r := <-res
+			if r.err == nil {
+				r.c.Close()
+			} else if strings.Contains(r.err.Error(), fmt.Sprintf("CAPACITY (code %d)", wire.CodeBacklog)) {
+				t.Fatalf("Dial: %v; the confirmed session's view was answered CodeBacklog", r.err)
+			}
+		})
+	})
+	t.Run("withdrawn: its other view", func(t *testing.T) {
+		// A pending session holds two views, one per trunk (the OPEN and
+		// its duplicate). The dialer withdraws the duplicate's attempt
+		// (RST(AbortWithdrawn), R1-5 rule 1): the session ends withdrawn
+		// and the first view, whose OPEN still awaits a response (R1-9),
+		// is answered with the tombstone's verdict, UNKNOWN_SESSION —
+		// before the fix the carrier answered CAPACITY CodeBacklog.
+		synctest.Test(t, func(t *testing.T) {
+			e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a", "b")
+			p, pb := e.peer(e.links[0]), e.peer(e.links[1])
+			s1, q1 := e2eOpen(t, p, e.ln, DialOptions{})  // trunk a, view 1 live
+			s2, q2 := e2eOpen(t, pb, e.ln, DialOptions{}) // trunk b, view 1 live
+			open := wpOpen(wpSID(4100), wire.KindStream, 1, nil)
+			type res struct {
+				st   wire.AckStatus
+				code uint32
+				err  error
+			}
+			x := make(chan res, 1)
+			go func() {
+				est, st, code, err := mxInject(context.Background(), p, 0, wire.TypeOpen, open)
+				if err == nil && st == wire.StatusOK {
+					mxDrop(est)
+				}
+				x <- res{st, code, err}
+			}()
+			synctest.Wait() // pending on trunk a's view (Accept is never called)
+			ctx, cancel := context.WithCancelCause(context.Background())
+			y := make(chan error, 1)
+			go func() {
+				est, st, _, err := mxInject(ctx, pb, 0, wire.TypeOpen, open)
+				if err == nil && st == wire.StatusOK {
+					mxDrop(est)
+				}
+				y <- err
+			}()
+			synctest.Wait() // the duplicate parked on trunk b's view
+			if st := e.p.Status(); st.Sessions.Pending != 1 {
+				t.Fatalf("pending sessions %d, want 1", st.Sessions.Pending)
+			}
+			cancel(carrier.ErrWithdrawn)
+			if err := <-y; err == nil {
+				t.Fatal("the withdrawn attempt returned a response")
+			}
+			var r res
+			select {
+			case r = <-x:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the first view got no response")
+			}
+			if r.err != nil || r.st != wire.StatusUnknownSession {
+				t.Fatalf("first view of a withdrawn session: %v code %d, %v; want UNKNOWN_SESSION (CodeBacklog is %d)", r.st, r.code, r.err, wire.CodeBacklog)
+			}
+			// The trunks and their sessions live on.
+			e2eExchange(t, s1, q1, 32<<10, 3)
+			e2eExchange(t, s2, q2, 32<<10, 5)
+			for _, c := range []*Conn{s1, q1, s2, q2} {
+				c.Close()
+			}
+		})
+	})
+	t.Run("withdrawn: dedicated carriers retire unanswered", func(t *testing.T) {
+		// The same withdrawal on two dedicated carriers (no MUX): the
+		// carrier whose OPEN still awaits a response retires without one
+		// (§6.2) — its CLOSE is its only frame. Only a MUX view is owed the
+		// tombstone's UNKNOWN_SESSION; a dedicated carrier ends with its
+		// CLOSE, which already tells the dialer the attempt is over.
+		synctest.Test(t, func(t *testing.T) {
+			rt := wpTestRuntime(t, Config{}, nil)
+			ln := wpListen(t, rt, ListenConfig{})
+			inst := wpInst(0xb7)
+			open := wpOpen(wpSID(4101), wire.KindStream, 1, nil)
+			first := wpConnect(t, ln, inst, 1)
+			first.hello(rt)
+			first.send(wire.TypeOpen, 0, open)
+			synctest.Wait() // pending (Accept is never called)
+			dup := wpConnect(t, ln, inst, 2)
+			dup.hello(rt)
+			dup.send(wire.TypeOpen, 0, open)
+			synctest.Wait() // the duplicate parked on the pending session
+			if st := rt.Status(); st.Sessions.Pending != 1 {
+				t.Fatalf("pending sessions %d, want 1", st.Sessions.Pending)
+			}
+			dup.send(wire.TypeRst, 0, wpRst(uint32(AbortWithdrawn), ""))
+			var wg sync.WaitGroup
+			wg.Go(func() { dup.drain() })
+			seen := first.drain()
+			wg.Wait()
+			if len(seen) != 1 || seen[0] != wire.TypeClose {
+				t.Fatalf("the first carrier of a withdrawn session placed %v; want its CLOSE only (§6.2)", seen)
+			}
+			synctest.Wait()
+			if st := rt.Status(); st.Sessions != (SessionCounts{Tombstones: 1}) || st.AcceptBacklog[0] != 0 {
+				t.Fatalf("after the withdrawal: %+v", st)
+			}
+		})
+	})
+	t.Run("full backlog", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{AcceptBacklog: 1}, "a")
+			p := e.peer()
+			first := e2eDialAsync(context.Background(), p, DialOptions{})
+			synctest.Wait() // pending, its slot held: Accept is not called yet
+			r := <-e2eDialAsync(context.Background(), p, DialOptions{})
+			if !errors.Is(r.err, ErrCapacity) {
+				t.Fatalf("second Dial: %v; want ErrCapacity (backlog full)", r.err)
+			}
+			pend, err := e.ln.Accept(context.Background())
+			if err != nil {
+				t.Fatalf("Accept: %v", err)
+			}
+			if err := pend.Reject(4242, "x"); err != nil {
+				t.Fatalf("Reject: %v", err)
+			}
+			bkWantReject(t, (<-first).err, 4242)
+		})
+	})
+}
+
+// TestPendingSurvivesTrunkDeath_L48 (m3 BACKLOG; design §6.2: a pending
+// session survives the death of its carriers): the only trunk that
+// carried a session's OPEN dies before the application decides. The
+// dialer's attempt ends with the carrier, the Dial goes on (a new trunk,
+// the OPEN again), and the application's verdict — given before or after
+// the new OPEN arrived — reaches the dialer as its RejectError, never a
+// CAPACITY answer.
+func TestPendingSurvivesTrunkDeath_L48(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		rejectFirst bool // Reject before the dialer's new OPEN can arrive
+	}{
+		{"verdict after the new OPEN", false},
+		{"verdict before the new OPEN", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a")
+				l := e.links[0]
+				p := e.peer()
+				dc, pc := e2eOpen(t, p, e.ln, DialOptions{})
+				res := e2eDialAsync(context.Background(), p, DialOptions{})
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				pend, err := e.ln.Accept(ctx)
+				if err != nil {
+					t.Fatalf("Accept: %v", err)
+				}
+				if tc.rejectFirst {
+					l.SetRefuse(true) // the new trunk cannot come up yet
+				}
+				if n := l.Kill(); n == 0 {
+					t.Fatal("no carrier to kill")
+				}
+				synctest.Wait()
+				if pend.s.State() != session.StatePending {
+					t.Fatalf("pending session after its trunk died: state %v", pend.s.State())
+				}
+				if tc.rejectFirst {
+					if err := pend.Reject(4242, "after the trunk died"); err != nil {
+						t.Fatalf("Reject: %v", err)
+					}
+					l.SetRefuse(false)
+				} else {
+					mxWait(t, 30*time.Second, "the new OPEN parked on the pending session", func() bool {
+						return len(pend.s.Status().Carriers) >= 2
+					})
+					if err := pend.Reject(4242, "after the trunk died"); err != nil {
+						t.Fatalf("Reject: %v", err)
+					}
+				}
+				var r dialResult
+				select {
+				case r = <-res:
+				case <-time.After(60 * time.Second):
+					t.Fatal("Dial did not return")
+				}
+				if r.err == nil {
+					r.c.Close()
+				}
+				bkWantReject(t, r.err, 4242)
+				// The open session migrated to the new trunk intact.
+				e2eExchange(t, dc, pc, 64<<10, 9)
+				dc.Close()
+				pc.Close()
+			})
+		})
+	}
+}
+
+// TestPendingVerdictUnplacedAtCloseBy_L48 (m3 BACKLOG follow-up, fixed at
+// I3 in carrier abandonLocked): the application rejects a session pending
+// on a view of a live MUX trunk while the trunk's writer is held (the
+// AfterViewFill gate) past the session's close bound, so the session's
+// end procedure Kills the view with its REJECTED unplaced. The carrier's
+// fallback refusal (abandonLocked) must be a code the dialer retries —
+// never CAPACITY CodeBacklog, which says the backlog is full and is
+// terminal — so the Dial retries and gets the verdict from the tombstone.
+func TestPendingVerdictUnplacedAtCloseBy_L48(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		g := newBKGate()
+		ovD, ovP := bkOverrides(g)
+		e := &e2ePair{t: t, d: wpTestRuntime(t, Config{}, ovD), p: wpTestRuntime(t, Config{}, ovP)}
+		e.ln = wpListen(t, e.p, ListenConfig{})
+		l := rendrtest.NewLink(rendrtest.LinkConfig{Name: "a", Accept: e.ln.Handle})
+		t.Cleanup(l.Close)
+		p := e.mxPeer(e2eCarrier(l))
+		dc, pc := e2eOpen(t, p, e.ln, DialOptions{})
+		g.armed.Store(true)
+		res := e2eDialAsync(context.Background(), p, DialOptions{})
+		select {
+		case <-g.fired:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the passive writer never called the pending view's Fill")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		pend, err := e.ln.Accept(ctx)
+		if err != nil {
+			t.Fatalf("Accept: %v", err)
+		}
+		if err := pend.Reject(4242, "rejected; the writer is held past closeBy"); err != nil {
+			t.Fatalf("Reject: %v", err)
+		}
+		time.Sleep(1500 * time.Millisecond) // past closeBy = min(1 s, DeadMax): the view is killed
+		close(g.release)
+		var r dialResult
+		select {
+		case r = <-res:
+		case <-time.After(30 * time.Second):
+			t.Fatal("Dial did not return")
+		}
+		if r.err == nil {
+			r.c.Close()
+		}
+		bkWantReject(t, r.err, 4242)
+		dc.Close()
+		pc.Close()
+	})
 }

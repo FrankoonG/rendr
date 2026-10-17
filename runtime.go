@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"crypto/rand"
+	"fmt"
 	"math"
 	"net"
 	"slices"
@@ -58,7 +59,7 @@ type Runtime struct {
 	pruneAt   int
 
 	fmu    sync.Mutex                    // guards pflows; taken before a udpflow.Flow's lock (holdFlow), never while one is held
-	pflows map[*session.Session]*flowSet // passive packet sessions: the raw-UDP flows of their OPEN carriers (listener_pkt.go)
+	pflows map[*session.Session]*flowSet // passive packet sessions: the raw-UDP flows of their OPEN carriers (datagram.go)
 
 	// rendr mux (M3 design §A4.5, §A4.6, §A5.6). The trunk set holds the
 	// passive MUX trunks (view 1 of each, the handshake's Conn) until their
@@ -853,4 +854,29 @@ func (g *group) goWatched(pool *carrier.AbandonPool, d time.Duration, f func()) 
 		}()
 		f()
 	}()
+}
+
+func init() { testhooks.Install(newRuntimeForTest) }
+
+// newRuntimeForTest builds a Runtime from cfg (a Config) with ov applied after
+// normalization, bypassing clamps and constraints (internal/testhooks). ov
+// is copied: changing it afterwards has no effect on the Runtime.
+func newRuntimeForTest(cfg any, ov *testhooks.Overrides) (any, error) {
+	var c Config
+	switch v := cfg.(type) {
+	case Config:
+		c = v
+	case *Config:
+		if v != nil {
+			c = *v
+		}
+	case nil:
+	default:
+		return nil, fmt.Errorf("rendr/testhooks: NewRuntime: cfg is %T, want rendr.Config", cfg)
+	}
+	rt, err := newRuntime(c, ov)
+	if err != nil {
+		return nil, err
+	}
+	return rt, nil
 }

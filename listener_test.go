@@ -1,12 +1,15 @@
 package rendr
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"math/rand/v2"
 	"net"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -14,6 +17,8 @@ import (
 	"testing/synctest"
 	"time"
 
+	"github.com/FrankoonG/rendr/v2/internal/session"
+	"github.com/FrankoonG/rendr/v2/internal/testhooks"
 	"github.com/FrankoonG/rendr/v2/internal/wire"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
@@ -771,5 +776,371 @@ func TestCarriersFromTwoSources_L50(t *testing.T) {
 		if srcA.closes.Load() != 1 || srcB.closes.Load() != 1 {
 			t.Fatalf("sources closed %d and %d times", srcA.closes.Load(), srcB.closes.Load())
 		}
+	})
+}
+
+// TestRejectedSessionEndsRejected_L50: a pending session this side's
+// application rejects ends — in its EventSessionEnd — with an error that
+// matches ErrRejected and names the code, not with the error of a second
+// decision; a later Confirm or Reject still reports that second decision.
+func TestRejectedSessionEndsRejected_L50(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var ends []error
+		rt := wpTestRuntime(t, Config{OnEvent: func(ev Event) {
+			if ev.Kind == EventSessionEnd {
+				mu.Lock()
+				ends = append(ends, ev.Err)
+				mu.Unlock()
+			}
+		}}, nil)
+		ln := wpListen(t, rt, ListenConfig{})
+		d := wpConnect(t, ln, wpInst(0xa7), 1)
+		d.hello(rt)
+		d.send(wire.TypeOpen, 0, wpOpen(wpSID(1), wire.KindStream, 1, nil))
+		pc, err := ln.Accept(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pc.Reject(4242, "no route"); err != nil {
+			t.Fatalf("Reject: %v", err)
+		}
+		d.expectOpenAck(wire.StatusRejected, 4242)
+		d.drain()
+		synctest.Wait()
+		if err := pc.Reject(1, "again"); err == nil || errors.Is(err, ErrRejected) {
+			t.Fatalf("a second Reject: %v, want the second-decision error", err)
+		}
+		rt.Close()
+		synctest.Wait()
+		mu.Lock()
+		defer mu.Unlock()
+		if len(ends) != 1 {
+			t.Fatalf("%d session-end events, want 1: %v", len(ends), ends)
+		}
+		if err := ends[0]; !errors.Is(err, ErrRejected) || !strings.Contains(err.Error(), "4242") {
+			t.Fatalf("the rejected session's end error: %v, want one matching ErrRejected with code 4242", err)
+		}
+	})
+}
+
+// M4 WP1 (m4-design §A2.1, §A5.4, §A12.1): the root side of
+// PendingConn.Context. Helpers start with "c4".
+
+// c4PendingExit is one way a pending session leaves StatePending.
+type c4PendingExit struct {
+	name     string
+	deadline bool // AcceptTimeout ended it: Err is DeadlineExceeded
+	exit     func(t *testing.T, rt *Runtime, ln *Listener, pc *PendingConn, d *wpDialer)
+}
+
+func c4PendingExits() []c4PendingExit {
+	return []c4PendingExit{
+		{name: "Confirm", exit: func(t *testing.T, _ *Runtime, _ *Listener, pc *PendingConn, _ *wpDialer) {
+			if _, err := pc.Confirm(); err != nil {
+				t.Fatalf("Confirm: %v", err)
+			}
+		}},
+		{name: "Reject", exit: func(t *testing.T, _ *Runtime, _ *Listener, pc *PendingConn, _ *wpDialer) {
+			if err := pc.Reject(4000, "no"); err != nil {
+				t.Fatalf("Reject: %v", err)
+			}
+		}},
+		{name: "AcceptTimeout", deadline: true, exit: func(*testing.T, *Runtime, *Listener, *PendingConn, *wpDialer) {
+			time.Sleep(c4AcceptTimeout)
+		}},
+		{name: "withdrawal", exit: func(t *testing.T, _ *Runtime, _ *Listener, _ *PendingConn, d *wpDialer) {
+			d.send(wire.TypeRst, 0, wpRst(uint32(AbortWithdrawn), ""))
+		}},
+		{name: "Listener.Close", exit: func(t *testing.T, _ *Runtime, ln *Listener, _ *PendingConn, _ *wpDialer) {
+			ln.Close()
+		}},
+		{name: "Runtime.Close", exit: func(t *testing.T, rt *Runtime, _ *Listener, _ *PendingConn, _ *wpDialer) {
+			rt.Close()
+		}},
+	}
+}
+
+const c4AcceptTimeout = 2 * time.Second
+
+// c4Pending admits one stream OPEN from a scripted dialer on ln and
+// accepts it. The dialer's carrier is read in the background until the
+// passive ends it (the returned channel closes then).
+func c4Pending(t *testing.T, rt *Runtime, ln *Listener, sid int) (*PendingConn, *wpDialer, time.Time, <-chan struct{}) {
+	t.Helper()
+	d := wpConnect(t, ln, wpInst(0x4c), uint32(sid))
+	d.hello(rt)
+	admitted := time.Now()
+	d.send(wire.TypeOpen, 0, wpOpen(wpSID(sid), wire.KindStream, 1, nil))
+	pc, err := ln.Accept(t.Context())
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		d.drain()
+	}()
+	return pc, d, admitted, drained
+}
+
+// TestPendingContextDone (M4-D22, R1-8): each of the six exits from the
+// pending phase closes the pending context's Done exactly once, at the
+// exit (the AcceptTimeout one at the Deadline); Err is nil before, then
+// context.DeadlineExceeded for AcceptTimeout and context.Canceled for every
+// other exit; Deadline is the AcceptTimeout instant throughout; every call
+// returns the same context; AfterFunc callbacks and derived contexts
+// follow it once, and a stopped callback never runs.
+func TestPendingContextDone(t *testing.T) {
+	for _, x := range c4PendingExits() {
+		t.Run(x.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				rt := wpTestRuntime(t, Config{}, nil)
+				ln := wpListen(t, rt, ListenConfig{AcceptTimeout: c4AcceptTimeout})
+				pc, d, admitted, drained := c4Pending(t, rt, ln, 1)
+				ctx := pc.Context()
+				if ctx != pc.Context() {
+					t.Fatal("two calls returned different contexts")
+				}
+				dl, ok := ctx.Deadline()
+				if !ok || dl.Before(admitted.Add(c4AcceptTimeout)) || dl.After(time.Now().Add(c4AcceptTimeout)) {
+					t.Fatalf("Deadline %v (%v), want the AcceptTimeout instant, %v after the admission", dl.Sub(admitted), ok, c4AcceptTimeout)
+				}
+				if err := ctx.Err(); err != nil {
+					t.Fatalf("Err while pending: %v", err)
+				}
+				var ran, stopped atomic.Int32
+				context.AfterFunc(ctx, func() { ran.Add(1) })
+				stop := context.AfterFunc(ctx, func() { stopped.Add(1) })
+				if !stop() || stop() {
+					t.Fatal("stop: want true once, then false")
+				}
+				child, cancel := context.WithCancel(ctx)
+				defer cancel()
+				timed, cancelT := context.WithTimeout(ctx, time.Hour) // later than the parent's deadline
+				defer cancelT()
+				synctest.Wait()
+				select {
+				case <-ctx.Done():
+					t.Fatal("Done closed while pending")
+				default:
+				}
+
+				x.exit(t, rt, ln, pc, d)
+				synctest.Wait()
+				select {
+				case <-ctx.Done():
+				default:
+					t.Fatalf("Done still open after %s", x.name)
+				}
+				want := context.Canceled
+				if x.deadline {
+					want = context.DeadlineExceeded
+					if now := time.Now(); !now.Equal(dl) {
+						t.Fatalf("AcceptTimeout ended the pending phase %v off its Deadline", now.Sub(dl))
+					}
+				}
+				if err := ctx.Err(); err != want {
+					t.Fatalf("Err after %s: %v, want %v", x.name, err, want)
+				}
+				if dl2, ok2 := ctx.Deadline(); dl2 != dl || !ok2 {
+					t.Fatalf("Deadline changed to %v (%v)", dl2, ok2)
+				}
+				if ran.Load() != 1 || stopped.Load() != 0 {
+					t.Fatalf("AfterFunc ran %d times, the stopped one %d; want 1 and 0", ran.Load(), stopped.Load())
+				}
+				for _, c := range []context.Context{child, timed} {
+					if err := c.Err(); err != want {
+						t.Fatalf("a derived context's Err: %v, want %v", err, want)
+					}
+				}
+				// Registered after the exit through the context's AfterFunc
+				// method, as the context package does when the session leaves
+				// pending between its Done check and that call (with Done
+				// already closed, context.AfterFunc starts f itself and never
+				// calls the method): f runs once on its own goroutine and stop
+				// reports false.
+				var late atomic.Int32
+				af, ok := pc.Context().(interface{ AfterFunc(func()) func() bool })
+				if !ok {
+					t.Fatal("the pending context has no AfterFunc method")
+				}
+				stopLate := af.AfterFunc(func() { late.Add(1) })
+				synctest.Wait()
+				if late.Load() != 1 {
+					t.Fatalf("an AfterFunc registered after the exit ran %d times, want 1", late.Load())
+				}
+				if stopLate() {
+					t.Fatal("stop of an AfterFunc registered after the exit reported true")
+				}
+				rt.Close()
+				d.close()
+				<-drained
+				synctest.Wait()
+			})
+		})
+	}
+}
+
+// c4PropagateGoroutines counts the goroutines the context package started
+// to watch a parent that has no AfterFunc method.
+func c4PropagateGoroutines() int {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return bytes.Count(buf[:n], []byte("created by context.(*cancelCtx).propagateCancel"))
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+}
+
+// TestPendingContextNoGoroutine (M4-D22, R1-8): context.AfterFunc and the
+// contexts WithCancel, WithDeadline (earlier and later than the pending
+// deadline) and WithTimeout derive from the pending context start no
+// goroutine; they are cancelled through the session's registrations when
+// the pending phase ends.
+func TestPendingContextNoGoroutine(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rt := wpTestRuntime(t, Config{}, nil)
+		ln := wpListen(t, rt, ListenConfig{AcceptTimeout: c4AcceptTimeout})
+		pc, d, _, drained := c4Pending(t, rt, ln, 1)
+		ctx := pc.Context()
+		synctest.Wait()
+		before := c4PropagateGoroutines()
+		var ran atomic.Int32
+		context.AfterFunc(ctx, func() { ran.Add(1) })
+		derived := make([]context.Context, 0, 4)
+		c1, cancel1 := context.WithCancel(ctx)
+		defer cancel1()
+		c2, cancel2 := context.WithDeadline(ctx, time.Now().Add(time.Second))
+		defer cancel2()
+		c3, cancel3 := context.WithDeadline(ctx, time.Now().Add(time.Hour))
+		defer cancel3()
+		c4, cancel4 := context.WithTimeout(c1, time.Minute) // a grandchild
+		defer cancel4()
+		derived = append(derived, c1, c2, c3, c4)
+		synctest.Wait()
+		if n := c4PropagateGoroutines() - before; n != 0 {
+			t.Fatalf("%d goroutines started to watch the pending context, want 0", n)
+		}
+		if _, err := pc.Confirm(); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if ran.Load() != 1 {
+			t.Fatalf("AfterFunc ran %d times, want 1", ran.Load())
+		}
+		for i, c := range derived {
+			if err := c.Err(); err != context.Canceled {
+				t.Fatalf("derived context %d: Err %v, want context.Canceled", i, err)
+			}
+		}
+		rt.Close()
+		d.close()
+		<-drained
+		synctest.Wait()
+	})
+}
+
+// TestAcceptSkipsWithdrawnQueued_L50 (design §6.2; L50): a queued session
+// whose dialer withdrew it (RST withdrawn) has ended — its state is no
+// longer pending — while its Registry.Ended, which unlinks it from the
+// Accept queue and frees its backlog slot, is still running (held by
+// Hooks.LeavePending). Accept, which finds it at the head of the queue,
+// skips it and returns the live session queued after it; nothing else is
+// accepted. Once Ended completes the withdrawn session's slot is free, its
+// carrier ended with CLOSE, and a replay of its OPEN gets UNKNOWN_SESSION
+// from the tombstone.
+func TestAcceptSkipsWithdrawnQueued_L50(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		gone, live := wpSID(1), wpSID(2)
+		entered, release := make(chan struct{}), make(chan struct{})
+		var releaseOnce sync.Once
+		free := func() { releaseOnce.Do(func() { close(release) }) }
+		var held atomic.Bool
+		hooks := &testhooks.Hooks{LeavePending: func(sid [16]byte) {
+			if sid == gone && held.CompareAndSwap(false, true) {
+				close(entered)
+				<-release
+			}
+		}}
+		rt := wpTestRuntime(t, Config{}, &testhooks.Overrides{Hooks: hooks})
+		t.Cleanup(free) // runs before the Runtime's own cleanup (LIFO)
+		ln := wpListen(t, rt, ListenConfig{})
+		inst := wpInst(0xb4)
+		id := uint32(1)
+		open := func(sid [16]byte) *wpDialer {
+			d := wpConnect(t, ln, inst, id)
+			id++
+			d.hello(rt)
+			d.send(wire.TypeOpen, 0, wpOpen(sid, wire.KindStream, 1, nil))
+			return d
+		}
+		w := open(gone)
+		synctest.Wait() // admitted and queued before the live one: the head of the queue
+		l := open(live)
+		synctest.Wait()
+		w.send(wire.TypeRst, 0, wpRst(uint32(AbortWithdrawn), ""))
+		drained := make(chan []wire.Type, 1)
+		go func() { drained <- w.drain() }()
+		select {
+		case <-entered:
+		case <-time.After(time.Minute):
+			t.Fatal("stimulus: the withdrawn session's Registry.Ended never reached Hooks.LeavePending")
+		}
+		synctest.Wait()
+
+		// Stimulus: the withdrawn session ended but is still queued at the
+		// head, holding its slot, while its Ended is held.
+		ln.mu.Lock()
+		var queued []*session.Session
+		for it := ln.q[kindIdxStream].head; it != nil; it = it.next {
+			queued = append(queued, it.s)
+		}
+		ln.mu.Unlock()
+		if len(queued) != 2 || queued[0].ID() != gone || queued[0].State() != session.StateEnded || queued[1].State() != session.StatePending {
+			t.Fatalf("stimulus: %d queued sessions; want the ended withdrawn one at the head, then the live one", len(queued))
+		}
+		if st := rt.Status(); st.AcceptBacklog[0] != 2 || st.Sessions.Pending != 1 || st.Sessions.Tombstones != 1 {
+			t.Fatalf("stimulus: %+v; want two backlog slots held, one pending session and the withdrawn one's tombstone", st)
+		}
+
+		pc, err := ln.Accept(context.Background())
+		if err != nil || pc.ID() != SessionID(live) {
+			var got SessionID
+			if pc != nil {
+				got = pc.ID()
+			}
+			t.Fatalf("Accept = %v, %v; want the live session %v", got, err, SessionID(live))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		if extra, err := ln.Accept(ctx); extra != nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("a second Accept: %v, %v; want nothing more", extra, err)
+		}
+		cancel()
+
+		free()
+		synctest.Wait()
+		if st := rt.Status(); st.AcceptBacklog[0] != 1 || st.Sessions.Pending != 1 {
+			t.Fatalf("after the withdrawn session's Ended: %+v; want only the accepted session's slot", st)
+		}
+		if seen := <-drained; len(seen) == 0 || seen[len(seen)-1] != wire.TypeClose {
+			t.Fatalf("the withdrawn session's carrier ended with %v, want its CLOSE", seen)
+		}
+		if err := pc.Reject(5, "seen"); err != nil {
+			t.Fatal(err)
+		}
+		l.expectOpenAck(wire.StatusRejected, 5)
+		l.drain()
+		r := open(gone)
+		r.expectOpenAck(wire.StatusUnknownSession, 0)
+		r.close()
+		synctest.Wait()
+		if st := rt.Status(); st.Sessions != (SessionCounts{Tombstones: 2}) || st.AcceptBacklog[0] != 0 {
+			t.Fatalf("after the verdicts: %+v", st)
+		}
+		rt.Close()
+		wpNoState(t, rt)
 	})
 }

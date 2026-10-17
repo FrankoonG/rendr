@@ -8,6 +8,9 @@ import (
 	"net"
 	"strconv"
 	"testing"
+
+	"github.com/FrankoonG/rendr/v2/internal/session"
+	"github.com/FrankoonG/rendr/v2/internal/wire"
 )
 
 // TestIDStrings checks the ID and Addr text forms.
@@ -111,5 +114,16 @@ func TestEnumStrings(t *testing.T) {
 		if got := itoa(v); got != strconv.FormatUint(v, 10) {
 			t.Errorf("itoa(%d) = %q", v, got)
 		}
+	}
+}
+
+// TestModeRaceString (§A2.1): ModeRace is 3, the wire's and the session's
+// value, and prints "race".
+func TestModeRaceString(t *testing.T) {
+	if ModeRace != 3 || uint8(ModeRace) != wire.ModeRace || int(ModeRace) != int(session.ModeRace) {
+		t.Fatalf("ModeRace = %d, wire %d, session %d", ModeRace, wire.ModeRace, session.ModeRace)
+	}
+	if s := ModeRace.String(); s != "race" {
+		t.Fatalf("ModeRace.String() = %q, want race", s)
 	}
 }

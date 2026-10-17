@@ -14,6 +14,305 @@ import (
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
+// mxSwitchOverrides make the selector's quality switch fast and the old
+// lane's retirement bound short (the timings of TestLocalCloseNoFailover_L01).
+func mxSwitchOverrides(cooldown time.Duration) *testhooks.Overrides {
+	return &testhooks.Overrides{
+		ProbeInterval: 50 * time.Millisecond, ProbeFresh: time.Second,
+		SelectorDwell: 200 * time.Millisecond, SelectorCooldown: cooldown,
+		RetireGrace: time.Second,
+	}
+}
+
+// mxSessionTaps returns the tampers of taps whose carrier is a session
+// carrier (its first dialer frame an OPEN or a JOIN), oldest first.
+func mxSessionTaps(t testing.TB, taps *mxTaps) []*rendrtest.Tamper {
+	t.Helper()
+	var out []*rendrtest.Tamper
+	for i := range taps.count() {
+		tp := taps.tap(t, i)
+		if len(mxFrames(tp, rendrtest.Up, rendrtest.FrameOpen, 0))+len(mxFrames(tp, rendrtest.Up, rendrtest.FrameJoin, 0)) > 0 {
+			out = append(out, tp)
+		}
+	}
+	return out
+}
+
+// mxCarrierRows returns c's session-level rows of carrier id (live and
+// dead), oldest first.
+func mxCarrierRows(c *Conn, id CarrierID) []session.CarrierStatus {
+	var out []session.CarrierStatus
+	for _, cs := range mxSessionCarriers(c) {
+		if CarrierID(cs.ID) == id {
+			out = append(out, cs)
+		}
+	}
+	return out
+}
+
+// TestRetireIsDetach (M3-D6, R1-3; A11.3's "Retire sends CLOSE on MUX
+// trunks" mutant): a selector session's planned switch away from a MUX
+// trunk that another session keeps alive retires its view with DETACH —
+// no CLOSE on that trunk in either direction —, the old lane is reaped with
+// its row retired, the session keeps delivering on its new lane, and when
+// it then ends Session.Done closes while the trunk stays alive with one
+// view fewer. On a dedicated carrier (CheapSubflow) the same switch
+// retires the carrier with CLOSE, as in M2.
+func TestRetireIsDetach(t *testing.T) {
+	for _, cheap := range []bool{false, true} {
+		name := "mux"
+		if cheap {
+			name = "dedicated"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := e2eNew(t, Config{}, Config{}, mxSwitchOverrides(time.Hour), ListenConfig{}, "a", "b")
+				la, lb := e.links[0], e.links[1]
+				la.SetDelay(time.Millisecond, 0)
+				lb.SetDelay(5*time.Millisecond, 0)
+				var ta, tb mxTaps
+				defer ta.close()
+				defer tb.close()
+				ca, cb := mxTapCarrier(la, &ta), mxTapCarrier(lb, &tb)
+				if cheap {
+					ca, cb = dedicated(ca), dedicated(cb)
+				}
+				p := e.mxPeer(ca, cb)
+				k, kq := e2eOpen(t, p, e.ln, DialOptions{Mode: ModeBond}) // keeps a carrier of a
+				mxWait(t, 2*time.Second, "the keeper's members", func() bool { return mxMembers(k) == 2 })
+				s, sq := e2eOpen(t, p, e.ln, DialOptions{})
+				old := mxCarrier(t, s, "a")
+				sa := mxSessionTaps(t, &ta)
+				tpA := sa[len(sa)-1] // the trunk (mux) or carrier (dedicated) of s on a
+				detBefore := len(mxFrames(tpA, rendrtest.Up, rendrtest.FrameDetach, 0))
+
+				la.SetDelay(20*time.Millisecond, 0) // a degrades: s switches to b
+				mxWait(t, 30*time.Second, "the quality switch and the old lane's end", func() bool {
+					st := s.Status()
+					if st.Migrations.Quality == 0 {
+						return false
+					}
+					rows := mxCarrierRows(s, old.ID)
+					return len(rows) == 1 && rows[0].State == session.LaneDead
+				})
+				synctest.Wait()
+				row := mxCarrierRows(s, old.ID)[0]
+				if row.DeathCause.String() != CauseRetired.String() {
+					t.Fatalf("the old lane's row: %v %s, want retired", row.DeathCause, row.DeathDetail)
+				}
+				closes := len(mxFrames(tpA, rendrtest.Up, rendrtest.FrameClose, 0)) + len(mxFrames(tpA, rendrtest.Down, rendrtest.FrameClose, 0))
+				dets := len(mxFrames(tpA, rendrtest.Up, rendrtest.FrameDetach, 0)) - detBefore
+				if cheap {
+					if closes == 0 || dets != 0 {
+						t.Fatalf("dedicated: %d CLOSEs and %d DETACHes on the old carrier, want CLOSE and no DETACH", closes, dets)
+					}
+				} else {
+					if closes != 0 || dets != 1 {
+						t.Fatalf("mux: %d CLOSEs and %d DETACHes on the old trunk, want one DETACH and no CLOSE", closes, dets)
+					}
+					if c := mxCarrier(t, k, "a"); c.ID != old.ID || c.State != CarrierMember {
+						t.Fatalf("the keeper's member on a %+v, want the trunk %d alive", c, old.ID)
+					}
+				}
+				e2eExchange(t, s, sq, 256<<10, 1)
+				before := e.d.Status().Mux
+				e2eFinish(t, s, sq)
+				if !cheap {
+					after := e.d.Status().Mux
+					if c := mxCarrier(t, k, "a"); c.ID != old.ID || after.Carriers != before.Carriers || after.Views != before.Views-1 {
+						t.Fatalf("after the session's end: keeper on %+v, Mux %+v (was %+v); want the trunk alive with one view fewer", c, after, before)
+					}
+				}
+				e2eExchange(t, k, kq, 128<<10, 2)
+				e2eFinish(t, k, kq)
+				e.close()
+			})
+		})
+	}
+}
+
+// TestMuxReattachSameTrunk (M3-D64, R1-6; A11.3's id-only known-carrier
+// mutant): a selector session switches by quality from trunk X to trunk Y
+// and, after its Cooldown, back to X, which another session kept alive:
+// the JOIN onto X is admitted at the first try (one JOIN placed for it),
+// the session's lane on X is new (a new handle; its dead-lane history
+// shows X twice, with two handles), SCHED routes its data to the new lane,
+// and every byte arrives intact.
+func TestMuxReattachSameTrunk(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := e2eNew(t, Config{}, Config{}, mxSwitchOverrides(3*time.Second), ListenConfig{}, "a", "b")
+		la, lb := e.links[0], e.links[1]
+		la.SetDelay(time.Millisecond, 0)
+		lb.SetDelay(5*time.Millisecond, 0)
+		var ta, tb mxTaps
+		defer ta.close()
+		defer tb.close()
+		p := e.mxPeer(mxTapCarrier(la, &ta), mxTapCarrier(lb, &tb))
+		k, kq := e2eOpen(t, p, e.ln, DialOptions{Mode: ModeBond})
+		mxWait(t, 2*time.Second, "the keeper's members", func() bool { return mxMembers(k) == 2 })
+		s, sq := e2eOpen(t, p, e.ln, DialOptions{})
+		x := mxCarrier(t, s, "a")
+		h1 := mxHandleOf(t, s, "a")
+		tpX := mxSessionTaps(t, &ta)[0]
+
+		la.SetDelay(20*time.Millisecond, 0)
+		mxWait(t, 30*time.Second, "the switch to b", func() bool { return mxCarrier(t, s, "").Name == "b" && s.Status().Migrations.Quality == 1 })
+		joinsBefore := len(mxFrames(tpX, rendrtest.Up, rendrtest.FrameJoin, 0))
+		la.SetDelay(time.Millisecond, 0)
+		lb.SetDelay(20*time.Millisecond, 0)
+		mxWait(t, 60*time.Second, "the switch back to a", func() bool {
+			c := mxCarrier(t, s, "")
+			return c.Name == "a" && c.State == CarrierActive && s.Status().Migrations.Quality == 2
+		})
+		synctest.Wait()
+		if n := len(mxFrames(tpX, rendrtest.Up, rendrtest.FrameJoin, 0)) - joinsBefore; n != 1 {
+			t.Fatalf("%d JOINs placed on trunk X for the return, want 1 (admitted at the first try)", n)
+		}
+		if c := mxCarrier(t, s, "a"); c.ID != x.ID {
+			t.Fatalf("returned to carrier %d, want trunk X %d", c.ID, x.ID)
+		}
+		h2 := mxHandleOf(t, s, "a")
+		rows := mxCarrierRows(s, x.ID)
+		if h2 == h1 || len(rows) != 2 || rows[0].Stats.Handle == rows[1].Stats.Handle {
+			t.Fatalf("handles %d then %d; rows of X %+v; want two rows of X with two handles", h1, h2, rows)
+		}
+		e2eExchange(t, s, sq, 256<<10, 3)
+		if got := mxHandles(tpX, rendrtest.Up, rendrtest.FrameData)[h2]; got == 0 {
+			t.Fatalf("no DATA on the new lane (handle %d) of trunk X", h2)
+		}
+		if st := s.Status(); st.Migrations.Death != 0 || st.NoPathEpisodes != 0 {
+			t.Fatalf("session %+v", st)
+		}
+		e2eFinish(t, s, sq)
+		e2eFinish(t, k, kq)
+		e.close()
+	})
+}
+
+// TestDetachReasonInformational (R1-5 rule 3, M3-D6): DETACH's reason is
+// informational — the receiver's view ends and its lane leaves as for M1's
+// peer CLOSE, and session state never changes by it. A selector session's
+// planned switch away from a shared trunk: the passive receives
+// DETACH(retired) on the live view of its live session — its lane on that
+// trunk leaves (its row retired), its session stays open with no error and
+// keeps delivering on the new lane, it sends no RST —; the dialer receives
+// the passive's answer, DETACH(ended), on its retiring view and its session
+// likewise goes on. DETACH(ended) on a live view of a live session (the
+// passive's side of a rewritten reason) is TestDetachEndedOnLiveView.
+func TestDetachReasonInformational(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := e2eNew(t, Config{}, Config{}, mxSwitchOverrides(time.Hour), ListenConfig{}, "a", "b")
+		la, lb := e.links[0], e.links[1]
+		la.SetDelay(time.Millisecond, 0)
+		lb.SetDelay(5*time.Millisecond, 0)
+		var ta, tb mxTaps
+		defer ta.close()
+		defer tb.close()
+		p := e.mxPeer(mxTapCarrier(la, &ta), mxTapCarrier(lb, &tb))
+		k, kq := e2eOpen(t, p, e.ln, DialOptions{Mode: ModeBond})
+		mxWait(t, 2*time.Second, "the keeper's members", func() bool { return mxMembers(k) == 2 })
+		s, sq := e2eOpen(t, p, e.ln, DialOptions{})
+		old := mxCarrier(t, sq, "")
+		tpA := mxSessionTaps(t, &ta)[0]
+		upDet := len(mxFrames(tpA, rendrtest.Up, rendrtest.FrameDetach, 0))
+		downDet := len(mxFrames(tpA, rendrtest.Down, rendrtest.FrameDetach, 0))
+		done := make(chan error, 1)
+		go func() { done <- e2eExchangeErr(s, sq, 8<<20, 41) }()
+		la.SetDelay(20*time.Millisecond, 0)
+		mxWait(t, 30*time.Second, "both old lanes leave", func() bool {
+			rows, drows := mxCarrierRows(sq, old.ID), mxCarrierRows(s, old.ID)
+			return len(rows) == 1 && rows[0].State == session.LaneDead && len(drows) == 1 && drows[0].State == session.LaneDead
+		})
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if row := mxCarrierRows(sq, old.ID)[0]; row.DeathCause.String() != CauseRetired.String() {
+			t.Fatalf("the passive's detached lane: %v %s, want retired", row.DeathCause, row.DeathDetail)
+		}
+		if row := mxCarrierRows(s, old.ID); len(row) != 1 || row[0].DeathCause.String() != CauseRetired.String() {
+			t.Fatalf("the dialer's detached lane: %+v, want retired", row)
+		}
+		if u, d := len(mxFrames(tpA, rendrtest.Up, rendrtest.FrameDetach, 0))-upDet, len(mxFrames(tpA, rendrtest.Down, rendrtest.FrameDetach, 0))-downDet; u != 1 || d != 1 {
+			t.Fatalf("DETACHes on the old trunk: %d from the dialer, %d from the passive; want one each", u, d)
+		}
+		if n := len(mxFrames(tpA, rendrtest.Down, rendrtest.FrameRst, 0)) + len(mxFrames(tpA, rendrtest.Up, rendrtest.FrameRst, 0)); n != 0 {
+			t.Fatalf("%d RSTs on the old trunk", n)
+		}
+		for _, c := range []*Conn{s, sq} {
+			if st := c.Status(); st.State != StateOpen || st.Err != nil || st.Migrations.Death != 0 {
+				t.Fatalf("%v after the DETACH: %+v", st.Role, st)
+			}
+		}
+		e2eExchange(t, s, sq, 64<<10, 43)
+		e2eFinish(t, s, sq)
+		e2eFinish(t, k, kq)
+		e.close()
+	})
+}
+
+// TestHandleStateMachine (§A5.4, R1-9; the session half — the carrier half
+// is the mux core's): the rows of the handle lifecycle a session sees, each
+// on a live trunk shared with a neighbour session that must stay
+// untouched (no death, no migration, its data intact):
+//
+//   - dialer opening/awaiting, abandoned (Dial withdrawn): RST then DETACH,
+//     the passive's pending session withdraws (TestMuxCancelCrossesConfirm_L49);
+//   - dialer attached-pending, the peer's DETACH: the view retires, our
+//     DETACH answers, the attach finds the view detached and counts a
+//     carrier refusal, for a JOIN and an OPEN (TestAttachedPendingPeerDetach);
+//   - live, the peer's DETACH(retired) or DETACH(ended): the lane leaves
+//     (TestDetachReasonInformational, TestDetachEndedOnLiveView);
+//   - dialer opening race lost after the session opened: DETACH only
+//     (TestOpeningRaceLoserDetachOnly);
+//   - live, planned retirement: DETACH (TestRetireIsDetach);
+//   - passive held, its session ends: DETACH only (TestHeldViewSessionEnd);
+//   - any, trunk death: every view's lane dies once, each session counts its
+//     own death and recovers.
+func TestHandleStateMachine(t *testing.T) {
+	t.Run("trunk death", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			e := e2eNew(t, Config{}, Config{}, nil, ListenConfig{}, "a", "b")
+			e.links[0].SetDelay(time.Millisecond, 0) // a ranks first
+			e.links[1].SetDelay(5*time.Millisecond, 0)
+			p := e.peer()
+			var ds, ps [3]*Conn
+			for i := range 3 {
+				ds[i], ps[i] = e2eOpen(t, p, e.ln, DialOptions{})
+			}
+			trunk := mxCarrier(t, ds[0], "").ID
+			for i := 1; i < 3; i++ {
+				if mxCarrier(t, ds[i], "").ID != trunk {
+					t.Fatal("the sessions do not share one trunk")
+				}
+			}
+			e.links[0].Kill()
+			for i := range 3 {
+				mxWait(t, 10*time.Second, "the session recovers", func() bool {
+					for _, c := range ds[i].Status().Carriers {
+						if c.State == CarrierActive && c.ID != trunk {
+							return true
+						}
+					}
+					return false
+				})
+				e2eExchange(t, ds[i], ps[i], 64<<10, uint64(i))
+				if st := ds[i].Status(); st.Migrations.Death != 1 {
+					t.Fatalf("session %d: %+v, want one death migration", i, st.Migrations)
+				}
+				rows := mxCarrierRows(ds[i], trunk)
+				if len(rows) != 1 || rows[0].State != session.LaneDead {
+					t.Fatalf("session %d: rows of the dead trunk %+v, want one dead lane", i, rows)
+				}
+			}
+			for i := range 3 {
+				e2eFinish(t, ds[i], ps[i])
+			}
+			e.close()
+		})
+	})
+}
+
 // mxSessionTap returns the newest tamper of taps that carries a session
 // frame (OPEN or JOIN) of the dialer.
 func mxSessionTap(t testing.TB, taps *mxTaps) *rendrtest.Tamper {
@@ -388,130 +687,6 @@ func TestDetachEndedOnLiveView(t *testing.T) {
 		e2eFinish(t, s, sq)
 		e2eFinish(t, k, kq)
 		e.close()
-	})
-}
-
-// TestPassiveTrunkZeroViewsTotal (M3-D22, the per-Runtime half and the
-// return of a view; TestPassiveTrunkZeroViewsBounded is the per-instance
-// half): six raw MUX trunks of two dialer instances, three each, are left
-// without views; with Sessionless.Total 3 (PerInstance 16, never binding)
-// after RetireGrace three of them hold a Sessionless place and the other
-// three get CLOSE(capacity) at once. Then an OPEN for a new handle arrives
-// on one of the counted trunks: its view's admission gives the place back
-// (Status.Sessionless drops to 2) and the trunk lives on — at
-// Sessionless.Idle only the two still counted trunks are retired.
-func TestPassiveTrunkZeroViewsTotal(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		const trunks, total = 6, 3
-		idle := 30 * time.Second
-		cfg := Config{RetireGrace: time.Second, Sessionless: SessionlessLimits{PerInstance: 16, Total: total, Idle: idle}}
-		ov := &testhooks.Overrides{DeadMin: 10 * time.Minute, DeadMax: 10 * time.Minute, WriteStall: 10 * time.Minute}
-		rt := wpTestRuntime(t, cfg, ov)
-		ln := wpListen(t, rt, ListenConfig{})
-		acc := newAcceptLog(ln, func(pc *PendingConn) (*Conn, error) { return pc.Confirm() })
-		type rawTrunk struct {
-			d      *wpDialer
-			mu     sync.Mutex
-			closes []wire.CloseReason
-			acks   []wire.OpenAck // OPEN_ACKs for handle 2
-		}
-		var rs []*rawTrunk
-		var wg sync.WaitGroup
-		for i := range trunks {
-			inst := wpInst(byte(9 + i%2))
-			id := uint32(100 + i)
-			r := &rawTrunk{d: wpConnect(t, ln, inst, id)}
-			pre := make([]byte, wire.PrefaceLen)
-			wire.PutPreface(pre, &wire.Preface{Minor: wire.Minor, Kind: wire.KindStream, Instance: inst, CarrierID: id, Opt: wire.OptMux})
-			ack, ok, _ := r.d.sendPreface(pre)
-			if !ok || ack.Status != wire.PrefaceOK || ack.Opt&wire.OptMux == 0 {
-				t.Fatalf("PREFACE_ACK %+v (%v), want OK with OptMux", ack, ok)
-			}
-			r.d.send(wire.TypeOpen, 0, wpOpen(wpSID(600+i), wire.KindStream, 1, nil))
-			r.d.expectOpenAck(wire.StatusOK, 0)
-			r.d.send(wire.TypeRst, 0, wpRst(wire.RstClosed, "gone"))
-			wg.Go(func() { // the raw dialer reads everything, answers nothing
-				for {
-					f, err := r.d.recv()
-					if err != nil {
-						return
-					}
-					r.mu.Lock()
-					switch {
-					case f.Type == wire.TypeClose:
-						reason, _ := wire.ParseClose(f.Payload)
-						r.closes = append(r.closes, reason)
-					case f.Type == wire.TypeOpenAck && f.Handle == 2:
-						oa, _ := wire.ParseOpenAck(f.Payload)
-						r.acks = append(r.acks, oa)
-					}
-					r.mu.Unlock()
-				}
-			})
-			rs = append(rs, r)
-		}
-		closes := func(r *rawTrunk, want wire.CloseReason) int {
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			n := 0
-			for _, c := range r.closes {
-				if c == want {
-					n++
-				}
-			}
-			return n
-		}
-		closesOf := func(want wire.CloseReason) int {
-			n := 0
-			for _, r := range rs {
-				n += closes(r, want)
-			}
-			return n
-		}
-		mxWait(t, 5*time.Second, "the Total bound at RetireGrace", func() bool { return closesOf(wire.CloseCapacity) == trunks-total })
-		mxWait(t, 2*time.Second, "the refused trunks drain", func() bool { return rt.Status().Mux.Carriers == total })
-		if st := rt.Status(); st.Sessionless != total || st.Mux.Views != 0 {
-			t.Fatalf("after RetireGrace at zero views: %+v; want %d counted Sessionless", st, total)
-		}
-		var back *rawTrunk
-		for _, r := range rs {
-			if closes(r, wire.CloseCapacity) == 0 {
-				back = r
-				break
-			}
-		}
-		// A new view on the counted trunk: OPEN for handle 2.
-		f := wire.AppendFrame(nil, wire.Header{Type: wire.TypeOpen, Fseq: back.d.txFseq, Handle: 2}, wpOpen(wpSID(700), wire.KindStream, 1, nil))
-		back.d.txFseq++
-		if _, err := back.d.nc.Write(f); err != nil {
-			t.Fatal(err)
-		}
-		mxWait(t, 2*time.Second, "the new view's OPEN_ACK(OK)", func() bool {
-			back.mu.Lock()
-			defer back.mu.Unlock()
-			return len(back.acks) == 1 && back.acks[0].Status == wire.StatusOK
-		})
-		if st := rt.Status(); st.Sessionless != total-1 || st.Mux.Carriers != total || st.Mux.Views != 1 {
-			t.Fatalf("after a view returned to a counted trunk: %+v; want %d counted Sessionless", st, total-1)
-		}
-		mxWait(t, idle+time.Second, "the bound at Sessionless.Idle", func() bool { return closesOf(wire.CloseRetire) == total-1 })
-		if n := closes(back, wire.CloseRetire) + closes(back, wire.CloseCapacity); n != 0 {
-			t.Fatalf("the trunk with a view again got %d CLOSEs", n)
-		}
-		for _, r := range rs {
-			r.d.close()
-		}
-		wg.Wait()
-		acc.stop()
-		for _, c := range acc.conns {
-			c.Close()
-		}
-		mxWait(t, 5*time.Second, "the trunk set empties", func() bool { return len(mxTrunkSet(rt)) == 0 })
-		if st := rt.Status(); st.Sessionless != 0 || st.Mux.Carriers != 0 {
-			t.Fatalf("after the closes: %+v", st)
-		}
-		rt.Close()
-		wpNoState(t, rt)
 	})
 }
 

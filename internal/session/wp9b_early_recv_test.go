@@ -13,7 +13,7 @@ import (
 // The passive's pre-verdict rule at the session level (M4 design §A5.1,
 // §A5.2; M4-D2, M4-D5, M4-D6; WP9b): lane.Data on a pending passive
 // session. The end-to-end rows through a Runtime admission are in the root
-// package (wp9b_early_*_test.go).
+// package (early_test.go).
 
 // ebPending returns a pending passive session as NewPending leaves it — the
 // stream initialized, nothing advertised (rightEdge = FirstOffset), state

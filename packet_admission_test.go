@@ -1,9 +1,11 @@
 package rendr
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -424,5 +426,306 @@ func TestHandlePacketOwnership_L57(t *testing.T) {
 		c.Close()
 		rt.Close()
 		wpNoState(t, rt)
+	})
+}
+
+// End-to-end admission rows of integration 2: OPEN pools under a flood,
+// OPEN_ACK per carrier, a kind mismatch on an open session, held carriers
+// and their H2 repeats, rebinding while held, and the response tail.
+
+// TestPacketOpenPoolsFlood_L48: the flood half of TestPacketOpenPools_L48
+// (R1-21). A packet session runs over a FromPacketConn socket; then a
+// flood — valid packet OPEN and JOIN first datagrams, bad CRCs and random
+// bytes, a quarter of it from the session's own source IP address —
+// arrives while nobody accepts (Accept stalls, so the flood's OPENs keep
+// that address's OPEN quota full). The session's carrier is closed under
+// rendr: its failover JOIN from the same address completes within 1 s and
+// datagrams flow again; the flows stay bounded.
+func TestPacketOpenPoolsFlood_L48(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		h := peNewHub(t, Config{}, ListenConfig{}, nil)
+		lc := &lastPC{}
+		dc, pc := peOpen(t, h.peer(h.carrier("h0", 0, lc)), h.ln, DialOptions{})
+		stop := h.hub.Flood(4000, rendrtest.FloodMix{Random: 1, BadCRC: 1, Preface: 4, Join: 2})
+		time.Sleep(2 * time.Second)
+		st := h.p.Status()
+		if st.Datagram.Admitting < 32 || st.AcceptBacklog[1] == 0 {
+			t.Fatalf("stimulus: the flood's OPENs fill no quota (admitting %d, packet backlog %d)", st.Datagram.Admitting, st.AcceptBacklog[1])
+		}
+		killed := lc.last()
+		killed.Close()
+		start := time.Now()
+		peWait(t, time.Second, "the failover JOIN", func() bool {
+			live := peLive(dc)
+			return len(live) == 1 && dc.Status().Rejoins == 1
+		})
+		t.Logf("failover JOIN completed %v after the kill; flows %d, admitting %d", time.Since(start), h.p.Status().Datagram.Flows, h.p.Status().Datagram.Admitting)
+		peSend(t, dc, 10, 0, 50, 500)
+		if v := peRecv(t, pc, 10, 50, time.Second); v.Result().Unique != 50 {
+			t.Fatalf("after the failover: %+v", v.Result())
+		}
+		stop()
+		peEnd(t, dc, pc)
+		h.close()
+	})
+}
+
+// TestPacketOpenAckPerCarrierE2E (R1-5, M2-D11): a bond whose passive
+// confirms after JoinStagger has two OPEN carriers of different budgets
+// (1200 and 1400); each is answered with its own cmtu_acc, both attach and
+// neither is killed; the session's MaxPayload is the smaller budget − 25.
+func TestPacketOpenAckPerCarrierE2E(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := peNew(t, Config{}, Config{}, nil, 0, "a", "b")
+		var downs atomic.Int32
+		ch := peDial(e.peer(peDatagramCarrier(e.links[0], 1200), peDatagramCarrier(e.links[1], 1400)), DialOptions{Mode: ModeBond})
+		pp, err := e.ln.AcceptPacket(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(3 * time.Second) // past JoinStagger: the second factory's OPEN is there too
+		pc, err := pp.Confirm()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := <-ch
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		dc := r.c
+		peWait(t, time.Second, "both OPEN carriers attached", func() bool { return len(peLive(dc)) == 2 })
+		mtus := map[string]int{}
+		for _, cs := range peLive(dc) {
+			mtus[cs.Name] = cs.MTU
+		}
+		if mtus["a"] != 1200 || mtus["b"] != 1400 {
+			t.Fatalf("carrier budgets %v, want a 1200, b 1400", mtus)
+		}
+		for _, cs := range dc.Status().Carriers {
+			if cs.State == CarrierDead {
+				downs.Add(1)
+			}
+		}
+		if downs.Load() != 0 || dc.Status().Rejoins != 0 {
+			t.Fatalf("a carrier died or was replaced: %+v", dc.Status().Carriers)
+		}
+		if dc.MaxPayload() != 1175 || pc.MaxPayload() != 1175 {
+			t.Fatalf("MaxPayload %d / %d, want 1175", dc.MaxPayload(), pc.MaxPayload())
+		}
+		peEnd(t, dc, pc)
+		e.close()
+	})
+}
+
+// TestOpenKindMismatchOpenSession: the open-session row of
+// TestOpenKindMismatchRefused. A stream OPEN with an open packet session's
+// key (its dialer instance and SID) is refused BAD_REQUEST CodeBadKind on
+// its own carrier and never attached; the packet session keeps working.
+func TestOpenKindMismatchOpenSession(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := peNew(t, Config{}, Config{}, nil, 0, "a")
+		dc, pc := peOpen(t, e.peer(peDatagramCarrier(e.links[0], 1400)), e.ln, DialOptions{})
+		w := wpConnect(t, e.ln, [16]byte(e.d.InstanceID()), 77)
+		w.hello(e.p)
+		w.send(wire.TypeOpen, 0, wpOpen([16]byte(dc.ID()), wire.KindStream, 1, nil))
+		w.expectOpenAck(wire.StatusBadRequest, wire.CodeBadKind)
+		w.close()
+		peSend(t, dc, 11, 0, 20, 300)
+		if v := peRecv(t, pc, 11, 20, time.Second); v.Result().Unique != 20 {
+			t.Fatalf("the packet session after the refused OPEN: %+v", v.Result())
+		}
+		if n := len(pc.Status().Carriers); n != 1 {
+			t.Fatalf("the passive session has %d carriers, want 1", n)
+		}
+		peEnd(t, dc, pc)
+		e.close()
+	})
+}
+
+// TestHeldCarrierRepeatsH2E2E: the H2-repeat half of
+// TestHeldDatagramCarrier (M2-D22, R1-8). While a packet OPEN's carrier is
+// held (no Confirm yet), a duplicate of its H1 is answered with the same H2
+// bytes and creates no state; at Confirm the verdict follows.
+func TestHeldCarrierRepeatsH2E2E(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		rt := wpTestRuntime(t, Config{}, nil)
+		ln := wpListen(t, rt, ListenConfig{})
+		w := newWDLink(t, rt, ln, 0)
+		d := w.dial(wpInst(0xc1), 9)
+		d.sendH1(wire.TypeOpen, wdPacketOpen(wpSID(9), 1, 1400, 1375))
+		h2 := d.read(time.Second)
+		if !wire.IsPreface(h2) {
+			t.Fatalf("no H2: %x", h2)
+		}
+		time.Sleep(500 * time.Millisecond)
+		for range 2 {
+			if _, err := d.pc.WriteTo(d.h1, d.peer); err != nil {
+				t.Fatal(err)
+			}
+			again := d.read(time.Second)
+			for again != nil && !wire.IsPreface(again) { // a held carrier's PONG or RACK may come first
+				again = d.read(time.Second)
+			}
+			if !bytes.Equal(again, h2) {
+				t.Fatalf("the repeated H2 differs:\n%x\n%x", again, h2)
+			}
+		}
+		if st := rt.Status(); st.Sessions.Pending != 1 || st.AcceptBacklog != [2]int{0, 1} {
+			t.Fatalf("the duplicate H1 created state: %+v", st)
+		}
+		pp, err := ln.AcceptPacket(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		go pp.Confirm()
+		d.expectOpenAck(wire.StatusOK, 0)
+		d.close()
+		rt.Close()
+	})
+}
+
+// TestRebindWhileHeld_L59: the held and between-H1-and-H3 rows of
+// TestRebindNonce_L59 (R1-14). A packet session's dialer moves to a new
+// address while its passive carrier is held (no Confirm for 3 s). Between
+// H1 and H2 (the H2 went to the old address): the passive learns the new
+// address from the dialer's resent H1 (a byte-identical copy from a
+// candidate source), challenges it from the held writer, the dialer's
+// Establish answers, the rebind commits and the verdict reaches the new
+// address — DialPacket succeeds at Confirm and the carrier counts one
+// rebind. After H2 (its H1 is acknowledged) the dialer's Establish still
+// sends a verbatim H1 copy every RelRTOMax until the verdict (a keepalive,
+// integration 2, K5), so the held flow learns the move the same way before
+// Confirm: one rebind, DialPacket at Confirm. Either way datagrams then
+// flow both ways.
+func TestRebindWhileHeld_L59(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		h2Lost bool // the rebind happens while H2 is in flight (between H1 and H2)
+	}{{"between H1 and H2", true}, {"after H2, held", false}} {
+		t.Run(tc.name, func(t *testing.T) { rebindWhileHeld(t, tc.h2Lost) })
+	}
+}
+
+func rebindWhileHeld(t *testing.T, h2Lost bool) {
+	synctest.Test(t, func(t *testing.T) {
+		h := peNewHub(t, Config{}, ListenConfig{}, nil)
+		h.hub.SetDelay(rendrtest.Down, 50*time.Millisecond, 0)
+		start := time.Now()
+		ch := peDial(h.peer(h.carrier("h0", 0, nil)), DialOptions{})
+		pp, err := h.ln.AcceptPacket(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !h2Lost {
+			time.Sleep(time.Second)
+		}
+		h.hub.Rebind(0)
+		time.Sleep(3 * time.Second)
+		pc, err := pp.Confirm()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var r peDialed
+		select {
+		case r = <-ch:
+		case <-time.After(15 * time.Second):
+			t.Fatal("DialPacket did not complete after the rebind")
+		}
+		retAt := time.Now()
+		t.Logf("DialPacket returned %v after its start (%v)", retAt.Sub(start), r.err)
+		if r.err != nil {
+			t.Fatalf("DialPacket: %v", r.err)
+		}
+		dc := r.c
+		peSend(t, dc, 15, 0, 20, 300)
+		if v := peRecv(t, pc, 15, 20, time.Second); v.Result().Unique != 20 {
+			t.Fatalf("up: %+v", v.Result())
+		}
+		peSend(t, pc, 16, 0, 20, 300)
+		if v := peRecv(t, dc, 16, 20, time.Second); v.Result().Unique != 20 {
+			t.Fatalf("down: %+v", v.Result())
+		}
+		want := uint64(1)
+		if d := retAt.Sub(start); d > 4100*time.Millisecond {
+			t.Fatalf("DialPacket took %v: the rebind was not found before the verdict", d)
+		}
+		var rebinds uint64
+		for _, cs := range pc.Status().Carriers {
+			rebinds += cs.Rebinds
+		}
+		if rebinds != want || h.p.Status().Datagram.Rebinds != want {
+			t.Fatalf("rebinds: carriers %+v, Runtime %d; want %d", pc.Status().Carriers, h.p.Status().Datagram.Rebinds, want)
+		}
+		peEnd(t, dc, pc)
+		h.close()
+	})
+}
+
+// peFrames decodes the frames of a captured datagram (REL payloads
+// unwrapped: their inner type is reported).
+func peFrames(t testing.TB, b []byte) []wire.Type {
+	t.Helper()
+	if wire.IsPreface(b) {
+		b = b[wire.PrefaceLen:]
+	}
+	var out []wire.Type
+	for len(b) > 0 {
+		f, n, err := wire.DecodeFrame(b)
+		if err != nil {
+			t.Fatalf("a captured frame: %v", err)
+		}
+		if f.Type == wire.TypeRel {
+			if h, _, err := wire.ParseRel(f.Payload); err == nil {
+				out = append(out, h.Type)
+			}
+		} else {
+			out = append(out, f.Type)
+		}
+		b = b[n:]
+	}
+	return out
+}
+
+// TestEstablishResponseTailE2E (R1-1, R1-8): a packet OPEN held longer than
+// PacketPing gets its verdict with the carrier's first PING packed behind
+// it in the same datagram; the dialer walks that tail before its first
+// read and answers the PING at once, so the passive's carrier has an RTT
+// sample within one round trip, without a PING retry.
+func TestEstablishResponseTailE2E(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := peNew(t, Config{}, Config{}, nil, 0, "a")
+		l := e.links[0]
+		l.SetDelay(rendrtest.Up, 10*time.Millisecond, 0)
+		l.SetDelay(rendrtest.Down, 10*time.Millisecond, 0)
+		ch := peDial(e.peer(peDatagramCarrier(l, 1400)), DialOptions{})
+		pp, err := e.ln.AcceptPacket(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Second) // held past PacketPing: a PING is due at the verdict
+		capt := l.CaptureNext(rendrtest.Down, rendrtest.FrameOpenAck)
+		pc, err := pp.Confirm()
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := <-ch
+		if r.err != nil {
+			t.Fatal(r.err)
+		}
+		resp := <-capt
+		types := peFrames(t, resp)
+		hasPing := false
+		for _, ty := range types {
+			hasPing = hasPing || ty == wire.TypePing
+		}
+		if !hasPing {
+			t.Fatalf("stimulus: the response datagram carries %v, no PING behind the OPEN_ACK", types)
+		}
+		time.Sleep(60 * time.Millisecond) // one round trip and a little
+		if cs := pc.Status().Carriers[0]; cs.SRTT == 0 || cs.Retransmits != 0 {
+			t.Fatalf("the tail's PING was not answered at once: passive carrier %+v", cs)
+		}
+		peEnd(t, r.c, pc)
+		e.close()
 	})
 }
