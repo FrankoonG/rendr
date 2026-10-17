@@ -956,12 +956,12 @@ func TestPacketWindowSplit(t *testing.T) {
 }
 
 // TestControlFrameSizes_L37: every row of the size table of M2 design
-// §A3.9 (M3 design §A3.6 and M4 design §A3.3 add theirs), and its
-// consequences: the largest control frame after the handshake fits
-// ControlFloor, every datagram carrier carries MaxPayload ≥ 512,
-// MaxPayload on one carrier is budget − 25, the metadata an OPEN carries is
-// budget − 99, and M4's largest first flight fits the stream write batch
-// (L37; plan:331, plan:358).
+// §A3.9 (M3 design §A3.6, M4 design §A3.3 and M6 design §A3.3 add theirs,
+// M5 its DOWN rows), and its consequences: the largest control frame after
+// the handshake fits ControlFloor, every datagram carrier carries
+// MaxPayload ≥ 512, MaxPayload on one carrier is budget − 25, the metadata
+// an OPEN carries is budget − 99, and M4's largest first flight fits the
+// stream write batch (L37; plan:331, plan:358).
 func TestControlFrameSizes_L37(t *testing.T) {
 	size := func(ty Type, v any) int { return FrameOverhead + len(encodeTyped(ty, v)) }
 	rel := func(ty Type, flags uint8, v any) int {
@@ -1043,6 +1043,11 @@ func TestControlFrameSizes_L37(t *testing.T) {
 		{"first-flight DATA, 1 byte", size(TypeData, dataVal{Body: make([]byte, 1)}), 13 + 8 + 1 + 4},
 		{"first-flight DATA, EarlyWindow bytes", size(TypeData, dataVal{Body: make([]byte, EarlyWindow)}), 65561},
 		{"largest first flight (PREFACE ‖ OPEN 4 KiB ‖ DATA 64 KiB)", PrefaceLen + size(TypeOpen, earlyOpen(l4MetaMax())) + size(TypeData, dataVal{Body: make([]byte, EarlyWindow)}), 69746},
+		// M6 (design §A3.3; hand-built l4 UDP metadata, m6_test.go).
+		{"l4 UDP metadata, IPv4, no first datagram", len(l4MetaUDPIPv4()), 13},
+		{"packet OPEN with l4 UDP metadata (IPv4, no first datagram)", size(TypeOpen, packetOpenWith(l4MetaUDPIPv4())), 13 + 32 + 13 + 4},
+		{"packet OPEN with 438 bytes of l4 UDP metadata", size(TypeOpen, packetOpenWith(l4MetaUDPBudget())), 487},
+		{"H1 with 438 bytes of l4 UDP metadata: MinFrameBudget", PrefaceLen + rel(TypeOpen, 0, packetOpenWith(l4MetaUDPBudget())), MinFrameBudget},
 	}
 	for n := 1; n <= MaxSchedIDs; n++ {
 		rows = append(rows, row{"REL{SCHED} n", rel(TypeSched, 0, sched(n)), 56 + 4*n})
