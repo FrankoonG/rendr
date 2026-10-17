@@ -128,7 +128,11 @@ func pwZeroAllocs(t *testing.T, rule promoteMode, twoWay bool) {
 			t.Fatalf("client Read = %d, %v (a datagram lost on loopback?)", n, err)
 		}
 	}
-	const warm, maxAllocs = 256, 40
+	const maxAllocs = 40
+	warm := 256
+	if raceEnabled {
+		warm = 64 // racebudget: the race lane does not assert
+	}
 	for range warm {
 		round()
 	}
@@ -175,18 +179,18 @@ func pwZeroAllocs(t *testing.T, rule promoteMode, twoWay bool) {
 // TestPortForwardMemoryPerFlow (M6 design §A12; recorded): the memory one
 // open UDP flow costs at the ingress, over 200 flows (100 in the race
 // lane) that each carried one exchange and stay open, and exactly one
-// goroutine per flow there. Asserted: the PortForward's own live heap per
-// flow — every allocation the ingress code made (its entry, done channel,
-// open bound, reply buffer; profiled at rate 1, garbage collected), not
-// the dialer session (DialUDP's), which the core bounds
-// (TestIdleSessionMemory); the bound sits about a third above the largest
-// figure observed (≈ 3.7 KiB per flow at MaxPayload 1,375, also under
-// -race), so an ingress cost that grows by more than a third fails, as
-// TestIdleSessionMemory. Logged: the heap allocated under the session's
-// open (Peer.DialPacket), and the whole process's growth per flow (both
-// ends, the kit passive included: heap plus stack spans).
+// goroutine per flow there. Asserted, each bound about a third above the
+// largest figure observed (at MaxPayload 1,375, the same under -race), so
+// that either part growing by more than a third fails, as
+// TestIdleSessionMemory: the PortForward's own live heap per flow — every
+// allocation the ingress code made (its entry, done channel, open bound,
+// reply buffer; profiled at rate 1, garbage collected; ≈ 3.7 KiB) — and
+// the live heap allocated under the flow's session open (Peer.DialPacket,
+// the dialer session the core keeps; ≈ 16.4 KiB). Logged: the whole
+// process's growth per flow (both ends, the kit passive and its pipes
+// included: heap plus stack spans).
 func TestPortForwardMemoryPerFlow(t *testing.T) {
-	const bound = 5000 // bytes per flow
+	const bound, sessionBound = 5000, 22000 // bytes per flow
 	n := 200
 	if raceEnabled {
 		n = 100
@@ -227,11 +231,11 @@ func TestPortForwardMemoryPerFlow(t *testing.T) {
 		if g := pwFlowGoroutines() - g0; g != n {
 			t.Fatalf("%d ingress goroutines for %d flows, want one each", g, n)
 		}
-		per := float64(ing1-ing0) / float64(n)
+		per, ses := float64(ing1-ing0)/float64(n), float64(ses1-ses0)/float64(n)
 		t.Logf("%d flows: the ingress's own heap %.2f KiB per flow; the session's open %.1f KiB; the process grew %.1f KiB per flow (both ends, kit passive, heap and stack spans; MaxPayload %d)",
-			n, per/1024, float64(ses1-ses0)/float64(n)/1024, float64(int64(total1)-int64(total0))/float64(n)/1024, st.MaxPayload)
-		if per > bound {
-			t.Fatalf("the ingress's own heap %.0f bytes per flow, want at most %d", per, bound)
+			n, per/1024, ses/1024, float64(int64(total1)-int64(total0))/float64(n)/1024, st.MaxPayload)
+		if per > bound || ses > sessionBound {
+			t.Fatalf("per flow: the ingress's own heap %.0f bytes (at most %d), the session's open %.0f bytes (at most %d)", per, bound, ses, sessionBound)
 		}
 	})
 }

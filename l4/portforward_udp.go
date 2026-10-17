@@ -301,23 +301,28 @@ func (s *udpServe) admit(b []byte, src netip.AddrPort) {
 		u.dropOpening.Add(1)
 		return
 	}
+	// The victim's unit becomes the newcomer's. An open victim is evicted;
+	// a held one only ends its hold early (§A8.6), so its end keeps the
+	// cause its session reported. Either may still have a session: an
+	// open flow's, or a held one's whose WriteTo met the far end's close
+	// (replace) and whose goroutine may still wait in ReadFrom.
 	var vpc ingressSession
+	evicted := false
 	if victim != nil {
-		// The victim's unit becomes the newcomer's.
-		if victim.state == FlowOpen {
-			vpc = victim.pc
-		}
+		vpc, evicted = victim.pc, victim.state == FlowOpen
 		s.remove(victim)
-		victim.evicted = true
+		victim.evicted = evicted
 	}
 	e := s.newEntry(b, src, now)
 	t.m[src] = e
 	t.mu.Unlock()
 	if victim != nil {
 		close(victim.done)
-		if vpc != nil {
+		if evicted {
 			u.evicted.Add(1)
-			vpc.Close() // returns at once; the victim's goroutine leaves ReadFrom
+		}
+		if vpc != nil {
+			victim.closeSession(vpc) // returns at once; the victim's goroutine leaves ReadFrom
 		}
 	}
 	s.start(e)
@@ -361,6 +366,7 @@ func (s *udpServe) replace(e *ingressFlow, b []byte, src netip.AddrPort, err err
 		// close: this side closes a flow's session only after taking the
 		// entry out (an eviction, the flow's end) or while stopping.
 		s.setState(e, FlowHeld)
+		e.peerEnd = true
 		t.mu.Unlock()
 		u.dropHeld.Add(1)
 		return
@@ -434,8 +440,7 @@ func (s *udpServe) flow(e *ingressFlow) {
 			t.mu.Unlock()
 			u.dropOpenQueue.Add(uint64(len(q)))
 			freeQueue(q)
-			pc.Close()
-			s.end(e, pc, net.ErrClosed)
+			s.end(e, pc, net.ErrClosed) // end closes the session (once)
 			return
 		}
 		q := e.takeQueue()
@@ -473,8 +478,10 @@ func (s *udpServe) flow(e *ingressFlow) {
 }
 
 // pump moves session → client until the session ends and returns its end
-// (§A8.3). A socket write error is counted (noise, M6-D25) and never ends
-// the flow; a dead socket halts the serve through the reader.
+// (§A8.3). A socket write error loses the reply, which WriteNoise counts
+// whatever the error's class (an embedder's socket may refuse a write with
+// an error of its own), and never ends the flow; a dead socket halts the
+// serve through the reader.
 func (s *udpServe) pump(e *ingressFlow, pc ingressSession) error {
 	u := &s.f.udp
 	buf := make([]byte, pc.MaxPayload()) // the flow's only buffer
@@ -487,9 +494,7 @@ func (s *udpServe) pump(e *ingressFlow, pc ingressSession) error {
 			return err
 		}
 		if _, werr := s.sock.WriteToUDPAddrPort(buf[:n], e.client); werr != nil {
-			if errClass(werr) != classFatal {
-				u.writeNoise.Add(1)
-			}
+			u.writeNoise.Add(1)
 			continue
 		}
 		u.toClient.Add(1)
@@ -510,6 +515,9 @@ func (s *udpServe) end(e *ingressFlow, pc ingressSession, err error) {
 	t := &s.tab
 	t.mu.Lock()
 	evicted, hold := e.evicted, false
+	if e.peerEnd {
+		err = io.EOF // the far end closed it; a local close since (an eviction, the stop) only woke the goroutine
+	}
 	switch {
 	case e.gone:
 	case e.state == FlowHeld:
@@ -522,7 +530,7 @@ func (s *udpServe) end(e *ingressFlow, pc ingressSession, err error) {
 		s.f.flows.Add(-1)
 	}
 	t.mu.Unlock()
-	pc.Close()
+	e.closeSession(pc)
 	s.f.udp.ends.count(err, evicted)
 	if st := pc.Status(); st.Packet != nil {
 		s.f.udp.sessionDrops.Add(sessionDrops(st.Packet))
@@ -590,22 +598,28 @@ func (s *udpServe) hold(e *ingressFlow) {
 }
 
 // shutdown ends every flow after the reader returned (L52): no entry
-// becomes open or held any more, the opens and holds are cancelled, the
-// open flows' sessions closed; it returns when every flow goroutine has.
+// becomes open or held any more, the opens and holds are cancelled, every
+// session in the table closed (the open flows', and a held one's whose
+// goroutine may still wait in ReadFrom); it returns when every flow
+// goroutine has.
 func (s *udpServe) shutdown() {
 	s.cancel()
 	t := &s.tab
 	t.mu.Lock()
 	t.stopped = true
-	var pcs []ingressSession
+	type open struct {
+		e  *ingressFlow
+		pc ingressSession
+	}
+	var es []open
 	for _, e := range t.m {
-		if e.state == FlowOpen {
-			pcs = append(pcs, e.pc)
+		if e.pc != nil {
+			es = append(es, open{e, e.pc})
 		}
 	}
 	t.mu.Unlock()
-	for _, pc := range pcs {
-		pc.Close()
+	for _, o := range es {
+		o.e.closeSession(o.pc)
 	}
 	s.wg.Wait()
 }

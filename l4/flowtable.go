@@ -59,6 +59,11 @@ type ingressFlow struct {
 	class  flowClass
 	done   chan struct{} // closed once when an eviction removes it (R1-5)
 
+	// closeOnce closes the flow's session exactly once (§A5.4): at its
+	// goroutine's end, or earlier by an eviction or the stop, which close
+	// it only to wake the goroutine (closeSession).
+	closeOnce sync.Once
+
 	// first is the pooled copy of the first datagram when it rides the
 	// OPEN, else nil. Written before the goroutine starts; only the
 	// goroutine uses it from then on.
@@ -68,6 +73,7 @@ type ingressFlow struct {
 	state   FlowState
 	gone    bool             // removed from the table (its MaxFlows unit handed on or released)
 	evicted bool             // removed to make room (M6-D29)
+	peerEnd bool             // its WriteTo met the far end's close (replace): its end is PeerClosed, whatever ReadFrom reports after a local close
 	pc      ingressSession   // the session once open
 	opened  time.Duration    // when DialUDP returned (the reopen rate limit)
 	firstQ  *queuedDatagram  // the first datagram's own copy when it does not ride (R1-9): it heads the queue, uncharged
@@ -154,6 +160,13 @@ func (e *ingressFlow) takeQueue() []queuedDatagram {
 	clear(e.q)
 	e.q, e.qBytes = e.q[:0], 0
 	return out
+}
+
+// closeSession closes pc, e's session, the first time it is called for e
+// (Close returns at once; the goroutine leaves ReadFrom with
+// net.ErrClosed).
+func (e *ingressFlow) closeSession(pc ingressSession) {
+	e.closeOnce.Do(func() { pc.Close() })
 }
 
 // freeQueue returns q's copies to their pools.

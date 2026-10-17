@@ -78,47 +78,175 @@ func TestPortForwardOpenBound(t *testing.T) {
 	})
 }
 
-// TestPortForwardReopenHold_L58 (M6-D28, R1-2; L58, L73): a flow whose
-// passive end fails 1 s after its open (a fatal error of its egress conn:
-// the passive closes the session, the ingress reads io.EOF) holds its
-// source for 5 s: a client retransmitting every 200 ms for 20 s costs one
-// OPEN per hold cycle (≈ 6 s: at most 4), not one per datagram; the
-// datagrams of the hold are DropHeld.
-func TestPortForwardReopenHold_L58(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		w := newPWWorld(t, pwOpts{target: func(fl *pwFlow) {
-			buf := make([]byte, 64<<10)
+// pwBreakAfter is a target that reads its flow's first datagram, then
+// breaks the passive's egress conn d later (a fatal error that is not an
+// Errno: the passive's forward closes the session, the ingress reads
+// io.EOF) and reads on.
+func pwBreakAfter(d time.Duration) func(*pwFlow) {
+	return func(fl *pwFlow) {
+		buf := make([]byte, 64<<10)
+		if _, err := fl.app.Read(buf); err != nil {
+			return
+		}
+		time.Sleep(d)
+		fl.local.Inject(errors.New("egress socket broke"), true)
+		for {
 			if _, err := fl.app.Read(buf); err != nil {
 				return
 			}
-			time.Sleep(time.Second)
-			fl.local.Inject(errors.New("egress socket broke"), true) // not an Errno: fatal
-			for {
-				if _, err := fl.app.Read(buf); err != nil {
-					return
+		}
+	}
+}
+
+// pwLateRead wraps a flow's session: ReadFrom waits until release or the
+// wrapper's Close before it reads, so the flow goroutine does not see its
+// session's end while the reader meets that end at WriteTo; Close is
+// counted.
+type pwLateRead struct {
+	ingressSession
+	release, closed chan struct{}
+	once            sync.Once
+	closes          atomic.Int64
+}
+
+func newPWLateRead(s ingressSession, release chan struct{}) *pwLateRead {
+	return &pwLateRead{ingressSession: s, release: release, closed: make(chan struct{})}
+}
+
+func (s *pwLateRead) ReadFrom(b []byte) (int, net.Addr, error) {
+	select {
+	case <-s.release:
+	case <-s.closed:
+	}
+	return s.ingressSession.ReadFrom(b)
+}
+
+func (s *pwLateRead) Close() error {
+	s.closes.Add(1)
+	s.once.Do(func() { close(s.closed) })
+	return s.ingressSession.Close()
+}
+
+// TestPortForwardReopenHold_L58 (M6-D28, R1-2; L58, L73): the reopen rate
+// limit.
+//   - early end: a flow whose passive end fails 1 s after its open (a
+//     fatal error of its egress conn: the passive closes the session, the
+//     ingress reads io.EOF) holds its source for 5 s: a client
+//     retransmitting every 200 ms for 20 s costs one OPEN per hold cycle
+//     (≈ 6 s: at most 4), not one per datagram; the datagrams of the hold
+//     are DropHeld.
+//   - late end: the same failure 6 s after the open (beyond the 5-s
+//     window) holds nothing: the client's next datagram opens a new flow
+//     at once (its OPEN at the passive within one round trip), no DropHeld.
+//   - met at WriteTo: the passive closes the flow 1 s after its open while
+//     the flow goroutine has not read the end yet (a wrapped session): the
+//     client's next datagram meets the far end's close at WriteTo and
+//     holds the source there (State FlowHeld, DropHeld, no replacement, no
+//     second OPEN while the client retransmits); a newcomer in the full
+//     table (MaxFlows 1) takes the held entry's place: the held flow's
+//     session is closed exactly once, its goroutine returns at once, and
+//     its end counts PeerClosed — not Evicted, which stays 0 (a held entry
+//     that makes room only ends its hold early, §A8.6).
+func TestPortForwardReopenHold_L58(t *testing.T) {
+	t.Run("early end", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := newPWWorld(t, pwOpts{target: pwBreakAfter(time.Second)})
+			w.serve()
+			c := w.client()
+			start := time.Now()
+			maxHeld := 0
+			for time.Since(start) < 20*time.Second {
+				pfSend(t, c, pwTagged(30, 0xC2, 0))
+				time.Sleep(200 * time.Millisecond)
+				maxHeld = max(maxHeld, pwStatus(w.pf).Held)
+			}
+			opens, _, _, flows := w.pas.snapshot()
+			st := pwStatus(w.pf)
+			t.Logf("%d OPENs in 20 s; %s", opens, pwDescribe(st))
+			if opens < 3 || opens > 4 || maxHeld != 1 || st.DropHeld == 0 || st.Ended.PeerClosed < uint64(opens-1) {
+				t.Fatalf("%d OPENs, held %d at most: %s; want one OPEN per 5-s hold after each early end", opens, maxHeld, pwDescribe(st))
+			}
+			for _, fl := range flows[:opens-1] {
+				if r := <-fl.res; r.LocalErr == nil {
+					t.Fatalf("a passive forward ended without its local error: %+v", r)
 				}
 			}
-		}})
-		w.serve()
-		c := w.client()
-		start := time.Now()
-		maxHeld := 0
-		for time.Since(start) < 20*time.Second {
-			pfSend(t, c, pwTagged(30, 0xC2, 0))
-			time.Sleep(200 * time.Millisecond)
-			maxHeld = max(maxHeld, pwStatus(w.pf).Held)
-		}
-		opens, _, _, flows := w.pas.snapshot()
-		st := pwStatus(w.pf)
-		t.Logf("%d OPENs in 20 s; %s", opens, pwDescribe(st))
-		if opens < 3 || opens > 4 || maxHeld != 1 || st.DropHeld == 0 || st.Ended.PeerClosed < uint64(opens-1) {
-			t.Fatalf("%d OPENs, held %d at most: %s; want one OPEN per 5-s hold after each early end", opens, maxHeld, pwDescribe(st))
-		}
-		for _, fl := range flows[:opens-1] {
-			if r := <-fl.res; r.LocalErr == nil {
-				t.Fatalf("a passive forward ended without its local error: %+v", r)
+		})
+	})
+	t.Run("late end", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := newPWWorld(t, pwOpts{target: pwBreakAfter(6 * time.Second)})
+			w.serve()
+			c := w.client()
+			pfSend(t, c, pwTagged(30, 0xC9, 0))
+			if _, ok := pwWaitFor(10*time.Second, func() bool { return pwStatus(w.pf).Ended.PeerClosed == 1 }); !ok {
+				t.Fatalf("the flow did not end: %s", pwDescribe(pwStatus(w.pf)))
 			}
-		}
+			pfSend(t, c, pwTagged(30, 0xC9, 1))
+			took, ok := pwWaitFor(time.Second, func() bool { opens, _, _, _ := w.pas.snapshot(); return opens == 2 })
+			st := pwStatus(w.pf)
+			t.Logf("the second OPEN reached the passive %v after the datagram; %s", took, pwDescribe(st))
+			if !ok || took > 2*pfOneWay || st.DropHeld != 0 || st.Held != 0 {
+				t.Fatalf("after a far-end close 6 s after the open: second OPEN after %v (%v), %s; want a new flow at once, nothing held", took, ok, pwDescribe(st))
+			}
+			if _, ok := pwWaitFor(2*pfOneWay, func() bool { return pwStatus(w.pf).Opened == 2 }); !ok {
+				t.Fatalf("the new flow did not open: %s", pwDescribe(pwStatus(w.pf)))
+			}
+		})
+	})
+	t.Run("met at WriteTo", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			release := make(chan struct{})
+			var late *pwLateRead
+			pwDialHook(t, func(first []byte, s ingressSession) ingressSession {
+				if tagOf(first) != 0xC7 {
+					return s
+				}
+				late = newPWLateRead(s, release)
+				return late
+			})
+			w := newPWWorld(t, pwOpts{pfwd: func(f *PortForward) { f.MaxFlows = 1 }, target: func(fl *pwFlow) {
+				if tagOf(fl.req.First) == 0xC7 {
+					pwBreakAfter(time.Second)(fl)
+					return
+				}
+				pwSink(fl)
+			}})
+			w.serve()
+			c := w.client()
+			pfSend(t, c, pwTagged(30, 0xC7, 0))
+			time.Sleep(1200 * time.Millisecond) // the passive closed the flow at 1 s; its end reached the ingress
+			pfSend(t, c, pwTagged(30, 0xC7, 1))
+			synctest.Wait()
+			opens, _, _, _ := w.pas.snapshot()
+			fi := pwSnapshot(w.pf)[pwAddr(c)]
+			if st := pwStatus(w.pf); fi.State != FlowHeld || st.Held != 1 || st.DropHeld != 1 || st.Replaced != 0 || opens != 1 {
+				t.Fatalf("a datagram that met the far end's close 1.2 s after the open: entry %+v, %d OPENs, %s; want the source held", fi, opens, pwDescribe(st))
+			}
+			for range 16 { // the client retransmits through the hold
+				time.Sleep(200 * time.Millisecond)
+				pfSend(t, c, pwTagged(30, 0xC7, 2))
+			}
+			synctest.Wait()
+			opens, _, _, _ = w.pas.snapshot()
+			if st := pwStatus(w.pf); st.DropHeld != 17 || st.Replaced != 0 || opens != 1 {
+				t.Fatalf("retransmissions during the hold: %d OPENs, %s", opens, pwDescribe(st))
+			}
+			n := w.client()
+			pfSend(t, n, pwTagged(30, 0xC8, 0))
+			if _, ok := pwWaitFor(time.Second, func() bool { return pwStatus(w.pf).Flows == 1 }); !ok {
+				t.Fatalf("the newcomer did not take the held entry's place: %s", pwDescribe(pwStatus(w.pf)))
+			}
+			st := pwStatus(w.pf)
+			if st.Evicted != 0 || st.Ended.Evicted != 0 || st.Ended.PeerClosed != 1 || st.Held != 0 || st.Opened != 2 {
+				t.Fatalf("after the newcomer: %s; want the held flow ended PeerClosed, nothing evicted", pwDescribe(st))
+			}
+			if g := pwFlowGoroutines(); g != 1 || late.closes.Load() != 1 {
+				t.Fatalf("%d flow goroutines for 1 entry; the held flow's session closed %d times, want once", g, late.closes.Load())
+			}
+			pwUnits(t, w.pf)
+			close(release)
+		})
 	})
 }
 
@@ -223,11 +351,11 @@ func TestPortForwardRefusedHold_L48_L72(t *testing.T) {
 			var counts [16]atomic.Int64
 			w := newPWWorld(t, pwOpts{decide: refuse(&counts)})
 			w.serve()
-			cs := pwClients(w, 10)
-			period, most := 30*time.Second, int64(6)
+			clients, period, most := 10, 30*time.Second, int64(6)
 			if raceEnabled {
-				period, most = 15*time.Second, 3
+				clients, period, most = 5, 15*time.Second, 3 // racebudget
 			}
+			cs := pwClients(w, clients)
 			for start := time.Now(); time.Since(start) < period; {
 				for i, c := range cs {
 					pfSend(t, c, pwTagged(30, byte(i), 0))
@@ -251,12 +379,12 @@ func TestPortForwardRefusedHold_L48_L72(t *testing.T) {
 			var counts [16]atomic.Int64
 			w := newPWWorld(t, pwOpts{decide: refuse(&counts), pfwd: func(f *PortForward) { f.MaxFlows = 4 }})
 			w.serve()
-			cs := pwClients(w, 10)
-			maxHeld := 0
-			period := 30 * time.Second
+			clients, period := 10, 30*time.Second
 			if raceEnabled {
-				period = 10 * time.Second
+				clients, period = 6, 6*time.Second // racebudget: still more clients than MaxFlows, over one hold
 			}
+			cs := pwClients(w, clients)
+			maxHeld := 0
 			for start := time.Now(); time.Since(start) < period; {
 				for i, c := range cs {
 					pfSend(t, c, pwTagged(30, byte(i), 0))
@@ -303,9 +431,10 @@ func (s *pwEnding) ReadFrom(b []byte) (int, net.Addr, error) {
 }
 
 // TestPortForwardIdleRace_L39 (M6-D13, R1-19, §A5.4; L39, L40): a datagram
-// at the instant its flow's session ends never vanishes. 100 flows with a
-// 10-s idle limit get a datagram at the expiry instant (calibrated), 1 ms
-// before and 1 ms after it: each is delivered — to the old session or to a
+// at the instant its flow's session ends never vanishes. 100 flows (60 in
+// the race lane) with a 10-s idle limit get a datagram at the expiry
+// instant (calibrated), 1 ms before and 1 ms after it: each is delivered —
+// to the old session or to a
 // new flow that replaced the entry (Replaced) or was opened for it — or
 // counted (the ended sessions' drops at either end, the ingress's drop
 // counters): delivered + counted = sent, and the MaxFlows units equal the
@@ -329,7 +458,10 @@ func TestPortForwardIdleRace_L39(t *testing.T) {
 				t.Fatal("calibration: the flow did not end")
 			}
 			t.Logf("calibration: the flow ends %v after its last datagram", lifetime)
-			const n = 100
+			n := 100
+			if raceEnabled {
+				n = 60 // racebudget: 20 datagrams at each instant
+			}
 			cs := pwClients(w, n)
 			for i, c := range cs {
 				pfSend(t, c, pwTagged(30, byte(i), 0))
@@ -364,10 +496,10 @@ func TestPortForwardIdleRace_L39(t *testing.T) {
 			st := pwStatus(w.pf)
 			counted := st.SessionDrops + passiveDrops + st.DropFull + st.DropOpening + st.DropOpenQueue + st.DropOpenAge + st.DropHeld + st.TooLarge
 			t.Logf("sent %d, delivered %d, counted %d (ingress session drops %d, passive %d); %s", 3*n, delivered, counted, st.SessionDrops, passiveDrops, pwDescribe(st))
-			if delivered+counted != 3*n {
+			if delivered+counted != uint64(3*n) {
 				t.Fatalf("delivered %d + counted %d != sent %d", delivered, counted, 3*n)
 			}
-			if st.Ended.Idle < n/3+1 {
+			if st.Ended.Idle < uint64(n/3+1) {
 				t.Fatalf("stimulus: %d idle ends, want at least the flows of the late datagrams (and the calibration's) to have expired", st.Ended.Idle)
 			}
 		})
@@ -450,9 +582,10 @@ func TestPortForwardIdleRace_L39(t *testing.T) {
 }
 
 // TestPortForwardStopJoins_L52_L66 (M6-D21, A8.1, §A5.4; L52, L66): ctx
-// cancelled with 500 flows, 100 of them opening (their OPENs held at the
-// passive): ServeUDP returns within 2 s, after every flow ended — every
-// open flow's session closed (each passive forward reads io.EOF), every
+// cancelled with 500 flows (300 in the race lane), 100 of them opening
+// (their OPENs held at the passive): ServeUDP returns within 2 s, after
+// every flow ended — every open flow's session closed exactly once (each
+// passive forward reads io.EOF), every
 // open withdrawn (no pending session left at the passive), no flow
 // goroutine, no MaxFlows unit, no gauge — and the socket closed exactly
 // once. In real time, the same with 50 flows, 10 opening, and
@@ -460,6 +593,7 @@ func TestPortForwardIdleRace_L39(t *testing.T) {
 // racebudget).
 func TestPortForwardStopJoins_L52_L66(t *testing.T) {
 	run := func(t *testing.T, n, gated int) {
+		closedOnce := pwCountCloses(t) // the stop's close and the flow goroutine's end close each session once
 		gate := make(chan struct{})
 		var pending atomic.Int64
 		w := newPWWorld(t, pwOpts{
@@ -501,6 +635,9 @@ func TestPortForwardStopJoins_L52_L66(t *testing.T) {
 		if g := pwFlowGoroutines(); g != 0 {
 			t.Fatalf("%d flow goroutines after ServeUDP returned", g)
 		}
+		if k := closedOnce(); k != n-gated {
+			t.Fatalf("%d sessions opened, want %d", k, n-gated)
+		}
 		_, _, _, flows := w.pas.snapshot()
 		for _, fl := range flows {
 			select {
@@ -513,7 +650,11 @@ func TestPortForwardStopJoins_L52_L66(t *testing.T) {
 		w.close()
 	}
 	t.Run("synctest", func(t *testing.T) {
-		synctest.Test(t, func(t *testing.T) { run(t, 500, 100) })
+		n := 500
+		if raceEnabled {
+			n = 300 // racebudget: still 100 opening
+		}
+		synctest.Test(t, func(t *testing.T) { run(t, n, 100) })
 	})
 	if raceEnabled {
 		return // racebudget: the bubble's own join check stands for the real-time row there
@@ -525,15 +666,15 @@ func TestPortForwardStopJoins_L52_L66(t *testing.T) {
 	})
 }
 
-// TestPortForwardManyFlowsAcrossTrunks (§A12; L54): 1,000 flows (200 in
-// the race lane) on one datagram factory: the dialer spreads them over at
-// least ⌈flows / 64⌉ datagram trunks (64 sessions each), every flow opens,
-// and every datagram is delivered both ways — none lost outside a
-// counter (every counter is 0).
+// TestPortForwardManyFlowsAcrossTrunks (§A12; L54): 1,000 flows (130 in
+// the race lane: still three trunks) on one datagram factory: the dialer
+// spreads them over at least ⌈flows / 64⌉ datagram trunks (64 sessions
+// each), every flow opens, and every datagram is delivered both ways —
+// none lost outside a counter (every counter is 0).
 func TestPortForwardManyFlowsAcrossTrunks(t *testing.T) {
 	n := 1000
 	if raceEnabled {
-		n = 200
+		n = 130 // racebudget
 	}
 	synctest.Test(t, func(t *testing.T) {
 		w := newPWWorld(t, pwOpts{})

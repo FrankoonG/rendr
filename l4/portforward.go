@@ -318,7 +318,8 @@ type UDPForwardStatus struct {
 	DropFull, DropOpening      uint64 // a new client while the table had no victim; the opening stage full
 	DropOpenQueue, DropOpenAge uint64 // an opening flow's queue overflowed; queued longer than 1 s
 	DropHeld                   uint64 // datagrams of held clients
-	ReadNoise, WriteNoise      uint64 // socket errors of the noise classes, counted and ignored
+	ReadNoise                  uint64 // socket read errors of the noise classes, counted and backed off
+	WriteNoise                 uint64 // replies the socket's write refused (any error: the reply is lost), counted and ignored
 	SessionDrops               uint64 // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
 	LastErr                    error  // the latest DialUDP error
 }

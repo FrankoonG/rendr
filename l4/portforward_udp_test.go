@@ -270,11 +270,12 @@ func equalInts(a, b []int) bool {
 //     that answers after 50 ms (a resolver's lookup): the first datagram
 //     reaches the target, and the echo the client, one round trip earlier;
 //   - warm, a target that answers at once: the first datagram reaches the
-//     target one round trip earlier; the echo's time is logged only: a
-//     passive packet session on a shared trunk sends its first datagram
-//     after the dialer's first frame behind OPEN_ACK has arrived (1.5 round
-//     trips after the OPEN; core behaviour, M3), so such an answer reaches
-//     the client two round trips after the client's datagram either way.
+//     target one round trip earlier; the echo is never later riding, its
+//     saving logged only: a passive packet session on a shared trunk sends
+//     its first datagram after the dialer's first frame behind OPEN_ACK has
+//     arrived (1.5 round trips after the OPEN; core behaviour, M3), so such
+//     an answer reaches the client two round trips after the client's
+//     datagram either way (an open item for G11-dns's criterion).
 //
 // FirstInOpen counts the riding first datagrams, and the passive wrote
 // exactly those to their targets before Confirm.
@@ -339,6 +340,9 @@ func TestPortForwardFirstInOpenSavesRTT(t *testing.T) {
 			}
 			if (!r.warm || r.answer > 0) && followEcho-rideEcho != 2*pfOneWay {
 				t.Fatalf("the first echo took %v riding and %v following the open: want exactly one round trip (%v) saved", rideEcho, followEcho, 2*pfOneWay)
+			}
+			if rideEcho > followEcho {
+				t.Fatalf("the first echo took %v riding and %v following the open: riding must never cost time", rideEcho, followEcho)
 			}
 		})
 	}
@@ -426,8 +430,9 @@ func TestPortForwardIdleReopen_L58_L70(t *testing.T) {
 }
 
 // TestPortForwardSourceChurn_L70 (M6-D24, A5.2; L70, L72): a client that
-// moves to a new source port every second for 60 s, sending 10 datagrams a
-// second, gets one flow per port (60 opens, each its own egress socket);
+// moves to a new source port every second for 60 s (40 s in the race
+// lane), sending 10 datagrams a second, gets one flow per port (one open
+// each, each its own egress socket);
 // the old flows end at their Short limit (30 s: one exchange a second for
 // a second never makes a stream under the rule in force), so the table
 // stays bounded (at most 32 entries at any second); at least 99 % of the
@@ -436,7 +441,10 @@ func TestPortForwardSourceChurn_L70(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newPWWorld(t, pwOpts{})
 		w.serve()
-		const ports, per = 60, 10
+		ports, per := 60, 10
+		if raceEnabled {
+			ports = 40 // racebudget: still 8 ports beyond the 32 entries the table may hold
+		}
 		sent, back := 0, 0
 		maxEntries := 0
 		for p := range ports {
@@ -467,10 +475,10 @@ func TestPortForwardSourceChurn_L70(t *testing.T) {
 		}
 		st := pwStatus(w.pf)
 		t.Logf("%d sent, %d at the targets, %d echoes read; table at most %d entries; %s", sent, at, back, maxEntries, pwDescribe(st))
-		if opens != ports || st.Opened != ports {
+		if opens != ports || st.Opened != uint64(ports) {
 			t.Fatalf("%d OPENs at the passive, %d opened: want one flow per port (%d)", opens, st.Opened, ports)
 		}
-		if maxEntries > 32 || st.Ended.Idle < ports-32 {
+		if maxEntries > 32 || st.Ended.Idle < uint64(ports-32) {
 			t.Fatalf("table at most %d entries, %d idle ends: want the old flows gone at Short", maxEntries, st.Ended.Idle)
 		}
 		if float64(at) < 0.99*float64(sent) || float64(back) < 0.99*float64(sent) {

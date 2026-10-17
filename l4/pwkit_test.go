@@ -394,8 +394,9 @@ func pwSeq(b []byte) int {
 	return int(b[1])<<8 | int(b[2])
 }
 
-// pwCountSock wraps a UDPSocket: it counts reads and Closes, and can block
-// writes to one client until released.
+// pwCountSock wraps a UDPSocket: it counts reads and Closes, can block
+// writes to one client until released, and can fail writes to one client
+// with an error.
 type pwCountSock struct {
 	UDPSocket
 	reads, closes atomic.Int64
@@ -403,6 +404,8 @@ type pwCountSock struct {
 	block         netip.AddrPort // writes to it block until released
 	release       chan struct{}
 	blocked       int
+	failTo        netip.AddrPort // writes to it return failErr (when set)
+	failErr       error
 }
 
 func (s *pwCountSock) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error) {
@@ -410,8 +413,20 @@ func (s *pwCountSock) ReadFromUDPAddrPort(b []byte) (int, netip.AddrPort, error)
 	return s.UDPSocket.ReadFromUDPAddrPort(b)
 }
 
+// failWrites makes every write to addr return err.
+func (s *pwCountSock) failWrites(addr netip.AddrPort, err error) {
+	s.mu.Lock()
+	s.failTo, s.failErr = addr, err
+	s.mu.Unlock()
+}
+
 func (s *pwCountSock) WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error) {
 	s.mu.Lock()
+	if s.failErr != nil && addr == s.failTo {
+		err := s.failErr
+		s.mu.Unlock()
+		return 0, err
+	}
 	if s.release != nil && addr == s.block {
 		rel := s.release
 		s.blocked++
@@ -462,6 +477,43 @@ func pwDialHook(t testing.TB, wrap func(first []byte, s ingressSession) ingressS
 		return wrap(first, pc), nil
 	}
 	t.Cleanup(func() { dialIngress = old })
+}
+
+// pwCloseCount wraps a flow's session and counts its Close calls.
+type pwCloseCount struct {
+	ingressSession
+	closes atomic.Int64
+}
+
+func (s *pwCloseCount) Close() error {
+	s.closes.Add(1)
+	return s.ingressSession.Close()
+}
+
+// pwCountCloses wraps every session the ingress opens for the rest of the
+// test (pwDialHook); check requires that each was closed exactly once
+// (§A5.4) and reports how many there were.
+func pwCountCloses(t testing.TB) (check func() int) {
+	var mu sync.Mutex
+	var all []*pwCloseCount
+	pwDialHook(t, func(_ []byte, s ingressSession) ingressSession {
+		c := &pwCloseCount{ingressSession: s}
+		mu.Lock()
+		all = append(all, c)
+		mu.Unlock()
+		return c
+	})
+	return func() int {
+		t.Helper()
+		mu.Lock()
+		defer mu.Unlock()
+		for i, c := range all {
+			if n := c.closes.Load(); n != 1 {
+				t.Fatalf("session %d of %d closed %d times, want exactly once", i, len(all), n)
+			}
+		}
+		return len(all)
+	}
 }
 
 // pwDescribe renders a status for failure messages.

@@ -1,6 +1,7 @@
 package l4
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -204,12 +205,14 @@ func pwEvictStep(t testing.TB, w *pwWorld, c *rendrtest.DatagramConn, b []byte) 
 // entry; the victim's session is closed (its passive forward ends with
 // io.EOF, PeerClosed) and its goroutine has returned within the step
 // (flow goroutines ≤ entries at every step); a flow whose answer is still
-// in flight (its last datagram < 1 s ago) is never a victim; with no
-// victim the newcomer is DropFull, exactly.
+// in flight (its query < 1 s old, the reply before it older) and an
+// opening flow (however old) are never victims; with no victim the
+// newcomer is DropFull, exactly.
 func TestPortForwardEvictShortIdle_L48_L72(t *testing.T) {
 	t.Run("flood", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pfRule(t, promoteActive)
+			closedOnce := pwCountCloses(t)
 			w := newPWWorld(t, pwOpts{pfwd: func(f *PortForward) { f.MaxFlows = 64 }})
 			w.serve()
 			pwFill(t, w, pwClients(w, 64), 0x20) // one-shot queries, answered: short under (a)
@@ -217,7 +220,7 @@ func TestPortForwardEvictShortIdle_L48_L72(t *testing.T) {
 			evicted := 0
 			flood := 150
 			if raceEnabled {
-				flood = 100
+				flood = 80 // racebudget: still beyond the table's 64 victims
 			}
 			for i := range flood {
 				if v := pwEvictStep(t, w, w.client(), pwTagged(30, 0x21, i)); v.IsValid() {
@@ -241,6 +244,10 @@ func TestPortForwardEvictShortIdle_L48_L72(t *testing.T) {
 				t.Fatalf("%d passive forwards ended with io.EOF, want the %d victims (their sessions closed)", eof, evicted)
 			}
 			pwUnits(t, w.pf)
+			w.stop()
+			if n := closedOnce(); n != int(st.Opened) { // the victims' (eviction, then their goroutines' end) and the rest's (the stop)
+				t.Fatalf("%d sessions wrapped, %d opened", n, st.Opened)
+			}
 		})
 	})
 	t.Run("least recently active", func(t *testing.T) {
@@ -293,49 +300,127 @@ func TestPortForwardEvictShortIdle_L48_L72(t *testing.T) {
 		})
 	})
 	t.Run("in flight", func(t *testing.T) {
+		// A flow's query whose answer is still on its way: the target answers
+		// a flow's first datagram at once and every later one after 1.5 s (a
+		// slow lookup). 0.5 s after the queries the replies before them are
+		// 2.5 s old, the queries 0.5 s: the flows' last datagrams are the
+		// queries, so none is a victim; every answer still reaches its
+		// client, and 1 s after the answers the flows are victims again.
 		synctest.Test(t, func(t *testing.T) {
 			pfRule(t, promoteActive)
-			w := newPWWorld(t, pwOpts{pfwd: func(f *PortForward) { f.MaxFlows = 8 }})
+			w := newPWWorld(t, pwOpts{pfwd: func(f *PortForward) { f.MaxFlows = 8 }, target: func(fl *pwFlow) {
+				buf := make([]byte, 64<<10)
+				for {
+					n, err := fl.app.Read(buf)
+					if err != nil {
+						return
+					}
+					fl.record(buf[:n])
+					if pwSeq(buf[:n]) > 0 {
+						time.Sleep(1500 * time.Millisecond)
+					}
+					fl.app.Write(buf[:n])
+				}
+			}})
 			w.serve()
-			pwFill(t, w, pwClients(w, 8), 0x24)
-			time.Sleep(900 * time.Millisecond) // every flow's last datagram < 1 s ago
+			cs := pwClients(w, 8)
+			pwFill(t, w, cs, 0x24)
+			for _, c := range cs {
+				pfExpect(t, c, pwTagged(30, 0x24, 0)) // the fill's answers
+			}
+			time.Sleep(2 * time.Second) // every flow idle ≥ 1 s: each a victim now
+			for _, c := range cs {
+				pfSend(t, c, pwTagged(30, 0x24, 1))
+			}
+			time.Sleep(500 * time.Millisecond) // the answers in flight
 			for i := range 5 {
 				if v := pwEvictStep(t, w, w.client(), pwTagged(30, 0x25, i)); v.IsValid() {
-					t.Fatalf("victim %v whose answer is < 1 s old", v)
+					t.Fatalf("victim %v whose answer is in flight (its query 0.5 s old)", v)
 				}
 			}
-			if st := pwStatus(w.pf); st.DropFull != 5 || st.Evicted != 0 {
+			if st := pwStatus(w.pf); st.DropFull != 5 || st.Evicted != 0 || st.Flows != 8 {
 				t.Fatalf("no victim: %s", pwDescribe(st))
 			}
-			time.Sleep(200 * time.Millisecond)
+			time.Sleep(1100 * time.Millisecond) // the answers arrived
+			for _, c := range cs {
+				pfExpect(t, c, pwTagged(30, 0x24, 1))
+			}
+			time.Sleep(1100 * time.Millisecond)
 			if v := pwEvictStep(t, w, w.client(), pwTagged(30, 0x25, 9)); !v.IsValid() {
 				t.Fatal("no victim once the flows were idle for 1 s")
 			}
 		})
 	})
+	t.Run("opening", func(t *testing.T) {
+		// An opening flow is never a victim, however long its open takes: a
+		// table of 8 with one entry opening for 1.5 s (its OPEN held at the
+		// passive) and seven open flows active within the last second: a
+		// newcomer is DropFull and the opening entry untouched; once the
+		// passive answers, it opens and carries its datagram, and the units
+		// match the table.
+		synctest.Test(t, func(t *testing.T) {
+			pfRule(t, promoteActive)
+			gate := make(chan struct{})
+			w := newPWWorld(t, pwOpts{pfwd: func(f *PortForward) { f.MaxFlows = 8 }, gate: func(_ int, r Request) <-chan struct{} {
+				if tagOf(r.First) == 0x2A {
+					return gate
+				}
+				return nil
+			}})
+			w.serve()
+			cs := pwClients(w, 7)
+			pwFill(t, w, cs, 0x29)
+			slow := w.client()
+			pfSend(t, slow, pwTagged(30, 0x2A, 0))
+			time.Sleep(1500 * time.Millisecond) // the opening entry 1.5 s old
+			for i, c := range cs {
+				pfSend(t, c, pwTagged(30, 0x29, 1+i)) // the open flows active again
+			}
+			time.Sleep(100 * time.Millisecond)
+			if v := pwEvictStep(t, w, w.client(), pwTagged(30, 0x2B, 0)); v.IsValid() {
+				t.Fatalf("victim %v: an opening entry or a flow active < 1 s ago", v)
+			}
+			if st := pwStatus(w.pf); st.DropFull != 1 || st.Evicted != 0 || st.Opening != 1 || st.Flows != 7 {
+				t.Fatalf("with an old opening entry: %s", pwDescribe(st))
+			}
+			if fi, ok := pwSnapshot(w.pf)[pwAddr(slow)]; !ok || fi.State != FlowOpening {
+				t.Fatalf("the opening entry: %+v (in the table: %v)", fi, ok)
+			}
+			close(gate)
+			pfExpect(t, slow, pwTagged(30, 0x2A, 0))
+			if st := pwStatus(w.pf); st.Opening != 0 || st.Flows != 8 || st.Opened != 8 {
+				t.Fatalf("after the gate: %s", pwDescribe(st))
+			}
+			pwUnits(t, w.pf)
+		})
+	})
 }
 
 // TestPortForwardStreamNeverEvicted_L72 (M6-D29, R1-7; L72): under both
-// rules, 4 stream flows — 3 exchanging every 200 ms and one, once a stream,
-// only a keepalive every 25 s (WireGuard's) — keep 100 % delivery through
-// a 60-s flood (30 s in the race lane) of one-shot newcomers into a table of 16: they stay in the
-// table, open and streams, on their first and only session (one flow each
-// at the passive), while the flood evicts one-shot flows (O-1 (a)) or is
-// refused (the literal rule).
+// rules, 4 stream flows — 3 exchanging every 200 ms and one, once a
+// stream, only a keepalive every 25 s (WireGuard's) — keep 100 % delivery
+// through a 60-s flood of 10 one-shot newcomers a second (26 s at half
+// both rates in the race lane) into a table of 16: every stream datagram
+// is sent once and its echo read once
+// (each target received exactly the datagrams sent, no client a datagram
+// more), they stay in the table, open and streams, on their first and only
+// session (one flow each at the passive), while the flood evicts one-shot
+// flows (O-1 (a)) or is refused (the literal rule).
 func TestPortForwardStreamNeverEvicted_L72(t *testing.T) {
 	for _, rule := range []promoteMode{promoteActive, promoteOnReply} {
-		t.Run(map[promoteMode]string{promoteActive: "active rule", promoteOnReply: "reply rule"}[rule], func(t *testing.T) {
+		t.Run(pwRuleName(rule), func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				pfRule(t, rule)
 				w := newPWWorld(t, pwOpts{pfwd: func(f *PortForward) { f.MaxFlows = 16 }})
 				w.serve()
 				streams := pwClients(w, 4)
-				k := 0
+				var sent [4]int64
 				exchange := func(c *rendrtest.DatagramConn, i int) {
-					k++
-					b := pwTagged(40, byte(0x30+i), k)
-					if !pwRoundTrip(t, c, b, time.Second) {
-						t.Fatalf("stream %d lost its echo at %v: %s", i, time.Now(), pwDescribe(pwStatus(w.pf)))
+					sent[i]++
+					b := pwTagged(40, byte(0x30+i), int(sent[i]))
+					pfSend(t, c, b)
+					if got, ok, err := pwRecvWithin(c, pfWithin); !ok || err != nil || !bytes.Equal(got, b) {
+						t.Fatalf("stream %d, datagram %d at %v: read %d bytes (%v, %v), want its echo: %s", i, sent[i], time.Now(), len(got), ok, err, pwDescribe(pwStatus(w.pf)))
 					}
 				}
 				for range 15 { // 3 s both ways: streams under either rule
@@ -345,10 +430,13 @@ func TestPortForwardStreamNeverEvicted_L72(t *testing.T) {
 					time.Sleep(200 * time.Millisecond)
 				}
 				pwFill(t, w, pwClients(w, 12), 0x40)
-				period := 60 * time.Second
+				period, step := 60*time.Second, 100*time.Millisecond
 				if raceEnabled {
-					period = 30 * time.Second // the keepalive still crosses twice (at 0 s and 25 s)
+					// racebudget: half the rates; the keepalive still crosses
+					// twice (at 0 s and 25 s).
+					period, step = 26*time.Second, 200*time.Millisecond
 				}
+				keepalive := int(25 * time.Second / step)
 				start := time.Now()
 				for n := 0; time.Since(start) < period; n++ {
 					pfSend(t, w.client(), pwTagged(30, 0x41, n))
@@ -357,11 +445,12 @@ func TestPortForwardStreamNeverEvicted_L72(t *testing.T) {
 							exchange(c, i)
 						}
 					}
-					if n%250 == 0 {
+					if n%keepalive == 0 {
 						exchange(streams[3], 3) // every 25 s
 					}
-					time.Sleep(100 * time.Millisecond)
+					time.Sleep(step)
 				}
+				pwNoneAll(t, streams...)
 				snap := pwSnapshot(w.pf)
 				for i, c := range streams {
 					if fi, ok := snap[pwAddr(c)]; !ok || fi.State != FlowOpen || !fi.Stream {
@@ -371,6 +460,9 @@ func TestPortForwardStreamNeverEvicted_L72(t *testing.T) {
 				for i := range streams {
 					if n := pwFlowsTagged(w.pas, byte(0x30+i)); n != 1 {
 						t.Fatalf("stream %d has %d sessions at the passive, want 1", i, n)
+					}
+					if got := w.pas.flowOf(byte(0x30 + i)).rxCount.Load(); got != sent[i] {
+						t.Fatalf("stream %d's target received %d datagrams, want the %d sent (each once)", i, got, sent[i])
 					}
 				}
 				st := pwStatus(w.pf)
@@ -397,24 +489,25 @@ func pwFlowsTagged(p *pwPassive, tag byte) int {
 }
 
 // TestPortForwardReusedSourceStaysShort_L72 (M6-D9, R1-23; L72): under O-1
-// (a), 2,000 one-shot queries from a 512-port space at 100 a second (1,000
-// from 256 ports in the race lane; each port reused after 5.12 s (2.56 s), while its flow still lives at Short): every
-// reused port lands on its live flow after a gap of ≥ 2 s, which starts a
-// new activity period, so no flow ever becomes a stream at either end;
-// the same flows serve the reused ports (512 sessions).
+// (a), 2,000 one-shot queries from a 512-port space at 100 a second (384
+// from 128 ports at 50 a second in the race lane), each port reused after
+// 5.12 s (2.56 s) while its flow still lives at Short: every reused port
+// lands on its live flow after a gap of ≥ 2 s, which starts a new activity
+// period, so no flow ever becomes a stream at either end; the same flows
+// serve the reused ports (one session per port).
 func TestPortForwardReusedSourceStaysShort_L72(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		pfRule(t, promoteActive)
 		w := newPWWorld(t, pwOpts{passiveDefaults: true}) // the passive's classes apply too: no promotion there either
 		w.serve()
-		ports, queries := 512, 2000
+		ports, queries, gap := 512, 2000, 10*time.Millisecond
 		if raceEnabled {
-			ports, queries = 256, 1000 // each port still reused after ≥ 2 s (2.56 s)
+			ports, queries, gap = 128, 384, 20*time.Millisecond // racebudget: each port still reused after ≥ 2 s (2.56 s)
 		}
 		cs := pwClients(w, ports)
 		for q := range queries {
 			pfSend(t, cs[q%ports], pwTagged(40, byte(q%ports), q))
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(gap)
 		}
 		time.Sleep(time.Second)
 		streams := 0
