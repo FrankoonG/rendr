@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/FrankoonG/rendr/v2"
@@ -19,11 +21,49 @@ import (
 const defaultUDPBuffer = 1 << 20
 
 // dialUDP is the target dial of a UDP flow on a Server without a Dial
-// hook: a socket connected to addr, names resolved here (M6-D17). It is a
-// variable only so that tests can observe the default dialer's calls and
-// the conn it returns (their buffer requests); nothing else sets it.
+// hook: a socket connected to addr, names resolved here (M6-D17), each
+// resolved address passed through udpTargetControl before its connect
+// (M6-D34). It is a variable only so that tests can observe the default
+// dialer's calls and the conn it returns (their buffer requests); nothing
+// else sets it.
 var dialUDP = func(ctx context.Context, addr string) (net.Conn, error) {
-	return (&net.Dialer{}).DialContext(ctx, "udp", addr)
+	return (&net.Dialer{Control: udpTargetControl}).DialContext(ctx, "udp", addr)
+}
+
+// errResolvedTarget is the default UDP dialer's refusal of a target that
+// resolved to an address the metadata rules refuse as a literal (M6-D34):
+// multicast, the IPv4 limited broadcast or unspecified. It wraps ErrDenied:
+// CodeNotAllowed.
+var errResolvedTarget = fmt.Errorf("l4: UDP target resolved to a multicast, broadcast or unspecified address: %w", ErrDenied)
+
+// udpTargetControl is the default UDP dialer's net.Dialer.Control (M6-D34).
+// It runs for each resolved target address, after the socket was made and
+// before its connect. It refuses with errResolvedTarget what checkIP
+// refuses, since a name may resolve to such an address. One exception:
+// where the net package dials the loopback for an unspecified address
+// (Windows, AIX, OpenBSD), the Control sees the loopback and allows it, as
+// it allows a literal loopback target. On an IPv4 socket
+// it turns SO_BROADCAST off; Go's net package turns it on for every IPv4
+// datagram socket. The OS then refuses a directed broadcast: Linux at the
+// connect (EACCES), Windows and the BSDs at the send (WSAEACCES, EACCES).
+// Both reach the flow as CodeNotAllowed (§A6.3). IPv6 has no broadcast.
+// Plan 9's net package calls no Control (l4 only compiles there).
+func udpTargetControl(network, address string, c syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return err
+	}
+	if checkIP(ap.Addr()) != "" {
+		return errResolvedTarget
+	}
+	if network != "udp4" {
+		return nil
+	}
+	var serr error
+	if err := c.Control(func(fd uintptr) { serr = clearBroadcast(fd) }); err != nil {
+		return err
+	}
+	return serr
 }
 
 // errNotDatagram is LastErr of a UDP flow whose Dial hook returned a conn
@@ -36,7 +76,10 @@ var errNotDatagram = errors.New("l4: Dial hook returned no connected datagram co
 type errBadDatagramConn struct{ v any }
 
 func (e errBadDatagramConn) Error() string {
-	return fmt.Sprint("l4: Dial hook's conn failed its datagram check: ", e.v)
+	if e.v == nil {
+		return "l4: Dial hook's conn called runtime.Goexit in its datagram check"
+	}
+	return fmt.Sprint("l4: Dial hook's conn panicked in its datagram check: ", e.v)
 }
 
 // HandleUDP serves one pending packet session and returns when its flow
@@ -50,10 +93,14 @@ func (e errBadDatagramConn) Error() string {
 // first datagram counted toward its class, until the flow ends. Use it for
 // Listeners shared with other packet sessions (Match tells them apart).
 // Cancelling ctx stops the dial (CodeDialFailed) or ends the flow. After
-// the flow ended (its MaxFlows unit released) HandleUDP waits for its
-// session's end (PacketConn.Done, at most the Runtime's Linger), unless
-// ctx is done, so that UDPServerStatus.SessionDrops holds the session's
-// final drop counts (R1-38).
+// the flow ended, its MaxFlows unit is released. HandleUDP then waits for
+// the session's end (PacketConn.Done) unless ctx is done, so that
+// UDPServerStatus.SessionDrops holds the session's final drop counts
+// (R1-38). That wait is at most the Runtime's Linger (30 s by default) plus
+// the carrier joins (about 2 s), and is at once when the session itself
+// ended the flow. Running handlers are therefore at most MaxFlows plus the
+// flows whose sessions are still ending, and every one of them holds a
+// session, so the Runtime's MaxSessions bounds them as well.
 func (s *Server) HandleUDP(ctx context.Context, p *rendr.PendingPacket) {
 	pc := s.serveFlow(ctx, p)
 	if pc == nil {
@@ -90,18 +137,47 @@ func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.P
 	if t == nil {
 		return nil
 	}
+	// The flow counts as Dialing until it is confirmed: the first
+	// datagram's write and Confirm finish the target's setup (a blocked
+	// write shows there).
+	k.dialing.Add(1)
+	pc, seed := s.openFlow(ctx, p, k, t, r.First)
+	if pc != nil {
+		k.confirmed.Add(1)
+		s.flow.maxPayload.Store(int64(pc.MaxPayload()))
+		k.live.Add(1)
+	}
+	k.dialing.Add(-1)
+	if pc == nil {
+		return nil
+	}
+	res := forwardPacket(ctx, pc, t, s.UDPIdle, seed, &s.flow.tally)
+	cause := endCauseOf(res.SessionErr)
+	if res.LocalErr != nil {
+		cause = endLocal
+	}
+	s.flow.ended.add(cause)
+	k.live.Add(-1)
+	return pc
+}
+
+// openFlow finishes the setup of a flow whose target socket t was dialled:
+// it writes the first datagram, if one rode the OPEN, and confirms p. It
+// returns the session and the forward's class seed, or nil after it closed
+// t and counted the outcome in k.
+func (s *Server) openFlow(ctx context.Context, p *rendr.PendingPacket, k *kindStats, t net.Conn, first []byte) (*rendr.PacketConn, flowSeed) {
 	var seed flowSeed
-	if len(r.First) > 0 {
+	if len(first) > 0 {
 		if p.Context().Err() != nil {
 			// Decided once the socket was dialled (withdrawn, timed out, its
 			// Listener or Runtime closed; §A6.5): nothing can be confirmed,
 			// so nothing is written.
 			resetConn(t)
 			k.unconfirmed.Add(1)
-			return nil
+			return nil, seed
 		}
 		at := time.Now()
-		written, refuse := s.writeFirst(ctx, p.Context(), t, r.First)
+		written, refuse := s.writeFirst(ctx, p.Context(), t, first)
 		if refuse != 0 {
 			resetConn(t)
 			switch { // as connect: Serve's ctx first, then the pending context
@@ -112,7 +188,7 @@ func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.P
 			default:
 				s.reject(p, k, refuse)
 			}
-			return nil
+			return nil, seed
 		}
 		if written {
 			// R1-10: the forward's class tracker counts this datagram.
@@ -127,19 +203,9 @@ func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.P
 		// whose replies are lost — UDP semantics.
 		resetConn(t)
 		k.unconfirmed.Add(1)
-		return nil
+		return nil, seed
 	}
-	k.confirmed.Add(1)
-	s.flow.maxPayload.Store(int64(pc.MaxPayload()))
-	k.live.Add(1)
-	res := forwardPacket(ctx, pc, t, s.UDPIdle, seed, &s.flow.tally)
-	cause := endCauseOf(res.SessionErr)
-	if res.LocalErr != nil {
-		cause = endLocal
-	}
-	s.flow.ended.add(cause)
-	k.live.Add(-1)
-	return pc
+	return pc, seed
 }
 
 // writeFirst writes the first datagram that rode the OPEN to the target
@@ -252,7 +318,7 @@ func (s *Server) udpStatus() UDPServerStatus {
 
 // UDPServerStatus counts a Server's UDP flows.
 type UDPServerStatus struct {
-	Dialing, Live                          int    // flows being dialled for; flows being forwarded
+	Dialing, Live                          int    // flows being set up (target dial, first datagram, Confirm); flows being forwarded
 	Confirmed, Rejected, Unconfirmed, Lost uint64 // as the TCP counters, for flows
 	ByCode                                 map[RejectCode]uint64
 	ToTarget, FromTarget                   uint64 // datagrams written to the targets (FirstSent included) and read from them

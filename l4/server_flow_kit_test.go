@@ -1,8 +1,10 @@
 package l4
 
 import (
+	"bytes"
 	"context"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -294,6 +296,31 @@ func suSetDialUDP(t testing.TB, dial func(ctx context.Context, addr string) (net
 	old := dialUDP
 	dialUDP = dial
 	t.Cleanup(func() { dialUDP = old })
+}
+
+// suHandlers counts the goroutines in HandleUDP, and those of them still in
+// serveFlow (the flow being set up or forwarded). Inlined frames are listed
+// too. No l4 test runs in parallel, so every one counted belongs to the
+// calling row.
+func suHandlers() (all, serving int) {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	for _, g := range bytes.Split(buf, []byte("\n\n")) {
+		if bytes.Contains(g, []byte("l4.(*Server).HandleUDP(")) {
+			all++
+			if bytes.Contains(g, []byte("l4.(*Server).serveFlow(")) {
+				serving++
+			}
+		}
+	}
+	return all, serving
 }
 
 // suUnits fails unless every MaxFlows unit of s was released.

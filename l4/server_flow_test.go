@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -547,6 +548,16 @@ func TestServerUDPHookConnCheck_L51(t *testing.T) {
 				}
 				if st := s.Status(); st.Panics-panics != row.panics || st.LastErr == nil || row.panics == 0 && !errors.Is(st.LastErr, errNotDatagram) {
 					t.Fatalf("status %+v", st)
+				}
+				if row.panics != 0 {
+					// LastErr names what the check met.
+					want := "panicked in its datagram check: LocalAddr"
+					if strings.HasPrefix(row.name, "Goexit") {
+						want = "called runtime.Goexit in its datagram check"
+					}
+					if e := s.Status().LastErr.Error(); !strings.Contains(e, want) {
+						t.Fatalf("LastErr %q, want it to say %q", e, want)
+					}
 				}
 				return
 			}

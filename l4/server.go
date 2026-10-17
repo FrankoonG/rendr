@@ -88,13 +88,19 @@ type Server struct {
 	//
 	// With UDP set, r.Cmd may be CmdUDP: return a connected datagram conn
 	// (each Read one datagram from the target, each Write one datagram to
-	// it; nil Dial: a net.Dialer's DialContext on "udp"). The conn must
-	// report a non-nil RemoteAddr and either implement net.PacketConn (a
-	// connected *net.UDPConn does) or report a LocalAddr whose Network is
-	// "udp", "udp4" or "udp6" (an embedder's own datagram tunnel reports
-	// "udp"); any other conn is closed and answered CodeDialFailed. A hook
-	// used with UDP must check r.Cmd. Every other rule above holds for both
-	// commands; at most 192 calls of each kind run at once.
+	// it). The conn must report a non-nil RemoteAddr and either implement
+	// net.PacketConn (a connected *net.UDPConn does) or report a LocalAddr
+	// whose Network is "udp", "udp4" or "udp6" (an embedder's own datagram
+	// tunnel reports "udp"); any other conn is closed and answered
+	// CodeDialFailed. A hook used with UDP must check r.Cmd. Every other
+	// rule above holds for both commands; at most 192 calls of each kind run
+	// at once. With nil Dial, a UDP flow uses a net.Dialer's DialContext on
+	// "udp" whose Control refuses a resolved multicast, limited-broadcast or
+	// unspecified address (CodeNotAllowed; Windows dials the loopback for an
+	// unspecified one) and turns SO_BROADCAST off. Go
+	// turns SO_BROADCAST on for every IPv4 UDP socket it makes, so with it
+	// off the OS refuses a directed broadcast (CodeNotAllowed). A hook that
+	// dials its own sockets should do the same in its Control.
 	Dial func(ctx context.Context, r Request) (net.Conn, error)
 	// DialTimeout bounds one target dial (0: DefaultDialTimeout; clamped to
 	// 0.5–30 s) and never runs past the pending session's AcceptTimeout
@@ -117,7 +123,8 @@ type Server struct {
 	UDPIdle FlowIdle
 	// MaxFlows bounds the UDP flows this Server dials for or forwards at once
 	// (0 or less: DefaultMaxFlows); a flow beyond it is rejected CodeCapacity
-	// at once. MaxConns bounds TCP connections only.
+	// at once. A flow's handler may outlive its unit while the flow's
+	// session ends (see HandleUDP). MaxConns bounds TCP connections only.
 	MaxFlows int
 	// UDPBuffer is the receive and send buffer size the default UDP dialer
 	// requests for each target socket (0 or less: 1 MiB; the kernel caps it
