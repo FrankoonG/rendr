@@ -56,3 +56,53 @@ func wsaCode(e syscall.Errno) (RejectCode, bool) {
 	}
 	return 0, false
 }
+
+// errnoClass classifies the syscall.Errno inside err, if any, for the l4
+// sockets (M6-D15, R1-2): this OS's symbols of the size class and the
+// fatal set first (symLocal), then the Windows numbers (wsaLocal), which
+// hold on every OS but plan9; every other errno is noise. ok is false when
+// err holds no syscall.Errno.
+func errnoClass(err error) (c localClass, ok bool) {
+	var e syscall.Errno
+	if !errors.As(err, &e) {
+		return 0, false
+	}
+	if c, ok := symLocal(e); ok {
+		return c, true
+	}
+	if c, ok := wsaLocal(e); ok {
+		return c, true
+	}
+	return classNoise, true
+}
+
+// The Windows socket error numbers of the l4 sockets' size class and fatal
+// set (winsock2.h; M6-D15, R1-2).
+const (
+	wsaEBADF        = syscall.Errno(10009)
+	wsaEFAULT       = syscall.Errno(10014)
+	wsaEINVAL       = syscall.Errno(10022)
+	wsaENOTSOCK     = syscall.Errno(10038)
+	wsaEDESTADDRREQ = syscall.Errno(10039)
+	wsaEMSGSIZE     = syscall.Errno(10040)
+	wsaEOPNOTSUPP   = syscall.Errno(10045)
+	wsaEISCONN      = syscall.Errno(10056)
+	wsaENOTCONN     = syscall.Errno(10057)
+	wsaESHUTDOWN    = syscall.Errno(10058)
+)
+
+// wsaLocal maps a Windows socket error number of the size class
+// (WSAEMSGSIZE: a datagram above the read buffer, the buffer filled) or of
+// the fatal set (a closed, invalid, wrong-kind or unconnected socket, and
+// EISCONN's twin). WSAECONNRESET, WSAENETRESET, WSAENOBUFS,
+// WSAEHOSTUNREACH, WSAENETUNREACH, WSAENETDOWN, WSAEACCES and the rest are
+// noise.
+func wsaLocal(e syscall.Errno) (localClass, bool) {
+	switch e {
+	case wsaEMSGSIZE:
+		return classSize, true
+	case wsaEBADF, wsaEFAULT, wsaEINVAL, wsaENOTSOCK, wsaEDESTADDRREQ, wsaEOPNOTSUPP, wsaEISCONN, wsaENOTCONN, wsaESHUTDOWN:
+		return classFatal, true
+	}
+	return 0, false
+}
