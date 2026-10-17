@@ -294,7 +294,8 @@ func (c *PacketConn) Done() <-chan struct{} { return c.s.Done() }
 // now on, with Conn.SetIdleTimeout's meaning and clamp: 0 or a negative
 // value turns idle expiry off; other values are clamped to 10 s–24 h. The
 // idle clock (moved by every accepted WriteTo, every datagram accepted from
-// a carrier and every datagram ReadFrom returns) is not restarted. Both
+// a carrier and every datagram ReadFrom returns; the move on an accepted
+// datagram may lag by up to Config.PacketPing) is not restarted. Both
 // roles. It returns net.ErrClosed once the session has ended.
 func (c *PacketConn) SetIdleTimeout(d time.Duration) error { return c.s.SetIdleTimeout(d) }
 
