@@ -17,9 +17,11 @@ import (
 // and agree with refParse, an independent statement of M4's §A3.4 and M6's
 // §A3.2 built on the net package and regular expressions; an accepted input
 // re-encodes to exactly itself and parses back to the same Request; no
-// input is accepted by both parsers. Allocations (≤ 1 for an accepted
-// input, ≤ 2 for a rejected one: the error and its message) are checked on
-// every seed and, while the fuzzing engine runs, on a sample of the inputs.
+// input is accepted by both parsers; ParseMetadata returns what v2.0.0's
+// returns, error messages and App's aliasing included (sameAsV200, R1-8).
+// Allocations (≤ 1 for an accepted input, ≤ 2 for a rejected one: the
+// error and its message) are checked on every seed and, while the fuzzing
+// engine runs, on a sample of the inputs.
 // Seeds: every golden vector of both files, each truncated by one byte and
 // with one trailing byte, and the longest UDP metadata with and without one
 // byte more.
@@ -93,6 +95,7 @@ func FuzzL4Metadata_L44(f *testing.F) {
 		if accepted > 1 {
 			t.Fatalf("both parsers accepted %x", md)
 		}
+		sameAsV200(t, md)
 	})
 }
 

@@ -46,7 +46,9 @@ const metaV1Frozen = "589798703f89880f522b50e61e4dc875a5eaa3e8b158fdfb689823dd30
 // file byte for byte and its vectors keep v2.0.0's codes (version-2
 // BadVersion, cmd-2 BadCommand); ParseMetadata accepts command 1 only, so
 // commands 2, 3 and 0x11 (CmdUDP, also with a whole UDP tail) are
-// BadCommand, and ParseUDPMetadata accepts command 0x11 only.
+// BadCommand, and ParseUDPMetadata accepts command 0x11 only. On every
+// input of the command sweep ParseMetadata returns what v2.0.0's returns
+// (sameAsV200: the same Request or error message).
 func TestL4MetadataV1Frozen_L44(t *testing.T) {
 	b, err := os.ReadFile(goldenConnect)
 	if err != nil {
@@ -82,6 +84,9 @@ func TestL4MetadataV1Frozen_L44(t *testing.T) {
 			md := bytes.Clone(p.vector.md)
 			md[3] = byte(c)
 			r, err := p.parse(md)
+			if p.cmd == CmdConnect {
+				sameAsV200(t, md)
+			}
 			switch {
 			case byte(c) != p.cmd:
 				wantMetadataError(t, p.name+" of "+p.vector.name+" with command "+numbered("", byte(c)), err, CodeBadCommand)
@@ -181,9 +186,12 @@ func TestL4MetadataUDPRoundTrip_L44(t *testing.T) {
 
 // TestAppendMetadataFirstTooLong (R1-19): AppendMetadata refuses a first
 // datagram longer than 65,535 bytes and a UDP metadata longer than 65,535
-// bytes with "first datagram too long", and accepts 65,535 bytes exactly,
-// which ParseUDPMetadata decodes while it refuses one byte more
-// (CodeBadRequest: accepted inputs stay canonical);
+// bytes with "first datagram too long" (without a first datagram as well:
+// DialUDP measures the ride on that encoding), and accepts 65,535 bytes
+// exactly, which ParseUDPMetadata decodes while it refuses one byte more
+// (CodeBadRequest: accepted inputs stay canonical); the bound is
+// wire.MaxMetadata, the OPEN's 16-bit metadata length (l4 cannot import
+// internal/wire, so this test ties the two);
 // a CONNECT request carries no first datagram; a command other than
 // CmdConnect and CmdUDP is "unsupported command". Every refusal returns dst
 // unchanged and writes nothing into its spare capacity, and none wraps
@@ -224,6 +232,9 @@ func TestAppendMetadataFirstTooLong(t *testing.T) {
 		}
 	}
 	const limit = 65535
+	if maxUDPMetadata != limit || wire.MaxMetadata != limit {
+		t.Fatalf("maxUDPMetadata %d, wire.MaxMetadata %d: want both %d", maxUDPMetadata, wire.MaxMetadata, limit)
+	}
 	// IPv4: an 11-byte header and the 2-byte length.
 	accept("IPv4, 65,535 bytes", Request{Cmd: CmdUDP, Addr: "192.0.2.1:53", First: metaFill(limit-13, 0)}, limit)
 	refuse("IPv4, a 65,536th byte of App", Request{Cmd: CmdUDP, Addr: "192.0.2.1:53", First: metaFill(limit-13, 0), App: []byte{1}}, "first datagram too long")
@@ -232,6 +243,9 @@ func TestAppendMetadataFirstTooLong(t *testing.T) {
 	accept("longest domain, 65,535 bytes", Request{Cmd: CmdUDP, Addr: longest + ":53", First: metaFill(limit-264-7, 0), App: metaFill(7, 9)}, limit)
 	refuse("longest domain, 65,536 bytes", Request{Cmd: CmdUDP, Addr: longest + ":53", First: metaFill(limit-264-6, 0), App: metaFill(7, 9)}, "first datagram too long")
 	refuse("a 65,536-byte first datagram", Request{Cmd: CmdUDP, Addr: "192.0.2.1:53", First: metaFill(limit+1, 0)}, "first datagram too long")
+	// No first datagram (flen 0): the same bound.
+	accept("IPv4, no first datagram, 65,535 bytes", Request{Cmd: CmdUDP, Addr: "192.0.2.1:53", App: metaFill(limit-13, 0)}, limit)
+	refuse("IPv4, no first datagram, 65,536 bytes", Request{Cmd: CmdUDP, Addr: "192.0.2.1:53", App: metaFill(limit-12, 0)}, "first datagram too long")
 	// ParseUDPMetadata accepts only what AppendMetadata encodes.
 	md, err := AppendMetadata(nil, Request{Cmd: CmdUDP, Addr: "192.0.2.1:53", First: []byte{7}, App: metaFill(limit-14, 0)})
 	if err != nil || len(md) != limit {
