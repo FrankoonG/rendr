@@ -382,6 +382,24 @@ func TestUDPSocketHubContract(t *testing.T) {
 		})
 	})
 
+	// On the real clock a wall-only deadline is held as the same instant
+	// with a monotonic reading, fixed when it is set (as net.Conn's; see
+	// the pipe's row).
+	t.Run("deadline-fixed-at-set", func(t *testing.T) {
+		h := NewUDPSocketHub(UDPSocketHubConfig{})
+		s := h.Socket()
+		defer s.Close()
+		wall := time.Now().Add(time.Hour).UTC()
+		s.SetReadDeadline(wall)
+		if dl := s.rx.rdl; !dl.Equal(wall) || !dpMonotonic(dl) {
+			t.Fatalf("the socket's deadline held as %v; want %v with a monotonic reading", dl, wall)
+		}
+		s.SetReadDeadline(time.Now().Add(5 * time.Millisecond).UTC())
+		if _, _, err := s.ReadFromUDPAddrPort(make([]byte, 8)); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("read with a wall-only deadline = %v; want a timeout", err)
+		}
+	})
+
 	// Close of the socket: its waiting read returns at once, its later
 	// calls fail; the clients' queued and later datagrams toward it are
 	// dropped and counted; a second Close fails. Close of a client wakes
@@ -466,7 +484,19 @@ func TestUDPSocketHubContract(t *testing.T) {
 			if d := dpRecv(t, c); string(d) != "r" {
 				t.Fatalf("got %q", d)
 			}
-			dpCounts(t, c, DatagramConnCounts{In: 1, Injected: 3})
+			// A client truncates as TruncLinux: n = len(b), no error, the
+			// rest discarded.
+			long := dpData(12, 0, 100)
+			hubSend(t, s, long, hubSrc(10))
+			hubSend(t, s, []byte("after"), hubSrc(10))
+			buf := make([]byte, 10)
+			if n, err := c.Read(buf); n != len(buf) || err != nil || !bytes.Equal(buf, long[:10]) {
+				t.Fatalf("a client's Read of a longer reply = %d, %v; want 10, nil and the reply's head", n, err)
+			}
+			if d := dpRecv(t, c); string(d) != "after" {
+				t.Fatalf("after the truncated Read: %q; want the next reply", d)
+			}
+			dpCounts(t, c, DatagramConnCounts{In: 3, Injected: 3, Truncated: 1})
 		})
 	})
 
@@ -521,25 +551,39 @@ func TestUDPSocketHubContract(t *testing.T) {
 		}
 	})
 
-	// Steady state allocates nothing: client → socket → client.
+	// Steady state allocates nothing, client → socket → client, at every
+	// size class up to the largest datagram, also after a burst of small
+	// datagrams filled the smallest class's free list.
 	t.Run("steady-state-allocs", func(t *testing.T) {
-		h := NewUDPSocketHub(UDPSocketHubConfig{})
+		h := NewUDPSocketHub(UDPSocketHubConfig{Queue: 1024})
 		s, c := h.Socket(), h.Client(hubSrc(11))
-		w, r := dpData(11, 0, 1400), make([]byte, 64<<10)
+		r := make([]byte, 64<<10)
 		c.SetReadDeadline(time.Now().Add(10 * time.Second))
 		s.SetReadDeadline(time.Now().Add(10 * time.Second))
-		bad := 0 // rounds that did not echo w intact (no allocation to count them)
-		round := func() {
-			c.Write(w)
-			n, src, err := s.ReadFromUDPAddrPort(r)
-			s.WriteToUDPAddrPort(r[:n], src)
-			if m, err2 := c.Read(r); err != nil || err2 != nil || m != len(w) || r[3] != w[3] {
-				bad++
+		small := dpData(11, 1, 100)
+		for range 300 {
+			dpWrite(t, c, small)
+		}
+		for i := range 300 {
+			if n, src, err := s.ReadFromUDPAddrPort(r); n != len(small) || src != hubSrc(11) || err != nil {
+				t.Fatalf("burst read %d = %d from %v, %v", i, n, src, err)
 			}
 		}
-		round()
-		if n := testing.AllocsPerRun(1000, round); n != 0 || bad != 0 {
-			t.Fatalf("%.1f allocations per round trip, %d rounds not echoed; want 0 and 0", n, bad)
+		for _, size := range []int{1400, 9000, 65507} {
+			w := dpData(11, 0, size)
+			bad := 0 // rounds that did not echo w intact (no allocation to count them)
+			round := func() {
+				c.Write(w)
+				n, src, err := s.ReadFromUDPAddrPort(r)
+				s.WriteToUDPAddrPort(r[:n], src)
+				if m, err2 := c.Read(r); err != nil || err2 != nil || m != len(w) || r[size-1] != w[size-1] {
+					bad++
+				}
+			}
+			round()
+			if n := testing.AllocsPerRun(1000, round); n != 0 || bad != 0 {
+				t.Fatalf("%d-byte datagrams after a burst of 100-byte ones: %.1f allocations per round trip, %d rounds not echoed; want 0 and 0", size, n, bad)
+			}
 		}
 	})
 }

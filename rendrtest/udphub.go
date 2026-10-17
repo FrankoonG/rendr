@@ -110,10 +110,11 @@ func (h *UDPSocketHub) leave(c *DatagramConn) {
 }
 
 // InjectRead makes the socket's next n reads return err (ICMP-class noise,
-// WSAECONNRESET). The error is returned as given, consumes no datagram and
-// wakes a waiting read; a nil err or an n below 1 clears an earlier
-// injection. A passed read deadline and Close take precedence, as on a
-// real socket.
+// WSAECONNRESET). The error is returned as given, with n = 0 and no
+// address, consumes no datagram and wakes a waiting read; a nil err or an
+// n below 1 clears an earlier injection. A passed read deadline and Close
+// take precedence, as on a real socket. The hub does not count injected
+// reads: a test that counts the reader's calls wraps the socket.
 func (h *UDPSocketHub) InjectRead(err error, n int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -141,7 +142,7 @@ func (h *UDPSocketHub) Counts() HubCounts {
 // HubCounts are a UDPSocketHub's counters.
 type HubCounts struct {
 	Clients       map[netip.AddrPort]DatagramConnCounts // per client source: In (from the socket), Out (to the socket), Dropped toward it
-	Dropped       uint64                                // datagrams toward the socket dropped (a full queue)
+	Dropped       uint64                                // datagrams toward the socket dropped (a full queue, or a closed socket)
 	Reads, Writes uint64                                // the socket's reads and writes that moved a datagram
 }
 

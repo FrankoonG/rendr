@@ -98,6 +98,10 @@ func dpBlocked(t *testing.T, ch <-chan dpResult) {
 	}
 }
 
+// dpMonotonic reports whether t carries a monotonic clock reading (Round(0)
+// strips it and so changes the value).
+func dpMonotonic(t time.Time) bool { return t != t.Round(0) }
+
 func dpCounts(t *testing.T, c *DatagramConn, want DatagramConnCounts) {
 	t.Helper()
 	if got := c.Counts(); got != want {
@@ -294,6 +298,29 @@ func TestDatagramPipeContract(t *testing.T) {
 				dpWrite(t, c, dpData(4, k, 8))
 			}
 			dpCounts(t, d, DatagramConnCounts{Dropped: 300 - 256})
+
+			// With Delay the bound counts the datagrams in flight too, as
+			// netem's limit does: a waiting reader makes no room before they
+			// arrive, so 6 written at once into a bound of 4 lose 2 at once.
+			const delay = 10 * time.Millisecond
+			e, f := NewDatagramPipe(DatagramPipeConfig{Queue: 4, Delay: delay})
+			rf := dpReadAsync(f)
+			dpBlocked(t, rf)
+			t0 := time.Now()
+			for k := range 6 {
+				dpWrite(t, e, dpData(4, 20+k, 30))
+			}
+			dpCounts(t, f, DatagramConnCounts{Dropped: 2})
+			if r := <-rf; r.err != nil || !bytes.Equal(r.b, dpData(4, 20, 30)) || r.at.Sub(t0) != delay {
+				t.Fatalf("the waiting Read got %d bytes, %v at +%v; want the first datagram at +%v", len(r.b), r.err, r.at.Sub(t0), delay)
+			}
+			for k := 1; k < 4; k++ {
+				if got := dpRecv(t, f); !bytes.Equal(got, dpData(4, 20+k, 30)) {
+					t.Fatalf("delayed datagram %d is not the %dth written", k, k)
+				}
+			}
+			dpQuiet(t, f, time.Millisecond)
+			dpCounts(t, f, DatagramConnCounts{In: 4, Dropped: 2})
 		})
 	})
 
@@ -368,6 +395,17 @@ func TestDatagramPipeContract(t *testing.T) {
 					t.Fatalf("delivery %d is datagram %d; want each once, in order, a duplicate right behind its original", i, fd[i])
 				}
 			}
+
+			// A duplicate that does not fit is never made: neither
+			// delivered nor counted Dropped (its original was delivered).
+			g, h := NewDatagramPipe(DatagramPipeConfig{Queue: 1, Dup: 1})
+			dpWrite(t, g, []byte("once"))
+			dpCounts(t, h, DatagramConnCounts{})
+			if got := dpRecv(t, h); string(got) != "once" {
+				t.Fatalf("got %q; want the original", got)
+			}
+			dpQuiet(t, h, time.Millisecond)
+			dpCounts(t, h, DatagramConnCounts{In: 1})
 		})
 	})
 
@@ -452,6 +490,34 @@ func TestDatagramPipeContract(t *testing.T) {
 			}
 			dpCounts(t, a, DatagramConnCounts{Out: 2})
 		})
+	})
+
+	// On the real clock a deadline is fixed against the runtime clock when
+	// it is set, as net.Conn's is: a wall-only time (Round(0), UTC,
+	// time.Unix) is held as the same instant with a monotonic reading, so a
+	// wall-clock step cannot move the timer or the expiry check. A step
+	// cannot be made in a test, so the held value is checked (inside a
+	// bubble the clock has no monotonic reading and no steps).
+	t.Run("deadline-fixed-at-set", func(t *testing.T) {
+		a, b := NewDatagramPipe(DatagramPipeConfig{})
+		defer a.Close()
+		wall := time.Now().Add(time.Hour).Round(0)
+		b.SetReadDeadline(wall)
+		a.SetWriteDeadline(wall.UTC())
+		for name, dl := range map[string]time.Time{"read": b.rx.rdl, "write": a.wdl} {
+			if !dl.Equal(wall) || !dpMonotonic(dl) {
+				t.Fatalf("%s deadline held as %v; want %v with a monotonic reading", name, dl, wall)
+			}
+		}
+		b.SetReadDeadline(time.Now().Add(5 * time.Millisecond).Round(0))
+		if _, err := b.Read(make([]byte, 8)); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("Read with a wall-only deadline = %v; want a timeout", err)
+		}
+		b.SetDeadline(time.Time{})
+		a.SetDeadline(time.Time{})
+		if !b.rx.rdl.IsZero() || !a.wdl.IsZero() {
+			t.Fatal("a cleared deadline is not zero")
+		}
 	})
 
 	// Close: every later call of both ends returns net.ErrClosed; waiting
@@ -563,26 +629,43 @@ func TestDatagramPipeContract(t *testing.T) {
 		a.Close()
 	})
 
-	// Steady state allocates nothing: the copies reuse recycled buffers
-	// (l4's allocation gates run on pipes).
+	// Steady state allocates nothing: the copies reuse freed buffers of
+	// their size class (l4's allocation gates run on pipes), at every class
+	// up to the largest datagram, also after a burst of small datagrams
+	// filled the smallest class's free list, whose length stays bounded.
 	t.Run("steady-state-allocs", func(t *testing.T) {
-		a, b := NewDatagramPipe(DatagramPipeConfig{})
-		w, r := dpData(9, 0, 1400), make([]byte, 2048)
+		a, b := NewDatagramPipe(DatagramPipeConfig{Queue: 1024})
+		r := make([]byte, 64<<10)
 		a.SetReadDeadline(time.Now().Add(10 * time.Second))
 		b.SetReadDeadline(time.Now().Add(10 * time.Second))
-		bad := 0 // rounds that did not deliver w both ways (no allocation to count them)
-		round := func() {
-			a.Write(w)
-			n1, err1 := b.Read(r)
-			b.Write(w)
-			n2, err2 := a.Read(r)
-			if err1 != nil || err2 != nil || n1 != len(w) || n2 != len(w) || r[3] != w[3] {
-				bad++
+		small := dpData(9, 1, 100)
+		for range 300 {
+			dpWrite(t, a, small)
+		}
+		for i := range 300 {
+			if n, err := b.Read(r); n != len(small) || err != nil {
+				t.Fatalf("burst read %d = %d, %v", i, n, err)
 			}
 		}
-		round()
-		if n := testing.AllocsPerRun(1000, round); n != 0 || bad != 0 {
-			t.Fatalf("%.1f allocations per round trip, %d rounds not delivered; want 0 and 0", n, bad)
+		if got := len(a.n.free[0]); got != dpRecycleMax {
+			t.Fatalf("after 300 freed small buffers the free list holds %d; want the bound %d", got, dpRecycleMax)
+		}
+		for _, size := range []int{1400, 9000, 65507} {
+			w := dpData(9, 0, size)
+			bad := 0 // rounds that did not deliver w both ways (no allocation to count them)
+			round := func() {
+				a.Write(w)
+				n1, err1 := b.Read(r)
+				b.Write(w)
+				n2, err2 := a.Read(r)
+				if err1 != nil || err2 != nil || n1 != len(w) || n2 != len(w) || r[size-1] != w[size-1] {
+					bad++
+				}
+			}
+			round()
+			if n := testing.AllocsPerRun(1000, round); n != 0 || bad != 0 {
+				t.Fatalf("%d-byte datagrams after a burst of 100-byte ones: %.1f allocations per round trip, %d rounds not delivered; want 0 and 0", size, n, bad)
+			}
 		}
 		a.Close()
 	})

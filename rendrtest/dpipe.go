@@ -20,46 +20,69 @@ import (
 // goroutine blocked in them is durably blocked inside a testing/synctest
 // bubble (use a pipe or hub inside one bubble, or outside every bubble).
 // Neither starts a goroutine: a datagram's arrival time is computed when
-// it is written. A datagram is copied once, at the Write, into a recycled
-// buffer, so steady-state I/O allocates nothing (the allocation gates of
-// l4's forwarding run on them). Their own errors are *net.OpError values
-// wrapping net.ErrClosed, os.ErrDeadlineExceeded or ErrMsgSize, as a real
-// socket's; injected errors are returned as given.
+// it is written. A datagram is copied once, at the Write, into a buffer of
+// the smallest size class that holds it (2, 16 or 64 KiB), recycled per
+// pipe or hub; each class keeps up to 256 freed buffers, so steady-state
+// I/O allocates nothing while no more than 256 datagrams of one class are
+// buffered at once, whatever the other classes did before (the allocation
+// gates of l4's forwarding run on them); a datagram above 64 KiB is
+// allocated per copy. Their own errors are *net.OpError values wrapping
+// net.ErrClosed, os.ErrDeadlineExceeded or ErrMsgSize, as a real socket's;
+// injected errors are returned as given.
 
 // Defaults and bounds of the datagram fakes.
 const (
-	defaultDpQueue = 256     // datagrams per queue
-	dpMinCap       = 2 << 10 // smallest datagram buffer: every datagram of ≤ 2 KiB reuses any recycled one
-	dpRecycleCap   = 16 << 10
-	dpRecycleMax   = 256
+	defaultDpQueue = 256 // datagrams per queue
+	dpRecycleMax   = 256 // freed buffers kept per size class
 )
 
-// dpNet is what a DatagramPipe or a UDPSocketHub shares: the lock over all
-// of its state and the recycled datagram buffers.
-type dpNet struct {
-	mu   sync.Mutex
-	free [][]byte
+// dpClasses are the buffer sizes of the datagram copies: each copy is made
+// into a buffer of the smallest class that holds it, so a burst of one
+// size never leaves a free list another size cannot use.
+var dpClasses = [...]int{2 << 10, 16 << 10, 64 << 10}
+
+// dpClass returns the index of the smallest class of at least n bytes, or
+// -1 above the largest.
+func dpClass(n int) int {
+	for k, c := range dpClasses {
+		if n <= c {
+			return k
+		}
+	}
+	return -1
 }
 
-// clone returns a copy of b in a recycled buffer when one is large enough.
-// n.mu held.
+// dpNet is what a DatagramPipe or a UDPSocketHub shares: the lock over all
+// of its state and the freed datagram buffers of each class.
+type dpNet struct {
+	mu   sync.Mutex
+	free [len(dpClasses)][][]byte
+}
+
+// clone returns a copy of b in a buffer of its class, a freed one when
+// there is one. n.mu held.
 func (n *dpNet) clone(b []byte) []byte {
-	if k := len(n.free); k > 0 && cap(n.free[k-1]) >= len(b) {
-		c := n.free[k-1][:len(b)]
-		n.free[k-1] = nil
-		n.free = n.free[:k-1]
-		copy(c, b)
-		return c
+	k := dpClass(len(b))
+	if k < 0 {
+		return append(make([]byte, 0, len(b)), b...)
 	}
-	c := make([]byte, len(b), max(len(b), dpMinCap))
+	var c []byte
+	if f := n.free[k]; len(f) > 0 {
+		c = f[len(f)-1][:len(b)]
+		f[len(f)-1] = nil
+		n.free[k] = f[:len(f)-1]
+	} else {
+		c = make([]byte, len(b), dpClasses[k])
+	}
 	copy(c, b)
 	return c
 }
 
-// recycle keeps b for a later datagram. n.mu held.
+// recycle keeps b, a buffer clone returned, for a later datagram of its
+// class. n.mu held.
 func (n *dpNet) recycle(b []byte) {
-	if cap(b) <= dpRecycleCap && len(n.free) < dpRecycleMax {
-		n.free = append(n.free, b[:0])
+	if k := dpClass(cap(b)); k >= 0 && cap(b) == dpClasses[k] && len(n.free[k]) < dpRecycleMax {
+		n.free[k] = append(n.free[k], b[:0])
 	}
 }
 
@@ -128,14 +151,28 @@ func (q *dpQueue) wait(now time.Time) {
 // setDeadline sets the read deadline and wakes the readers, so that a
 // waiting read honours it at once.
 func (q *dpQueue) setDeadline(t time.Time) {
-	q.rdl = t
+	q.rdl = dpFix(t)
 	stopTimer(q.dlTm)
-	if !t.IsZero() {
-		if d := time.Until(t); d > 0 {
+	if !q.rdl.IsZero() {
+		if d := time.Until(q.rdl); d > 0 {
 			q.arm(&q.dlTm, d)
 		}
 	}
 	q.cond.Broadcast()
+}
+
+// dpFix returns deadline t fixed against the runtime clock, as net.Conn
+// fixes a deadline when it is set: a time without a monotonic reading
+// (from time.Unix, Round(0), UTC, In) is turned into the same instant with
+// one, so a later wall-clock step moves neither the timer nor the expiry
+// check. The zero time stays zero; inside a synctest bubble, whose clock
+// has no monotonic reading and no steps, t is returned as the same instant.
+func dpFix(t time.Time) time.Time {
+	if t.IsZero() {
+		return t
+	}
+	now := time.Now()
+	return now.Add(t.Sub(now))
 }
 
 // arm makes *tm wake the readers after d; the timer is created once and
@@ -174,7 +211,7 @@ func (q *dpQueue) drain(n *dpNet) uint64 {
 
 // DatagramPipeConfig configures NewDatagramPipe; zero values take defaults.
 type DatagramPipeConfig struct {
-	Queue        int           // datagrams buffered per direction (256); more are dropped and counted, as a socket buffer drops
+	Queue        int           // datagrams buffered per direction, in flight under Delay or arrived and unread (256); more are dropped and counted, as netem's limit drops
 	Trunc        TruncMode     // a Read into a shorter buffer: TruncLinux (n = len(b), the rest discarded) or TruncWindows (ErrMsgSize, buffer filled)
 	Loss, Dup    float64       // per datagram and direction, from Seed
 	Delay        time.Duration // one-way, both directions
@@ -234,9 +271,14 @@ var (
 //
 // A Write never blocks. Each datagram is copied (the caller may reuse its
 // buffer at once), then passes seeded loss and duplication (a duplicate
-// arrives right behind its original), the receiving direction's Queue
-// bound (a full queue drops it) and Delay; datagrams arrive in the order
-// they were written. Every datagram toward an end is either read, counted
+// arrives right behind its original; one that does not fit is never
+// made), the receiving direction's Queue bound (a full queue drops it) and
+// Delay; datagrams arrive in the order they were written. The bound counts
+// the datagrams still in flight under Delay as well as the arrived unread
+// ones, as netem's limit does, so it also bounds the memory of a fast
+// writer: a reader that keeps up still loses datagrams when rate × Delay
+// exceeds Queue, and a row with Delay sizes Queue ≥ rate × Delay plus the
+// reader's backlog. Every datagram toward an end is either read, counted
 // Dropped at that end, or still queued. A Read into an empty buffer
 // returns (0, nil) at once and consumes nothing, as the net package's
 // does on Unix; zero-length datagrams are delivered as such. Loss and Dup are
@@ -302,7 +344,7 @@ func (p *dpPipe) close() {
 	for _, e := range p.ends {
 		e.ctr.Dropped += e.rx.drain(&p.dpNet)
 	}
-	p.free = nil
+	p.free = [len(dpClasses)][][]byte{}
 }
 
 // DatagramConn is one end of a DatagramPipe, or a UDPSocketHub client: a
@@ -457,7 +499,7 @@ func (c *DatagramConn) setDeadline(t time.Time, read, write bool) error {
 		return c.opErr("set", net.ErrClosed)
 	}
 	if write {
-		c.wdl = t
+		c.wdl = dpFix(t)
 	}
 	if read {
 		c.rx.setDeadline(t)
@@ -466,8 +508,10 @@ func (c *DatagramConn) setDeadline(t time.Time, read, write bool) error {
 }
 
 // Inject makes the next Read (every later one if persistent) return err.
-// The error is returned as given, consumes no datagram and wakes a
-// waiting Read; a nil err clears an earlier injection.
+// The Read returns (0, err) with the error as given, consumes no datagram
+// and wakes a waiting Read (each such Read counts Injected); a nil err
+// clears an earlier injection. A test that needs a count beside the error,
+// as (n, io.ErrShortBuffer) or n > len(b), wraps the end.
 func (c *DatagramConn) Inject(err error, persistent bool) {
 	c.n.mu.Lock()
 	defer c.n.mu.Unlock()
