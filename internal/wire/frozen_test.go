@@ -20,7 +20,7 @@ import (
 // refreeze rewrites testdata/frozen.sha256 from the golden vector files in
 // the tree. It is separate from -update on purpose: regenerating a vector
 // never refreezes the list in the same command.
-var refreeze = flag.Bool("refreeze", false, "rewrite testdata/frozen.sha256 from the golden vector files (after v2.0.0: a new wire minor version, an optional PREFACE feature bit or a new version of a versioned payload format only)")
+var refreeze = flag.Bool("refreeze", false, "rewrite testdata/frozen.sha256 from the golden vector files (after v2.0.0: a new wire minor version, an optional PREFACE feature bit or a new version of a versioned payload format only; or a new vector file defining a new value of an extension field the old decoder rejects deterministically, every existing file unchanged and the list only gaining lines)")
 
 const (
 	frozenPath   = "testdata/frozen.sha256"
@@ -28,14 +28,19 @@ const (
 )
 
 // frozenRule is the failure message's rule (plan:309, plan:362; M5 D2-6:
-// the one freeze rule, stated in the same words in the headers of
-// testdata/golden.txt and l4/testdata/meta-v1.txt).
+// the one freeze rule, stated in the headers of testdata/golden.txt and
+// l4/testdata/meta-v1.txt; M6 PA-88 adds the clause for a new vector file,
+// stated in the header of l4/testdata/meta-v1-udp.txt, while the older
+// headers stay byte-identical).
 const frozenRule = `The golden vectors freeze rendr's wire format at v2.0.0. Before v2.0.0 a
 change is deliberate and recorded in the milestone report. After v2.0.0 a
 frozen vector changes only with a new wire minor version, an optional
 PREFACE feature bit, or a new version of a versioned payload format such
-as L4 metadata, together with the vectors that define it. Update the list
-in the same change as the vectors:
+as L4 metadata, together with the vectors that define it. In addition,
+when an extension field that the old decoder rejects deterministically
+takes a new value, such as an L4 metadata command, a new vector file may
+define it: every existing vector file stays byte-identical and the list
+only gains lines. Update the list in the same change as the vectors:
     go test ./internal/wire -run TestWireGoldenFrozen -refreeze`
 
 // TestWireGoldenFrozen is the wire freeze (m5 R4): testdata/frozen.sha256
