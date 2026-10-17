@@ -22,18 +22,27 @@ import (
 // carrier/udp loopback packet session (rendr's own UDP sockets, one
 // dedicated carrier: the session's steady state allocates nothing, as the
 // packet scenario's TestPacketSteadyStateZeroAllocs_L41_L54 proves). At
-// least 4,000 round trips of a 1000-byte datagram each way (16,000
-// datagrams through the four movers) and 50 PacketPing intervals cost at
-// most 40 allocations in total, counted raw (runtime.MemStats.Mallocs,
+// least 4,000 rounds of a 1000-byte datagram and 50 PacketPing intervals
+// cost at most 40 allocations in total, counted raw (runtime.MemStats.Mallocs,
 // every goroutine, GC off, one P), so an allocation per datagram, per
-// class check or per SetIdleTimeout call exceeds the bound. The flow is a
-// stream from the warm-up (the reply rule, so that the window measures the
-// promoted state; the tracker's pre-promotion path allocates nothing
-// either, TestFlowClassRules_L72 runs it). Asserted in the non-race lane;
-// the race lane logs the figure.
+// class check or per SetIdleTimeout call exceeds the bound. Two legs:
+//   - promoted: round trips under the reply rule, a stream from the
+//     warm-up (16,000 datagrams through the four movers);
+//   - unpromoted: the rule in force (promoteActive) with datagrams one way
+//     only, so both trackers stay short and check every datagram (time and
+//     lock, no allocation).
+//
+// Asserted in the non-race lane; the race lane logs the figure.
 func TestForwardPacketZeroAllocs_L54(t *testing.T) {
+	t.Run("promoted", func(t *testing.T) { pfZeroAllocs(t, promoteOnReply, true) })
+	t.Run("unpromoted", func(t *testing.T) { pfZeroAllocs(t, promoteActive, false) })
+}
+
+// pfZeroAllocs is one leg of TestForwardPacketZeroAllocs_L54: rule in
+// force, round trips (twoWay) or client datagrams only.
+func pfZeroAllocs(t *testing.T, rule promoteMode, twoWay bool) {
 	check := rendrtest.AssertNoLeak(t)
-	pfRule(t, promoteOnReply)
+	pfRule(t, rule)
 	ov := testhooks.Overrides{PacketPing: 10 * time.Millisecond}
 	d := kitRuntime(t, rendr.Config{}, ov)
 	p := kitRuntime(t, rendr.Config{}, ov)
@@ -97,6 +106,9 @@ func TestForwardPacketZeroAllocs_L54(t *testing.T) {
 		if n, err := tgt.Read(rbuf); n != len(up) || err != nil {
 			t.Fatalf("target Read = %d, %v (a datagram lost on loopback?)", n, err)
 		}
+		if !twoWay {
+			return
+		}
 		if _, err := tgt.Write(down); err != nil {
 			t.Fatalf("target Write: %v", err)
 		}
@@ -117,26 +129,31 @@ func TestForwardPacketZeroAllocs_L54(t *testing.T) {
 		minRounds, minWindow = warm, 0
 	}
 	mallocs, rounds, el := countMallocs(minRounds, minWindow, round)
-	if !bytes.Equal(rbuf[:len(down)], down) {
+	if last := map[bool][]byte{true: down, false: up}[twoWay]; !bytes.Equal(rbuf[:len(last)], last) {
 		t.Fatal("the last round delivered other bytes")
 	}
-	t.Logf("%d allocations in %d round trips of %d bytes each way through both forwards (%v)", mallocs, rounds, len(up), el)
+	t.Logf("%d allocations in %d rounds of %d bytes (both ways: %v) through both forwards (%v)", mallocs, rounds, len(up), twoWay, el)
 	if rounds < minRounds || el < minWindow {
 		t.Fatalf("load: %d rounds in %v", rounds, el)
 	}
 	if raceEnabled {
 		t.Log("race lane: not asserted")
 	} else if mallocs > maxAllocs {
-		t.Fatalf("%d allocations in %d steady-state round trips (%d datagrams forwarded) over %v, want at most %d", mallocs, rounds, 4*rounds, el, maxAllocs)
+		t.Fatalf("%d allocations in %d steady-state rounds (both ways: %v) over %v, want at most %d", mallocs, rounds, twoWay, el, maxAllocs)
 	}
 
 	fcancel()
 	n := uint64(warm + 16 + rounds)
+	back := map[bool]uint64{true: n, false: 0}[twoWay]
 	for name, r := range map[string]PacketResult{"dialer": <-in, "passive": <-out} {
 		// Both ctxs end at once: a forward whose peer's close arrived before
 		// its own ctx's halt ran ends with io.EOF.
-		if r.ToSession != n || r.ToLocal != n || !r.Stream || r.LocalErr != nil || !errors.Is(r.SessionErr, context.Canceled) && !errors.Is(r.SessionErr, io.EOF) {
-			t.Fatalf("%s forward %+v: want %d datagrams each way, a stream, ended by ctx", name, r, n)
+		to, from := r.ToSession, r.ToLocal
+		if name == "passive" {
+			to, from = from, to
+		}
+		if to != n || from != back || r.Stream != twoWay || r.LocalErr != nil || !errors.Is(r.SessionErr, context.Canceled) && !errors.Is(r.SessionErr, io.EOF) {
+			t.Fatalf("%s forward %+v: want %d datagrams toward the target, %d back, a stream: %v, ended by ctx", name, r, n, back, twoWay)
 		}
 	}
 	for _, c := range []*rendr.PacketConn{dc, pc} {

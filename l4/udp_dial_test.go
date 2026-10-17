@@ -31,8 +31,11 @@ func pfDialBegins(n *atomic.Int64) func(*testhooks.Overrides) {
 // the open by WriteTo (Request.First is nil) — the boundary included (425
 // bytes of first datagram with the 13-byte IPv4 header ride, 426 do not),
 // also when every datagram toward the passive is duplicated (the OPEN's
-// REL copy included) and over two links in race mode. The flow then
-// carries the target's reply.
+// REL copy included), over two links in race mode (the second carrier
+// joins), and with the OPEN duplicated on a second carrier: link 0's
+// answers are delayed beyond JoinStagger, so the second carrier sends its
+// own OPEN (captured; it carries the first datagram when that rides) in
+// race, selector and bond mode. The flow then carries the target's reply.
 func TestDialUDPFirstOnce_L47(t *testing.T) {
 	// 13 + 425 = 438 (M6-D4), written out rather than taken from
 	// firstBudget, so a changed constant fails here too.
@@ -41,11 +44,19 @@ func TestDialUDPFirstOnce_L47(t *testing.T) {
 		rides bool
 	}{{29, true}, {425, true}, {426, false}, {600, false}}
 	shapes := []struct {
-		name  string
-		links int
-		mode  rendr.Mode
-		dup   bool
-	}{{"plain", 1, rendr.ModeSelector, false}, {"duplicated", 1, rendr.ModeSelector, true}, {"race", 2, rendr.ModeRace, false}}
+		name   string
+		links  int
+		mode   rendr.Mode
+		dup    bool // every datagram toward the passive duplicated
+		second bool // link 0's answers delayed beyond JoinStagger: a second OPEN on link 1
+	}{
+		{"plain", 1, rendr.ModeSelector, false, false},
+		{"duplicated", 1, rendr.ModeSelector, true, false},
+		{"race", 2, rendr.ModeRace, false, false},
+		{"second OPEN/race", 2, rendr.ModeRace, false, true},
+		{"second OPEN/selector", 2, rendr.ModeSelector, false, true},
+		{"second OPEN/bond", 2, rendr.ModeBond, false, true},
+	}
 	for _, sh := range shapes {
 		for _, sz := range sizes {
 			t.Run(sh.name+"/"+itoa(sz.n), func(t *testing.T) {
@@ -57,9 +68,27 @@ func TestDialUDPFirstOnce_L47(t *testing.T) {
 					tgtLocal, target := rendrtest.NewDatagramPipe(rendrtest.DatagramPipeConfig{})
 					served := w.serve(tgtLocal, FlowIdle{Short: -1})
 					first := pfData(sz.n, 0x5A)
+					var open1 <-chan []byte
+					if sh.second {
+						// The OPEN_ACK on link 0 comes after JoinStagger (1 s):
+						// link 1's carrier sends its own OPEN meanwhile.
+						w.links[0].SetDelay(rendrtest.Down, 1500*time.Millisecond, 0)
+						open1 = w.links[1].CaptureNext(rendrtest.Up, rendrtest.FrameOpen)
+					}
 					pc, err := DialUDP(context.Background(), w.peer, pfTarget, first, rendr.DialOptions{Mode: sh.mode})
 					if err != nil {
 						t.Fatalf("DialUDP: %v", err)
+					}
+					if sh.second {
+						select {
+						case b := <-open1:
+							if sz.rides && !bytes.Contains(b, first) {
+								t.Fatal("stimulus: the second carrier's OPEN lacks the first datagram")
+							}
+						default:
+							t.Fatal("stimulus: no OPEN on the second carrier before the open completed")
+						}
+						w.links[0].SetDelay(rendrtest.Down, pfOneWay, 0)
 					}
 					s := <-served
 					if s.err != nil {

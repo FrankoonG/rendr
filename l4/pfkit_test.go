@@ -327,6 +327,8 @@ func tagOf(b []byte) byte {
 }
 
 // pfRule selects the promotion rule for the rest of the test (R1-7).
+// ruleForTest is package-global: a test that calls pfRule, and every l4
+// test while one does, must not call t.Parallel.
 func pfRule(t testing.TB, r promoteMode) {
 	old := ruleForTest.Swap(uint32(r))
 	t.Cleanup(func() { ruleForTest.Store(old) })

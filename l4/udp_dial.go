@@ -99,7 +99,9 @@ const streamAfter = 2 * time.Second
 
 // ruleForTest, when non-zero, holds the promoteMode that replaces
 // promoteRule (tests only: the rows of the other rule, R1-7). Tests set it
-// before the forwards or PortForwards they observe start.
+// before the forwards or PortForwards they observe start. It is
+// package-global: a test that sets it must not run in parallel with
+// another l4 test (no l4 test calls t.Parallel).
 var ruleForTest atomic.Uint32
 
 // activeRule returns the rule in force: promoteRule unless a test selected

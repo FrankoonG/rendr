@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"sync"
 	"syscall"
 	"testing"
@@ -137,6 +138,26 @@ func (c *pfNoiseConn) count() int {
 	return c.reads
 }
 
+// pfScriptConn returns its errors from its next Reads, one each, then
+// reads the wrapped conn.
+type pfScriptConn struct {
+	net.Conn
+	mu   sync.Mutex
+	errs []error
+}
+
+func (c *pfScriptConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	if len(c.errs) > 0 {
+		err := c.errs[0]
+		c.errs = c.errs[1:]
+		c.mu.Unlock()
+		return 0, err
+	}
+	c.mu.Unlock()
+	return c.Conn.Read(b)
+}
+
 // TestForwardPacketNoise_L58_L73 (M6-D15, R1-2; L58, L73): every noise
 // errno of §A7.2 (the OS's symbols and the Windows numbers, bare and
 // wrapped) on a local Read and on a local Write is counted (LocalNoise)
@@ -147,6 +168,8 @@ func (c *pfNoiseConn) count() int {
 // exactly 64 free reads and then the back-off (5 ms doubling to 100 ms):
 // ≤ 64 + 5 + 100 reads in the first 10 virtual seconds, and the datagram
 // behind them reaches the session after the sum of the waits (993.255 s).
+// A size-class read (a datagram arrived, too long) ends a run: 64 noise
+// errors, a WSAEMSGSIZE and 64 more cost no wait.
 func TestForwardPacketNoise_L58_L73(t *testing.T) {
 	var noise []pfErrno
 	for _, e := range pfNoiseErrnos() {
@@ -218,6 +241,36 @@ func TestForwardPacketNoise_L58_L73(t *testing.T) {
 			}
 			cancel()
 			if r := <-res; r.LocalNoise != errs || r.ToSession != 1 || r.LocalErr != nil {
+				t.Fatalf("result %+v", r)
+			}
+			w.shutdown()
+		})
+	})
+	t.Run("a size read ends the run", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := newPFWorld(t, pfOpts{})
+			dc, pc := w.dial(rendr.DialOptions{})
+			app, local := rendrtest.NewDatagramPipe(rendrtest.DatagramPipeConfig{})
+			var script []error
+			for range 2 * noiseRunFree {
+				script = append(script, noise[0].err)
+			}
+			script = slices.Insert(script, noiseRunFree, pfWSASize.err)
+			sc := &pfScriptConn{Conn: local, errs: script}
+			d := pfData(30, 0x78)
+			pfSend(t, app, d) // waits behind the errors
+			t0 := time.Now()
+			ctx, cancel := context.WithCancel(context.Background())
+			res := pfForward(ctx, dc, sc, FlowIdle{Short: -1})
+			pc.SetReadDeadline(time.Now().Add(time.Hour))
+			buf := make([]byte, 64)
+			n, _, err := pc.ReadFrom(buf)
+			if el := time.Since(t0); err != nil || !bytes.Equal(buf[:n], d) || el != pfOneWay {
+				t.Fatalf("the datagram behind %d noise errors, a size error and %d more arrived after %v (%d bytes, %v), want %v: no back-off",
+					noiseRunFree, noiseRunFree, el, n, err, pfOneWay)
+			}
+			cancel()
+			if r := <-res; r.LocalNoise != 2*noiseRunFree || r.TooLarge != 1 || r.ToSession != 1 || r.LocalErr != nil {
 				t.Fatalf("result %+v", r)
 			}
 			w.shutdown()

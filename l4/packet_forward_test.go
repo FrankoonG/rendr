@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -323,9 +324,9 @@ func TestForwardPacketIdleClasses_L30_L72(t *testing.T) {
 // SessionErr — the peer's close (io.EOF, after the datagrams the peer sent
 // before it), idle here and at the peer, no carrier for NoPathGrace
 // (ErrNoPath at both ends), a peer restart (ErrSessionLost; the old
-// passive's ErrNoPath), the peer Runtime's Close (AbortGoingAway; the
-// closed side's own net.ErrClosed), this side's ctx (ctx.Err(); the peer
-// reads io.EOF) —
+// passive's ErrNoPath), the peer Runtime's Close and the dialer Runtime's
+// (AbortGoingAway at the other end; the closed side's own net.ErrClosed),
+// this side's ctx (ctx.Err(); the peer reads io.EOF) —
 // local is closed (its far end reads net.ErrClosed), and no transport
 // failure ever becomes a datagram: the applications receive exactly the
 // datagrams that were sent.
@@ -353,6 +354,8 @@ func TestForwardPacketSessionEnds_L01_L02(t *testing.T) {
 			is(rendr.ErrSessionLost), is(rendr.ErrNoPath)},
 		{"peer runtime close", FlowIdle{Short: -1}, false, func(w *pfWorld, ch *pfChain) { w.p.Close() },
 			isAbort(rendr.AbortGoingAway, true), is(net.ErrClosed)},
+		{"dialer runtime close", FlowIdle{Short: -1}, false, func(w *pfWorld, ch *pfChain) { w.d.Close() },
+			is(net.ErrClosed), isAbort(rendr.AbortGoingAway, true)},
 	}
 	for _, r := range rows {
 		t.Run(r.name, func(t *testing.T) {
@@ -397,13 +400,15 @@ func TestForwardPacketSessionEnds_L01_L02(t *testing.T) {
 }
 
 // pfBlockConn is a local conn whose Writes block until its deadline or
-// Close (a socket whose send buffer never drains); Reads pass through.
+// Close (a socket whose send buffer never drains), or until release lets
+// them through; Reads pass through.
 type pfBlockConn struct {
 	net.Conn
 	mu      sync.Mutex
 	dl      time.Time
 	wake    chan struct{}
 	blocked int
+	pass    bool // released: Writes before the deadline go to the wrapped conn
 }
 
 func newPFBlockConn(c net.Conn) *pfBlockConn { return &pfBlockConn{Conn: c, wake: make(chan struct{})} }
@@ -411,7 +416,7 @@ func newPFBlockConn(c net.Conn) *pfBlockConn { return &pfBlockConn{Conn: c, wake
 func (c *pfBlockConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
 	c.blocked++
-	for c.dl.IsZero() || time.Now().Before(c.dl) {
+	for !c.pass && (c.dl.IsZero() || time.Now().Before(c.dl)) {
 		wake := c.wake
 		var tc <-chan time.Time
 		if !c.dl.IsZero() {
@@ -424,8 +429,21 @@ func (c *pfBlockConn) Write(b []byte) (int, error) {
 		}
 		c.mu.Lock()
 	}
+	pass := c.pass && (c.dl.IsZero() || time.Now().Before(c.dl))
 	c.mu.Unlock()
+	if pass {
+		return c.Conn.Write(b)
+	}
 	return 0, &net.OpError{Op: "write", Net: "udp", Err: os.ErrDeadlineExceeded}
+}
+
+// release lets the blocked Write, and every later one, through.
+func (c *pfBlockConn) release() {
+	c.mu.Lock()
+	c.pass = true
+	close(c.wake)
+	c.wake = make(chan struct{})
+	c.mu.Unlock()
 }
 
 // writes returns how many Writes were called.
@@ -460,7 +478,105 @@ func (c *pfBlockConn) Close() error {
 //     reading its local conn (no datagram waits or is dropped there: the
 //     pipe's drop counter stays 0) and WriteTo never blocks; the core
 //     drops and counts.
+//   - The session ends (the peer's close, idle) while the passive's local
+//     Write never returns: the forward returns endWriteGrace after the
+//     session's end (at once when its ctx is done in between) with that
+//     end as SessionErr, local closed once; a Write that returns within
+//     endWriteGrace still delivers its datagram.
 func TestForwardPacketNeverBlocks_L40(t *testing.T) {
+	is := func(target error) func(error) bool { return func(err error) bool { return errors.Is(err, target) } }
+	for _, r := range []struct {
+		name        string
+		idleOut     FlowIdle
+		end         func(ch *pfChain)
+		inOK, outOK func(error) bool // the dialer's and the passive's SessionErr
+		ctxAfter    bool             // the passive's ctx is done endWriteGrace/2 after the end: the forward returns then, still with the session's end
+	}{
+		{"peer closed", FlowIdle{Short: -1}, func(ch *pfChain) { ch.cancelIn() }, is(context.Canceled), is(io.EOF), false},
+		{"idle", FlowIdle{Short: 10 * time.Second, Stream: 10 * time.Second}, func(*pfChain) {}, pfAbortIdle, is(rendr.ErrIdleTimeout), false},
+		{"peer closed, then ctx", FlowIdle{Short: -1}, func(ch *pfChain) { ch.cancelIn() }, is(context.Canceled), is(io.EOF), true},
+	} {
+		t.Run("session ends under a blocked write/"+r.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				w := newPFWorld(t, pfOpts{})
+				var blk *pfBlockConn
+				var spy *spyConn
+				ch := w.chain(pfChainOpts{idleIn: FlowIdle{Short: -1}, idleOut: r.idleOut, localOut: func(c *rendrtest.DatagramConn) net.Conn {
+					blk = newPFBlockConn(c)
+					spy = &spyConn{Conn: blk}
+					return spy
+				}})
+				pfSend(t, ch.client, pfData(100, 1))
+				time.Sleep(pfWithin)
+				if blk.writes() != 1 {
+					t.Fatalf("stimulus: %d local Writes at the passive, want the one that blocks", blk.writes())
+				}
+				r.end(ch)
+				<-ch.pc.Done()
+				ended := time.Now()
+				want := endWriteGrace
+				if r.ctxAfter {
+					want = endWriteGrace / 2
+					time.Sleep(want)
+					ch.cancelOut()
+				}
+				var out PacketResult
+				select {
+				case out = <-ch.out:
+				case <-time.After(time.Hour):
+					ch.cancelOut() // releases the forward, so that the bubble can end
+					<-ch.out
+					t.Fatalf("the passive forward did not return within an hour of its session's end (%v)", ch.pc.Status().Err)
+				}
+				if el := time.Since(ended); el < want || el > want+pfOneWay {
+					t.Fatalf("the passive forward returned %v after its session's end, want %v", el, want)
+				}
+				if !r.outOK(out.SessionErr) || out.LocalErr != nil || out.ToLocal != 0 || out.ToSession != 0 {
+					t.Fatalf("passive forward %+v (session %v): want the session's end, no local error, nothing moved", out, ch.pc.Status().Err)
+				}
+				if in := <-ch.in; !r.inOK(in.SessionErr) || in.LocalErr != nil || in.ToSession != 1 {
+					t.Fatalf("dialer forward %+v", in)
+				}
+				synctest.Wait()
+				if _, _, closes, _ := spy.snapshot(); closes != 1 {
+					t.Fatalf("local closed %d times, want once", closes)
+				}
+				if _, err := ch.target.Read(make([]byte, 64)); !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("the target reads %v, want net.ErrClosed (local closed)", err)
+				}
+				w.shutdown()
+			})
+		})
+	}
+	t.Run("a write that returns within the grace", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := newPFWorld(t, pfOpts{})
+			var blk *pfBlockConn
+			ch := w.chain(pfChainOpts{idleIn: FlowIdle{Short: -1}, idleOut: FlowIdle{Short: -1}, localOut: func(c *rendrtest.DatagramConn) net.Conn {
+				blk = newPFBlockConn(c)
+				return blk
+			}})
+			pfSend(t, ch.client, pfData(100, 1))
+			time.Sleep(pfWithin)
+			if blk.writes() != 1 {
+				t.Fatalf("stimulus: %d local Writes at the passive, want the one that blocks", blk.writes())
+			}
+			ch.cancelIn()
+			<-ch.pc.Done()
+			time.Sleep(endWriteGrace / 2)
+			blk.release()
+			out := <-ch.out
+			if !errors.Is(out.SessionErr, io.EOF) || out.LocalErr != nil || out.ToLocal != 1 {
+				t.Fatalf("passive forward %+v: want the datagram delivered, then the peer's io.EOF", out)
+			}
+			synctest.Wait()
+			if c := ch.target.Counts(); c.In+c.Dropped != 1 {
+				t.Fatalf("the target's end got %d datagrams (read %d, dropped at close %d), want 1", c.In+c.Dropped, c.In, c.Dropped)
+			}
+			<-ch.in
+			w.shutdown()
+		})
+	})
 	t.Run("local never reads", func(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			pcfg := rendr.Config{Packet: rendr.PacketPolicy{Queue: 64 << 10}}
@@ -675,6 +791,220 @@ func TestForwardPacketFatalLocal_L42_L52(t *testing.T) {
 			})
 		}
 	}
+}
+
+// pfHoldConn holds the first local Read that fails (at the teardown: its
+// deadline) until hold is closed: the pump is then still inside local.
+type pfHoldConn struct {
+	net.Conn
+	hold chan struct{}
+	held atomic.Bool
+}
+
+func (c *pfHoldConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if err != nil && c.held.CompareAndSwap(false, true) {
+		<-c.hold
+	}
+	return n, err
+}
+
+// pfHoldSession holds the first Close of the session (the watcher's, on
+// ctx), after the session closed, until hold is closed: the watcher is then
+// still inside pc.
+type pfHoldSession struct {
+	packetSession
+	hold   chan struct{}
+	closes atomic.Int32
+}
+
+func (s *pfHoldSession) Close() error {
+	err := s.packetSession.Close()
+	if s.closes.Add(1) == 1 {
+		<-s.hold
+	}
+	return err
+}
+
+// TestForwardPacketJoins_L52 (§A7.1 teardown, L52): ForwardPacket returns
+// only after both of its goroutines ended. The pump: its local Read, failed
+// by the teardown's deadline, is held — the call must not return before
+// that Read returned. The watcher: ctx's halt closes the session (the
+// caller's loop ends) and is held inside that Close — the call must not
+// return before the halt finished. Then the forward ends by ctx and the
+// peer reads io.EOF.
+func TestForwardPacketJoins_L52(t *testing.T) {
+	for _, r := range []struct {
+		name  string
+		pump  bool // hold the pump (else the watcher)
+		stage string
+	}{{"pump", true, "its pump was in local's Read"}, {"watcher", false, "its watcher was in the session's Close"}} {
+		t.Run(r.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				w := newPFWorld(t, pfOpts{})
+				dc, pc := w.dial(rendr.DialOptions{})
+				_, local := rendrtest.NewDatagramPipe(rendrtest.DatagramPipeConfig{})
+				hold := make(chan struct{})
+				var once sync.Once
+				release := func() { once.Do(func() { close(hold) }) }
+				defer release()
+				var sess packetSession = dc
+				var l net.Conn = local
+				var held func() bool
+				if r.pump {
+					hc := &pfHoldConn{Conn: local, hold: hold}
+					l, held = hc, hc.held.Load
+				} else {
+					hs := &pfHoldSession{packetSession: dc, hold: hold}
+					sess, held = hs, func() bool { return hs.closes.Load() >= 1 }
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				res := pfForward(ctx, sess, l, FlowIdle{})
+				synctest.Wait()
+				cancel()
+				synctest.Wait()
+				if !held() {
+					t.Fatal("stimulus: nothing is held")
+				}
+				select {
+				case got := <-res:
+					t.Fatalf("the forward returned (%+v) while %s", got, r.stage)
+				default:
+				}
+				release()
+				if got := <-res; !errors.Is(got.SessionErr, context.Canceled) || got.LocalErr != nil {
+					t.Fatalf("result %+v: want the end by ctx", got)
+				}
+				if _, err := pfRecvPC(t, pc); !errors.Is(err, io.EOF) {
+					t.Fatalf("the peer reads %v, want io.EOF", err)
+				}
+				w.shutdown()
+			})
+		})
+	}
+}
+
+// pfGateConn holds the first SetDeadline call (the teardown's) until gate
+// is closed.
+type pfGateConn struct {
+	net.Conn
+	gate chan struct{}
+	held atomic.Bool
+}
+
+func (c *pfGateConn) SetDeadline(t time.Time) error {
+	if c.held.CompareAndSwap(false, true) {
+		<-c.gate
+	}
+	return c.Conn.SetDeadline(t)
+}
+
+// TestForwardPacketCtxDuringTeardown_L52 (§A7.1 teardown, §A7.2; L52): a
+// ctx done while the forward tears down after a fatal local error changes
+// nothing — the end already happened: LocalErr is that error, SessionErr
+// net.ErrClosed (not ctx.Err()), local is closed once and the peer reads
+// io.EOF. The teardown is held in local's SetDeadline while ctx is
+// cancelled, so the watcher, still live, sees ctx first.
+func TestForwardPacketCtxDuringTeardown_L52(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newPFWorld(t, pfOpts{})
+		dc, pc := w.dial(rendr.DialOptions{})
+		app, local := rendrtest.NewDatagramPipe(rendrtest.DatagramPipeConfig{})
+		gc := &pfGateConn{Conn: local, gate: make(chan struct{})}
+		var once sync.Once
+		release := func() { once.Do(func() { close(gc.gate) }) }
+		defer release()
+		spy := &spyConn{Conn: gc}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		res := pfForward(ctx, dc, spy, FlowIdle{})
+		fatal := errors.New("embedder conn failed") // fatal on every OS
+		local.InjectWrite(fatal, 1)
+		pc.WriteTo(pfData(70, 4), nil)
+		// Step virtual time until the teardown holds: the datagram's
+		// arrival (one way); the session has not ended then (its end waits
+		// for the peer's read of io.EOF), so the watcher still watches ctx.
+		for k := 0; !gc.held.Load(); k++ {
+			if k == 1000 {
+				t.Fatal("stimulus: the teardown did not reach local's SetDeadline")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		select {
+		case <-dc.Done():
+			t.Fatal("stimulus: the session ended before ctx")
+		default:
+		}
+		cancel()
+		synctest.Wait()
+		release()
+		r := <-res
+		if !errors.Is(r.LocalErr, fatal) || !errors.Is(r.SessionErr, net.ErrClosed) {
+			t.Fatalf("result %+v: want LocalErr %v and SessionErr net.ErrClosed, ctx's end ignored", r, fatal)
+		}
+		if _, err := pfRecvPC(t, pc); !errors.Is(err, io.EOF) {
+			t.Fatalf("the peer reads %v, want io.EOF", err)
+		}
+		synctest.Wait()
+		if _, _, closes, _ := spy.snapshot(); closes != 1 {
+			t.Fatalf("local closed %d times, want once", closes)
+		}
+		if _, err := app.Read(make([]byte, 64)); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("the application end reads %v, want net.ErrClosed", err)
+		}
+		w.shutdown()
+	})
+}
+
+// pfLateSession refuses SetIdleTimeout(stream) with net.ErrClosed, as a
+// session that ended an instant before the promotion does (§A5.4).
+type pfLateSession struct {
+	packetSession
+	stream  time.Duration
+	refused atomic.Int32
+}
+
+func (s *pfLateSession) SetIdleTimeout(d time.Duration) error {
+	if d == s.stream {
+		s.refused.Add(1)
+		return net.ErrClosed
+	}
+	return s.packetSession.SetIdleTimeout(d)
+}
+
+// TestForwardPacketPromotionVsExpiry_L72 (§A5.4 "promotion vs expiry",
+// M6-D9; L72): the promotion's SetIdleTimeout(Stream) returning
+// net.ErrClosed is ignored — it is no local failure and ends nothing: the
+// flow is a stream, keeps moving datagrams both ways, and ends by its
+// session's end (here ctx).
+func TestForwardPacketPromotionVsExpiry_L72(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pfRule(t, promoteOnReply)
+		w := newPFWorld(t, pfOpts{})
+		dc, pc := w.dial(rendr.DialOptions{})
+		app, local := rendrtest.NewDatagramPipe(rendrtest.DatagramPipeConfig{})
+		_, stream := FlowIdle{}.limits()
+		late := &pfLateSession{packetSession: dc, stream: stream}
+		ctx, cancel := context.WithCancel(context.Background())
+		res := pfForward(ctx, late, local, FlowIdle{})
+		for k := range 3 {
+			up, down := pfData(20, byte(2*k)), pfData(30, byte(2*k+1))
+			pfSend(t, app, up)
+			if got, err := pfRecvPC(t, pc); err != nil || !bytes.Equal(got, up) {
+				t.Fatalf("exchange %d: the passive read %d bytes, %v", k, len(got), err)
+			}
+			pc.WriteTo(down, nil)
+			pfExpect(t, app, down)
+		}
+		if late.refused.Load() != 1 {
+			t.Fatalf("stimulus: %d SetIdleTimeout(Stream) calls refused, want the promotion's", late.refused.Load())
+		}
+		cancel()
+		if r := <-res; !r.Stream || r.ToSession != 3 || r.ToLocal != 3 || r.LocalErr != nil || !errors.Is(r.SessionErr, context.Canceled) {
+			t.Fatalf("result %+v: want a stream that moved 3 datagrams each way, ended by ctx", r)
+		}
+		w.shutdown()
+	})
 }
 
 // TestForwardPacketSeedCounts_L72 (R1-10, M6-D9; L72): the passive's

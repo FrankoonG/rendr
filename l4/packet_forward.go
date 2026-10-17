@@ -39,9 +39,13 @@ type PacketResult struct {
 // descriptor, an unconnected socket) — are counted and ignored; a run of
 // them backs off up to 100 ms; they never end the flow. Other errors end it.
 // ForwardPacket applies idle's classes to pc with SetIdleTimeout (Short at
-// once, Stream once the flow is a stream). It sets no deadlines during the
-// transfer, owns pc and local from the call on, and starts one goroutine
-// that ends before it returns. Carrier changes are invisible to local.
+// once, Stream once the flow is a stream). When the session ends while a
+// local Write is still running, ForwardPacket sets local's deadline one
+// second later, so a local that never takes a datagram cannot hold the
+// flow (a Write that returns within the second still delivers its
+// datagram). It sets no other deadlines during the transfer, owns pc and
+// local from the call on, and starts two goroutines that end before it
+// returns. Carrier changes are invisible to local.
 func ForwardPacket(ctx context.Context, pc *rendr.PacketConn, local net.Conn, idle FlowIdle) PacketResult {
 	return forwardPacket(ctx, pc, local, idle, flowSeed{}, nil)
 }
@@ -54,7 +58,14 @@ type packetSession interface {
 	MaxPayload() int
 	SetIdleTimeout(d time.Duration) error
 	Close() error
+	Done() <-chan struct{}
 }
+
+// endWriteGrace bounds a local Write still running when the session ended
+// (L52): then local's deadline is set. The core releases every queued
+// datagram at the end, so only the datagram of that Write is at stake.
+// l4's tests read it.
+var endWriteGrace = time.Second
 
 // flowSeed is a datagram that moved before a forward started (R1-10): the
 // first datagram HandleUDP wrote to the target before Confirm (dir
@@ -105,7 +116,8 @@ var errBadDatagramCount = errors.New("l4: forwarded datagram conn returned an in
 // forwardPacket is ForwardPacket with the passive's seed (R1-10: the class
 // tracker counts the first datagram HandleUDP wrote) and an optional live
 // tally. The caller's goroutine moves session → local; one pump goroutine
-// moves local → session (M6 design §A7.1).
+// moves local → session (M6 design §A7.1); one watcher ends the forward
+// from outside both loops (ctx, the session's end).
 func forwardPacket(ctx context.Context, pc packetSession, local net.Conn, idle FlowIdle, seed flowSeed, tally *packetTally) PacketResult {
 	mp := pc.MaxPayload()
 	f := &pfwd{pc: pc, local: local, tally: tally, stop: make(chan struct{})}
@@ -115,15 +127,9 @@ func forwardPacket(ctx context.Context, pc packetSession, local net.Conn, idle F
 		f.promote()
 	}
 	buf := make([]byte, 2*mp+1) // session → local: mp; local → session: mp + 1, so an oversize datagram shows on every OS
-	pumpDone := make(chan struct{})
+	pumpDone, watchDone := make(chan struct{}), make(chan struct{})
 	go f.pump(buf[mp:], pumpDone)
-
-	cancelDone := make(chan struct{})
-	stopCancel := context.AfterFunc(ctx, func() {
-		defer close(cancelDone)
-		f.cancelled.Store(true)
-		f.halt()
-	})
+	go f.watch(ctx, watchDone)
 
 	var r PacketResult
 	var readErr error
@@ -147,7 +153,10 @@ func forwardPacket(ctx context.Context, pc packetSession, local net.Conn, idle F
 		}
 		if werr != nil {
 			if f.stopping.Load() {
-				break // the teardown's deadline, not local's failure
+				// The watcher's deadline, not local's failure: ctx closed
+				// the session or the session ended, so the next ReadFrom
+				// returns at once with that end.
+				continue
 			}
 			if errClass(werr) != classFatal {
 				// A write's size-class error is a datagram local refused
@@ -168,28 +177,24 @@ func forwardPacket(ctx context.Context, pc packetSession, local net.Conn, idle F
 
 	// Teardown (L52): local's deadline first, so a call blocked where Close
 	// does not interrupt returns too, then local's Close (exactly once),
-	// the session's Close (a no-op once it ended), the pump's join.
+	// the session's Close (a no-op once it ended), the joins of the pump
+	// and of the watcher (which may still be touching pc and local). The
+	// watcher stays live until the joins: a ctx done meanwhile finds
+	// stopping set and changes nothing (the end already happened).
 	f.stopping.Store(true)
-	close(f.stop)
 	local.SetDeadline(time.Now())
 	local.Close()
 	pc.Close()
+	close(f.stop)
 	<-pumpDone
-	if !stopCancel() {
-		<-cancelDone // ctx's teardown started: it touches pc and local, so it ends first
-	}
+	<-watchDone
 
 	r.ToSession, r.TooLarge, r.LocalNoise = f.toSession, r.TooLarge+f.tooLarge, r.LocalNoise+f.noise
 	r.Stream = f.class.isStream()
 	r.LocalErr = f.localError()
-	switch {
-	case f.cancelled.Load() && (readErr == nil || errors.Is(readErr, net.ErrClosed)):
-		// ctx's halt closed pc (or ended a local Write): ctx ended the flow.
-		r.SessionErr = ctx.Err()
-	case readErr == nil:
-		r.SessionErr = net.ErrClosed
-	default:
-		r.SessionErr = readErr
+	r.SessionErr = readErr
+	if f.cancelled.Load() && errors.Is(readErr, net.ErrClosed) {
+		r.SessionErr = ctx.Err() // ctx's halt closed pc: ctx ended the flow
 	}
 	return r
 }
@@ -203,9 +208,9 @@ type pfwd struct {
 	class         flowClass
 	tally         *packetTally
 
-	stop      chan struct{} // closed at the teardown: a back-off wait ends
-	stopping  atomic.Bool   // the teardown (or ctx's halt) began: local's errors are not failures
-	cancelled atomic.Bool   // ctx's halt ran
+	stop      chan struct{} // closed at the teardown: a back-off wait and the watcher end
+	stopping  atomic.Bool   // the teardown or the watcher's halt began: local's errors are not failures
+	cancelled atomic.Bool   // the watcher's halt ran for ctx
 
 	toSession, tooLarge, noise uint64 // the pump's counts
 
@@ -240,12 +245,52 @@ func (f *pfwd) localError() error {
 	return f.localErr
 }
 
-// halt is ctx's end of the forward: local's errors from now on are the
-// teardown's, the session is closed (the caller's ReadFrom returns) and
-// local's deadline set (a Write blocked in local returns).
-func (f *pfwd) halt() {
-	f.stopping.Store(true)
-	f.pc.Close()
+// watch ends the forward from outside its two loops until the teardown
+// (L52, M4-D38's reap for packets): ctx done halts it at once (the session
+// closed, SessionErr ctx.Err()); the session's end halts it endWriteGrace
+// later unless the caller's loop ended first — that loop reads the end at
+// once unless a local Write holds it, and the halt's deadline ends that
+// Write.
+func (f *pfwd) watch(ctx context.Context, done chan<- struct{}) {
+	defer close(done)
+	ended := f.pc.Done()
+	var grace *time.Timer
+	var graceC <-chan time.Time
+	defer func() {
+		if grace != nil {
+			grace.Stop()
+		}
+	}()
+	for {
+		select {
+		case <-f.stop:
+			return
+		case <-ctx.Done():
+			f.halt(ended != nil) // after the session's end, that end is the result
+			return
+		case <-ended:
+			ended = nil
+			grace = time.NewTimer(endWriteGrace)
+			graceC = grace.C
+		case <-graceC:
+			f.halt(false)
+			return
+		}
+	}
+}
+
+// halt is the watcher's end of the forward, unless the teardown began:
+// local's errors from now on are not failures, the session is closed for
+// ctx (the caller's ReadFrom returns), and local's deadline is set (a
+// Write blocked in local returns).
+func (f *pfwd) halt(cancel bool) {
+	if !f.stopping.CompareAndSwap(false, true) {
+		return
+	}
+	if cancel {
+		f.cancelled.Store(true)
+		f.pc.Close()
+	}
 	f.local.SetDeadline(time.Now())
 }
 
