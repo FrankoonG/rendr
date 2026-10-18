@@ -215,8 +215,8 @@ type DatagramPipeConfig struct {
 	Trunc        TruncMode     // a Read into a shorter buffer: TruncLinux (n = len(b), the rest discarded) or TruncWindows (ErrMsgSize, buffer filled)
 	Loss, Dup    float64       // per datagram and direction, from Seed
 	Delay        time.Duration // one-way, both directions
-	Seed         uint64
-	AddrA, AddrB net.Addr // what each end reports as LocalAddr (documentation addresses by default)
+	Seed         uint64        // seeds Loss and Dup (one PCG stream per direction)
+	AddrA, AddrB net.Addr      // what each end reports as LocalAddr (documentation addresses by default)
 }
 
 // TruncMode is how a DatagramConn's Read reports a datagram longer than

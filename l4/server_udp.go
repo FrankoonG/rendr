@@ -318,16 +318,16 @@ func (s *Server) udpStatus() UDPServerStatus {
 
 // UDPServerStatus counts a Server's UDP flows.
 type UDPServerStatus struct {
-	Dialing, Live                          int    // flows being set up (target dial, first datagram, Confirm); flows being forwarded
-	Confirmed, Rejected, Unconfirmed, Lost uint64 // as the TCP counters, for flows
-	ByCode                                 map[RejectCode]uint64
-	ToTarget, FromTarget                   uint64 // datagrams written to the targets (FirstSent included) and read from them
-	FirstSent                              uint64 // first datagrams written from the OPEN
-	TooLarge                               uint64 // target datagrams above their flow's MaxPayload, dropped
-	TargetNoise                            uint64 // egress errors of the noise classes, counted and ignored
-	SessionDrops                           uint64 // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
-	MaxPayload                             int    // the MaxPayload of the latest flow confirmed (0 before any)
-	Ended                                  FlowEnds
+	Dialing, Live                          int                   // flows being set up (target dial, first datagram, Confirm); flows being forwarded
+	Confirmed, Rejected, Unconfirmed, Lost uint64                // as the TCP counters, for flows
+	ByCode                                 map[RejectCode]uint64 // Rejected by code
+	ToTarget, FromTarget                   uint64                // datagrams written to the targets (FirstSent included) and read from them
+	FirstSent                              uint64                // first datagrams written from the OPEN
+	TooLarge                               uint64                // target datagrams above their flow's MaxPayload, dropped
+	TargetNoise                            uint64                // egress errors of the noise classes, counted and ignored
+	SessionDrops                           uint64                // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
+	MaxPayload                             int                   // the MaxPayload of the latest flow confirmed (0 before any)
+	Ended                                  FlowEnds              // ended flows by cause
 }
 
 // FlowEnds counts ended flows by cause.
@@ -335,13 +335,13 @@ type FlowEnds struct {
 	Idle        uint64 // this end's idle limit (ErrIdleTimeout)
 	PeerIdle    uint64 // the other end's (*rendr.AbortError{AbortIdle})
 	PeerClosed  uint64 // the other end closed the flow (io.EOF): its stop, eviction or local failure
-	NoPath      uint64
-	SessionLost uint64
-	GoingAway   uint64
+	NoPath      uint64 // no carrier for NoPathGrace (rendr.ErrNoPath)
+	SessionLost uint64 // the passive no longer knows the session, as after its restart (rendr.ErrSessionLost)
+	GoingAway   uint64 // the other side's Runtime closed (*rendr.AbortError{AbortGoingAway})
 	Stopped     uint64 // this side's ctx or Serve ended
 	Evicted     uint64 // ingress only: ended to make room in a full table
 	Local       uint64 // a fatal local socket error
-	Other       uint64
+	Other       uint64 // any other end
 }
 
 // endCause is a flow's end cause: the field of FlowEnds it counts in.

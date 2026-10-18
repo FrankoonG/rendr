@@ -16,10 +16,15 @@ import (
 // implements it. ServeUDP refuses a socket that also has a RemoteAddr
 // method returning non-nil (a connected socket).
 type UDPSocket interface {
+	// ReadFromUDPAddrPort reads one datagram and the address it came from.
 	ReadFromUDPAddrPort(b []byte) (n int, addr netip.AddrPort, err error)
+	// WriteToUDPAddrPort sends one datagram to addr.
 	WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error)
+	// LocalAddr is the address the socket is bound to.
 	LocalAddr() net.Addr
+	// SetReadDeadline ends a blocked read at ServeUDP's stop.
 	SetReadDeadline(t time.Time) error
+	// Close closes the socket; ServeUDP calls it once, when it returns.
 	Close() error
 }
 
@@ -41,7 +46,7 @@ var (
 // defaults. A PortForward must not be copied after first use. It does no
 // authentication: whoever reaches an ingress socket reaches its target.
 type PortForward struct {
-	Peer    *rendr.Peer
+	Peer    *rendr.Peer       // the Peer every connection and flow is dialled through (required)
 	Options rendr.DialOptions // every session's Mode, Metadata (Request.App) and NoPathGrace; EarlyReturn applies to TCP only
 	// AllowNonLoopback permits sockets bound to non-loopback or unspecified
 	// addresses (a LAN-facing ingress). Without it Serve refuses them.
@@ -290,36 +295,36 @@ type FlowInfo struct {
 
 // PortForwardStatus counts what a PortForward does, TCP and UDP apart.
 type PortForwardStatus struct {
-	TCP TCPForwardStatus
-	UDP UDPForwardStatus
+	TCP TCPForwardStatus // ServeTCP's connections
+	UDP UDPForwardStatus // ServeUDP's flows
 }
 
 // TCPForwardStatus counts a PortForward's TCP connections.
 type TCPForwardStatus struct {
-	Live                      int    // connections being dialled or forwarded (MaxConns units)
-	Accepted, Refused, Failed uint64 // Refused: beyond MaxConns; Failed: Dial errors (typed ones in ByCode)
-	ByCode                    map[RejectCode]uint64
-	AcceptNoise               uint64 // temporary Accept errors, backed off
-	LastErr                   error  // the latest Dial error
+	Live                      int                   // connections being dialled or forwarded (MaxConns units)
+	Accepted, Refused, Failed uint64                // Refused: beyond MaxConns; Failed: Dial errors (typed ones in ByCode)
+	ByCode                    map[RejectCode]uint64 // Failed by code (the l4 Server's refusals)
+	AcceptNoise               uint64                // temporary Accept errors, backed off
+	LastErr                   error                 // the latest Dial error
 }
 
 // UDPForwardStatus counts a PortForward's UDP flows.
 type UDPForwardStatus struct {
-	Flows, Opening, Held       int    // open flows; flows being opened; held clients
-	Opened, Failed             uint64 // sessions opened; opens that failed (typed refusals in ByCode)
-	Evicted, Replaced          uint64 // flows ended to make room; flows reopened at an expiry race
-	ByCode                     map[RejectCode]uint64
-	Ended                      FlowEnds
-	ToSession, ToClient        uint64 // datagrams
-	FirstInOpen                uint64 // first datagrams that rode the OPEN
-	TooLarge                   uint64 // client datagrams above their flow's MaxPayload, dropped
-	TooLargeMax                int    // the largest of them (the ingress reads whole datagrams)
-	MaxPayload                 int    // the MaxPayload of the latest flow opened (0 before any)
-	DropFull, DropOpening      uint64 // a new client while the table had no victim; the opening stage full
-	DropOpenQueue, DropOpenAge uint64 // an opening flow's queue overflowed; queued longer than 1 s
-	DropHeld                   uint64 // datagrams of held clients
-	ReadNoise                  uint64 // socket read errors of the noise classes, counted and backed off
-	WriteNoise                 uint64 // replies the socket's write refused (any error: the reply is lost), counted and ignored
-	SessionDrops               uint64 // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
-	LastErr                    error  // the latest DialUDP error
+	Flows, Opening, Held       int                   // open flows; flows being opened; held clients
+	Opened, Failed             uint64                // sessions opened; opens that failed (typed refusals in ByCode)
+	Evicted, Replaced          uint64                // flows ended to make room; flows reopened at an expiry race
+	ByCode                     map[RejectCode]uint64 // Failed by code (the l4 Server's refusals)
+	Ended                      FlowEnds              // ended flows by cause
+	ToSession, ToClient        uint64                // datagrams
+	FirstInOpen                uint64                // first datagrams that rode the OPEN
+	TooLarge                   uint64                // client datagrams above their flow's MaxPayload, dropped
+	TooLargeMax                int                   // the largest of them (the ingress reads whole datagrams)
+	MaxPayload                 int                   // the MaxPayload of the latest flow opened (0 before any)
+	DropFull, DropOpening      uint64                // a new client while the table had no victim; the opening stage full
+	DropOpenQueue, DropOpenAge uint64                // an opening flow's queue overflowed; queued longer than 1 s
+	DropHeld                   uint64                // datagrams of held clients
+	ReadNoise                  uint64                // socket read errors of the noise classes, counted and backed off
+	WriteNoise                 uint64                // replies the socket's write refused (any error: the reply is lost), counted and ignored
+	SessionDrops               uint64                // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
+	LastErr                    error                 // the latest DialUDP error
 }

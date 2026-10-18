@@ -44,7 +44,7 @@ its guarantees cover the whole path from end to end.
 | Race | Every byte or datagram goes on every carrier and the receiver keeps the first copy, for the lowest latency. |
 | Mux | Many sessions share the same live carriers. |
 | Fate group | Carriers that fail together, such as two paths through one relay; rendr spreads its choices across groups. |
-| L4 forwarding | Package `l4` carries TCP connections over stream sessions. |
+| L4 forwarding | Package `l4` carries TCP connections over stream sessions and UDP flows over packet sessions, and forwards local TCP and UDP ports. |
 
 ## What rendr is not
 
