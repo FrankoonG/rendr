@@ -40,9 +40,10 @@ const (
 // AcceptPacket returned is new — and the Server's UDP.Confirmed equals the
 // dialer's opens (PortForward's Opened) and the target dials, exactly;
 // every flow's query rode its OPEN and was written to the target once
-// (FirstInOpen = Opened, FirstSent = Confirmed); every flow opened (no
-// Failed, no refusal) and every query was answered at its first try;
-// nothing is left at the end (close's checks).
+// (FirstInOpen = Opened, FirstSent = Confirmed, and every egress received
+// exactly one query: the target's own count, end to end); every flow
+// opened (no Failed, no refusal) and every query was answered at its
+// first try; nothing is left at the end (close's checks).
 func TestL4UChurnNoResurrection_L47(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		// Both Runtimes' MaxSessions (lane.churnSessions, 1,000): the passive
@@ -149,6 +150,7 @@ func TestL4UChurnNoResurrection_L47(t *testing.T) {
 		if st.bad.Load() != 0 || st.unanswered.Load() != 0 || st.retried.Load() != 0 {
 			t.Fatalf("queries: %d bad answers, %d unanswered, %d retried; want every one answered at its first try", st.bad.Load(), st.unanswered.Load(), st.retried.Load())
 		}
+		ev.once(t, flows)
 		if maxTomb.Load() < int64(2*maxSess) || capped.Load() < 10 {
 			t.Fatalf("stimulus: the passive's tombstones reached %d (at the cap %d s), want the cap %d for at least 10 s: not the eviction regime",
 				maxTomb.Load(), capped.Load(), 2*maxSess)

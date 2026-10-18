@@ -89,7 +89,8 @@ func isAnswer(b []byte, seq uint64) bool {
 }
 
 // dnsTarget answers every intact query at once with its answer, and
-// records each flow's last datagram and the instant its egress closed.
+// records each flow's last datagram, the queries it received and the
+// instant its egress closed.
 func dnsTarget(ev *evictionLog) targetApp {
 	return func(e *egress) {
 		r := ev.open(e)
@@ -109,6 +110,7 @@ func dnsTarget(ev *evictionLog) targetApp {
 			if !bytes.Equal(buf[:n], rendrtest.PacketPayload(nil, dnsQuerySeed, seq, dnsQuery, time.Unix(0, int64(seq)))) {
 				continue
 			}
+			ev.query(r)
 			e.conn.Write(rendrtest.PacketPayload(nil, dnsAnsSeed, seq, dnsAnswer, time.Unix(0, int64(seq))))
 			ev.touch(r, time.Now())
 		}
@@ -116,7 +118,8 @@ func dnsTarget(ev *evictionLog) targetApp {
 }
 
 // evictionLog is the in-process EvictionJudge's record (R1-38): per flow
-// at the target, its last datagram and its egress close.
+// at the target, its last datagram, the queries it received and its egress
+// close.
 type evictionLog struct {
 	mu sync.Mutex
 	rs []*egressRec
@@ -125,6 +128,7 @@ type evictionLog struct {
 type egressRec struct {
 	src         netip.AddrPort
 	last, close time.Time
+	queries     int // intact queries received
 }
 
 func (l *evictionLog) open(e *egress) *egressRec {
@@ -139,6 +143,29 @@ func (l *evictionLog) touch(r *egressRec, at time.Time) {
 	l.mu.Lock()
 	r.last = at
 	l.mu.Unlock()
+}
+
+func (l *evictionLog) query(r *egressRec) {
+	l.mu.Lock()
+	r.queries++
+	l.mu.Unlock()
+}
+
+// once fails unless the target saw want egresses and each received exactly
+// one query: every query was written to its target once, whatever rode
+// the OPEN and whatever crossed a second carrier (L47).
+func (l *evictionLog) once(t testing.TB, want int) {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.rs) != want {
+		t.Fatalf("the target saw %d egresses, want %d", len(l.rs), want)
+	}
+	for _, r := range l.rs {
+		if r.queries != 1 {
+			t.Fatalf("the egress %v received %d queries, want exactly one", r.src, r.queries)
+		}
+	}
 }
 
 func (l *evictionLog) closed(r *egressRec, at time.Time) {

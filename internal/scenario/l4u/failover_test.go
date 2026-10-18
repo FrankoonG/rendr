@@ -123,10 +123,15 @@ func TestL4UManyFlowsFailover_L27(t *testing.T) {
 			}
 			return true
 		})
-		// Steady before the load: every flow open at both ends, then one
-		// second (the views' go frames are in; a datagram the passive writes
-		// in the instant of its Confirm is the WP9 report's open item, not
-		// this row's subject).
+		// Steady before the load (G4-l4u's "once steady"): every flow open
+		// at both ends, then one second. A load that starts at the opens —
+		// learn-and-stream targets writing as their flows confirm — loses
+		// datagrams at the passive while 64 views wait for the trunk's REL
+		// window (DropAge; the WP9 report's defect B): this row failed that
+		// way in about two runs of three. That rule is guarded by
+		// TestL4UFirstReplyAtConfirm_L40 (mux_test.go, merged with the core
+		// fix), not here; once it passes, a load-at-open variant of this
+		// row may follow.
 		waitFor(t, 15*time.Second, "every flow open at both ends", func() bool {
 			if w.srv.Status().UDP.Live != flows {
 				return false

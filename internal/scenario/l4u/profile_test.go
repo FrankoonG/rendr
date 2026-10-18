@@ -39,34 +39,48 @@ const (
 
 // Profile parameters (§B3.1 at 1/20: 5 Mbit/s of video).
 const (
-	mlHdr         = 28
-	mlFPS         = 60
-	mlInterval    = time.Second / mlFPS
-	mlVideoBps    = 5e6
-	mlMeanFrame   = mlVideoBps / 8 / mlFPS // 10,416.7 bytes
-	mlShard       = 1408                   // a video datagram: 16-byte shard header + 1,392 payload bytes
-	mlShardData   = 1392
-	mlBlockData   = 212 // data shards per FEC block at most
-	mlParity      = 0.2
-	mlIDREvery    = 600 // frames
-	mlIDRScale    = 4
-	mlIDRGap      = 500 * time.Millisecond // no IDR starts within this of another IDR's start
-	mlSigma       = 0.25
-	mlPing        = 500 * time.Millisecond
-	mlAudioBlock  = 20 * time.Millisecond // 4 data + 2 parity shards of 220 bytes: 300 pps
-	mlAudioSize   = 220
-	mlMsgRate     = 250 // client → host reliable messages per second, 48 bytes
-	mlMsgSize     = 48
-	mlAckSize     = 40
-	mlFeedback    = 100 * time.Millisecond // host → client feedback, 256 bytes
-	mlFeedSize    = 256
-	mlKeepalive   = 500 * time.Millisecond // 32 bytes each way
-	mlKeepSize    = 32
-	mlDisconnect  = 10 * time.Second // either side declares "disconnected" after this long without a datagram
-	mlRTOInit     = 500 * time.Millisecond
-	mlRTOMin      = 100 * time.Millisecond
-	mlJudgeTick   = 5 * time.Millisecond
-	mlPreDeadline = 50 * time.Millisecond // the frame deadline before Q's latencies set it
+	mlHdr        = 28
+	mlFPS        = 60
+	mlInterval   = time.Second / mlFPS
+	mlVideoBps   = 5e6
+	mlMeanFrame  = mlVideoBps / 8 / mlFPS // 10,416.7 bytes
+	mlShard      = 1408                   // a video datagram: 16-byte shard header + 1,392 payload bytes
+	mlShardData  = 1392
+	mlBlockData  = 212 // data shards per FEC block at most
+	mlParity     = 0.2
+	mlIDREvery   = 600 // frames
+	mlIDRScale   = 4
+	mlIDRGap     = 500 * time.Millisecond // no IDR starts within this of another IDR's start
+	mlSigma      = 0.25
+	mlPing       = 500 * time.Millisecond
+	mlAudioBlock = 20 * time.Millisecond // 4 data + 2 parity shards of 220 bytes: 300 pps
+	mlAudioSize  = 220
+	mlMsgRate    = 250 // client → host reliable messages per second, 48 bytes
+	mlMsgSize    = 48
+	mlAckSize    = 40
+	mlFeedback   = 100 * time.Millisecond // host → client feedback, 256 bytes
+	mlFeedSize   = 256
+	mlKeepalive  = 500 * time.Millisecond // 32 bytes each way
+	mlKeepSize   = 32
+	mlDisconnect = 10 * time.Second // either side declares "disconnected" after this long without a datagram
+	mlRTOInit    = 500 * time.Millisecond
+	mlRTOMin     = 100 * time.Millisecond
+	mlJudgeTick  = 5 * time.Millisecond
+)
+
+// The direct baseline R (G10's F78 phase), which an in-process world has
+// exactly: every link delays each datagram by oneWay with no jitter, no
+// rate limit and no loss, and the host writes a frame's shards in one
+// burst, so on a direct path every datagram's one-way delay and every
+// frame's completion latency (first shard's send → the last block's
+// completing shard) is oneWay, and a control message's round trip (the
+// host acks at once) is 2·oneWay. The frame deadline is G10 criterion 3's:
+// first shard's send + R's p99.9 frame-completion latency + 20 ms.
+const (
+	rOneWay    = oneWay
+	rFrame     = oneWay
+	rRTT       = 2 * oneWay
+	mlDeadline = rFrame + 20*time.Millisecond
 )
 
 // Control datagram kinds (mlHead.block on the control flows).
@@ -188,7 +202,7 @@ type mlRun struct {
 	vDown, aDown, cDown *mlFlow // host → client
 	vUp, aUp, cUp       *mlFlow // client → host
 
-	deadline atomic.Int64 // the frame deadline offset in force (ns)
+	deadline atomic.Int64 // the frame deadline offset in force (ns): mlDeadline
 
 	mu        sync.Mutex
 	frames    []mlFrame
@@ -207,7 +221,9 @@ type mlRun struct {
 	hostGap   time.Duration
 	disc      int // "disconnected" verdicts
 	judged    map[uint32]bool
-	requested int // IDR requests the client sent
+	requested int      // IDR requests the client sent
+	reqFor    []uint32 // the frame each IDR request asked for, in send order
+	reqAt     []time.Time
 
 	cMu  sync.Mutex // the control client's writers (messages, retransmissions, IDR requests, keepalives)
 	cBuf [512]byte
@@ -218,7 +234,7 @@ func newMLRun(quit <-chan struct{}) *mlRun {
 		vDown: newMLFlow("video host → client", tagVideo), aDown: newMLFlow("audio host → client", tagAudio),
 		cDown: newMLFlow("control host → client", tagCtlDown), vUp: newMLFlow("video client → host", tagVideoPing),
 		aUp: newMLFlow("audio client → host", tagAudioPing), cUp: newMLFlow("control client → host", tagCtlUp)}
-	m.deadline.Store(int64(mlPreDeadline))
+	m.deadline.Store(int64(mlDeadline))
 	return m
 }
 
@@ -442,8 +458,8 @@ func (m *mlRun) clientVideo(c *rendrtest.DatagramConn, ctl *rendrtest.DatagramCo
 	m.go_(func() {
 		t0 := time.Now()
 		for k := 1; m.tick(t0.Add(time.Duration(k) * mlJudgeTick)); k++ {
-			for range m.lateIncomplete(time.Now()) {
-				m.sendMsg(ctl, true)
+			for _, id := range m.lateIncomplete(time.Now()) {
+				m.sendMsg(ctl, true, id)
 			}
 		}
 	})
@@ -529,7 +545,7 @@ func (m *mlRun) clientControl(c *rendrtest.DatagramConn) {
 		t0 := time.Now()
 		step := time.Second / mlMsgRate
 		for k := 0; m.tick(t0.Add(time.Duration(k) * step)); k++ {
-			m.sendMsg(c, false)
+			m.sendMsg(c, false, 0)
 			if k%int(mlKeepalive/step) == 0 {
 				m.cMu.Lock()
 				m.cUp.send(c, m.cBuf[:], mlKeepSize, mlHead{block: ctlKeep})
@@ -583,8 +599,9 @@ func (m *mlRun) clientControl(c *rendrtest.DatagramConn) {
 	})
 }
 
-// sendMsg sends a new reliable message (an IDR request when idr).
-func (m *mlRun) sendMsg(c *rendrtest.DatagramConn, idr bool) {
+// sendMsg sends a new reliable message (an IDR request for frame when
+// idr).
+func (m *mlRun) sendMsg(c *rendrtest.DatagramConn, idr bool, frame uint32) {
 	now := time.Now()
 	m.mu.Lock()
 	rto := mlRTOInit
@@ -595,6 +612,8 @@ func (m *mlRun) sendMsg(c *rendrtest.DatagramConn, idr bool) {
 	id := uint32(len(m.msgs) - 1)
 	if idr {
 		m.requested++
+		m.reqFor = append(m.reqFor, frame)
+		m.reqAt = append(m.reqAt, now)
 	}
 	m.mu.Unlock()
 	m.transmit(c, id)

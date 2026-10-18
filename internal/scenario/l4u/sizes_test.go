@@ -37,8 +37,11 @@ const fullPayload = 65507
 // of a kill (G3's window, plan:750) and every other one arrived; the kills
 // are invisible to both applications: one flow, one session (the same
 // session ID at the start and the end, Opened 1, Confirmed 1, one target
-// dial: one egress address), the client never sees an error, and the
-// session never was without a carrier for longer than the window.
+// dial: one egress address), the client never sees an error, and the flow
+// is never interrupted for long: in each direction the largest arrival gap
+// in [kill − 1 s, kill + 1 s], less the 10-ms send interval, stays below
+// 200 ms (G10's CLOSE bound; the session was without a carrier for less
+// than that).
 func TestL4UStreamCarrierFallback_L37(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const (
@@ -71,6 +74,7 @@ func TestL4UStreamCarrierFallback_L37(t *testing.T) {
 		})
 		id := fi.Session.ID
 		var kills []window
+		var killAt []time.Time
 		for k := 1; k <= int((span-time.Second)/(6*time.Second)); k++ {
 			sleepUntil(start.Add(time.Duration(k) * 6 * time.Second))
 			fi, _ = flowOf(pf, src)
@@ -83,6 +87,7 @@ func TestL4UStreamCarrierFallback_L37(t *testing.T) {
 				t.Fatalf("stimulus: kill %d of %s closed no carrier", k, a.Name)
 			}
 			kills = append(kills, window{at.Add(-slack), at.Add(slack)})
+			killAt = append(killAt, at)
 			waitFor(t, 2*time.Second, "the killed carrier dead and another active", func() bool {
 				fi, _ = flowOf(pf, src)
 				dead, _ := carrierOf(fi.Session, a.ID)
@@ -111,6 +116,15 @@ func TestL4UStreamCarrierFallback_L37(t *testing.T) {
 			t.Logf("%s: %d sent, %d arrived, %d lost inside the kill windows", l.name, l.sentCount(), l.arrived(), lost)
 			if l.sentCount() < rate*int(span/time.Second)*99/100 && l == up {
 				t.Fatalf("load: %s sent %d datagrams, want about %d", l.name, l.sentCount(), rate*int(span/time.Second))
+			}
+		}
+		for _, at := range killAt {
+			for _, l := range []*ledger{up, down} {
+				g := maxGap(l, at.Add(-time.Second), at.Add(time.Second))
+				t.Logf("kill at +%v: %s's largest arrival gap %v", at.Sub(start), l.name, g)
+				if g-time.Second/rate >= slack {
+					t.Fatalf("kill at +%v: %s's datagrams stopped arriving for %v, want an interruption below %v", at.Sub(start), l.name, g, slack)
+				}
 			}
 		}
 		oneFlow(t, w, pf, port, 1)

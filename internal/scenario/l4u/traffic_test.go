@@ -193,6 +193,37 @@ func (l *ledger) firstArrivalFrom(t time.Time) time.Time {
 	return first
 }
 
+// maxGap returns the longest interval within [a, b] in which none of the
+// ledger's datagrams arrived (an interval may start at a or end at b): the
+// arrival gap G10's interruption is measured by.
+func maxGap(l *ledger, a, b time.Time) time.Duration {
+	g, _ := maxGapAt(l, a, b)
+	return g
+}
+
+// maxGapAt is maxGap and the instant the longest gap began.
+func maxGapAt(l *ledger, a, b time.Time) (time.Duration, time.Time) {
+	l.mu.Lock()
+	var ts []time.Time
+	for _, at := range l.arr {
+		if !at.IsZero() && !at.Before(a) && !at.After(b) {
+			ts = append(ts, at)
+		}
+	}
+	l.mu.Unlock()
+	slices.SortFunc(ts, time.Time.Compare)
+	var g time.Duration
+	var from time.Time
+	prev := a
+	for _, at := range append(ts, b) {
+		if d := at.Sub(prev); d > g {
+			g, from = d, prev
+		}
+		prev = at
+	}
+	return g, from
+}
+
 // integrity requires that every datagram that arrived was intact and
 // arrived once (PacketIntegrity: no corruption, no merged, split or
 // truncated datagram, no duplicate).
