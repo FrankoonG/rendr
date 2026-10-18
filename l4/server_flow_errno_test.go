@@ -256,6 +256,12 @@ func TestServerUDPBroadcastNotAllowed(t *testing.T) {
 			t.Fatalf("dialUDP [::1]: %v", err)
 		}
 	})
+	if raceEnabled {
+		// racebudget (M6 I1, R1-37): about 2 s of real time on Linux; the
+		// kernel's EACCES runs in the non-race unit and sweep lanes, and
+		// the race lane keeps the default dialer's SO_BROADCAST rows above.
+		return
+	}
 	t.Run("linux broadcast route", func(t *testing.T) {
 		if runtime.GOOS != "linux" {
 			t.Skip("platform row: only Linux refuses a broadcast connect without SO_BROADCAST; the Windows path is the first-write row above")

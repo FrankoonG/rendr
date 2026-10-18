@@ -645,20 +645,25 @@ func TestPortForwardExampleE2E(t *testing.T) {
 
 	// udp-off: a server without -udp never serves a flow (the dialer's open
 	// ends with ErrCapacity at the AcceptTimeout) and still forwards TCP.
-	t.Run("udp-off", func(t *testing.T) {
-		t.Parallel()
-		ut, tt := newUDPTarget(t), newTCPTarget(t)
-		srv, addr := startServer(t, "-allow-any")
-		cli, local := startClient(t, addr, []string{"udp:" + ut.addr(), "tcp:" + tt.addr()})
-		dialClient(t, local["udp:"+ut.addr()]).send(t, 64)
-		tcpEcho(t, local["tcp:"+tt.addr()], 64<<10)
-		cli.out.wait(t, regexp.MustCompile(`client: status udp:[^\n]* Failed=1[^\n]* LastErr="[^"\n]*capacity`), 25*time.Second)
-		if n := len(ut.received()); n != 0 {
-			t.Fatalf("the UDP target was reached from %d sources", n)
-		}
-		cli.stop(t, "client")
-		srv.stop(t, "server")
-	})
+	// racebudget (M6 I1, R1-37): it waits out the 10-s AcceptTimeout, so
+	// it runs outside -race only (the non-race unit lane); under -race the
+	// path is l4's TestPortForwardOldPassive_L49 (synctest, both lanes).
+	if !raceEnabled {
+		t.Run("udp-off", func(t *testing.T) {
+			t.Parallel()
+			ut, tt := newUDPTarget(t), newTCPTarget(t)
+			srv, addr := startServer(t, "-allow-any")
+			cli, local := startClient(t, addr, []string{"udp:" + ut.addr(), "tcp:" + tt.addr()})
+			dialClient(t, local["udp:"+ut.addr()]).send(t, 64)
+			tcpEcho(t, local["tcp:"+tt.addr()], 64<<10)
+			cli.out.wait(t, regexp.MustCompile(`client: status udp:[^\n]* Failed=1[^\n]* LastErr="[^"\n]*capacity`), 25*time.Second)
+			if n := len(ut.received()); n != 0 {
+				t.Fatalf("the UDP target was reached from %d sources", n)
+			}
+			cli.stop(t, "client")
+			srv.stop(t, "server")
+		})
+	}
 
 	// mode: -mode is every session's Mode, selector by default (seen by a
 	// test passive on the example's carriers).

@@ -182,6 +182,19 @@ func pfAbortIdle(err error) bool {
 //   - both rules: a negative Stream turns expiry off once the flow is a
 //     stream, and a negative Short for both classes (no idle end in 24
 //     virtual hours; the flow still carries datagrams).
+//
+// raceSkipsIdleRow are TestForwardPacketIdleClasses_L30_L72's rows that
+// the race lane leaves to the non-race unit and sweep lanes (racebudget,
+// M6 I1: the race-unit pass exceeded 280 s, R1-37; each runs 24 virtual
+// hours of PINGs). Under -race each negative class still runs once under
+// the rule in force (promoteActive): "active rule: negative Stream" and
+// "active rule: negative Short"; every bound is unchanged.
+var raceSkipsIdleRow = map[string]bool{
+	"reply rule: negative Stream":                 true,
+	"reply rule: negative Short":                  true,
+	"active rule: a negative Short with a stream": true,
+}
+
 func TestForwardPacketIdleClasses_L30_L72(t *testing.T) {
 	const s = time.Second
 	type ex struct {
@@ -216,6 +229,9 @@ func TestForwardPacketIdleClasses_L30_L72(t *testing.T) {
 		{"active rule: a negative Short with a stream", promoteActive, FlowIdle{Short: -1}, exch(6, 500*time.Millisecond), true, 0},
 	}
 	for _, r := range rows {
+		if raceEnabled && raceSkipsIdleRow[r.name] {
+			continue // racebudget (M6 I1, R1-37): run in full outside -race
+		}
 		t.Run(r.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
 				pfRule(t, r.rule)
