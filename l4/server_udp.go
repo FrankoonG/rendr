@@ -365,9 +365,10 @@ const (
 // SessionErr, or ReadFrom's error at the ingress) to its cause (M6 design
 // §A5.3): ErrIdleTimeout is this end's idle limit; *AbortError AbortIdle
 // from the peer the other end's, AbortGoingAway a Runtime closing; io.EOF
-// the peer's close; ErrNoPath, ErrSessionLost; a ctx error this side's
-// stop; anything else (net.ErrClosed after a local failure, which the
-// caller counts as endLocal) is endOther.
+// the peer's close; ErrNoPath, ErrSessionLost; a ctx error, or
+// net.ErrClosed after this side's Runtime closed, this side's stop (a
+// net.ErrClosed after a local failure the caller counts as endLocal);
+// anything else is endOther.
 func endCauseOf(err error) endCause {
 	switch {
 	case errors.Is(err, rendr.ErrIdleTimeout):
@@ -379,6 +380,10 @@ func endCauseOf(err error) endCause {
 	case errors.Is(err, rendr.ErrSessionLost):
 		return endSessionLost
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return endStopped
+	case errors.Is(err, net.ErrClosed):
+		// This side's Runtime closed (the session's end after Runtime.Close),
+		// which ends Serve too: Stopped, as the ingress counts it.
 		return endStopped
 	}
 	if ae, ok := errors.AsType[*rendr.AbortError](err); ok {
