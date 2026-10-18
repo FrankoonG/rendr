@@ -47,6 +47,29 @@
 // the handshake lowers a larger dialer budget to the listener's; either way
 // nothing is truncated in steady state. A longer datagram that still
 // arrives is dropped and counted, never delivered in part (L58).
+//
+// A packet session over this carrier carries application datagrams of up
+// to MaxDatagram − 34 bytes (the flow header and rendr's datagram
+// framing): 1,198 with the default, below what many UDP applications send
+// — game-streaming video at its LAN packet size (about 1,400 bytes),
+// WireGuard at its default MTU (1,452), the largest DNS answers with EDNS
+// (1,232), every QUIC Initial (at least 1,200). A larger datagram is
+// dropped and counted, never fragmented (package l4 counts it where it was
+// read). To carry such applications, set MaxDatagram on both ends — every
+// dialer's Carrier and the passive's Listen socket — to the smallest MTU
+// on the path minus 28 (IPv4) or 48 (IPv6): 1,472 on a 1500-byte IPv4
+// path carries datagrams of up to 1,438 bytes, 1,452 on IPv6 up to 1,418;
+// size the application below that where it can be sized (a WireGuard MTU
+// of at most MaxDatagram − 66). Dial lowers the value to the first hop's
+// interface MTU by itself, but cannot see a smaller MTU further along the
+// path, and too high is worse than too low: a datagram that fits the first
+// hop but not a later one is lost (don't-fragment), and the carrier dies
+// when its fourth MTU probe finds the three before it unanswered (about
+// 40 s after it attached, at the default PacketPing) and is redialled
+// with the same budget, again about every 40 s, because a packet
+// session's MaxPayload is fixed at its OPEN and a failed probe does not
+// lower it. Set the value from the real path MTU, and size ReadBuffer
+// for the larger buffer class (see Options).
 package udp
 
 import (
