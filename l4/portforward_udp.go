@@ -544,11 +544,14 @@ func (s *udpServe) end(e *ingressFlow, pc ingressSession, err error) {
 // datagrams — and the first that rode the failed OPEN — are DropHeld, the
 // failure is counted (Failed, ByCode, LastErr). An open the stop cancelled
 // counts no failure, its datagrams DropOpenQueue, and leaves the table at
-// once; a net.ErrClosed open
-// (the Peer or the Runtime closed) halts the serve.
+// once; an open that failed with the bare net.ErrClosed (the Peer or the
+// Runtime closed: DialUDP returns DialPacket's sentinel unwrapped) halts
+// the serve. A wrapped one is a carrier's (ErrNoPath's last carrier error:
+// an embedder tunnel that is down), so it is this flow's failure, as in
+// ServeTCP.
 func (s *udpServe) openFailed(e *ingressFlow, err error, rode bool) {
 	u, t := &s.f.udp, &s.tab
-	if errors.Is(err, net.ErrClosed) {
+	if err == net.ErrClosed {
 		s.halt(err)
 	}
 	stopping := s.ctx.Err() != nil
