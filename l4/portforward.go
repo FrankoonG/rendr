@@ -296,7 +296,7 @@ type PortForwardStatus struct {
 
 // TCPForwardStatus counts a PortForward's TCP connections.
 type TCPForwardStatus struct {
-	Live                      int    // connections being forwarded
+	Live                      int    // connections being dialled or forwarded (MaxConns units)
 	Accepted, Refused, Failed uint64 // Refused: beyond MaxConns; Failed: Dial errors (typed ones in ByCode)
 	ByCode                    map[RejectCode]uint64
 	AcceptNoise               uint64 // temporary Accept errors, backed off
