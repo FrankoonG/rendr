@@ -24,7 +24,7 @@ type UDPSocket interface {
 	LocalAddr() net.Addr
 	// SetReadDeadline ends a blocked read at ServeUDP's stop.
 	SetReadDeadline(t time.Time) error
-	// Close closes the socket; ServeUDP calls it once, when it returns.
+	// Close closes the socket; ServeUDP calls it exactly once, at its stop.
 	Close() error
 }
 

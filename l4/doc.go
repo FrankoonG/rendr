@@ -105,13 +105,16 @@
 // "symmetric" NAT): client-server protocols work; peer-to-peer hole
 // punching does not, nor does a target that answers from another address
 // or port. There is no hairpinning and no ICMP relay in either direction,
-// DSCP and ECN marks are not carried, and multicast and broadcast are never
-// forwarded: the metadata rules refuse such targets, the default UDP
-// dialer refuses a name that resolves to one, and the OS refuses a
-// subnet-directed broadcast (Linux at the connect; Windows at the first
-// send, so a flow whose OPEN carries no first datagram opens and counts its
-// sends as TargetNoise). A client whose own NAT gives it a new source port
-// gets a new flow, and the old one idles out.
+// and DSCP and ECN marks are not carried. Multicast and broadcast are not
+// forwarded: the metadata rules refuse such targets, and the default UDP
+// dialer refuses a name that resolves to one and turns SO_BROADCAST off,
+// so the OS refuses a subnet-directed broadcast (Linux at the connect;
+// Windows at the first send, so a flow whose OPEN carries no first datagram
+// opens and counts its sends as TargetNoise); a Dial hook must do the same
+// itself (see Security). Discovery that relies on them, such as a
+// game-streaming client's automatic search for hosts, does not cross a
+// forward: add hosts by address. A client whose own NAT gives it a new
+// source port gets a new flow, and the old one idles out.
 //
 // DialUDP opens one flow's session; ForwardPacket forwards it to a
 // connected datagram conn (both ends use it: Server.HandleUDP on the
@@ -173,32 +176,40 @@
 // it has arrived, about one round trip after its OPEN_ACK; replies wait in
 // the session's queue meanwhile, which drops datagrams older than the
 // passive's Packet.MaxAge (100 ms by default): on paths whose round trip
-// comes near it, raise it (up to 2 s), or a one-shot flow's first answer may
-// be dropped.
+// comes near it, raise it (up to 2 s), or the first answer of a new flow on
+// a shared carrier is dropped (DropAge) and the client must send again.
 //
-// Sizes. A flow's largest datagram is its session's MaxPayload, fixed at
-// the OPEN: the smallest datagram budget among the Peer's datagram
-// factories, 25 bytes below their MTU. With carrier/udp's default
-// MaxDatagram (1,232 bytes) that is 1,198; over QUIC DATAGRAM it is 1,127
-// and cannot be raised; a Peer with stream carriers only carries datagrams
-// of up to 65,507 bytes, with TCP's head-of-line latency. A larger datagram
-// is never fragmented or split: it is dropped and counted where it was read
-// — at the ingress (UDPForwardStatus.TooLarge, and TooLargeMax: the ingress
-// reads whole datagrams), at the passive (UDPServerStatus.TooLarge), under
-// ForwardPacket (PacketResult.TooLarge). The application sees loss, as on a
-// path whose MTU is too small, and no ICMP. Common datagrams exceed the
-// default: game-streaming video at its LAN packet size (about 1,400 bytes),
-// WireGuard at its default MTU (1,452), the largest DNS answers with EDNS
-// (1,232) and every QUIC Initial (at least 1,200: HTTP/3 through a default
-// forward cannot handshake). To carry them, set udp.Options.MaxDatagram to
-// the smallest MTU on the path minus 28 (IPv4) or 48 (IPv6) on the
-// dialer's carriers and on the passive's listening socket: 1,472 on a
-// 1500-byte path carries 1,438 bytes (a WireGuard MTU of up to 1,406). Too
-// high is worse than too low (see package carrier/udp).
+// Sizes. A flow's largest datagram is its session's MaxPayload, fixed at the
+// OPEN: the smallest datagram budget among the Peer's datagram factories, 25
+// bytes below their MTU, and never more than either side's
+// Packet.MaxPayload. With carrier/udp's default MaxDatagram (1,232 bytes)
+// that is 1,198; over QUIC DATAGRAM it is 1,127 and cannot be raised. Two
+// shapes carry datagrams of up to Packet.MaxPayload (65,507 bytes by
+// default) instead: a Peer with stream carriers only, with TCP's
+// head-of-line latency, and a bond or race session on a Peer that also has
+// stream factories, where the datagrams wider than the datagram carriers'
+// budget ride the stream carriers, with that latency, and are not counted
+// TooLarge (one that no live carrier can carry is dropped by the session,
+// PacketCounters.DropTooLarge); a selector session on such a Peer keeps the
+// datagram budget. A datagram above MaxPayload is never fragmented or split:
+// it is dropped and counted where it was read — at the ingress
+// (UDPForwardStatus.TooLarge, and TooLargeMax: the ingress reads whole
+// datagrams), at the passive (UDPServerStatus.TooLarge), under ForwardPacket
+// (PacketResult.TooLarge). The application sees loss, as on a path whose MTU
+// is too small, and no ICMP. Common datagrams exceed the default:
+// game-streaming video at its LAN packet size (about 1,400 bytes), WireGuard
+// at its default MTU (1,452), the largest DNS answers with EDNS (1,232) and
+// every QUIC Initial (at least 1,200: HTTP/3 through a default forward
+// cannot handshake). To carry them, set udp.Options.MaxDatagram to the
+// smallest MTU on the path minus 28 (IPv4) or 48 (IPv6) on the dialer's
+// carriers and on the passive's listening socket: 1,472 on a 1500-byte path
+// carries 1,438 bytes (a WireGuard MTU of up to 1,406). Too high is worse
+// than too low (see package carrier/udp).
 //
 // Peers and modes. Put UDP forwards on a Peer with datagram carriers only,
 // and TCP forwards on another: on a Peer that also has stream carriers,
-// bond and race sessions send some datagrams on them, with TCP's
+// bond and race sessions also send datagrams on them (every one wider than
+// the datagram carriers' budget among them, see Sizes), with TCP's
 // head-of-line latency, and a selector session falls back to them when
 // every datagram carrier is dead. For latency-sensitive streams (game
 // streaming, voice): race when every path has spare capacity for the
@@ -206,10 +217,12 @@
 // carrier costs a gap below about 200 ms, a path that dies silently a few
 // seconds of loss); bond only for a stream that one path cannot carry, over
 // paths of similar round-trip time. Size every buffer a burst crosses: a
-// burst from the target waits in the passive's socket (Server.UDPBuffer),
-// then in the sessions' Packet.Queue, the carrier sockets'
-// udp.Options.ReadBuffer and the client application's own socket; a burst
-// from the client waits in the ingress socket.
+// burst from the target waits in the passive's flow socket, then in the
+// sessions' Packet.Queue, the carrier sockets' udp.Options.ReadBuffer and
+// the client application's own socket; a burst from the client waits in
+// the ingress socket. The default UDP dialer requests Server.UDPBuffer for
+// the flow socket; Server.UDPBuffer does not apply to a Dial hook, which
+// sizes the socket it returns itself (SetReadBuffer and SetWriteBuffer).
 //
 // DNS-like forwards. Stub resolvers send each query from a fresh ephemeral
 // port, so a busy DNS forward with the default classes keeps one table
@@ -235,8 +248,9 @@
 // relay at the session's rate. Give the Server a Dial hook that checks
 // r.Cmd and the resolved address (net.Dialer.Control also runs before a
 // UDP connect) and turns SO_BROADCAST off in that Control, as the default
-// dialer does: Go turns it on for every IPv4 UDP socket. A hook written for
-// TCP alone must check r.Cmd; a stream conn returned for a UDP flow is
+// dialer does: Go turns it on for every IPv4 UDP socket. Such a hook also
+// sizes its socket's buffers (see Peers and modes). A hook written for TCP
+// alone must check r.Cmd; a stream conn returned for a UDP flow is
 // refused CodeDialFailed. A PortForward does no authentication: whoever
 // reaches an ingress port reaches its target and costs a flow, a session
 // and a socket on the passive. On a LAN-facing ingress (AllowNonLoopback) a
@@ -256,21 +270,21 @@
 // PortForward forwards local ports to targets through one Peer: ServeTCP
 // accepts connections from a net.Listener and forwards each as Dial and
 // Forward do; ServeUDP reads a UDPSocket (an unconnected *net.UDPConn) and
-// forwards each client source address as one flow, its replies going back
-// to exactly that address. Both refuse a socket bound to a non-loopback or
+// forwards each client source address as one flow, its replies going back to
+// exactly that address. Both refuse a socket bound to a non-loopback or
 // unspecified address (ErrNonLoopback) unless AllowNonLoopback is set (a
-// Unix-domain listener counts as loopback), and ServeUDP refuses a
-// connected socket. A Serve call owns its listener or socket from the call
-// on and closes it exactly once when it returns, after every connection
-// and flow it started has ended. One PortForward may serve several
-// listeners and sockets at once; MaxConns, MaxFlows and Status cover them
-// together. A TCP connection that cannot be forwarded (beyond MaxConns, a
-// failed Dial) is reset, never closed cleanly. Status counts TCP and UDP
-// apart; Flows lists the UDP flows (state, class, times, each open flow's
-// SessionStatus) for diagnostics. A wildcard socket is single-homed:
-// replies leave from the source address the routing table chooses, so
-// bind a specific address on a multi-homed host; a dual-stack wildcard
-// socket keys an IPv4 client by its IPv4-mapped address.
+// Unix-domain listener counts as loopback), and ServeUDP refuses a connected
+// socket. A Serve call owns its listener or socket from the call on and
+// closes it exactly once (ServeTCP when it stops accepting, ServeUDP at its
+// stop), and returns only after every connection or flow it started has
+// ended. One PortForward may serve several listeners and sockets at once;
+// MaxConns, MaxFlows and Status cover them together. A TCP connection that
+// cannot be forwarded (beyond MaxConns, a failed Dial) is reset, never
+// closed cleanly. Status counts TCP and UDP apart; Flows lists the UDP flows
+// (state, class, times, each open flow's SessionStatus) for diagnostics. A
+// wildcard socket is single-homed: replies leave from the source address the
+// routing table chooses, so bind a specific address on a multi-homed host; a
+// dual-stack wildcard socket keys an IPv4 client by its IPv4-mapped address.
 //
 // A new client's first datagram opens its flow (DialUDP, at most 12 s); its
 // later datagrams wait for the open (at most 8 datagrams and 16 KiB, each
@@ -278,16 +292,17 @@
 // order. A client whose open failed, or whose flow the far end closed within
 // 5 s of its open, is held: its datagrams are dropped (DropHeld) for 5 s, so
 // a refusing passive sees at most one OPEN per client every 5 s while the
-// table has room. At most 256 flows open at once per PortForward (beyond:
-// DropOpening). When MaxFlows entries exist (opening and held ones
-// included), a new client takes the place of a held client, or of an open
-// flow that never became a stream and has been idle for at least 1 s (the
-// least recently active among up to 8 entries sampled from its socket's
-// table); a stream and an opening flow are never taken. Without such an
-// entry the new client's datagram is dropped (DropFull). Because MaxFlows
-// covers every socket of a PortForward, a flood of new sources on one port
-// can refuse new flows on another: use one PortForward per traffic kind and
-// trust class (a DNS forward apart from a streaming forward).
+// table has room. At most 256 flows are being opened at once per
+// PortForward (beyond: DropOpening). When MaxFlows entries exist (opening
+// and held ones included), a new client takes the place of a held client,
+// or of an open flow that never became a stream and has been idle for at
+// least 1 s (the least recently active among up to 8 entries sampled from
+// its socket's table); a stream and an opening flow are never taken.
+// Without such an entry the new client's datagram is dropped (DropFull).
+// Because MaxFlows covers every socket of a PortForward, a flood of new
+// sources on one port can refuse new flows on another: use one PortForward
+// per traffic kind and trust class (a DNS forward apart from a streaming
+// forward).
 //
 // # Bounds and memory
 //
@@ -304,9 +319,9 @@
 // forwarded UDP flow costs, on the passive, three goroutines, one connected
 // socket (a file descriptor and an ephemeral port; Linux has about 28,000
 // per source address), 2 × MaxPayload + 1 bytes of buffers and its session,
-// besides the kernel buffers in use (Server.UDPBuffer requests 1 MiB by
-// default, which the kernel charges as datagrams queue), so the default
-// MaxFlows of 4,096 needs as many file descriptors; at the ingress, one
-// goroutine, one MaxPayload buffer and its session: about 20 KiB of heap and
-// a goroutine stack per flow.
+// besides the kernel buffers in use (the default dialer requests
+// Server.UDPBuffer, 1 MiB by default, which the kernel charges as datagrams
+// queue), so the default MaxFlows of 4,096 needs as many file descriptors;
+// at the ingress, one goroutine, one MaxPayload buffer and its session:
+// about 20 KiB of heap and a goroutine stack per flow.
 package l4

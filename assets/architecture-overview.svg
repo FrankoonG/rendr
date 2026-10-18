@@ -73,7 +73,7 @@
 
   <rect class="panel-strong" x="860" y="112" width="300" height="84" rx="6" />
   <text class="pt" x="876" y="136">Destination application</text>
-  <text class="mu" x="876" y="154">or a TCP target reached through l4</text>
+  <text class="mu" x="876" y="154">or a TCP or UDP target reached through l4</text>
   <g transform="translate(876,164)">
     <rect class="pill" x="0" y="0" width="96" height="22" rx="11" />
     <text class="pillt" x="48" y="15" text-anchor="middle">net.Conn</text>

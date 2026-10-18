@@ -64,10 +64,11 @@
 // interface MTU by itself, but cannot see a smaller MTU further along the
 // path, and too high is worse than too low: a datagram that fits the first
 // hop but not a later one is lost (don't-fragment), and the carrier dies
-// after three unanswered MTU probes (about 30 s at the default PacketPing)
-// and is redialled with the same budget, again and again, because a
-// packet session's MaxPayload is fixed at its OPEN and a failed probe does
-// not lower it. Set the value from the real path MTU, and size ReadBuffer
+// when its fourth MTU probe finds the three before it unanswered (about
+// 40 s after it attached, at the default PacketPing) and is redialled
+// with the same budget, again about every 40 s, because a packet
+// session's MaxPayload is fixed at its OPEN and a failed probe does not
+// lower it. Set the value from the real path MTU, and size ReadBuffer
 // for the larger buffer class (see Options).
 package udp
 

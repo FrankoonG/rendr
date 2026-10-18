@@ -64,8 +64,8 @@ func udpPassive(ctx context.Context, srv *l4.Server) (rt *rendr.Runtime, addr st
 // target on the loopback address. The passive Runtime runs an l4.Server
 // with UDP set, which dials the target named in the OPEN while the session
 // is pending. The flow's first datagram rides the OPEN: the Server writes
-// it to the target before it confirms the session, so the first answer
-// costs no extra round trip. A datagram is never retransmitted, so the
+// it to the target before it confirms the session, so the target receives
+// it one round trip earlier. A datagram is never retransmitted, so the
 // dialer sends again when no answer arrives in time. A forward of a local
 // UDP port uses PortForward instead, which runs DialUDP for every client
 // source address.
@@ -149,7 +149,9 @@ func ExamplePortForward_ServeUDP() {
 	// metadata spells them: an IP host in canonical form). A hook that
 	// allows names or address ranges checks the resolved address in a
 	// net.Dialer.Control instead, and turns SO_BROADCAST off there, as the
-	// default UDP dialer does.
+	// default UDP dialer does. A hook also sizes the socket it returns for
+	// the target's bursts (a video keyframe): Server.UDPBuffer applies to
+	// the default dialer only.
 	allowed := map[string]bool{target.LocalAddr().String(): true}
 	server := &l4.Server{
 		UDP: true,
@@ -158,7 +160,15 @@ func ExamplePortForward_ServeUDP() {
 				return nil, l4.ErrDenied // CodeNotAllowed; TCP is refused too
 			}
 			var d net.Dialer
-			return d.DialContext(ctx, "udp", r.Addr) // a connected UDP socket
+			c, err := d.DialContext(ctx, "udp", r.Addr) // a connected UDP socket
+			if err != nil {
+				return nil, err
+			}
+			if u, ok := c.(*net.UDPConn); ok {
+				u.SetReadBuffer(4 << 20)
+				u.SetWriteBuffer(4 << 20)
+			}
+			return c, nil
 		},
 	}
 	srv, rendrAddr, stopServe := udpPassive(ctx, server)
