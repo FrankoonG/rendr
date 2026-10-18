@@ -944,12 +944,15 @@ func (d *l4uDNS) answer(q []byte) []byte {
 
 // TestL4URealIPv6Target (M6 design §A16.3, §A3.1): UDP targets reached over
 // IPv6 by the Server's default dialer: an IPv6 literal ([::1]:port) and a
-// name in the .test zone whose only record is AAAA ::1, which the passive
-// resolves (the dialer resolves nothing) through a fake DNS server.
-// Stimulus: one flow to each. Integrity: every datagram comes back intact;
-// the target hears two egress sockets, both from ::1; the fake answered
-// the name's AAAA query (the name was resolved there, to its only
-// address); two sessions, both open, none ended.
+// name in the .test zone whose only record is AAAA ::1, resolved through a
+// fake DNS server. Both Runtimes share net.DefaultResolver in this process,
+// so the fake cannot tell which side asked; that the name crosses the
+// metadata unresolved, for the passive to resolve, is the l4 unit rows'
+// proof (their Dial hooks get .test names as written, TestServerMaxConns_L48
+// for one). Stimulus: one flow to each. Integrity: every datagram comes
+// back intact; the target hears two egress sockets, both from ::1; the
+// fake answered the name's AAAA query (the name was resolved through it, to
+// its only address); two sessions, both open, none ended.
 func TestL4URealIPv6Target(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	const name = "aaaa-only.rendr.test"
@@ -1107,9 +1110,13 @@ func TestL4URealTCPUDPSamePort(t *testing.T) {
 			wg.Wait()
 		}
 	}()
-	<-half
-	seq, during := uint64(2), 0
 	deadline := time.Now().Add(30 * time.Second)
+	select { // the first half's send is bounded as the whole transfer is
+	case <-half:
+	case <-time.After(time.Until(deadline)):
+		t.Fatalf("the TCP sender did not send its first half within 30 s (%d of %d bytes echoed)", got.Load(), size)
+	}
+	seq, during := uint64(2), 0
 	for running := true; running; {
 		select {
 		case <-tcpDone:
@@ -1163,9 +1170,10 @@ func TestL4URealTCPUDPSamePort(t *testing.T) {
 // flow opens, A's socket closes, and the target sends to A's flow until
 // the ingress's reply to A's closed port drew an ICMP port unreachable and
 // the socket's next ReadFrom failed (WSAECONNRESET). Integrity: the error
-// is counted ReadNoise and backed off, ServeUDP keeps running, and client
-// B's datagram, sent after it, opens a flow and comes back intact; both
-// flows open, none ended.
+// is counted ReadNoise, ServeUDP keeps running, and client B's datagram,
+// sent after it, opens a flow and comes back intact; both flows open, none
+// ended. One error is all the row makes: the back-off of a run of them is
+// the unit row TestPortForwardReadNoise_L58_L73's.
 func TestL4URealIngressReadNoiseWindows_L73(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows socket behaviour: Winsock's SIO_UDP_CONNRESET (Linux reports nothing on an unconnected socket without IP_RECVERR)")
