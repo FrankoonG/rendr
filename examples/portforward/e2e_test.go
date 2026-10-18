@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -220,8 +221,8 @@ func tcpEcho(t *testing.T, addr string, n int) {
 	}
 }
 
-// tcpRefused checks that a connection to the TCP ingress at addr ends
-// without a byte.
+// tcpRefused checks that a connection to the TCP ingress at addr is reset
+// without a byte (ServeTCP never ends a refused connection cleanly).
 func tcpRefused(t *testing.T, addr string) {
 	t.Helper()
 	c, err := net.Dial("tcp", addr)
@@ -232,11 +233,178 @@ func tcpRefused(t *testing.T, addr string) {
 	c.Write([]byte("ping"))
 	c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var b [1]byte
-	n, err := c.Read(b[:])
-	var ne net.Error
-	if n != 0 || err == nil || (errors.As(err, &ne) && ne.Timeout()) {
-		t.Fatalf("a refused connection: %d bytes, %v; want its end without data", n, err)
+	if n, err := c.Read(b[:]); n != 0 || !errors.Is(err, errConnReset) {
+		t.Fatalf("a refused connection: %d bytes, %v; want a reset without data", n, err)
 	}
+}
+
+// relayPair is a TCP proxy and a UDP relay on one loopback port in front
+// of a server's carrier address, which the client's carriers cross; kill
+// ends every carrier crossing it at once: the TCP ones with a reset of
+// both legs, the UDP ones by dropping their datagrams both ways from then
+// on. A redialled carrier crosses it afresh.
+type relayPair struct {
+	tl      net.Listener
+	uc      *net.UDPConn
+	to      *net.UDPAddr
+	mu      sync.Mutex
+	legs    []*net.TCPConn                  // both legs of every live proxied connection
+	open    int                             // proxied connections whose client leg still reads
+	changed chan struct{}                   // closed and replaced when open falls
+	ups     map[netip.AddrPort]*net.UDPConn // every client source's upstream socket
+	dead    map[netip.AddrPort]bool         // the sources kill dropped
+	wg      sync.WaitGroup
+}
+
+func newRelayPair(t *testing.T, to string) *relayPair {
+	t.Helper()
+	ta, err := net.ResolveUDPAddr("udp", to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &relayPair{to: ta, changed: make(chan struct{}), ups: map[netip.AddrPort]*net.UDPConn{}, dead: map[netip.AddrPort]bool{}}
+	for try := 0; r.uc == nil; try++ {
+		if r.tl, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			t.Fatal(err)
+		}
+		if r.uc, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort(r.tl.Addr().String()))); err != nil {
+			r.tl.Close()
+			if try == 9 {
+				t.Fatalf("relay pair: %v", err)
+			}
+		}
+	}
+	r.wg.Go(r.acceptTCP)
+	r.wg.Go(r.relayUDP)
+	t.Cleanup(func() {
+		r.tl.Close()
+		r.uc.Close()
+		r.mu.Lock()
+		for _, c := range r.legs {
+			c.Close()
+		}
+		for _, u := range r.ups {
+			u.Close()
+		}
+		r.mu.Unlock()
+		r.wg.Wait()
+	})
+	return r
+}
+
+func (r *relayPair) addr() string { return r.tl.Addr().String() }
+
+func (r *relayPair) acceptTCP() {
+	for {
+		a, err := r.tl.Accept()
+		if err != nil {
+			return
+		}
+		b, err := net.Dial("tcp", r.to.String())
+		if err != nil {
+			a.Close()
+			continue
+		}
+		r.mu.Lock()
+		r.legs = append(r.legs, a.(*net.TCPConn), b.(*net.TCPConn))
+		r.open++
+		r.mu.Unlock()
+		for _, p := range [][2]net.Conn{{a, b}, {b, a}} {
+			r.wg.Go(func() {
+				io.Copy(p[0], p[1])
+				p[0].Close()
+				p[1].Close()
+				if p[1] == a { // the client leg's reads ended
+					r.mu.Lock()
+					r.open--
+					close(r.changed)
+					r.changed = make(chan struct{})
+					r.mu.Unlock()
+				}
+			})
+		}
+	}
+}
+
+// waitNoClient waits up to d until no proxied connection's client leg is
+// open any more.
+func (r *relayPair) waitNoClient(t *testing.T, d time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	for {
+		r.mu.Lock()
+		n, ch := r.open, r.changed
+		r.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		select {
+		case <-ch:
+		case <-timer.C:
+			t.Fatalf("%d carrier connections of the client still open %v after its stop", n, d)
+		}
+	}
+}
+
+func (r *relayPair) relayUDP() {
+	buf := make([]byte, 65536)
+	for {
+		n, src, err := r.uc.ReadFromUDPAddrPort(buf)
+		if errors.Is(err, net.ErrClosed) {
+			return
+		}
+		r.mu.Lock()
+		up, dead := r.ups[src], r.dead[src]
+		if err == nil && !dead && up == nil {
+			if up, err = net.DialUDP("udp", nil, r.to); err == nil {
+				r.ups[src] = up
+				r.wg.Go(func() { r.replies(src, up) })
+			}
+		}
+		r.mu.Unlock()
+		if err == nil && !dead {
+			up.Write(buf[:n])
+		}
+	}
+}
+
+// replies relays what the server sends to the upstream socket up of the
+// source src back to src, until kill drops src.
+func (r *relayPair) replies(src netip.AddrPort, up *net.UDPConn) {
+	buf := make([]byte, 65536)
+	for {
+		n, err := up.Read(buf)
+		if errors.Is(err, net.ErrClosed) {
+			return
+		}
+		r.mu.Lock()
+		dead := r.dead[src]
+		r.mu.Unlock()
+		if err == nil && !dead {
+			r.uc.WriteToUDPAddrPort(buf[:n], src)
+		}
+	}
+}
+
+// kill resets every proxied TCP connection and drops every UDP source seen
+// so far; it returns how many of each it ended.
+func (r *relayPair) kill() (tcpConns, udpSources int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, c := range r.legs {
+		c.SetLinger(0)
+		c.Close()
+	}
+	tcpConns = len(r.legs) / 2
+	r.legs = nil
+	for src := range r.ups {
+		if !r.dead[src] {
+			r.dead[src] = true
+			udpSources++
+		}
+	}
+	return tcpConns, udpSources
 }
 
 // statusRe matches a status line of kind (e.g. "client: status udp")
@@ -267,11 +435,14 @@ func TestPortForwardExampleE2E(t *testing.T) {
 	t.Run("allow", func(t *testing.T) {
 		t.Parallel()
 		ut, ut2, tt, tt2 := newUDPTarget(t), newUDPTarget(t), newTCPTarget(t), newTCPTarget(t)
-		// The UDP entry is another spelling of the client's target.
+		// The UDP entry is another spelling of the client's target; the TCP
+		// target is a name in another case than its entry.
 		ua := ut.c.LocalAddr().(*net.UDPAddr)
 		mapped := "[::ffff:" + ua.IP.String() + "]:" + strconv.Itoa(ua.Port)
-		srv, addr := startServer(t, "-udp", "-allow", mapped, "-allow", tt.addr())
-		cli, local := startClient(t, addr, []string{"udp:" + ut.addr(), "tcp:" + tt.addr(), "udp:" + ut2.addr(), "tcp:" + tt2.addr()})
+		_, tport, _ := net.SplitHostPort(tt.addr())
+		tname := "LOCALHOST:" + tport
+		srv, addr := startServer(t, "-udp", "-allow", mapped, "-allow", "LocalHost:"+tport)
+		cli, local := startClient(t, addr, []string{"udp:" + ut.addr(), "tcp:" + tname, "udp:" + ut2.addr(), "tcp:" + tt2.addr()})
 		a, b := dialClient(t, local["udp:"+ut.addr()]), dialClient(t, local["udp:"+ut.addr()])
 		sizes := []int{4, 5, 11, 257, 1000, 1198}
 		for i := range 150 {
@@ -287,14 +458,18 @@ func TestPortForwardExampleE2E(t *testing.T) {
 				t.Fatalf("source %v sent %d datagrams, want 150 (+%d resent)", src, n, a.resent+b.resent)
 			}
 		}
-		tcpEcho(t, local["tcp:"+tt.addr()], 1<<20)
+		tcpEcho(t, local["tcp:"+tname], 1<<20)
 		dialClient(t, local["udp:"+ut2.addr()]).send(t, 64)
 		tcpRefused(t, local["tcp:"+tt2.addr()])
 		cli.out.wait(t, statusRe("client: status udp", "Opened=2", "Failed=1", "ByCode(not allowed)=1"), 15*time.Second)
 		cli.out.wait(t, statusRe("client: status tcp", "Accepted=2", "Failed=1", "ByCode(not allowed)=1"), 15*time.Second)
 		srv.out.wait(t, statusRe("server: status l4", "Confirmed=1", "ByCode(not allowed)=1", "UDP.Confirmed=2", "UDP.ByCode(not allowed)=1"), 15*time.Second)
-		if n := len(ut2.received()); n != 0 || tt2.conns.Load() != 0 {
-			t.Fatalf("an unlisted target was reached: %d UDP sources, %d TCP connections", n, tt2.conns.Load())
+		if n := len(ut2.received()); n != 0 || tt2.conns.Load() != 0 || tt.conns.Load() != 1 {
+			t.Fatalf("an unlisted target was reached (%d UDP sources, %d TCP connections) or the listed one not once (%d)", n, tt2.conns.Load(), tt.conns.Load())
+		}
+		// Nothing was too large: the UDP lines carry no TooLarge sentence.
+		if out := cli.out.String(); strings.Contains(out, "datagrams up to") {
+			t.Fatalf("a TooLarge sentence without an oversize datagram: %q", out)
 		}
 		cli.stop(t, "client")
 		srv.stop(t, "server")
@@ -318,11 +493,14 @@ func TestPortForwardExampleE2E(t *testing.T) {
 		srv.stop(t, "server")
 	})
 
-	// allow-any: every target is forwarded (l4's default dialer).
+	// allow-any: every target is forwarded (the hook without its list), here
+	// through the second of the server's two -rendr addresses (one Listener
+	// each).
 	t.Run("allow-any", func(t *testing.T) {
 		t.Parallel()
 		ut, tt := newUDPTarget(t), newTCPTarget(t)
-		srv, addr := startServer(t, "-udp", "-allow-any")
+		srv := start(t, "server", "-rendr", "127.0.0.1:0", "-rendr", "127.0.0.1:0", "-udp", "-allow-any")
+		addr := srv.out.waitN(t, serverLine, 2, 10*time.Second)[1][1]
 		cli, local := startClient(t, addr, []string{"udp:" + ut.addr(), "tcp:" + tt.addr()})
 		c := dialClient(t, local["udp:"+ut.addr()])
 		for i := range 40 {
@@ -365,6 +543,104 @@ func TestPortForwardExampleE2E(t *testing.T) {
 		cli.stop(t, "client")
 		cli2.stop(t, "client")
 		srv.stop(t, "server")
+	})
+
+	// carrier-death (R1-44's proof, in process): the carriers of a live UDP
+	// flow and a live TCP connection are killed (a relay between the ends
+	// resets the TCP ones and drops the UDP ones); each client status line
+	// names its kind's death by cause, and the server's line names both;
+	// the flow and the connection go on over redialled carriers, every byte
+	// intact, the flow still one source at its target; the client's stop
+	// closes every carrier it redialled.
+	t.Run("carrier-death", func(t *testing.T) {
+		t.Parallel()
+		ut, tt := newUDPTarget(t), newTCPTarget(t)
+		srv, addr := startServer(t, "-udp", "-allow-any")
+		rp := newRelayPair(t, addr)
+		// Two paths through the relay: each Peer then keeps a sessionless
+		// probe carrier per path, which only Runtime.Close ends.
+		cli, local := startClient(t, rp.addr(), []string{"udp:" + ut.addr(), "tcp:" + tt.addr()}, "-rendr", rp.addr())
+		u := dialClient(t, local["udp:"+ut.addr()])
+		for range 20 {
+			u.roundTrip(t, 512)
+		}
+		c, err := net.Dial("tcp", local["tcp:"+tt.addr()])
+		if err != nil {
+			t.Fatalf("dial the TCP ingress: %v", err)
+		}
+		defer c.Close()
+		c.SetDeadline(time.Now().Add(60 * time.Second))
+		echo := func(n int) {
+			p := make([]byte, n)
+			rand.Read(p)
+			werr := make(chan error, 1)
+			go func() { _, err := c.Write(p); werr <- err }()
+			got := make([]byte, n)
+			if _, err := io.ReadFull(c, got); err != nil || !bytes.Equal(got, p) || <-werr != nil {
+				t.Fatalf("TCP echo of %d bytes across the carriers: equal %v, %v", n, bytes.Equal(got, p), err)
+			}
+		}
+		echo(64 << 10)
+		if nt, nu := rp.kill(); nt == 0 || nu == 0 {
+			t.Fatalf("the relay carried %d TCP connections and %d UDP sources, want both kinds", nt, nu)
+		}
+		for _, w := range []struct {
+			p  *proc
+			re string
+		}{
+			{cli, `client: status tcp:[^\n]* CarrierDeaths\(transport_error\)=[1-9][^\n]*`},
+			{cli, `client: status udp:[^\n]* CarrierDeaths\(ping_timeout\)=[1-9][^\n]*`}, // dropped datagrams: no transport error
+			{srv, `server: status l4:[^\n]* CarrierDeaths\(ping_timeout\)=[1-9][^\n]* CarrierDeaths\(transport_error\)=[1-9][^\n]*`},
+		} {
+			t.Log(w.p.out.wait(t, regexp.MustCompile(w.re), 20*time.Second)[0])
+		}
+		for range 20 {
+			u.roundTrip(t, 512)
+		}
+		echo(64 << 10)
+		if srcs := ut.received(); len(srcs) != 1 {
+			t.Fatalf("the UDP target saw sources %v, want one: the flow did not survive its carrier", srcs)
+		}
+		// Each line counts its own Runtime's deaths: the TCP carriers were
+		// reset, the UDP ones timed out.
+		for _, l := range regexp.MustCompile(`client: status (?:tcp:[^\n]*ping_timeout|udp:[^\n]*transport_error)[^\n]*`).FindAllString(cli.out.String(), -1) {
+			t.Fatalf("a client line counts the other kind's death: %s", l)
+		}
+		c.Close()
+		cli.stop(t, "client")
+		// The client closed its Runtimes: its TCP carriers, the probe ones
+		// included, are gone while the server still runs.
+		rp.waitNoClient(t, 3*time.Second)
+		srv.stop(t, "server")
+	})
+
+	// server-restart: a stopped server's Runtime.Close tells the client's
+	// carriers it went away over its carrier sockets, which close only
+	// after it, so a server restarted on the same address is reached at
+	// once: a new UDP flow's first datagram is echoed without a resend
+	// (the client's old UDP carrier would otherwise wait for its ping
+	// timeout, about 4 s), and a new TCP connection forwards.
+	t.Run("server-restart", func(t *testing.T) {
+		t.Parallel()
+		ut, tt := newUDPTarget(t), newTCPTarget(t)
+		srv, addr := startServer(t, "-udp", "-allow-any")
+		cli, local := startClient(t, addr, []string{"udp:" + ut.addr(), "tcp:" + tt.addr()})
+		u := dialClient(t, local["udp:"+ut.addr()])
+		for range 5 {
+			u.roundTrip(t, 512)
+		}
+		tcpEcho(t, local["tcp:"+tt.addr()], 4<<10)
+		srv.stop(t, "server")
+		srv2 := start(t, "server", "-rendr", addr, "-udp", "-allow-any")
+		srv2.out.wait(t, serverLine, 10*time.Second)
+		u2 := dialClient(t, local["udp:"+ut.addr()]) // a new flow
+		t0 := time.Now()
+		if u2.roundTrip(t, 512); u2.resent != 0 {
+			t.Fatalf("the first echo after the restart took %v and %d resends, want none: the client's carriers missed the GOAWAY", time.Since(t0), u2.resent)
+		}
+		tcpEcho(t, local["tcp:"+tt.addr()], 4<<10)
+		cli.stop(t, "client")
+		srv2.stop(t, "server")
 	})
 
 	// udp-off: a server without -udp never serves a flow (the dialer's open

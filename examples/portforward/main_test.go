@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/carrier/tcp"
 	"github.com/FrankoonG/rendr/v2/l4"
 )
 
@@ -112,7 +113,7 @@ func start(t *testing.T, args ...string) *proc {
 }
 
 // stop stops p and checks its exit through the shutdown path (status 0,
-// "<sub>: stopped" logged) within the 5-s stop bound and a margin.
+// "<sub>: stopped" logged) within the 5-s stop bound.
 func (p *proc) stop(t *testing.T, sub string) {
 	t.Helper()
 	p.cancel()
@@ -122,8 +123,8 @@ func (p *proc) stop(t *testing.T, sub string) {
 		if code != 0 || !strings.Contains(p.out.String(), sub+": stopped") {
 			t.Fatalf("%s: status %d after its stop, want 0 and %q; output %q", sub, code, sub+": stopped", p.out)
 		}
-	case <-time.After(8 * time.Second):
-		t.Fatalf("%s still running 8 s after its stop; output %q", sub, p.out)
+	case <-time.After(stopWait):
+		t.Fatalf("%s still running %v after its stop; output %q", sub, stopWait, p.out)
 	}
 }
 
@@ -158,12 +159,14 @@ func startClient(t *testing.T, rendrAddr string, fwds []string, args ...string) 
 	return p, local
 }
 
-// TestPortForwardExampleFlags (M6-D31, PA-95): a -L that does not resolve
-// to a loopback address exits with status 2 and names the rule unless
-// -allow-nonloopback; malformed forwards, targets, modes, sizes, -allow
-// entries and stray arguments exit with status 2 before any socket is
-// bound; loopback forwards (a name included) serve on loopback until ctx
-// ends (status 0).
+// TestPortForwardExampleFlags (M6-D31, PA-95, §A9): a -L that does not
+// resolve to a loopback address exits with status 2 and names the rule
+// unless -allow-nonloopback; malformed forwards, targets, modes, sizes,
+// -allow entries and stray arguments exit with status 2 before any socket
+// is bound; a server carrier address that is not loopback fails (status 1)
+// with carrier/tcp's loopback error before any bind unless
+// -carrier-insecure; loopback forwards (a name included) serve on loopback
+// until ctx ends (status 0).
 func TestPortForwardExampleFlags(t *testing.T) {
 	for _, l := range []string{"udp:0.0.0.0:0", "tcp:0.0.0.0:0", "udp:[::]:0", "tcp::0", "udp::5000", "udp:192.0.2.1:5000", "tcp:198.51.100.7:0", "udp:[2001:db8::1]:53"} {
 		var out bytes.Buffer
@@ -199,6 +202,30 @@ func TestPortForwardExampleFlags(t *testing.T) {
 			t.Errorf("args %q: status %d, output %q; want 2 and the usage before any bind", args, code, out.String())
 		}
 	}
+	// The carriers are loopback-only on both sides by default (the client's
+	// options: TestPortForwardExampleWiring). The wildcard forms only on
+	// Linux: the code under test binds nothing, but a mutant would, and a
+	// wildcard bind may prompt on a Windows host.
+	nonLoopback := []string{"192.0.2.1:7443", "[2001:db8::1]:7443"}
+	if runtime.GOOS == "linux" {
+		nonLoopback = append(nonLoopback, "0.0.0.0:0", ":0", "[::]:0")
+	}
+	for _, a := range nonLoopback {
+		var out bytes.Buffer
+		code := run(context.Background(), []string{"server", "-rendr", a, "-allow-any"}, &out)
+		if code != 1 || !strings.Contains(out.String(), tcp.ErrNonLoopback.Error()) || serverLine.MatchString(out.String()) {
+			t.Errorf("server -rendr %s: status %d, output %q; want 1 and %q before any bind", a, code, out.String(), tcp.ErrNonLoopback)
+		}
+	}
+	// -carrier-insecure lifts the rule: the bind itself then fails, as
+	// 192.0.2.1 (TEST-NET-1) is no local address (or, where the host binds
+	// non-local addresses, the server serves until ctx ends).
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	var out bytes.Buffer
+	if code := run(ctx, []string{"server", "-rendr", "192.0.2.1:7443", "-allow-any", "-carrier-insecure"}, &out); code == 2 || strings.Contains(out.String(), tcp.ErrNonLoopback.Error()) {
+		t.Errorf("server -rendr 192.0.2.1:7443 -carrier-insecure: status %d, output %q; want the loopback rule lifted", code, out.String())
+	}
+	cancel()
 	// Loopback forms serve on loopback; the stop is status 0.
 	p := start(t, "client", "-rendr", "127.0.0.1:1", "-L", "udp:127.0.0.1:0=192.0.2.10:53", "-L", "tcp:localhost:0=192.0.2.10:80", "-L", "udp:[::1]:0=[2001:db8::1]:53", "-mode", "race")
 	for _, m := range p.out.waitN(t, forwardLine, 3, 10*time.Second) {

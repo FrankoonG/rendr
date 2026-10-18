@@ -41,9 +41,7 @@ func appendFields(b []byte, prefix string, v reflect.Value) []byte {
 		case f.Kind() == reflect.Struct:
 			b = appendFields(b, name+".", f)
 		case f.Kind() == reflect.Map:
-			keys := f.MapKeys()
-			slices.SortFunc(keys, func(x, y reflect.Value) int { return cmp.Compare(x.Uint(), y.Uint()) })
-			for _, k := range keys {
+			for _, k := range slices.SortedFunc(f.Seq(), func(x, y reflect.Value) int { return cmp.Compare(x.Uint(), y.Uint()) }) {
 				b = fmt.Appendf(b, " %s(%v)=%v", name, k, f.MapIndex(k))
 			}
 		case f.Kind() == reflect.Interface && !f.IsNil():

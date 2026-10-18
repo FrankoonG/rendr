@@ -3,16 +3,22 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 
 	"github.com/FrankoonG/rendr/v2"
 	"github.com/FrankoonG/rendr/v2/carrier/tcp"
 	"github.com/FrankoonG/rendr/v2/carrier/udp"
 	"github.com/FrankoonG/rendr/v2/l4"
 )
+
+// listenUDP opens a UDP ingress socket (a variable only so that tests can
+// observe the sockets the client opens).
+var listenUDP = net.ListenUDP
 
 // parseForward parses the -L s, tcp:<local addr>=<target> or
 // udp:<local addr>=<target>, into its protocol, its resolved local address
@@ -37,6 +43,13 @@ func parseForward(s string, nonLoopback bool) (proto string, local *net.TCPAddr,
 	return proto, local, target, nil
 }
 
+// carrierOptions are both ends' carrier/tcp and carrier/udp options:
+// loopback only unless -carrier-insecure, the -max-datagram budget, and
+// carrier/udp socket buffers sized for keyframe bursts.
+func carrierOptions(o options) (tcp.Options, udp.Options) {
+	return tcp.Options{AllowNonLoopback: o.insecure}, udp.Options{AllowNonLoopback: o.insecure, MaxDatagram: o.maxDatagram, ReadBuffer: carrierReadBuffer, WriteBuffer: burstBuffer}
+}
+
 // side is one kind of forward, UDP or TCP: its Runtime, its Peer (datagram
 // carriers only for UDP, stream carriers for TCP: M6-D33) and its
 // PortForward.
@@ -49,16 +62,17 @@ type side struct {
 
 func newSide(kind string, o options) (*side, error) {
 	s := &side{kind: kind}
-	rt, err := newRuntime(&s.deaths)
+	rt, err := rendr.NewRuntime(runtimeConfig(&s.deaths))
 	if err != nil {
 		return nil, err
 	}
+	to, uo := carrierOptions(o)
 	cs := make([]rendr.Carrier, len(o.rendr))
 	for i, a := range o.rendr {
 		if name := fmt.Sprintf("%s-%d", kind, i); kind == "udp" {
-			cs[i] = udp.Carrier(name, "udp", a, udpOptions(o))
+			cs[i] = udp.Carrier(name, "udp", a, uo)
 		} else {
-			cs[i] = tcp.Carrier(name, "tcp", a, tcp.Options{AllowNonLoopback: o.insecure})
+			cs[i] = tcp.Carrier(name, "tcp", a, to)
 		}
 	}
 	peer, err := rt.NewPeer(rendr.PeerConfig{Carriers: cs})
@@ -89,7 +103,7 @@ func (s *side) serve(ctx context.Context, logger *log.Logger, local *net.TCPAddr
 		logger.Printf("client: tcp %s to %s", ln.Addr(), target)
 		return s.pf.ServeTCP(ctx, ln, target)
 	}
-	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: local.IP, Port: local.Port, Zone: local.Zone})
+	c, err := listenUDP("udp", &net.UDPAddr{IP: local.IP, Port: local.Port, Zone: local.Zone})
 	if err != nil {
 		return err
 	}
@@ -103,11 +117,8 @@ func (s *side) serve(ctx context.Context, logger *log.Logger, local *net.TCPAddr
 // ctx is done.
 func runClient(ctx context.Context, logger *log.Logger, o options) error {
 	sides := map[string]*side{}
-	defer func() {
-		for _, s := range sides {
-			s.rt.Close()
-		}
-	}()
+	var rts []io.Closer
+	defer func() { closeAll(rts) }()
 	var serves []func(context.Context) error
 	for _, spec := range o.fwd {
 		proto, local, target, err := parseForward(spec, o.allowNonLoopback)
@@ -117,7 +128,7 @@ func runClient(ctx context.Context, logger *log.Logger, o options) error {
 		s := sides[proto]
 		if s == nil {
 			if s, err = newSide(proto, o); s != nil {
-				sides[proto] = s
+				sides[proto], rts = s, append(rts, s.rt)
 			}
 			if err != nil {
 				return err
@@ -132,4 +143,14 @@ func runClient(ctx context.Context, logger *log.Logger, o options) error {
 			}
 		}
 	}, serves)
+}
+
+// closeAll closes cs at once: a stop holds one Runtime.Close bound, not
+// one per Runtime.
+func closeAll(cs []io.Closer) {
+	var wg sync.WaitGroup
+	for _, c := range cs {
+		wg.Go(func() { c.Close() })
+	}
+	wg.Wait()
 }

@@ -44,11 +44,12 @@ func startChild(t *testing.T, args ...string) *child {
 // TestPortForwardExampleSignalExit (M6-D31, §A9): both subcommands stop on
 // SIGTERM and SIGINT (Windows: CTRL_BREAK) through the shutdown path with
 // a UDP flow and a TCP connection live: each logs that it stopped after
-// its Runtime closed and exits with status 0 within the 5-s stop bound,
-// the forwarded TCP connection is reset (where an exit without the reset
-// would send a FIN), and no socket is left: the ingress and carrier
-// addresses bind again (UDP)
-// and refuse connections (TCP).
+// its Runtime closed and exits with status 0 within the 5-s stop bound
+// (when both ends stop at once, the server's Runtime.Close may wait its
+// 1-s close bound for a client already gone), the forwarded TCP
+// connection is reset (where an exit without the reset would send a FIN),
+// and no socket is left: the ingress and carrier addresses bind again
+// (UDP) and refuse connections (TCP).
 func TestPortForwardExampleSignalExit(t *testing.T) {
 	if len(stopSignals) == 0 {
 		t.Skip("this platform cannot signal a child process")

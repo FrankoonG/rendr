@@ -19,9 +19,12 @@
 // the TCP forwards (two Peers, one PortForward each).
 //
 // Security: rendr neither encrypts nor authenticates. The server forwards
-// only to its -allow targets (host:port as the client names them) and UDP
-// only with -udp; -allow-any reaches every address the server host can,
-// its loopback services and private networks included: an open relay.
+// only to its -allow targets (host:port as the client names them, in any
+// spelling of the address and any case) and UDP only with -udp. A name
+// that resolves to a multicast, broadcast or unspecified address is
+// refused (a subnet-directed broadcast by the OS), with -allow-any too, as
+// by l4's default dialer. -allow-any reaches every address the server host
+// can, its loopback services and private networks included: an open relay.
 // The carriers are loopback-only unless -carrier-insecure, which is for
 // carriers inside a tunnel that authenticates and encrypts (see
 // examples/mtls). The client's -L addresses are loopback-only unless
@@ -45,11 +48,13 @@
 // "; datagrams up to <TooLargeMax> bytes dropped; this path carries
 // <MaxPayload> (raise -max-datagram on both ends)".
 //
-// SIGINT or SIGTERM stops a subcommand: it ends its flows and connections,
-// waits at most 5 s for them, closes its Runtime, logs "<subcommand>:
-// stopped" and exits with status 0. A usage error, a non-loopback -L
-// without -allow-nonloopback included, exits with status 2; any other
-// failure with status 1.
+// SIGINT or SIGTERM stops a subcommand within 5 s: it ends its flows and
+// connections, waits at most 2.5 s for them, closes its Runtimes (bounded
+// by Runtime.Close at about 2.25 s), logs "<subcommand>: stopped" and
+// exits with status 0. A usage error, a non-loopback -L without
+// -allow-nonloopback included, exits with status 2; any other failure, a
+// non-loopback carrier address without -carrier-insecure included, with
+// status 1.
 package main
 
 import (
@@ -66,15 +71,18 @@ import (
 	"time"
 
 	"github.com/FrankoonG/rendr/v2"
-	"github.com/FrankoonG/rendr/v2/carrier/udp"
 )
 
 const (
 	defaultRendr = "127.0.0.1:7443"
 	insecureHelp = "allow non-loopback carrier addresses; the carriers are plaintext and unauthenticated: only inside a tunnel that authenticates and encrypts (see examples/mtls)"
-	stopWait     = 5 * time.Second
+	// stopWait bounds a stop: the serves get stopWait minus closeBound, the
+	// Runtimes' Close (closed at once; each joins within about 2.25 s when
+	// no embedder code is stuck) the rest.
+	stopWait   = 5 * time.Second
+	closeBound = 2500 * time.Millisecond
 	// The buffers a burst crosses (M6 design §A4.4 item 6): burstBuffer is
-	// every packet session's queue per direction, the server's target
+	// every packet session's queue per direction, the server's UDP target
 	// socket buffers and the carrier/udp write buffers.
 	burstBuffer       = 4 << 20
 	carrierReadBuffer = 16 << 20 // both ends' carrier/udp sockets
@@ -89,6 +97,9 @@ var errUsage = errors.New("usage")
 
 var modes = map[string]rendr.Mode{"selector": rendr.ModeSelector, "bond": rendr.ModeBond, "race": rendr.ModeRace}
 
+// subcommands are the subcommands by name.
+var subcommands = map[string]func(context.Context, *log.Logger, options) error{"client": runClient, "server": runServer}
+
 // options are a subcommand's flags.
 type options struct {
 	rendr, allow, fwd                         []string
@@ -98,10 +109,8 @@ type options struct {
 }
 
 func main() {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	code := run(ctx, os.Args[1:], os.Stderr)
-	stop()
-	os.Exit(code)
+	ctx, _ := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	os.Exit(run(ctx, os.Args[1:], os.Stderr))
 }
 
 // run runs the subcommand in args until ctx is done and returns the exit
@@ -109,23 +118,20 @@ func main() {
 // failure.
 func run(ctx context.Context, args []string, stderr io.Writer) int {
 	logger := log.New(stderr, "portforward: ", log.LstdFlags)
-	if len(args) == 0 || (args[0] != "client" && args[0] != "server") {
+	if len(args) == 0 || subcommands[args[0]] == nil {
 		fmt.Fprint(stderr, usageText)
 		return 2
 	}
 	o, err := parseFlags(args[0], args[1:], stderr)
-	if err == nil && args[0] == "client" {
-		err = runClient(ctx, logger, o)
-	} else if err == nil {
-		err = runServer(ctx, logger, o)
+	if err == nil {
+		err = subcommands[args[0]](ctx, logger, o)
 	}
-	switch {
-	case errors.Is(err, errUsage):
+	if err != nil {
 		logger.Print(err)
-		fmt.Fprint(stderr, usageText)
-		return 2
-	case err != nil:
-		logger.Print(err)
+		if errors.Is(err, errUsage) {
+			fmt.Fprint(stderr, usageText)
+			return 2
+		}
 		return 1
 	}
 	logger.Printf("%s: stopped", args[0]) // the Runtimes are closed
@@ -158,68 +164,56 @@ func parseFlags(sub string, args []string, stderr io.Writer) (options, error) {
 		fs.BoolVar(&o.allowAny, "allow-any", false, "forward to every target: an open relay to everything the server host reaches, its loopback services and private networks included")
 		fs.BoolVar(&o.udp, "udp", false, "serve UDP flows")
 	}
-	if err := fs.Parse(args); err != nil {
+	switch err := fs.Parse(args); {
+	case err != nil:
 		return o, fmt.Errorf("%w: %v", errUsage, err)
-	}
-	switch {
 	case fs.NArg() > 0:
 		return o, fmt.Errorf("%w: unexpected arguments %q", errUsage, fs.Args())
 	case o.maxDatagram != 0 && (o.maxDatagram < 546 || o.maxDatagram > 65507):
 		return o, fmt.Errorf("%w: -max-datagram %d: want 546-65507", errUsage, o.maxDatagram)
 	case sub == "client" && len(o.fwd) == 0:
 		return o, fmt.Errorf("%w: the client needs at least one -L", errUsage)
-	}
-	if len(o.rendr) == 0 {
+	case len(o.rendr) == 0: // valid flags without -rendr: the default
 		o.rendr = []string{defaultRendr}
 	}
 	return o, nil
 }
 
-// udpOptions are both ends' carrier/udp options.
-func udpOptions(o options) udp.Options {
-	return udp.Options{AllowNonLoopback: o.insecure, MaxDatagram: o.maxDatagram, ReadBuffer: carrierReadBuffer, WriteBuffer: burstBuffer}
-}
-
-// newRuntime is a Runtime whose carrier deaths d counts.
-func newRuntime(d *carrierDeaths) (*rendr.Runtime, error) {
-	return rendr.NewRuntime(rendr.Config{Packet: rendr.PacketPolicy{Queue: burstBuffer}, OnEvent: d.event})
+// runtimeConfig is the Config of every Runtime: packet queues sized for
+// keyframe bursts, the carrier deaths counted in d.
+func runtimeConfig(d *carrierDeaths) rendr.Config {
+	return rendr.Config{Packet: rendr.PacketPolicy{Queue: burstBuffer}, OnEvent: d.event}
 }
 
 // supervise runs serves until ctx is done or one of them returns, calling
-// report every statusEvery; after the stop it waits at most stopWait for
-// them and calls report once more. It returns the error of a serve that
-// ended before the stop.
+// report every statusEvery; after the stop it waits at most stopWait minus
+// closeBound for them and calls report once more. It returns the error of
+// the first serve that ended before the stop.
 func supervise(ctx context.Context, report func(), serves []func(context.Context) error) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	errc := make(chan error, len(serves))
+	sctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	var wg sync.WaitGroup
 	for _, s := range serves {
-		wg.Go(func() {
-			if err := s(ctx); ctx.Err() == nil {
-				errc <- err
-				cancel()
-			}
-		})
+		wg.Go(func() { cancel(s(sctx)) }) // after the stop, the cause is ctx's
 	}
 	done := make(chan struct{})
 	go func() { wg.Wait(); close(done) }()
 	tick := time.NewTicker(statusEvery)
 	defer tick.Stop()
-	for ctx.Err() == nil {
+	for sctx.Err() == nil {
 		select {
 		case <-tick.C:
 			report()
-		case <-ctx.Done():
+		case <-sctx.Done():
 		}
 	}
 	select {
 	case <-done:
-	case <-time.After(stopWait): // closing the Runtime ends the rest
+	case <-time.After(stopWait - closeBound): // closing the Runtimes ends the rest
 	}
 	report()
-	if len(errc) > 0 {
-		return <-errc
+	if err := context.Cause(sctx); err != context.Cause(ctx) {
+		return err // a serve ended first (a nil return as context.Canceled)
 	}
 	return nil
 }
