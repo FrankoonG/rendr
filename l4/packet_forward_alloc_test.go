@@ -143,7 +143,7 @@ func pfZeroAllocs(t *testing.T, rule promoteMode, twoWay bool) {
 	}
 
 	fcancel()
-	n := uint64(warm + 16 + rounds)
+	n := uint64(warm + 16 + settleRuns(minRounds) + rounds)
 	back := map[bool]uint64{true: n, false: 0}[twoWay]
 	for name, r := range map[string]PacketResult{"dialer": <-in, "passive": <-out} {
 		// Both ctxs end at once: a forward whose peer's close arrived before

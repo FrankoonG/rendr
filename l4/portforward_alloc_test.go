@@ -157,7 +157,7 @@ func pwZeroAllocs(t *testing.T, rule promoteMode, twoWay bool) {
 	} else if mallocs > maxAllocs {
 		t.Fatalf("%d allocations in %d steady-state rounds (both ways: %v) over %v, want at most %d", mallocs, rounds, twoWay, el, maxAllocs)
 	}
-	n := uint64(warm + 16 + rounds)
+	n := uint64(warm + 16 + settleRuns(minRounds) + rounds)
 	st := pf.Status().UDP
 	if st.Opened != 1 || st.ToSession != n || st.ToClient != map[bool]uint64{true: n, false: 0}[twoWay] {
 		t.Fatalf("ingress status %+v: want one flow and %d datagrams", st, n)
