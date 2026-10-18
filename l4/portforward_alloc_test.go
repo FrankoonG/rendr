@@ -170,6 +170,7 @@ func pwZeroAllocs(t *testing.T, rule promoteMode, twoWay bool) {
 		t.Fatalf("ServeUDP = %v", err)
 	}
 	<-out
+	cli.Close() // before the check: on Linux it counts the client's fd
 	peer.Close()
 	d.Close()
 	p.Close()
