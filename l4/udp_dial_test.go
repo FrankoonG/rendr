@@ -186,8 +186,11 @@ func TestDialUDPIdleDefault_L30(t *testing.T) {
 }
 
 // TestDialUDPErrors (M6-D7, R1-9; §A11): a bad target address fails
-// ErrBadAddress before any network I/O (no Dial began, no carrier was
-// dialled); EarlyReturn is refused ErrProtocol, also before any; a first
+// ErrBadAddress, not ErrMetadataTooLarge, before any network I/O (no Dial
+// began, no carrier was dialled); an o.Metadata of 65,530 bytes, which
+// makes the flow's metadata longer than 65,535 bytes, fails
+// ErrMetadataTooLarge (not ErrBadAddress), also before any; EarlyReturn
+// is refused ErrProtocol, also before any; a first
 // datagram that does not ride and is above the session's MaxPayload
 // returns (nil, ErrPacketTooLarge) with the session closed (the passive
 // reads io.EOF, the dialer Runtime keeps no session: no leak) and nothing
@@ -203,8 +206,15 @@ func TestDialUDPErrors(t *testing.T) {
 			var begins atomic.Int64
 			w := newPFWorld(t, pfOpts{ov: pfDialBegins(&begins)})
 			for _, addr := range []string{"192.0.2.1", "192.0.2.1:0", ":53", "224.0.0.1:53", "255.255.255.255:53", "[fe80::1%eth0]:53", "[::ffff:224.0.0.1]:53", "a..b.test:53"} {
-				if pc, err := DialUDP(context.Background(), w.peer, addr, pfData(20, 1), rendr.DialOptions{}); pc != nil || !errors.Is(err, ErrBadAddress) {
-					t.Errorf("DialUDP(%q) = %v, %v; want ErrBadAddress", addr, pc, err)
+				if pc, err := DialUDP(context.Background(), w.peer, addr, pfData(20, 1), rendr.DialOptions{}); pc != nil || !errors.Is(err, ErrBadAddress) || errors.Is(err, rendr.ErrMetadataTooLarge) {
+					t.Errorf("DialUDP(%q) = %v, %v; want ErrBadAddress alone", addr, pc, err)
+				}
+			}
+			// The IPv4 header (11 bytes) and flen (2) + 65,530 = 65,543 > 65,535.
+			big := rendr.DialOptions{Metadata: make([]byte, 65530)}
+			for _, first := range [][]byte{nil, pfData(20, 1)} {
+				if pc, err := DialUDP(context.Background(), w.peer, pfTarget, first, big); pc != nil || !errors.Is(err, rendr.ErrMetadataTooLarge) || errors.Is(err, ErrBadAddress) {
+					t.Errorf("DialUDP with %d bytes of o.Metadata and a %d-byte first = %v, %v; want ErrMetadataTooLarge", len(big.Metadata), len(first), pc, err)
 				}
 			}
 			if pc, err := DialUDP(context.Background(), w.peer, pfTarget, pfData(20, 1), rendr.DialOptions{EarlyReturn: true}); pc != nil || !errors.Is(err, rendr.ErrProtocol) {
