@@ -319,7 +319,17 @@ func (f *pfwd) pump(buf []byte, done chan<- struct{}) {
 			return
 		}
 		if err != nil {
-			switch errClass(err) {
+			c := errClass(err)
+			if c == classSize && n < len(buf) && !errors.Is(err, io.ErrShortBuffer) {
+				// A size errno without a filled buffer is no datagram that
+				// arrived: Windows reports a longer one as WSAEMSGSIZE with
+				// the buffer filled, Unix truncates it silently (n =
+				// len(buf), no error), and a connected socket reports an
+				// ICMP fragmentation-needed or packet-too-big of an earlier
+				// send as EMSGSIZE on its next call: noise (L58).
+				c = classNoise
+			}
+			switch c {
 			case classSize: // WSAEMSGSIZE with the buffer filled, io.ErrShortBuffer
 				run.ok()
 				f.tooLarge++

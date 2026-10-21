@@ -17,9 +17,11 @@ const (
 	// backs off; the flow continues.
 	classNoise localClass = iota + 1
 	// classSize: EMSGSIZE or WSAEMSGSIZE on a read, or io.ErrShortBuffer:
-	// a datagram above MaxPayload, dropped and counted TooLarge. On a
-	// write the caller counts it as noise (a datagram the local socket
-	// refused to send).
+	// a datagram above MaxPayload, dropped and counted TooLarge — an errno
+	// only when the read filled its buffer; without, ForwardPacket's pump
+	// counts it as noise (an ICMP fragmentation-needed or packet-too-big
+	// of an earlier send). On a write the caller counts it as noise (a
+	// datagram the local socket refused to send).
 	classSize
 	// classFatal: the fatal errno set (a closed, invalid or unconnected
 	// socket and their WSA twins), net.ErrClosed, io.EOF, a timeout and

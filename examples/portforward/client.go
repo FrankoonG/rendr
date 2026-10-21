@@ -136,6 +136,9 @@ func runClient(ctx context.Context, logger *log.Logger, o options) error {
 		}
 		serves = append(serves, func(ctx context.Context) error { return s.serve(ctx, logger, local, target) })
 	}
+	if sides["udp"] != nil {
+		checkBuffers(logger, "client", "ingress", ingressBuffer)
+	}
 	return supervise(ctx, func() {
 		for _, k := range []string{"udp", "tcp"} {
 			if s := sides[k]; s != nil {

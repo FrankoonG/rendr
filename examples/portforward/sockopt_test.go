@@ -29,12 +29,6 @@ func sockoptInt(t *testing.T, c syscall.Conn, opt int) int {
 	return v
 }
 
-// getInt calls get, syscall.GetsockoptInt (an int descriptor on Unix, a
-// syscall.Handle on Windows), on fd.
-func getInt[H ~int | ~uintptr](get func(H, int, int) (int, error), fd uintptr, opt int) (int, error) {
-	return get(H(fd), syscall.SOL_SOCKET, opt)
-}
-
 // granted returns the SO_RCVBUF and SO_SNDBUF the OS reports for a fresh
 // UDP socket that asked for n bytes of each (n 0: asked for nothing). The
 // OS caps and may double a request (Linux), so a socket's buffers are

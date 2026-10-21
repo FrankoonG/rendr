@@ -36,6 +36,10 @@
 // is dropped and counted, never fragmented. -max-datagram 1472 on both
 // ends of a 1500-byte path carries datagrams of up to 1,438 bytes
 // (Moonlight video, QUIC Initials, WireGuard with an MTU of at most 1406).
+// The UDP sockets ask for buffers sized for keyframe bursts (4 MiB toward
+// the target, 8 MiB at the client's ingress); a subcommand logs a warning
+// at its start when the OS grants less (on Linux raise net.core.rmem_max
+// and net.core.wmem_max).
 //
 // Every 10 s, and once at the stop, the client logs one status line per
 // forward kind ("client: status udp: …", "client: status tcp: …") and the

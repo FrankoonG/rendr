@@ -30,6 +30,9 @@ func runServer(ctx context.Context, logger *log.Logger, o options) error {
 		allow[strings.ToLower(r.Addr)] = true
 	}
 	s := &l4.Server{UDP: o.udp, Dial: allowDial(allow, o.allowAny)}
+	if o.udp {
+		checkBuffers(logger, "server", "target", burstBuffer)
+	}
 	var deaths carrierDeaths
 	rt, err := rendr.NewRuntime(runtimeConfig(&deaths))
 	if err != nil {

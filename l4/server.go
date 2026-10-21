@@ -106,13 +106,14 @@ type Server struct {
 	// 0.5–30 s) and never runs past the pending session's AcceptTimeout
 	// minus 250 ms, so a slow target is answered CodeTimeout.
 	DialTimeout time.Duration
-	// IdleTimeout is set on every served session (0: DefaultIdleTimeout;
-	// negative: none, so the Runtime's Config.IdleTimeout applies, which is
-	// off by default).
+	// IdleTimeout is set on every served TCP connection's session (0:
+	// DefaultIdleTimeout; negative: none, so the Runtime's
+	// Config.IdleTimeout applies, which is off by default). UDP flows take
+	// UDPIdle instead.
 	IdleTimeout time.Duration
-	// MaxConns bounds the sessions this Server dials for or forwards at once
-	// (0 or less: DefaultMaxConns); a session beyond it is rejected
-	// CodeCapacity at once.
+	// MaxConns bounds the TCP connections this Server dials for or forwards
+	// at once (0 or less: DefaultMaxConns); a session beyond it is rejected
+	// CodeCapacity at once. UDP flows have MaxFlows.
 	MaxConns int
 
 	// UDP enables L4 UDP flows: Serve also accepts packet sessions, and
@@ -127,9 +128,12 @@ type Server struct {
 	// session ends (see HandleUDP). MaxConns bounds TCP connections only.
 	MaxFlows int
 	// UDPBuffer is the receive and send buffer size the default UDP dialer
-	// requests for each target socket (0 or less: 1 MiB; the kernel caps it
-	// at rmem_max and wmem_max). Bursts from the target wait there until the
-	// flow's pump reads them: size it for the largest burst.
+	// requests for each target socket (0 or less: 1 MiB). The OS may grant
+	// less: Linux caps the request at net.core.rmem_max and wmem_max (about
+	// 208 KiB by default), which must be raised for large bursts; darwin
+	// keeps its default for a request above kern.ipc.maxsockbuf. Bursts
+	// from the target wait there until the flow's pump reads them: size it
+	// for the largest burst.
 	UDPBuffer int
 
 	tcp, udp  kindStats  // the counters of TCP connections and of UDP flows

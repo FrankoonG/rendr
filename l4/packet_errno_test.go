@@ -139,12 +139,17 @@ func (c *pfNoiseConn) count() int {
 }
 
 // pfScriptConn returns its errors from its next Reads, one each, then
-// reads the wrapped conn.
+// reads the wrapped conn. A Read returns (0, err), or (len(b), err) for a
+// pfFilled.
 type pfScriptConn struct {
 	net.Conn
 	mu   sync.Mutex
 	errs []error
 }
+
+// pfFilled is a scripted read that fills the buffer with its error, as
+// Windows reports a datagram longer than the buffer (WSAEMSGSIZE).
+type pfFilled struct{ error }
 
 func (c *pfScriptConn) Read(b []byte) (int, error) {
 	c.mu.Lock()
@@ -152,6 +157,9 @@ func (c *pfScriptConn) Read(b []byte) (int, error) {
 		err := c.errs[0]
 		c.errs = c.errs[1:]
 		c.mu.Unlock()
+		if f, ok := err.(pfFilled); ok {
+			return len(b), f.error
+		}
 		return 0, err
 	}
 	c.mu.Unlock()
@@ -168,8 +176,9 @@ func (c *pfScriptConn) Read(b []byte) (int, error) {
 // exactly 64 free reads and then the back-off (5 ms doubling to 100 ms):
 // ≤ 64 + 5 + 100 reads in the first 10 virtual seconds, and the datagram
 // behind them reaches the session after the sum of the waits (993.255 s).
-// A size-class read (a datagram arrived, too long) ends a run: 64 noise
-// errors, a WSAEMSGSIZE and 64 more cost no wait.
+// A size-class read (a datagram arrived, too long: WSAEMSGSIZE with the
+// buffer filled) ends a run: 64 noise errors, that read and 64 more cost
+// no wait.
 func TestForwardPacketNoise_L58_L73(t *testing.T) {
 	var noise []pfErrno
 	for _, e := range pfNoiseErrnos() {
@@ -255,7 +264,7 @@ func TestForwardPacketNoise_L58_L73(t *testing.T) {
 			for range 2 * noiseRunFree {
 				script = append(script, noise[0].err)
 			}
-			script = slices.Insert(script, noiseRunFree, pfWSASize.err)
+			script = slices.Insert(script, noiseRunFree, error(pfFilled{pfWSASize.err}))
 			sc := &pfScriptConn{Conn: local, errs: script}
 			d := pfData(30, 0x78)
 			pfSend(t, app, d) // waits behind the errors
