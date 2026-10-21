@@ -175,7 +175,8 @@ func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.P
 // it writes the first datagram, if one rode the OPEN, and confirms p. A
 // first datagram above the session's MaxPayload follows the size rule of
 // every datagram of the flow: dropped and counted TooLarge (only an OPEN
-// that DialUDP did not build carries one; §A3.3). It returns the session
+// that DialUDP did not build carries one; §A3.3), and, not having moved,
+// it does not seed the forward's class tracker. It returns the session
 // and the forward's class seed, or nil after it closed t and counted the
 // outcome in k.
 func (s *Server) openFlow(ctx context.Context, p *rendr.PendingPacket, k *kindStats, t net.Conn, first []byte) (*rendr.PacketConn, flowSeed) {

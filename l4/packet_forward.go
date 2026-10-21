@@ -38,8 +38,9 @@ type PacketResult struct {
 // space: every syscall.Errno except a small fatal set (a closed or invalid
 // descriptor, an unconnected socket) — are counted and ignored; a run of
 // them backs off up to 100 ms; they never end the flow. Other errors end
-// it, and so does a count local must not return (L42: a Write's other than
-// the datagram's length without an error).
+// it, and so does a count local must not return (L42: a Read count outside
+// its buffer, or a Write count other than the datagram's length, without
+// an error).
 // ForwardPacket applies idle's classes to pc with SetIdleTimeout (Short at
 // once, Stream once the flow is a stream). When the session ends while a
 // local Write is still running, ForwardPacket sets local's deadline one
