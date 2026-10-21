@@ -9,17 +9,34 @@ import (
 	"github.com/FrankoonG/rendr/v2/l4"
 )
 
-// TestL4UMixedRaceJoiningOversize_L37 (§A4.1 "bond or race with a stream
-// factory"; the M6 delegate decision of 2026-10-21 on a mixed session's
-// joining stream member; l4's "Sizes" text; L37): the documented
-// limitation, in race mode. One UDP flow through the ingress over a Peer of
-// one datagram factory u1 (frame budget 1,463: 1,438-byte datagrams) and
-// one stream factory s1. The flow's first datagram is 3,000 bytes, wider
-// than the datagram member, so it cannot ride the OPEN and is flushed when
-// the flow opens; from the instant the flow is open at the ingress the
-// client sends 3,000- and 1,000-byte test datagrams alternately, 200 per
-// second for 2 s, and the target echoes each. The session opens on u1 and
-// s1 joins about one round trip (20 ms) later.
+// TestL4UMixedBondJoiningOversize_L37 (§A4.1 "bond or race with a stream
+// factory", M2-D43; the M6 delegate decision of 2026-10-21 on a mixed
+// bond's joining stream member, which makes WP9-red's row of this name the
+// row of the documented behaviour; l4's "Sizes" text; L37): the documented
+// limitation in bond mode, where the bond's fill drops a wide head that no
+// live member can carry (joiningOversize).
+func TestL4UMixedBondJoiningOversize_L37(t *testing.T) {
+	joiningOversize(t, rendr.ModeBond)
+}
+
+// TestL4UMixedRaceJoiningOversize_L37 (§A4.1; the same decision, which
+// l4's "Sizes" text extends to race; L37): the documented limitation in
+// race mode, where the race head that no live lane can carry is dropped
+// (joiningOversize).
+func TestL4UMixedRaceJoiningOversize_L37(t *testing.T) {
+	joiningOversize(t, rendr.ModeRace)
+}
+
+// joiningOversize is the row of a mixed session's joining stream member in
+// mode m (bond or race): the limitation l4's "Sizes" text documents. One
+// UDP flow through the ingress over a Peer of one datagram factory u1
+// (frame budget 1,463: 1,438-byte datagrams) and one stream factory s1.
+// The flow's first datagram is 3,000 bytes, wider than the datagram
+// member, so it cannot ride the OPEN and is flushed when the flow opens;
+// from the instant the flow is open at the ingress the client sends 3,000-
+// and 1,000-byte test datagrams alternately, 200 per second for 2 s, and
+// the target echoes each. The session opens on u1 and s1 joins about one
+// round trip (20 ms) later.
 //
 // Stimulus: the flow's MaxPayload is 65,507 at both ends (the session has
 // a stream factory), and the stream member was not yet live when the flow
@@ -32,14 +49,9 @@ import (
 // within two round trips of the open, every later one arrives whole and
 // once in both directions, no datagram is counted TooLarge (its size is
 // within MaxPayload) and the flow stays the one open flow. The row fails
-// when the core starts keeping such a datagram for the joining member: l4's
-// "Sizes" text changes with it.
-func TestL4UMixedRaceJoiningOversize_L37(t *testing.T) {
-	joiningOversize(t, rendr.ModeRace)
-}
-
-// joiningOversize is the row of TestL4UMixedRaceJoiningOversize_L37 in
-// mode m (bond or race): the limitation l4's "Sizes" text documents.
+// when the core starts keeping such a datagram for the joining member, or
+// counts its drop as anything but DropTooLarge: l4's "Sizes" text changes
+// with it.
 func joiningOversize(t *testing.T, m rendr.Mode) {
 	synctest.Test(t, func(t *testing.T) {
 		const (

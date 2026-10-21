@@ -10,18 +10,6 @@ import (
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
 
-// serveOn runs s.Serve on ln with a cancellable ctx.
-func serveOn(s *Server, ln *rendr.Listener) *served {
-	ctx, cancel := context.WithCancel(context.Background())
-	sv := &served{s: s, cancel: cancel, done: make(chan error, 1)}
-	go func() {
-		err := s.Serve(ctx, ln)
-		sv.ended.Store(time.Now().UnixNano())
-		sv.done <- err
-	}()
-	return sv
-}
-
 // TestServerSeveralListeners_L48 (Serve's doc; M4-D28, M6-D19; the shape of
 // examples/portforward's server, one Listener per address): one Server
 // serves two Listeners of the passive Runtime at once, each reached through
