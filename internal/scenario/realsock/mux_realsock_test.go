@@ -33,8 +33,8 @@ import (
 // lower size or rate with the same criteria (R2-37). Helpers carry the ms
 // prefix: the package's other files belong to other work packages.
 
-// msRace reports a race-detector build (the build setting "-race"; the
-// package keeps no build-tagged files of its own).
+// msRace reports a race-detector build (the build setting "-race"; race
+// detection needs no build-tagged file).
 var msRace = func() bool {
 	bi, ok := debug.ReadBuildInfo()
 	if !ok {
