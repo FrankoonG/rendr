@@ -218,7 +218,9 @@ func (s *Session) pktAgeQueueLocked(q *pring, nowNs int64, noData bool) {
 // clock starts at the view's first call after the go frame. A dedicated
 // carrier's first response and DGRAMs share a round (R1-8). A dialer's
 // clock runs from its start (initPacketLocked). Once per session;
-// O(queued).
+// O(queued). A held txBig (pk.bigHeld: a mixed bond's stream member
+// awaits its SCHED) is aged by the actor, which wanted no deadline for it
+// until now (pktAgeBigLocked): it is rung to arm the restamped one.
 func (s *Session) pktAgeStartLocked(nowNs int64) {
 	pk := s.pk
 	pk.ageOn = true
@@ -227,6 +229,9 @@ func (s *Session) pktAgeStartLocked(nowNs int64) {
 			d := &q.desc[(q.head+i)&(len(q.desc)-1)]
 			d.at = max(d.at, nowNs)
 		}
+	}
+	if pk.bigHeld && pk.txBig.n > 0 {
+		s.ringActor()
 	}
 }
 

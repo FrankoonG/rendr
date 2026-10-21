@@ -897,11 +897,12 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 // frames and payload bytes the call appended, stuck: the call placed
 // nothing because the batch had no room for the view's next frame (the
 // view stays ready), and relWait: the call placed nothing and the REL
-// window refused a reliable frame of it (the view is neither idle nor
-// drained; it waits in the REL list, which a RACK that frees room
-// re-readies). The rest of a cut turn that places nothing on a batch
-// with room for it ends the turn, and the view's next turn is called at
-// once (at most two calls).
+// window refused a reliable frame of it (the view is not drained: it
+// waits in the REL list, which a RACK that frees room re-readies). A REL
+// refusal changes none of the DRR rules: the rest of a cut turn that
+// places nothing on a batch with room for it ends the turn, and the
+// view's next turn is called at once (at most two calls), as without it
+// (TestMuxDRRCutTurnRelRefusedKeepsRate).
 func (t *trunk) drrTurn(v *Conn, b *Batch, rd *roundData, nowNs int64, quantum int) (appended, used int, stuck, relWait bool) {
 	for {
 		q := min(v.deficit+quantum, 2*quantum)
@@ -937,15 +938,13 @@ func (t *trunk) drrTurn(v *Conn, b *Batch, rd *roundData, nowNs int64, quantum i
 			return 0, 0, b.nearFull(), relRef
 		case short || b.nearFull():
 			return 0, 0, true, relRef // no room for its next frame: no change, and it stays ready
-		case relRef:
-			// The REL window refused a frame it owes (a datagram trunk's
-			// RST, FIN, SCHED or response): no change, as for the cap; the
-			// RACK that frees room re-readies it (reReadyLocked).
-			return 0, 0, false, true
 		}
 		v.deficit, v.vx.resume = 0, false // nothing placed, and not for want of room
 		if !resumed {
-			return 0, 0, false, false // idle
+			// Idle, or (relWait) waiting for the REL room of a frame it
+			// owes (a datagram trunk's RST, FIN, SCHED or response): the
+			// RACK that frees room re-readies it (reReadyLocked).
+			return 0, 0, false, relRef
 		}
 		// The rest of a cut turn was smaller than the view's next frame:
 		// the turn ends, and its next turn starts at once.

@@ -41,6 +41,8 @@ const heldWithin = 2 * time.Second
 //   - go-frame: a second packet session on a datagram trunk with a 150-ms
 //     round trip (≥ MaxAge): the replies wait about one round trip for the
 //     go frame.
+//   - go-frame/stream: the same on a stream MUX trunk, which holds a view
+//     for its go frame too (no REL window).
 //   - rel-room: 63 packet sessions opened in one instant on one datagram
 //     trunk (its 64 views with the first; 10-ms round trip): their
 //     OPEN_ACKs share the trunk's 8-frame REL window, and the datagram of
@@ -66,15 +68,18 @@ func TestMuxFirstReplyAgesFromPlaceable_L40(t *testing.T) {
 		oneWay   time.Duration
 		sessions int  // opened together after the trunk's first session
 		dropAck  bool // the passive → dialer direction drops the datagram of the first of their OPEN_ACKs
+		stream   bool // a stream MUX trunk instead of a datagram trunk
 	}{
-		{"go-frame", rendr.ModeSelector, 75 * time.Millisecond, 1, false},
-		{"go-frame/race", rendr.ModeRace, 75 * time.Millisecond, 1, false},
-		{"rel-room", rendr.ModeSelector, 5 * time.Millisecond, 63, true}, // with the first: the 64 views of a datagram trunk
-		{"rel-room/race", rendr.ModeRace, 5 * time.Millisecond, 63, true},
+		{"go-frame", rendr.ModeSelector, 75 * time.Millisecond, 1, false, false},
+		{"go-frame/race", rendr.ModeRace, 75 * time.Millisecond, 1, false, false},
+		{"go-frame/stream", rendr.ModeSelector, 75 * time.Millisecond, 1, false, true},
+		{"go-frame/stream/race", rendr.ModeRace, 75 * time.Millisecond, 1, false, true},
+		{"rel-room", rendr.ModeSelector, 5 * time.Millisecond, 63, true, false}, // with the first: the 64 views of a datagram trunk
+		{"rel-room/race", rendr.ModeRace, 5 * time.Millisecond, 63, true, false},
 	} {
 		t.Run(arm.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
-				w := newWorld(t, worldOpts{}, linkSpec{name: "u", oneWay: arm.oneWay, dgram: true})
+				w := newWorld(t, worldOpts{}, linkSpec{name: "u", oneWay: arm.oneWay, dgram: !arm.stream})
 				peer := w.peer("u")
 				first := w.openPacket(peer, "first", rendr.ModeSelector) // view 1: it opens the trunk
 				if arm.dropAck {
