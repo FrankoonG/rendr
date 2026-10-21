@@ -137,9 +137,11 @@
 // new period); an unanswered sender stays short; a stream — game video with
 // the client's pings, a VPN tunnel that carries traffic — becomes one within
 // about 2 s; a flow that only exchanges keepalives (a quiet WireGuard
-// tunnel's, every 25 s) stays short and lives while they come within Short.
-// A negative FlowIdle field turns that class's idle end off; a negative
-// Short turns off both. DialUDP alone sets DefaultFlowIdle on its session;
+// tunnel's, every 25 s) stays short and lives while they come within Short,
+// and in a full table it can make room for a new client (see Port
+// forwarding): give such a tunnel a PortForward of its own. A negative
+// FlowIdle field turns that class's idle end off; a negative Short turns
+// off both. DialUDP alone sets DefaultFlowIdle on its session;
 // ForwardPacket and PortForward apply the classes.
 //
 //	The flow ends by                        Seen at the other end         FlowEnds (this end; the other)
@@ -182,7 +184,17 @@
 // return path) — so lost ≤ SessionUnreported ≤ lost + those; after the
 // peer's idle end it is exact unless a report was lost. An end this side
 // decided adds nothing: what its session sent before reaches the peer
-// ahead of the end.
+// ahead of the end. After a stop the session still sends or drops what it
+// queued, so the ingress reads its drops at the session's end, at most
+// 2.1 s after the close: the largest Packet.MaxAge, within which a session
+// without a carrier drops what it held (a stop while no carrier lives
+// takes that long). An evicted flow's drops are read at once: it was idle
+// for at least 1 s, so its session holds none of its datagrams unless
+// Packet.MaxAge exceeds 1 s. Either way, what a session whose carriers
+// cannot take datagrams drops after that read is in no counter. A first
+// datagram that rode an OPEN that failed counts DropHeld, though a passive
+// may have written it to the target before its Confirm failed
+// (UDPServerStatus.FirstSent and Unconfirmed count it there).
 //
 // The first datagram. DialUDP puts a flow's first datagram into the OPEN
 // when the whole metadata stays within 438 bytes (a DNS query, a WireGuard
@@ -355,5 +367,11 @@
 // Server.UDPBuffer, 1 MiB by default, which the kernel charges as datagrams
 // queue), so the default MaxFlows of 4,096 needs as many file descriptors;
 // at the ingress, one goroutine, one MaxPayload buffer and its session:
-// about 20 KiB of heap and a goroutine stack per flow.
+// about 20 KiB of heap and a goroutine stack per flow at a datagram
+// carrier's MaxPayload. These buffers are outside the sessions'
+// MaxBufferedBytes and grow with MaxPayload: where flows carry
+// Packet.MaxPayload (65,507 bytes; see Sizes) a flow costs about 84 KiB at
+// the ingress and 128 KiB of buffers at the passive, about 340 MiB and
+// 512 MiB at the default MaxFlows. Put UDP forwards on a Peer with datagram
+// carriers only, or lower Packet.MaxPayload or MaxFlows.
 package l4

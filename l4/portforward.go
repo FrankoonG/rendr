@@ -328,7 +328,7 @@ type UDPForwardStatus struct {
 	DropHeld                   uint64                // datagrams of held clients
 	ReadNoise                  uint64                // socket read errors of the noise classes, counted and backed off
 	WriteNoise                 uint64                // replies the socket's write refused (any error: the reply is lost), counted and ignored
-	SessionDrops               uint64                // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
+	SessionDrops               uint64                // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end (after the stop, at its session's end; see the package doc, "UDP flows")
 	LastErr                    error                 // the latest DialUDP error
 
 	// SessionUnreported counts the datagrams the flows' sessions handed to

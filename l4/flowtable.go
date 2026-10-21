@@ -39,6 +39,12 @@ const (
 	// stream is one once its last datagram is ingressEvictIdle old.
 	ingressSample    = 8
 	ingressEvictIdle = time.Second
+	// ingressSettle bounds how long a flow that the stop closed waits for
+	// its session's end (Done) before it reads the session's drop counters
+	// (R1-38): the largest Packet.MaxAge (2 s), within which a session
+	// without a carrier has dropped every datagram it still held, plus
+	// 100 ms.
+	ingressSettle = 2*time.Second + 100*time.Millisecond
 )
 
 // flowTable is one ServeUDP socket's table: the flows by client address
