@@ -72,7 +72,8 @@ type ingressFlow struct {
 
 	// first is the pooled copy of the first datagram when it rides the
 	// OPEN, else nil. Written before the goroutine starts; only the
-	// goroutine uses it from then on.
+	// goroutine uses it from then on (it moves it to firstQ when the open
+	// went without it, R1-4).
 	first []byte
 
 	// Under the table's mutex:

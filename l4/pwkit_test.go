@@ -465,8 +465,8 @@ func (s *pwCountSock) blockedWrites() int {
 }
 
 // pwDialHook replaces dialIngress for the rest of the test: wrap gets
-// every session it opens and the first datagram its open carried (nil when
-// none rode the OPEN).
+// every session it opens and the first datagram the ingress handed the
+// open (it may not have ridden: the session's Metadata tells).
 func pwDialHook(t testing.TB, wrap func(first []byte, s ingressSession) ingressSession) {
 	old := dialIngress
 	dialIngress = func(ctx context.Context, p *rendr.Peer, addr string, first []byte, o rendr.DialOptions) (ingressSession, error) {

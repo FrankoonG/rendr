@@ -108,11 +108,14 @@ type ingressSession interface {
 	Metadata() []byte
 }
 
-// dialIngress opens one flow's session for the ingress: DialUDP. It is a
-// variable only so that tests can wrap the session (a blocking fake, M6
-// design §A16.1 TestPortForwardNeverBlocks_L40); nothing else sets it.
+// dialIngress opens one flow's session for the ingress: DialUDP up to the
+// open (openUDP). A first datagram that did not ride the OPEN (DialUDP's
+// retry without it, R1-4) is the ingress's to write: the flush sends it
+// ahead of the queue. It is a variable only so that tests can wrap the
+// session (a blocking fake, M6 design §A16.1
+// TestPortForwardNeverBlocks_L40); nothing else sets it.
 var dialIngress = func(ctx context.Context, p *rendr.Peer, addr string, first []byte, o rendr.DialOptions) (ingressSession, error) {
-	pc, err := DialUDP(ctx, p, addr, first, o)
+	pc, _, err := openUDP(ctx, p, addr, first, o)
 	if err != nil {
 		return nil, err
 	}
@@ -415,9 +418,9 @@ func (s *udpServe) flow(e *ingressFlow) {
 	pc, err := dialIngress(ctx, s.f.Peer, s.target, e.first, s.opts)
 	cancel()
 	first := e.first != nil
-	ingressFree(e.first) // DialUDP does not retain it
-	e.first = nil
 	if err != nil {
+		ingressFree(e.first) // openUDP does not retain it
+		e.first = nil
 		s.openFailed(e, err, first)
 		return
 	}
@@ -426,15 +429,23 @@ func (s *udpServe) flow(e *ingressFlow) {
 	u.maxPayload.Store(int64(pc.MaxPayload()))
 	pc.SetIdleTimeout(s.short) // net.ErrClosed only: the session already ended, which ReadFrom reports
 	if first {
-		// DialUDP sent it: in the OPEN when the OPEN's metadata holds it,
-		// else after the open, by its retry without it (R1-4).
 		if len(pc.Metadata()) > s.bare {
+			// It rode the OPEN: sent.
+			ingressFree(e.first) // openUDP does not retain it
 			u.firstInOpen.Add(1)
+			u.toSession.Add(1)
+			if e.class.out(s.base.Add(e.since)) {
+				s.promote(pc)
+			}
+		} else {
+			// The OPEN with it was refused ErrMetadataTooLarge and the retry
+			// opened without it (R1-4): it heads the flush, which counts its
+			// write's outcome as the queue's (R1-20: its age too).
+			t.mu.Lock()
+			e.firstQ = &queuedDatagram{b: e.first, at: e.since}
+			t.mu.Unlock()
 		}
-		u.toSession.Add(1)
-		if e.class.out(s.base.Add(e.since)) {
-			s.promote(pc)
-		}
+		e.first = nil
 	}
 	// The flush (R1-13): take the queue under the lock, write it outside,
 	// until the queue is empty under the lock; then the entry is open. A

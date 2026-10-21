@@ -138,6 +138,28 @@ func activeRule() promoteMode {
 // Server without UDP, or a v2.0.0 passive, never serves the flow:
 // ErrCapacity after the passive's AcceptTimeout.
 func DialUDP(ctx context.Context, p *rendr.Peer, addr string, first []byte, o rendr.DialOptions) (*rendr.PacketConn, error) {
+	pc, rode, err := openUDP(ctx, p, addr, first, o)
+	if err != nil {
+		return nil, err
+	}
+	if len(first) > 0 && !rode {
+		// WriteTo copies the datagram: first is not retained. Any other error
+		// is the session's end, which its next call reports (as openUDP's
+		// SetIdleTimeout); the datagram is lost with it.
+		if _, err := pc.WriteTo(first, nil); errors.Is(err, rendr.ErrPacketTooLarge) {
+			pc.Close() // R1-9: an error never comes with a live session
+			return nil, err
+		}
+	}
+	return pc, nil
+}
+
+// openUDP is DialUDP without the first datagram's write after the open:
+// rode reports whether first rode the OPEN, and one that did not is the
+// caller's to write. The PortForward ingress writes it at the head of its
+// flush, so that the write's outcome is counted (ToSession, or a drop when
+// the session has ended).
+func openUDP(ctx context.Context, p *rendr.Peer, addr string, first []byte, o rendr.DialOptions) (pc *rendr.PacketConn, rode bool, err error) {
 	app := o.Metadata
 	// The metadata without the first datagram: the address check, before any
 	// network I/O, and the retry's OPEN (R1-4).
@@ -150,39 +172,30 @@ func DialUDP(ctx context.Context, p *rendr.Peer, addr string, first []byte, o re
 			// error (before any network I/O).
 			err = fmt.Errorf("l4: DialUDP: %d bytes of o.Metadata make the flow's metadata longer than %d bytes: %w", len(app), maxUDPMetadata, rendr.ErrMetadataTooLarge)
 		}
-		return nil, err
+		return nil, false, err
 	}
 	o.Metadata = bare
-	rides := len(first) > 0 && len(bare)+len(first) <= firstBudget
-	if rides {
+	rode = len(first) > 0 && len(bare)+len(first) <= firstBudget
+	if rode {
 		if o.Metadata, err = AppendMetadata(make([]byte, 0, len(bare)+len(first)), Request{Cmd: CmdUDP, Addr: addr, App: app, First: first}); err != nil {
-			return nil, err
+			return nil, false, err
 		}
 	}
-	pc, err := p.DialPacket(ctx, o)
-	if rides && errors.Is(err, rendr.ErrMetadataTooLarge) {
+	pc, err = p.DialPacket(ctx, o)
+	if rode && errors.Is(err, rendr.ErrMetadataTooLarge) {
 		// This Runtime's Handshake.MaxMetadata refused it before any I/O, or
 		// the passive's answered CodeMetadataSize before admitting a session:
 		// no target received the first datagram. Once more without it, and
 		// it follows the open, so it is still sent at most once (M6-D4,
 		// R1-4).
-		o.Metadata, rides = bare, false
+		o.Metadata, rode = bare, false
 		pc, err = p.DialPacket(ctx, o)
 	}
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	// net.ErrClosed only: the session already ended, and its first ReadFrom
 	// or WriteTo reports why.
 	pc.SetIdleTimeout(DefaultFlowIdle)
-	if len(first) > 0 && !rides {
-		// WriteTo copies the datagram: first is not retained. Any other error
-		// is the session's end, which its next call reports (as Dial's
-		// SetIdleTimeout above); the datagram is lost with it.
-		if _, err := pc.WriteTo(first, nil); errors.Is(err, rendr.ErrPacketTooLarge) {
-			pc.Close() // R1-9: an error never comes with a live session
-			return nil, err
-		}
-	}
-	return pc, nil
+	return pc, rode, nil
 }

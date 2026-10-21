@@ -13,8 +13,8 @@ import (
 // the ingress lets ride (its whole metadata within firstBudget) but whose
 // OPEN a Handshake.MaxMetadata refuses — the dialer's own (64: refused
 // before any I/O) or the passive's (256, a 300-byte datagram: answered
-// CodeMetadataSize) — is sent by DialUDP's retry after the open as a
-// datagram: FirstInOpen 0, ToSession 1, the passive wrote no first
+// CodeMetadataSize) — is sent after the retry's open by the ingress's
+// flush: FirstInOpen 0, ToSession 1, the passive wrote no first
 // datagram from an OPEN, and the target received the datagram exactly
 // once (its echo came back). The control: one that rides counts
 // FirstInOpen 1.

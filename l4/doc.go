@@ -332,12 +332,14 @@
 // A new client's first datagram opens its flow (DialUDP, at most 12 s); its
 // later datagrams wait for the open (at most 8 datagrams and 16 KiB, each
 // charged at its buffer class, at most 1 s old at the flush) and are sent in
-// order; one longer than the flow's MaxPayload counts TooLarge at the flush
-// however long it waited. A client whose open failed, or whose flow the far
-// end closed within 5 s of its open, is held: its datagrams are dropped
-// (DropHeld) for 5 s, so a refusing passive sees at most one OPEN per client
-// every 5 s while the table has room. At most 256 flows are being opened at
-// once per PortForward (beyond: DropOpening). When MaxFlows entries exist
+// order, after the first datagram when it did not ride the OPEN (too large
+// for it, or refused by a Handshake.MaxMetadata); one longer than the flow's
+// MaxPayload counts TooLarge at the flush however long it waited. A client
+// whose open failed, or whose flow the far end closed within 5 s of its
+// open, is held: its datagrams are dropped (DropHeld) for 5 s, so a
+// refusing passive sees at most one OPEN per client every 5 s while the
+// table has room. At most 256 flows are being opened at once per
+// PortForward (beyond: DropOpening). When MaxFlows entries exist
 // (opening and held ones included), a new client takes the place of a held
 // client, or of an open flow that never became a stream and has been idle
 // for at least 1 s (the least recently active among up to 8 entries sampled
