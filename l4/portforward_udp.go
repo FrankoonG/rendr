@@ -255,12 +255,18 @@ func (s *udpServe) datagram(b []byte, src netip.AddrPort) {
 	}
 	switch e.state {
 	case FlowOpening:
-		dropped := e.push(b, s.now())
+		// Its latest datagram, also while it waits: the eviction's idle
+		// floor (victim) and FlowInfo.Last count from it, not from the
+		// first, so a flow that a slow open delays is not idle.
+		now := s.now()
+		e.last.Store(int64(now))
+		dropped := e.push(b, now)
 		t.mu.Unlock()
 		if dropped > 0 {
 			u.dropOpenQueue.Add(uint64(dropped))
 		}
 	case FlowHeld:
+		e.last.Store(int64(s.now())) // FlowInfo.Last: its datagrams are dropped, its client is active
 		t.mu.Unlock()
 		u.dropHeld.Add(1)
 	default: // FlowOpen: WriteTo never blocks, and never under the lock (R1-13)

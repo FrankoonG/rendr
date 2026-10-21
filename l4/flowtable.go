@@ -61,7 +61,7 @@ type flowTable struct {
 type ingressFlow struct {
 	client netip.AddrPort
 	since  time.Duration // its first datagram, as an offset from the serve's base
-	last   atomic.Int64  // its latest datagram in either direction, an offset from the base (ns)
+	last   atomic.Int64  // its latest datagram in either direction (opening and held ones included), an offset from the base (ns)
 	class  flowClass
 	done   chan struct{} // closed once when an eviction removes it (R1-5)
 

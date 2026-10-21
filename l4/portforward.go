@@ -51,10 +51,10 @@ type PortForward struct {
 	// AllowNonLoopback permits sockets bound to non-loopback or unspecified
 	// addresses (a LAN-facing ingress). Without it Serve refuses them.
 	AllowNonLoopback bool
-	MaxConns         int           // TCP connections at once over every ServeTCP (0: DefaultMaxConns); one beyond is reset at once
+	MaxConns         int           // TCP connections at once over every ServeTCP (0 or less: DefaultMaxConns); one beyond is reset at once
 	MaxFlows         int           // UDP flows at once over every ServeUDP, opening and held entries included (0 or less: DefaultMaxFlows)
 	Idle             FlowIdle      // the UDP flows' classes (zero: the defaults)
-	IdleTimeout      time.Duration // TCP sessions (0: DefaultIdleTimeout; negative: none), as l4.Dial and Server
+	IdleTimeout      time.Duration // TCP sessions (0: DefaultIdleTimeout; negative: not set, so the Runtime's Config.IdleTimeout applies), as l4.Dial and Server
 
 	tcp tcpForwardCounters // ServeTCP's
 	udp udpForwardCounters // ServeUDP's
@@ -282,7 +282,7 @@ type FlowState uint8
 const (
 	FlowOpening FlowState = iota + 1 // DialUDP running
 	FlowOpen                         // forwarding
-	FlowHeld                         // its open failed; the client's datagrams are dropped until the hold ends
+	FlowHeld                         // its open failed, or the far end closed it within 5 s of its open; the client's datagrams are dropped until the hold ends
 )
 
 // FlowInfo describes one UDP flow.

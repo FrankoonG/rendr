@@ -266,6 +266,8 @@
 // the ingress socket. The default UDP dialer requests Server.UDPBuffer for
 // the flow socket; Server.UDPBuffer does not apply to a Dial hook, which
 // sizes the socket it returns itself (SetReadBuffer and SetWriteBuffer).
+// The OS may grant a socket less than it asks for: on Linux raise
+// net.core.rmem_max and wmem_max for large bursts.
 //
 // DNS-like forwards. Stub resolvers send each query from a fresh ephemeral
 // port, so a busy DNS forward with the default classes keeps one table

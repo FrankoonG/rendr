@@ -11,21 +11,23 @@ import (
 )
 
 // ServeTCP's accept back-off (M6 design §A8.7, R1-19): a temporary Accept
-// error (EMFILE, ENFILE, ECONNABORTED, a deadline on the listener) waits
-// 5 ms, doubling up to 100 ms while they continue; an accepted connection
-// ends the run. The root Listener's back-off is not reachable from l4.
+// error (EMFILE, ENFILE, ENOBUFS, ENOMEM, Windows' WSAEMFILE and
+// WSAENOBUFS, ECONNABORTED, a deadline on the listener) waits 5 ms,
+// doubling up to 100 ms while they continue; an accepted connection ends
+// the run. The root Listener's back-off is not reachable from l4.
 const (
 	tcpAcceptBackoffMin = 5 * time.Millisecond
 	tcpAcceptBackoffMax = 100 * time.Millisecond
 )
 
 // ServeTCP accepts connections from ln until ctx is done or Accept fails
-// permanently (temporary errors back off 5–100 ms) and forwards each to
-// target ("host:port", resolved by the passive; validated before the first
-// Accept: ErrBadAddress). A connection beyond MaxConns, or whose Dial
-// fails, is reset. ServeTCP owns ln from the call on: it closes it exactly
-// once when it stops accepting, and returns only after every connection it
-// started ended. A Unix-domain listener counts as loopback.
+// permanently (temporary errors, out-of-resource errnos included, back off
+// 5–100 ms) and forwards each to target ("host:port", resolved by the
+// passive; validated before the first Accept: ErrBadAddress). A connection
+// beyond MaxConns, or whose Dial fails, is reset. ServeTCP owns ln from
+// the call on: it closes it exactly once when it stops accepting, and
+// returns only after every connection it started ended. A Unix-domain
+// listener counts as loopback.
 //
 // Each accepted connection holds one MaxConns unit while its session is
 // dialled and forwarded: Peer.Dial with Options (EarlyReturn honoured: the
@@ -185,10 +187,16 @@ var errNilAccept = errors.New("l4: listener Accept returned no conn and no error
 
 // temporaryAccept reports an Accept error worth retrying: a net.Error
 // whose Temporary or Timeout is true (EMFILE, ENFILE, ECONNABORTED, a
-// listener deadline), or a (nil, nil) Accept. Everything else — the
+// listener deadline), an errno of M4's capacity class (EMFILE, ENFILE,
+// ENOBUFS, ENOMEM, EADDRNOTAVAIL and their Windows numbers: the net
+// package calls ENOBUFS, ENOMEM and every WSA one permanent, though the
+// resource comes back), or a (nil, nil) Accept. Everything else — the
 // listener's net.ErrClosed included — ends the serve.
 func temporaryAccept(err error) bool {
 	if err == errNilAccept {
+		return true
+	}
+	if c, ok := errnoCode(err); ok && c == CodeCapacity {
 		return true
 	}
 	var t interface{ Temporary() bool }
