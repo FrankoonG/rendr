@@ -153,7 +153,8 @@ func TestL4UStreamCarrierFallback_L37(t *testing.T) {
 // one 1,000-byte datagram and the load starts once both members are live:
 // a datagram wider than the datagram member written while the stream
 // member is still joining has no carrier and is dropped (DropTooLarge), a
-// start-up gap this row does not judge (the WP9 report's open item).
+// start-up gap this row does not judge: the documented limitation
+// TestL4UMixedBondJoiningOversize_L37 pins.
 //
 // PASS: the flow's MaxPayload is 65,507 at both ends (the bond has a
 // stream member); every datagram of both sizes arrives whole and once in
@@ -187,7 +188,7 @@ func TestL4UMixedBondOversize_L37(t *testing.T) {
 		// The flow opens with a small datagram, and the load starts once
 		// both members are live: a datagram wider than the datagram member
 		// written while the stream member is still joining has no carrier
-		// and is dropped (DropTooLarge; the WP9 report's open item).
+		// and is dropped (DropTooLarge; TestL4UMixedBondJoiningOversize_L37).
 		openEcho(t, c, up, down, small)
 		var fi l4.FlowInfo
 		waitFor(t, 10*time.Second, "both members live", func() bool {

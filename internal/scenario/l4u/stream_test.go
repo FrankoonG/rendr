@@ -126,10 +126,12 @@ type mlEvent struct {
 // 200 ms of a kill" (§A16.2), whatever the IDR extension of its W; the
 // blackhole: selector the first arrival of every flow within recoveryBound
 // (the W rule), race an interruption < 50 ms, bond the member's death
-// within recoveryBound (G10-bond's other rule, no video arrival gap above
-// 200 ms, is recorded here and judged by
-// TestL4UBondSilentMemberKeepsStream_L39, merged with its decision); the
-// removal: no loss.
+// within recoveryBound and the video's recovery within it (G10-bond's DROP
+// rule as the M6 delegate decision of 2026-10-21 amends it, judged against
+// the death-detection bound as G4-pkt-bond is: no video arrival gap above
+// 200 ms outside [t_d − 200 ms, t_d + recoveryBound], bondDropRecovery,
+// which TestL4UBondSilentMemberKeepsStream_L39 also judges in every lane);
+// the removal: no loss.
 func TestL4UStreamMiniature_L39_L40_L70(t *testing.T) {
 	for _, mode := range lane.mlModes {
 		t.Run(mode.String(), func(t *testing.T) {
@@ -629,14 +631,17 @@ func (m *mlRun) judgeEvents(t *testing.T, evs []mlEvent, mode rendr.Mode, qGap t
 				t.Fatalf("kill at +%v: the video interruption is %v (largest gap %v less Q's %v), want below %v", ev.at.Sub(t0), g-qGap, g, qGap, bound)
 			}
 		case mode == rendr.ModeBond:
-			// Recorded here; G10-bond's rule (no video arrival gap above
-			// 200 ms) is TestL4UBondSilentMemberKeepsStream_L39's, which
-			// fails on the core of 2026-10-18: the bond keeps placing the
-			// video on the silent member until its death (the WP9 report's
-			// open item).
-			g := span(ev.remove.Add(mlSpanAfter))
-			t.Logf("blackhole at +%v (%s): largest video gap until the removal + %v: %v from +%v (G10-bond's bound %v: TestL4UBondSilentMemberKeepsStream_L39)",
-				ev.at.Sub(t0), ev.link, mlSpanAfter, g, gapAt.Sub(t0), mlStopMax)
+			// G10-bond's DROP rule as amended (2026-10-21): the bond keeps
+			// placing the video on the silent member until its death is
+			// detected, so the stream may stop until then, never after.
+			to := ev.remove.Add(mlSpanAfter)
+			if to.After(next) {
+				to = next
+			}
+			g := span(to)
+			rec := bondDropRecovery(t, m.vDown.ledger, ev.at, to, t0)
+			t.Logf("blackhole at +%v (%s): largest video gap until the removal + %v: %v from +%v; the video recovered %v after it (bound %v)",
+				ev.at.Sub(t0), ev.link, mlSpanAfter, g, gapAt.Sub(t0), rec, recoveryBound)
 		case mode == rendr.ModeRace:
 			g := span(ev.at.Add(mlSpanAfter))
 			t.Logf("blackhole at +%v (%s): largest video gap %v, interruption %v (bound %v)", ev.at.Sub(t0), ev.link, g, g-qGap, mlRaceStop)

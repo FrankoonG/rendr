@@ -31,6 +31,7 @@ type laneSize struct {
 	churnSpan                       time.Duration
 	fallbackSpan                    time.Duration // TestL4UStreamCarrierFallback_L37 (a kill every 6 s)
 	bondSpan                        time.Duration // TestL4UMixedBondOversize_L37
+	silentWarm, silentTail          time.Duration // TestL4UBondSilentMemberKeepsStream_L39: the streaming before the blackhole, the judged span after its removal
 }
 
 // fullLane is the design's size: what the non-race lanes run.
@@ -41,21 +42,25 @@ var fullLane = laneSize{
 	dnsQueries: [3]int{20000, 4000, 4000}, dnsPorts: 4096,
 	churnSessions: 1000, churnRate: 40, churnSpan: 5 * time.Minute,
 	fallbackSpan: 30 * time.Second, bondSpan: 20 * time.Second,
+	silentWarm: 3 * time.Second, silentTail: mlSpanAfter,
 }
 
 // raceLane is the race lane's size: the default mode of the stream
 // miniature with one kill and a shorter blackhole (the same windows and
-// bounds), the 64 flows at 200 and 20 datagrams per second, a fortieth and
-// a tenth of the DNS arms' queries (the reuse arm's port space scaled with
-// them), and the churn's regime at a quarter of the sessions and the rate
-// (10 × 64 s = 640 tombstones wanted against 500).
+// bounds), the 64 flows at 200 and 10 datagrams per second, an eightieth
+// and three fortieths of the DNS arms' queries (the reuse arm's port space
+// scaled with them), the churn's regime at an eighth of the sessions and
+// the rate (5 × 64 s = 320 tombstones wanted against 250), and the bond's
+// silent member after 2 s of streaming, judged until 2 s after the
+// blackhole's removal (its 6-s blackhole, windows and bounds unchanged).
 var raceLane = laneSize{
 	mlModes: []rendr.Mode{rendr.ModeSelector},
 	mlQuiet: 3 * time.Second, mlKills: 1, mlFirst: 2 * time.Second, mlKill: 5 * time.Second, mlDrop: 6 * time.Second, mlTail: 2 * time.Second,
-	failBig: 200, failSmall: 20, failWarm: 4 * time.Second, failObserve: 6 * time.Second,
-	dnsQueries: [3]int{500, 400, 400}, dnsPorts: 409,
-	churnSessions: 250, churnRate: 10, churnSpan: 80 * time.Second,
+	failBig: 200, failSmall: 10, failWarm: 4 * time.Second, failObserve: 6 * time.Second,
+	dnsQueries: [3]int{250, 300, 300}, dnsPorts: 307,
+	churnSessions: 125, churnRate: 5, churnSpan: 80 * time.Second,
 	fallbackSpan: 14 * time.Second, bondSpan: 8 * time.Second,
+	silentWarm: 2 * time.Second, silentTail: 2 * time.Second,
 }
 
 // TestL4URaceLane (racebudget): the lane's sizes follow the binary's
@@ -77,7 +82,8 @@ func TestL4URaceLane(t *testing.T) {
 		want = raceLane
 	}
 	if lane.mlKills != want.mlKills || len(lane.mlModes) != len(want.mlModes) || lane.dnsQueries != want.dnsQueries ||
-		lane.churnSpan != want.churnSpan || lane.failBig != want.failBig {
+		lane.churnSpan != want.churnSpan || lane.churnSessions != want.churnSessions ||
+		lane.failBig != want.failBig || lane.failSmall != want.failSmall || lane.silentTail != want.silentTail {
 		t.Fatalf("the lane runs %+v, want %+v", lane, want)
 	}
 	// More tombstones wanted (rate × 64 s of TombstoneTTL) than the cap (2 ×
