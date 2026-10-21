@@ -23,6 +23,7 @@ import (
 	"time"
 
 	rendr "github.com/FrankoonG/rendr/v2"
+	"github.com/FrankoonG/rendr/v2/internal/udpsocket"
 	"github.com/FrankoonG/rendr/v2/l4"
 	"github.com/FrankoonG/rendr/v2/rendrtest"
 )
@@ -34,7 +35,9 @@ import (
 // RENDR_TAIL_SECS seconds (default 60) after a 2-s warm-up;
 // RENDR_TAIL_PACE=sleep paces the bursts' groups with timers only (the
 // default spins between a burst's groups, so that the burst keeps about
-// 71 kpps where Go's timers round sub-millisecond sleeps up to 1 ms).
+// 71 kpps where Go's timers round sub-millisecond sleeps up to 1 ms; with
+// timers the bursts may stretch beyond the load proof's bound, and the run
+// is then INVALID with all its figures logged: a variant for attribution).
 //
 // Topology: one process; the dialer and the passive Runtime joined by one
 // carrier/udp carrier on loopback (MaxDatagram 1,472 on both ends: the
@@ -43,8 +46,11 @@ import (
 // 4-MiB egress buffers (F86's UDPBuffer). Flow 1 carries ML-100's down
 // shape from the passive's target side to the client: a frame every
 // 16.667 ms of 203 datagrams of 1,408 bytes, written in groups of 46 (46,
-// 46, 46, 46, 19) 46/71,000 s apart, about 71 kpps inside the burst; its
-// client sends a 32-byte keepalive every 100 ms (so the flow is a stream).
+// 46, 46, 46, 19) 46/71,000 s apart, about 71 kpps inside the burst, each
+// group in one sendmmsg call (internal/udpsocket's batch writer, as C1's
+// harness sends; one call per datagram where the platform has no batch
+// calls, logged); its client sends a 32-byte keepalive every 100 ms (so
+// the flow is a stream).
 // Flow 2 echoes a 48-byte datagram every 4 ms through the same Peer (one
 // shared datagram trunk). The baseline is a direct loopback echo pair
 // with the same schedule, 2 ms out of phase, running at the same time, so
@@ -53,9 +59,14 @@ import (
 // Verdict (tailJudge): FAIL when more than 0.05 % of the echoes through
 // rendr were lost or came back more than 4 ms above the baseline's median
 // round trip, or when rendr's p99 exceeds the baseline's by more than
-// 0.5 ms. INVALID (a fatal "INVALID:" message) when the load was not
-// reached: frames missed or started more than 2 ms late beyond 1 %, or
-// fewer than 90 % of the video datagrams arrived. Everything else is
+// 0.5 ms. INVALID (a fatal "INVALID:" message, after every figure is
+// logged) when the load was not the designed one (tailLoadProof: frames
+// missed, or more than 1 % of them started more than 2 ms late or wrote
+// their burst slower than 71 kpps within 25 %; fewer than 90 % of the
+// video datagrams arrived; either echo client sent fewer than 99 % of the
+// window's echoes), or when the direct baseline itself had more than
+// 0.025 % of its echoes lost or beyond its median plus 4 ms (the host was
+// not quiet: a FAIL could be the host's). Everything else is
 // logged for attribution: each echo's two legs (both clocks are the
 // process's monotonic clock), the tail's phase in the frame cycle and in
 // the wall-clock second (C1's once-per-second window), the worst echoes,
@@ -78,7 +89,11 @@ func TestL4UQuietTailDiag(t *testing.T) {
 	span := time.Duration(secs) * time.Second
 	d := &tailDiag{t: t, base: time.Now(), spin: spin, warm: warm}
 	d.wall0 = d.base.UnixNano()
-	echoes := int((warm+span)/tailEchoEvery) + 1000
+	// The echo clients send from their creation until stopAll: through the
+	// opens (each wait bounded by l4uWait), the warm-up, the window and the
+	// 200-ms drain; their seq budget covers all of it, so that they never
+	// stop before the window ends (the load proof counts the window's).
+	echoes := int((2*l4uWait + warm + span + time.Second) / tailEchoEvery)
 
 	n := newL4uNet(t, l4uOpts{maxDatagram: 1472, srv: &l4.Server{UDP: true, UDPBuffer: 4 << 20}})
 	t.Cleanup(d.stopAll) // a failed premise stops the diagnostic's goroutines first
@@ -101,7 +116,8 @@ func TestL4UQuietTailDiag(t *testing.T) {
 	}
 	start := time.Now()
 	d.opened = start.Sub(d.base)
-	d.from, d.to = start.Add(warm).Sub(d.base), start.Add(warm+span).Sub(d.base)
+	d.from.Store(int64(start.Add(warm).Sub(d.base)))
+	d.to.Store(int64(start.Add(warm + span).Sub(d.base)))
 	vt.startBursts(start)
 	time.Sleep(warm)
 	snapBefore := d.snapshot(n)
@@ -115,27 +131,16 @@ func TestL4UQuietTailDiag(t *testing.T) {
 	n.close()
 }
 
-const (
-	tailEchoEvery  = 4 * time.Millisecond
-	tailEchoSize   = 48
-	tailKeepEvery  = 100 * time.Millisecond
-	tailKeepSize   = 32
-	tailShard      = 1408
-	tailFrameDgram = 203
-	tailGroup      = 46
-	tailFrameEvery = time.Second / 60
-)
-
-// tailGroupGap spaces a burst's groups: 46 datagrams at 71 kpps.
-var tailGroupGap = tailGroup * time.Second / 71000
-
 // tailDiag is the diagnostic's shared state: the process clock's origin
 // and the measuring window, as offsets from base.
 type tailDiag struct {
-	t        *testing.T
-	base     time.Time
-	wall0    int64 // base's wall clock (ns since the epoch)
-	from, to time.Duration
+	t     *testing.T
+	base  time.Time
+	wall0 int64 // base's wall clock (ns since the epoch)
+	// from and to are the window (offsets from base; both 0 until the
+	// bursts start), stored once by the test goroutine and read by the
+	// video client's reader for every datagram: window reads them.
+	from, to atomic.Int64
 	opened   time.Duration // both flows open: about the shared carrier's start, the origin of its PING cadence
 	warm     time.Duration
 	spin     bool
@@ -147,6 +152,11 @@ type tailDiag struct {
 }
 
 func (d *tailDiag) now() time.Duration { return time.Since(d.base) }
+
+// window returns the measuring window as offsets from base.
+func (d *tailDiag) window() (from, to time.Duration) {
+	return time.Duration(d.from.Load()), time.Duration(d.to.Load())
+}
 
 // goStop runs f on a goroutine that stopAll joins; f must return when
 // d.stopCh() closes or its socket closes.
@@ -207,11 +217,12 @@ func (d *tailDiag) sock(to net.Addr, buf int) (*net.UDPConn, int) {
 // The video target: it reads the client's keepalives (the first one names
 // the flow's egress socket) and sends the frames to that socket.
 type tailVideoTarget struct {
-	d      *tailDiag
-	c      *net.UDPConn
-	rcvbuf int
-	peer   atomic.Pointer[netip.AddrPort]
-	keeps  atomic.Int64
+	d       *tailDiag
+	c       *net.UDPConn
+	rcvbuf  int
+	peer    atomic.Pointer[netip.AddrPort]
+	keeps   atomic.Int64
+	batched bool // each group is one sendmmsg call (else one call per datagram)
 	// Written by the burst goroutine; read after stopAll.
 	frames, sent, errs int
 	firstErr           error
@@ -242,13 +253,23 @@ func (d *tailDiag) newVideoTarget() *tailVideoTarget {
 	return vt
 }
 
-// startBursts sends a frame every tailFrameEvery from start until stopAll.
+// startBursts sends a frame every tailFrameEvery from start until stopAll,
+// each group of a frame in one batched write.
 func (vt *tailVideoTarget) startBursts(start time.Time) {
 	d := vt.d
 	dst := *vt.peer.Load()
 	stop := d.stopCh()
+	uc, err := udpsocket.New(vt.c, tailGroup, nil)
+	if err != nil {
+		d.t.Fatalf("premise: the video target's batch writer: %v", err)
+	}
+	vt.batched = uc.Mode() == udpsocket.ModeBatch
+	bt := udpsocket.NewBatch(tailGroup)
+	ms := make([]udpsocket.Msg, tailGroup)
+	for i := range ms {
+		ms[i] = udpsocket.Msg{Buf: make([]byte, tailShard), Addr: dst}
+	}
 	d.goStop(func() {
-		b := make([]byte, tailShard)
 		var seq uint64
 		for f := 0; ; f++ {
 			due := start.Add(time.Duration(f) * tailFrameEvery)
@@ -267,9 +288,9 @@ func (vt *tailVideoTarget) startBursts(start time.Time) {
 			t0 := time.Now()
 			vt.late = append(vt.late, t0.Sub(due))
 			vt.starts = append(vt.starts, t0.Sub(d.base))
-			for k := 0; k < tailFrameDgram; k++ {
-				if k > 0 && k%tailGroup == 0 {
-					at := t0.Add(time.Duration(k/tailGroup) * tailGroupGap)
+			for g := 0; g*tailGroup < tailFrameDgram; g++ {
+				if g > 0 {
+					at := t0.Add(time.Duration(g) * tailGroupGap)
 					if d.spin {
 						for time.Now().Before(at) {
 							runtime.Gosched()
@@ -278,25 +299,44 @@ func (vt *tailVideoTarget) startBursts(start time.Time) {
 						time.Sleep(w)
 					}
 				}
-				binary.BigEndian.PutUint64(b, seq)
-				binary.BigEndian.PutUint32(b[8:], uint32(f))
-				binary.BigEndian.PutUint64(b[12:], uint64(d.now()))
-				if _, err := vt.c.WriteToUDPAddrPort(b, dst); err != nil {
-					if errors.Is(err, net.ErrClosed) {
-						return // stopAll closed the socket during the frame
-					}
-					if vt.errs++; vt.firstErr == nil {
-						vt.firstErr = err
-					}
-				} else {
-					vt.sent++
+				k := min(tailGroup, tailFrameDgram-g*tailGroup)
+				now := uint64(d.now())
+				for i := range ms[:k] {
+					b := ms[i].Buf
+					binary.BigEndian.PutUint64(b, seq)
+					binary.BigEndian.PutUint32(b[8:], uint32(f))
+					binary.BigEndian.PutUint64(b[12:], now)
+					seq++
 				}
-				seq++
+				if !vt.write(uc, bt, ms[:k]) {
+					return // stopAll closed the socket during the frame
+				}
 			}
 			vt.burst = append(vt.burst, time.Since(t0))
 			vt.frames++
 		}
 	})
+}
+
+// write sends ms through uc (one sendmmsg call where the platform has
+// one), counting and skipping a datagram the socket refused; false: the
+// socket closed.
+func (vt *tailVideoTarget) write(uc *udpsocket.Conn, b *udpsocket.Batch, ms []udpsocket.Msg) bool {
+	for len(ms) > 0 {
+		n, err := uc.WriteBatch(b, ms)
+		vt.sent += n
+		if err == nil {
+			return true
+		}
+		if errors.Is(err, net.ErrClosed) {
+			return false
+		}
+		if vt.errs++; vt.firstErr == nil {
+			vt.firstErr = err
+		}
+		ms = ms[min(n+1, len(ms)):]
+	}
+	return true
 }
 
 // The video client: a keepalive every 100 ms; every datagram's one-way
@@ -349,7 +389,7 @@ func (d *tailDiag) newVideoClient(to net.Addr) *tailVideoClient {
 			}
 			vc.next = seq + 1
 			vc.got++
-			if sentAt >= d.from && sentAt < d.to {
+			if from, to := d.window(); sentAt >= from && sentAt < to {
 				vc.inWindow++
 				vc.delays = append(vc.delays, at-sentAt)
 			}
@@ -463,9 +503,10 @@ type tailEcho struct {
 // echoes returns the echoes the client sent in the window.
 func (d *tailDiag) echoes(ec *tailEchoClient, et *tailEchoTarget) []tailEcho {
 	var out []tailEcho
+	from, to := d.window()
 	for seq := range ec.sent {
 		s := time.Duration(ec.sent[seq].Load())
-		if s == 0 || s-1 < d.from || s-1 >= d.to {
+		if s == 0 || s-1 < from || s-1 >= to {
 			continue
 		}
 		e := tailEcho{seq: seq, sent: s - 1}
@@ -538,10 +579,10 @@ func tailSNMP() map[string]int64 {
 	return out
 }
 
-// histDiff returns the quantiles q of the samples a histogram gained
+// tailHistDiff returns the quantiles q of the samples a histogram gained
 // between two snapshots (the bucket's upper bound) and the highest bucket
 // that gained any.
-func histDiff(a, b *metrics.Float64Histogram, qs ...float64) (out []time.Duration, top time.Duration, total uint64) {
+func tailHistDiff(a, b *metrics.Float64Histogram, qs ...float64) (out []time.Duration, top time.Duration, total uint64) {
 	if a == nil || b == nil || len(a.Counts) != len(b.Counts) {
 		return nil, 0, 0
 	}
@@ -550,7 +591,7 @@ func histDiff(a, b *metrics.Float64Histogram, qs ...float64) (out []time.Duratio
 		diff[i] = b.Counts[i] - a.Counts[i]
 		total += diff[i]
 		if diff[i] > 0 {
-			top = histBound(b.Buckets[i+1])
+			top = tailHistBound(b.Buckets[i+1])
 		}
 	}
 	for _, q := range qs {
@@ -559,7 +600,7 @@ func histDiff(a, b *metrics.Float64Histogram, qs ...float64) (out []time.Duratio
 		for i, c := range diff {
 			acc += c
 			if acc >= want && c > 0 {
-				v = histBound(b.Buckets[i+1])
+				v = tailHistBound(b.Buckets[i+1])
 				break
 			}
 		}
@@ -568,15 +609,15 @@ func histDiff(a, b *metrics.Float64Histogram, qs ...float64) (out []time.Duratio
 	return out, top, total
 }
 
-func histBound(sec float64) time.Duration {
+func tailHistBound(sec float64) time.Duration {
 	if sec > 3600 {
 		return time.Hour
 	}
 	return time.Duration(sec * float64(time.Second))
 }
 
-// q is the nearest-rank quantile of s (not sorted; empty: 0).
-func q(s []time.Duration, p float64) time.Duration {
+// tailQ is the nearest-rank quantile of s (not sorted; empty: 0).
+func tailQ(s []time.Duration, p float64) time.Duration {
 	if len(s) == 0 {
 		return 0
 	}
@@ -585,32 +626,33 @@ func q(s []time.Duration, p float64) time.Duration {
 	return tailQuantile(c, p)
 }
 
-// report logs the measurement and judges it.
+// report logs the measurement and judges it: every figure first, then the
+// load proof and the baseline's quiet check (INVALID), then the verdict.
 func (d *tailDiag) report(n *l4uNet, vt *tailVideoTarget, vc *tailVideoClient, ec *tailEchoClient, et *tailEchoTarget, bc *tailEchoClient, bt *tailEchoTarget, s0, s1 tailSnap) {
 	t := d.t
-	t.Logf("host: GOMAXPROCS %d, %d CPUs, %v; window %v after a %v warm-up; pacing between a burst's groups: %s",
-		runtime.GOMAXPROCS(0), runtime.NumCPU(), runtime.Version(), d.to-d.from, d.warm, map[bool]string{true: "spin", false: "timers"}[d.spin])
+	from, to := d.window()
+	t.Logf("host: GOMAXPROCS %d, %d CPUs, %v; window %v after a %v warm-up; pacing between a burst's groups: %s; video writes: %s",
+		runtime.GOMAXPROCS(0), runtime.NumCPU(), runtime.Version(), to-from, d.warm, map[bool]string{true: "spin", false: "timers"}[d.spin],
+		map[bool]string{true: "one sendmmsg call per group", false: "one call per datagram (no batch calls here)"}[vt.batched])
 	t.Logf("socket receive buffers (as the kernel reports them): video target %d, video client %d, echo targets %d and %d", vt.rcvbuf, vc.rcvbuf, et.rcvbuf, bt.rcvbuf)
 
 	// The load.
-	lateOver := 0
-	for _, l := range vt.late {
-		if l > 2*time.Millisecond {
-			lateOver++
-		}
-	}
-	due := int((d.to - d.from + 2*time.Second) / tailFrameEvery)
+	load := tailLoad{frames: vt.frames, due: int((to - from + d.warm) / tailFrameEvery), late: vt.late, burst: vt.burst,
+		sent: vt.sent, got: vc.got, echoDue: int((to - from) / tailEchoEvery)}
+	lateOver, slowOver := tailBeyond(vt.late, tailLateMax), tailBeyond(vt.burst, tailBurstSpanMax)
 	var rate float64
-	if b := q(vt.burst, 0.5); b > 0 {
+	if b := tailQ(vt.burst, 0.5); b > 0 {
 		rate = float64(tailFrameDgram-1) / b.Seconds()
 	}
-	t.Logf("video: %d frames (about %d due), %d datagrams written (%d write errors, the first %v); frame start late p50 %v, p99 %v, max %v (%d over 2 ms); burst first-to-last write p50 %v (%.0f datagrams/s inside a burst), max %v",
-		vt.frames, due, vt.sent, vt.errs, vt.firstErr, q(vt.late, 0.5), q(vt.late, 0.99), q(vt.late, 1), lateOver, q(vt.burst, 0.5), rate, q(vt.burst, 1))
+	t.Logf("video: %d frames (about %d due), %d datagrams written (%d write errors, the first %v); frame start late p50 %v, p99 %v, max %v (%d over %v); burst first-to-last write p50 %v (%.0f datagrams/s inside a burst), p99 %v, max %v (%d over %v)",
+		vt.frames, load.due, vt.sent, vt.errs, vt.firstErr, tailQ(vt.late, 0.5), tailQ(vt.late, 0.99), tailQ(vt.late, 1), lateOver, tailLateMax,
+		tailQ(vt.burst, 0.5), rate, tailQ(vt.burst, 0.99), tailQ(vt.burst, 1), slowOver, tailBurstSpanMax)
 	t.Logf("video client: %d datagrams received (%d of the window's), %d sequence gaps, %d malformed; one-way delay in the window p50 %v, p99 %v, p99.9 %v, max %v; %d keepalives at the target",
-		vc.got, vc.inWindow, vc.gaps, vc.bad, q(vc.delays, 0.5), q(vc.delays, 0.99), q(vc.delays, 0.999), q(vc.delays, 1), vt.keeps.Load())
+		vc.got, vc.inWindow, vc.gaps, vc.bad, tailQ(vc.delays, 0.5), tailQ(vc.delays, 0.99), tailQ(vc.delays, 0.999), tailQ(vc.delays, 1), vt.keeps.Load())
 
 	// The echoes.
 	re, be := d.echoes(ec, et), d.echoes(bc, bt)
+	load.echoes, load.baseEchoes = len(re), len(be)
 	split := func(es []tailEcho) (rtt, up, down []time.Duration, lost int) {
 		for _, e := range es {
 			if e.lost {
@@ -626,27 +668,22 @@ func (d *tailDiag) report(n *l4uNet, vt *tailVideoTarget, vc *tailVideoClient, e
 	}
 	rr, ru, rd, rl := split(re)
 	br, bu, bd, bl := split(be)
-	v := tailJudge(rr, rl, br)
+	v := tailJudge(rr, rl, br, bl)
 	for _, x := range []struct {
 		name          string
 		rtt, up, down []time.Duration
 		lost, sent    int
 		dups, bad     int64
 	}{{"through rendr", rr, ru, rd, rl, len(re), ec.dups.Load(), ec.bad.Load()}, {"direct baseline", br, bu, bd, bl, len(be), bc.dups.Load(), bc.bad.Load()}} {
-		t.Logf("echo %s: %d sent in the window, %d lost, %d duplicates, %d malformed; round trip p50 %v, p99 %v, p99.9 %v, max %v; up p50 %v, p99 %v, max %v; down p50 %v, p99 %v, max %v",
-			x.name, x.sent, x.lost, x.dups, x.bad, q(x.rtt, 0.5), q(x.rtt, 0.99), q(x.rtt, 0.999), q(x.rtt, 1),
-			q(x.up, 0.5), q(x.up, 0.99), q(x.up, 1), q(x.down, 0.5), q(x.down, 0.99), q(x.down, 1))
+		t.Logf("echo %s: %d sent in the window (%d due), %d lost, %d duplicates, %d malformed; round trip p50 %v, p99 %v, p99.9 %v, max %v; up p50 %v, p99 %v, max %v; down p50 %v, p99 %v, max %v",
+			x.name, x.sent, load.echoDue, x.lost, x.dups, x.bad, tailQ(x.rtt, 0.5), tailQ(x.rtt, 0.99), tailQ(x.rtt, 0.999), tailQ(x.rtt, 1),
+			tailQ(x.up, 0.5), tailQ(x.up, 0.99), tailQ(x.up, 1), tailQ(x.down, 0.5), tailQ(x.down, 0.99), tailQ(x.down, 1))
 	}
-	baseOver := 0
-	for _, r := range br {
-		if r > v.baseMedian+tailMargin {
-			baseOver++
-		}
-	}
-	t.Logf("tail: through rendr %d of %d (%.4f %%, %d lost) more than %v above the baseline's median %v; the baseline itself %d of %d (%.4f %%); added p50 %v, p99 %v, p99.9 %v",
-		v.over, v.sent, 100*v.share, v.lost, tailMargin, v.baseMedian, baseOver, len(be), 100*float64(baseOver+bl)/float64(max(len(be), 1)), v.addP50, v.addP99, v.addP999)
-	d.attribute("through rendr", re, v.baseMedian, q(bu, 0.5), q(bd, 0.5), vt.starts)
-	d.attribute("direct baseline", be, v.baseMedian, q(bu, 0.5), q(bd, 0.5), vt.starts)
+	t.Logf("tail: through rendr %d of %d (%.4f %%, %d lost) more than %v above the baseline's median %v; the baseline itself %d of %d (%.4f %%, %d lost; quiet bound %.3f %%); rendr's excess over the baseline's share %.4f %%; added p50 %v, p99 %v, p99.9 %v",
+		v.over, v.sent, 100*v.share, v.lost, tailMargin, v.baseMedian, v.baseOver, v.baseSent, 100*v.baseShare, v.baseLost, 100*tailBaseShareMax,
+		100*(v.share-v.baseShare), v.addP50, v.addP99, v.addP999)
+	d.attribute("through rendr", re, v.baseMedian, tailQ(bu, 0.5), tailQ(bd, 0.5), vt.starts)
+	d.attribute("direct baseline", be, v.baseMedian, tailQ(bu, 0.5), tailQ(bd, 0.5), vt.starts)
 
 	// rendr's counters and the host's over the window.
 	t.Logf("rendr dialer datagram I/O over the window: %s", tailDgDiff(s0.d, s1.d))
@@ -658,7 +695,7 @@ func (d *tailDiag) report(n *l4uNet, vt *tailVideoTarget, vc *tailVideoClient, e
 	for _, fi := range n.pf.Flows() {
 		if pc := fi.Session.Packet; pc != nil {
 			srtt := time.Duration(0)
-			if c, ok := activeCarrier(fi.Session); ok {
+			if c, ok := tailActiveCarrier(fi.Session); ok {
 				srtt = c.SRTT
 			}
 			t.Logf("flow %v → %s: stream %v, session %v packet counters %+v, active carrier SRTT %v", fi.Client, fi.Target, fi.Stream, fi.Session.ID, *pc, srtt)
@@ -673,22 +710,23 @@ func (d *tailDiag) report(n *l4uNet, vt *tailVideoTarget, vc *tailVideoClient, e
 		}
 		t.Logf("kernel Udp counters over the window (the whole host): %s", strings.Join(parts, ", "))
 	}
-	if qs, top, total := histDiff(s0.sched, s1.sched, 0.99, 0.999); qs != nil {
+	if qs, top, total := tailHistDiff(s0.sched, s1.sched, 0.99, 0.999); qs != nil {
 		t.Logf("Go scheduler latency over the window (runnable to running, %d samples): p99 ≤ %v, p99.9 ≤ %v, highest bucket ≤ %v", total, qs[0], qs[1], top)
 	}
-	if _, top, total := histDiff(s0.gcPause, s1.gcPause); total > 0 || s1.gcCycles > s0.gcCycles {
+	if _, top, total := tailHistDiff(s0.gcPause, s1.gcPause); total > 0 || s1.gcCycles > s0.gcCycles {
 		t.Logf("GC over the window: %d cycles, %d stop-the-world pauses, the longest ≤ %v", s1.gcCycles-s0.gcCycles, total, top)
 	}
 
-	// The load proof, then the verdict.
-	if vt.frames < due*99/100 || lateOver > vt.frames/100 {
-		t.Fatalf("INVALID: the video generator did not keep its schedule: %d of about %d frames, %d started more than 2 ms late", vt.frames, due, lateOver)
+	// The load proof and the baseline's quiet check, then the verdict.
+	judged := "PASS"
+	if len(v.fails) != 0 {
+		judged = "FAIL: " + strings.Join(v.fails, "; ")
 	}
-	if vc.got < vt.sent*9/10 {
-		t.Fatalf("INVALID: the video flow delivered %d of %d datagrams (the load was not carried; see the counters above)", vc.got, vt.sent)
+	if why := append(tailLoadProof(load), v.invalid...); len(why) != 0 {
+		t.Fatalf("INVALID: %s (the judge alone: %s)", strings.Join(why, "; "), judged)
 	}
 	if len(v.fails) != 0 {
-		t.Errorf("FAIL: %s", strings.Join(v.fails, "; "))
+		t.Errorf("%s", judged)
 	} else {
 		t.Logf("PASS: %.4f %% of the echoes through rendr in the tail (bound %.2f %%), added p99 %v (bound %v)", 100*v.share, 100*tailShareMax, v.addP99, tailAddedP99Max)
 	}
@@ -706,11 +744,16 @@ func (d *tailDiag) attribute(name string, es []tailEcho, baseMedian, upMed, down
 			tail = append(tail, e)
 		}
 	}
-	var legUp, legDown, legBoth, legNone, inBurst int
+	var lost, legUp, legDown, legBoth, legNone, legUnknown, inBurst int
 	var frame [8]int
 	var wall, carrier [10]int
 	for _, e := range tail {
-		if !e.lost && e.up != 0 {
+		switch {
+		case e.lost:
+			lost++
+		case e.up == 0:
+			legUnknown++ // the target's arrival was not stamped
+		default:
 			u, w := e.up > upMed+tailMargin/2, e.down > downMed+tailMargin/2
 			switch {
 			case u && w:
@@ -738,8 +781,8 @@ func (d *tailDiag) attribute(name string, es []tailEcho, baseMedian, upMed, down
 			carrier[int((e.sent-d.opened)%time.Second/(100*time.Millisecond))]++
 		}
 	}
-	d.t.Logf("%s tail: %d echoes (%d lost); excess on the way up %d, down %d, both %d, neither alone %d; sent within 3 ms of a frame start %d; by eighth of the frame cycle %v; by 100 ms of the wall-clock second %v; by 100 ms of the second since the flows opened (the carrier's 1-s PING cadence) %v",
-		name, len(tail), len(tail)-legUp-legDown-legBoth-legNone, legUp, legDown, legBoth, legNone, inBurst, frame, wall, carrier)
+	d.t.Logf("%s tail: %d echoes (%d lost); excess on the way up %d, down %d, both %d, neither alone %d, legs unknown %d; sent within 3 ms of a frame start %d; by eighth of the frame cycle %v; by 100 ms of the wall-clock second %v; by 100 ms of the second since the flows opened (the carrier's 1-s PING cadence) %v",
+		name, len(tail), lost, legUp, legDown, legBoth, legNone, legUnknown, inBurst, frame, wall, carrier)
 	slices.SortFunc(tail, func(a, b tailEcho) int {
 		if a.lost != b.lost {
 			if a.lost {
@@ -749,9 +792,10 @@ func (d *tailDiag) attribute(name string, es []tailEcho, baseMedian, upMed, down
 		}
 		return cmp.Compare(b.rtt, a.rtt)
 	})
+	from, _ := d.window()
 	for i, e := range tail[:min(len(tail), 10)] {
 		d.t.Logf("%s worst %d: seq %d sent at +%v (wall-second phase %v): lost %v, round trip %v, up %v, down %v",
-			name, i+1, e.seq, e.sent-d.from, time.Duration((d.wall0+int64(e.sent))%int64(time.Second)), e.lost, e.rtt, e.up, e.down)
+			name, i+1, e.seq, e.sent-from, time.Duration((d.wall0+int64(e.sent))%int64(time.Second)), e.lost, e.rtt, e.up, e.down)
 	}
 }
 
@@ -762,8 +806,8 @@ func tailDgDiff(a, b rendr.DatagramStatus) string {
 		b.SentDatagrams-a.SentDatagrams, b.SendCalls-a.SendCalls, b.RecvDatagrams-a.RecvDatagrams, b.RecvCalls-a.RecvCalls, b.ChargeRefused-a.ChargeRefused)
 }
 
-// activeCarrier returns the active carrier of a selector session.
-func activeCarrier(st rendr.SessionStatus) (rendr.CarrierStatus, bool) {
+// tailActiveCarrier returns the active carrier of a selector session.
+func tailActiveCarrier(st rendr.SessionStatus) (rendr.CarrierStatus, bool) {
 	for _, c := range st.Carriers {
 		if c.State == rendr.CarrierActive {
 			return c, true

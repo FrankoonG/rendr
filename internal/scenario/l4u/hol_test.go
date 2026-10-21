@@ -38,6 +38,19 @@ const (
 	// holQuietMax is the defect bound of the wave-D audit: on a path that
 	// is not saturated no datagram is held longer than about 1 ms.
 	holQuietMax = time.Millisecond
+	// holBatchFrames is one trunk round's batch (carrier.MaxBatchFrames at
+	// v2.0.0): on a sender that blocks, a datagram that became ready during
+	// a round waits for the rest of that round's batch and then goes first
+	// (the trunk serves the least recently served view first; the wave-D
+	// audit's bound).
+	holBatchFrames = 64
+	// holBatchWait bounds a low-rate datagram's added delay behind a burst
+	// in the paced arms: one round's batch of frames of at most kitMTU
+	// bytes at holRate (3.75 ms), plus holQuietMax.
+	holBatchWait = holBatchFrames*kitMTU*time.Second/holRate + holQuietMax
+	// holBurstDrain is a burst's time at holRate, each datagram counted at
+	// kitMTU bytes (its carrier datagram is at most that).
+	holBurstDrain = holBurstLen * kitMTU * time.Second / holRate
 )
 
 // holStep spaces a burst's datagrams: 71 kpps, ML-100's rate inside a
@@ -86,9 +99,14 @@ type holArm struct {
 // low-rate datagram arrives after a bursty datagram written after it (the
 // FIFO order of the writes); a low-rate datagram written while no bursty
 // datagram is on its way arrives within its 10-ms delay plus holQuietMax;
-// the two flows are one session each on one shared carrier and their
-// sessions dropped nothing. The low-rate flow's added delay (beyond the
-// link's 10 ms) is logged, as is the bursty flow's.
+// in the paced arms (the queue inside rendr) a low-rate datagram written
+// behind a burst waits at most holBatchWait beyond the link's delay (the
+// rest of one trunk round at the path rate, plus holQuietMax); no bursty
+// datagram takes longer than its burst's drain at the path rate after the
+// burst's last write, plus the link's delay and holQuietMax; the two flows
+// are one session each on one shared carrier and their sessions dropped
+// nothing. The low-rate flow's added delay (beyond the link's 10 ms) is
+// logged, as is the bursty flow's.
 func TestL4UNoHeadOfLineAcrossFlows_L40_L55(t *testing.T) {
 	for _, a := range []holArm{
 		{name: "down/fifo", down: true},
@@ -208,6 +226,13 @@ func holRun(t *testing.T, a holArm) {
 	}
 	if r.quietMax > holQuietMax {
 		t.Fatalf("a low-rate datagram written on an idle path was held %v beyond the link's delay, above %v (L55: no hold waits for more datagrams, a timer or a batch)", r.quietMax, holQuietMax)
+	}
+	if a.paced && r.behindMax > holBatchWait {
+		t.Fatalf("a low-rate datagram written behind a burst waited %v beyond the link's delay, above %v: the rest of one trunk round (%d frames of at most %d bytes at the path rate) plus %v (L40, L55: on a sender that blocks a ready datagram waits for one round, not for more datagrams or a timer)",
+			r.behindMax, holBatchWait, holBatchFrames, kitMTU, holQuietMax)
+	}
+	if bound := holBurstDrain - time.Duration(holBurstLen-1)*holStep + oneWay + holQuietMax; r.bigMax > bound {
+		t.Fatalf("a bursty datagram took %v, above %v: its burst's drain at the path rate after the burst's last write, plus the link's delay and %v (L55: rendr held datagrams of a backlog)", r.bigMax, bound, holQuietMax)
 	}
 	for i := range roles {
 		fi, _ := flowOf(pf, clientSrc(i))
