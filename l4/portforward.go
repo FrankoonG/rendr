@@ -332,11 +332,11 @@ type UDPForwardStatus struct {
 	LastErr                    error                 // the latest DialUDP error
 
 	// SessionUnreported counts the datagrams the flows' sessions handed to
-	// a carrier and the peer never reported received (PacketCounters.Sent
-	// − PeerReceived), summed at each flow end the peer or the path
-	// decided (Ended.PeerIdle, NoPath, SessionLost, GoingAway): lost in
-	// flight or with the peer's session. An upper bound: a datagram the
-	// peer received in its last report delay before the end counts too
-	// (see the package doc, "UDP flows").
+	// a carrier and the peer had not reported received at the flow's end
+	// (PacketCounters.Sent − PeerReceived), summed at each flow end the
+	// peer or the path decided (Ended.PeerIdle, PeerClosed, NoPath,
+	// SessionLost, GoingAway): lost in flight or with the peer's session.
+	// An upper bound: a datagram the peer received after the last of its
+	// reports that arrived counts too (see the package doc, "UDP flows").
 	SessionUnreported uint64
 }

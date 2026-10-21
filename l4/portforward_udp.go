@@ -511,11 +511,12 @@ func (s *udpServe) pump(e *ingressFlow, pc ingressSession) error {
 	}
 }
 
-// end closes the flow's session and accounts its end (cause, SessionDrops),
-// then leaves the table: the entry is removed and its unit released,
-// unless it is gone already (evicted, replaced) or it is held — by the
-// reader's expiry race or here when the far end closed the flow within
-// ingressReopenHold of its open (R1-2) — and then waits out the hold.
+// end closes the flow's session and accounts its end (cause, SessionDrops,
+// SessionUnreported), then leaves the table: the entry is removed and its
+// unit released, unless it is gone already (evicted, replaced) or it is
+// held — by the reader's expiry race or here when the far end closed the
+// flow within ingressReopenHold of its open (R1-2) — and then waits out
+// the hold.
 func (s *udpServe) end(e *ingressFlow, pc ingressSession, err error) {
 	t := &s.tab
 	t.mu.Lock()

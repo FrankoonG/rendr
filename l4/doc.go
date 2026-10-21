@@ -171,14 +171,18 @@
 // SessionDrops, the drops of the flows' sessions), or, after its session
 // handed it to a carrier, as a loss in flight (which a carrier's or the
 // network's counters show) or with the peer's session. At a flow end the
-// peer or the path decided (PeerIdle, NoPath, SessionLost, GoingAway)
-// SessionUnreported adds the datagrams the session handed to a carrier that
-// the peer never reported received: those lost in flight or with the peer's
-// session (one that crossed the peer's idle end, or reached a restarted
-// passive). It is an upper bound: a datagram the peer received within its
-// report delay before the end (its PacketPing, 1 s by default) counts too,
-// so lost ≤ SessionUnreported ≤ lost + those; after the peer's idle end it
-// is exact unless a report was lost in flight.
+// peer or the path decided (PeerIdle, PeerClosed, NoPath, SessionLost,
+// GoingAway) SessionUnreported adds the datagrams the session handed to a
+// carrier that the peer had not reported received by then: those lost in
+// flight or with the peer's session (one that crossed the peer's idle end
+// or its close, or reached a restarted passive). It is an upper bound: a
+// datagram the peer received after the last of its reports that arrived
+// counts too — normally one within the peer's report delay before the end
+// (its PacketPing, 1 s by default), more after a lost report (a lossy
+// return path) — so lost ≤ SessionUnreported ≤ lost + those; after the
+// peer's idle end it is exact unless a report was lost. An end this side
+// decided adds nothing: what its session sent before reaches the peer
+// ahead of the end.
 //
 // The first datagram. DialUDP puts a flow's first datagram into the OPEN
 // when the whole metadata stays within 438 bytes (a DNS query, a WireGuard
