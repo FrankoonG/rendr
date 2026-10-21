@@ -303,6 +303,20 @@ func (b *Batch) heldOut(handle uint32) bool {
 	return b.holdOn && handle == b.holdH
 }
 
+// HeldOut reports that the response hold keeps handle's session frames out
+// of the rest of this call (M3-D8): the call placed the OK response of a
+// passive view of a MUX trunk, which places nothing else for the handle
+// until the dialer's go frame ends the hold. A passive packet session's
+// MaxAge clock does not start in such a call (core defect B, 2026-10-21).
+func (b *Batch) HeldOut(handle uint32) bool { return b.heldOut(handle) }
+
+// SetResponseHold arms the response hold for the next endpoint call
+// (M3-D8): once it adds an OK OPEN_ACK or JOIN_ACK for handle, the call
+// adds nothing else for that handle. The MUX writer arms it around the
+// call of a passive view whose first response is due; package session
+// tests call it to drive such a call. Reset disarms it.
+func (b *Batch) SetResponseHold(handle uint32) { b.holdH, b.holdOn = handle, false }
+
 // AddJoinAck appends a JOIN_ACK frame (REL on a datagram batch); false if
 // the batch is full or no REL room is left.
 func (b *Batch) AddJoinAck(handle uint32, a *wire.JoinAck) bool {

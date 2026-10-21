@@ -112,7 +112,10 @@ type PacketPolicy struct {
 	Queue int
 	// MaxAge (100 ms; 10 ms–2 s): a datagram not handed to a carrier within
 	// MaxAge of its WriteTo is dropped; one a dying carrier hands back
-	// unwritten keeps that age.
+	// unwritten keeps that age. On the passive, a datagram written before
+	// the session could first place one — its first response still to be
+	// sent or, on a shared carrier, the dialer's first frame behind it still
+	// to come — ages from that moment instead.
 	MaxAge time.Duration
 	// MaxPayload (65,507; 512–65,507) is the largest datagram this side
 	// offers (dialer) or accepts (passive); a session's limit is fixed at

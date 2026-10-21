@@ -180,11 +180,14 @@ func (s *Session) pktAgeOutLocked(now time.Time) time.Time {
 // member, so its heads older than MaxAge are dropped here (DropAge: a data
 // lane exists, M2-D35) and the time the next one ages out is returned
 // (zero: none queued). Emptied here, txBig no longer holds the FIN back:
-// the wake policy runs.
+// the wake policy runs. Before a passive's MaxAge clock starts (pk.ageOn
+// false; the actor calls it only while a data lane exists) nothing ages,
+// so no deadline is wanted: pktAgeStartLocked restamps txBig and rings the
+// actor, which arms the restamped one (TestPacketBigHeldAgesFromPlaceable_L37_L40).
 func (s *Session) pktAgeBigLocked(now time.Time) time.Time {
 	pk := s.pk
 	q := &pk.txBig
-	if q.n == 0 {
+	if q.n == 0 || !pk.ageOn {
 		return time.Time{}
 	}
 	s.pktAgeQueueLocked(q, now.Sub(pk.base).Nanoseconds(), false)

@@ -706,10 +706,14 @@ func (t *trunk) oneViewFill(b *Batch, rd *roundData) {
 	}
 	nb, pb, rb := b.n, b.payload(), b.retx
 	retiring := v.vx.retireQ.Load() // requested before the call (drrRound's rule)
+	relB := b.relBlocked
+	b.relBlocked = false
 	v.ep.Fill(v, b)
 	v.exit()
+	relWait := b.relBlocked // the REL window refused a frame the view owes: not drained
+	b.relBlocked = relB || relWait
 	t.countTx(v, b, nb, pb, rb)
-	if rd != nil && b.n == nb && retiring && v.vx.retireQ.Load() {
+	if rd != nil && b.n == nb && !relWait && retiring && v.vx.retireQ.Load() {
 		t.mx.Lock()
 		t.retireDrainedLocked(v, b, rd, t.nsAt(b.Now()), &t.ms.post)
 		t.mx.Unlock()
@@ -836,12 +840,14 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 			}
 			// A planned retirement follows a call that placed nothing and
 			// that started after it was requested (M2 reads the retirement
-			// before Fill) — not one the batch had no room for (stuck): the
-			// view's last frames are still due (TestRetireAfterNoRoomCall,
-			// TestRetireRequestedDuringCall).
+			// before Fill) — not one the batch had no room for (stuck), nor
+			// one the REL window refused a frame of (relWait; a RACK that
+			// frees room re-readies the view): the view's last frames are
+			// still due (TestRetireAfterNoRoomCall,
+			// TestRetireRequestedDuringCall, TestMuxRetireWaitsForRelRoom_L30).
 			retiring := v.vx.retireQ.Load()
-			appended, used, stuck := t.drrTurn(v, b, rd, nowNs, quantum)
-			if appended == 0 && !stuck && retiring && v.vx.retireQ.Load() {
+			appended, used, stuck, relWait := t.drrTurn(v, b, rd, nowNs, quantum)
+			if appended == 0 && !stuck && !relWait && retiring && v.vx.retireQ.Load() {
 				t.mx.Lock()
 				t.retireDrainedLocked(v, b, rd, nowNs, &t.ms.post)
 				t.mx.Unlock()
@@ -888,12 +894,16 @@ func (t *trunk) drrRound(b *Batch, n int, rd *roundData, nowNs int64) {
 
 // drrTurn makes view v's DRR call under its quota and keeps its deficit,
 // cut-turn mark and service stamp (drrRound's rules). It returns the
-// frames and payload bytes the call appended, and stuck: the call placed
+// frames and payload bytes the call appended, stuck: the call placed
 // nothing because the batch had no room for the view's next frame (the
-// view stays ready). The rest of a cut turn that places nothing on a batch
-// with room for it ends the turn, and the view's next turn is called at
-// once (at most two calls).
-func (t *trunk) drrTurn(v *Conn, b *Batch, rd *roundData, nowNs int64, quantum int) (appended, used int, stuck bool) {
+// view stays ready), and relWait: the call placed nothing and the REL
+// window refused a reliable frame of it (the view is not drained: it
+// waits in the REL list, which a RACK that frees room re-readies). A REL
+// refusal changes none of the DRR rules: the rest of a cut turn that
+// places nothing on a batch with room for it ends the turn, and the
+// view's next turn is called at once (at most two calls), as without it
+// (TestMuxDRRCutTurnRelRefusedKeepsRate).
+func (t *trunk) drrTurn(v *Conn, b *Batch, rd *roundData, nowNs int64, quantum int) (appended, used int, stuck, relWait bool) {
 	for {
 		q := min(v.deficit+quantum, 2*quantum)
 		resumed := v.vx.resume
@@ -902,8 +912,8 @@ func (t *trunk) drrTurn(v *Conn, b *Batch, rd *roundData, nowNs int64, quantum i
 		}
 		b.limit(q)
 		v.ready.Store(false) // R1-1 rule 3: cleared before the call
-		var capped bool
-		appended, used, capped = t.viewCall(v, b, rd, nowNs)
+		var capped, relRef bool
+		appended, used, capped, relRef = t.viewCall(v, b, rd, nowNs)
 		if hk := t.env.Hooks; hk != nil && hk.AfterViewFill != nil {
 			hk.AfterViewFill(t.id, v.handle)
 		}
@@ -918,20 +928,23 @@ func (t *trunk) drrTurn(v *Conn, b *Batch, rd *roundData, nowNs int64, quantum i
 				t.ms.turn++
 				v.vx.served = t.ms.turn
 			}
-			return appended, used, false
+			return appended, used, false, false
 		case appended > 0:
-			return appended, 0, false // control frames only: no change
+			return appended, 0, false, false // control frames only: no change
 		case capped:
 			// The cap stopped it before it placed anything: no change (the
 			// PONG re-readies it); it stays ready when the batch may have
 			// refused a control frame (nearFull, as below).
-			return 0, 0, b.nearFull()
+			return 0, 0, b.nearFull(), relRef
 		case short || b.nearFull():
-			return 0, 0, true // no room for its next frame: no change, and it stays ready
+			return 0, 0, true, relRef // no room for its next frame: no change, and it stays ready
 		}
 		v.deficit, v.vx.resume = 0, false // nothing placed, and not for want of room
 		if !resumed {
-			return 0, 0, false // idle
+			// Idle, or (relWait) waiting for the REL room of a frame it
+			// owes (a datagram trunk's RST, FIN, SCHED or response): the
+			// RACK that frees room re-readies it (reReadyLocked).
+			return 0, 0, false, relRef
 		}
 		// The rest of a cut turn was smaller than the view's next frame:
 		// the turn ends, and its next turn starts at once.
@@ -955,18 +968,19 @@ func batchCut(b *Batch, rest int) bool {
 // viewCall makes one Fill call of view v (quota set by the caller) and
 // keeps the view's state: per-view WakeAt, cap and REL marks, counters,
 // the go frame and the passive's first response. It returns the frames and
-// payload bytes the call appended and whether the call marked the batch
-// cap-blocked (the shared capacity stopped it).
-func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appended, used int, capped bool) {
+// payload bytes the call appended, whether the call marked the batch
+// cap-blocked (the shared capacity stopped it) and relRef: the REL window
+// refused a reliable frame of the call (a datagram trunk).
+func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appended, used int, capped, relRef bool) {
 	if !v.enter() {
-		return 0, 0, false
+		return 0, 0, false, false
 	}
 	nb, pb, rb := b.n, b.payload(), b.retx
 	wake, capB, relB := b.wake, b.capBlocked, b.relBlocked
 	b.wake, b.capBlocked, b.relBlocked = time.Time{}, false, false
 	needResp := v.vx.needResp.Load()
 	if needResp {
-		b.holdH = v.handle // nothing after its OK response (M3-D8)
+		b.SetResponseHold(v.handle) // nothing after its OK response (M3-D8)
 	}
 	v.ep.Fill(v, b)
 	v.exit()
@@ -995,12 +1009,12 @@ func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appende
 			wake = w
 		}
 	}
-	capped = b.capBlocked
-	b.wake, b.capBlocked, b.relBlocked = wake, capB || capped, relB || b.relBlocked
+	capped, relRef = b.capBlocked, b.relBlocked
+	b.wake, b.capBlocked, b.relBlocked = wake, capB || capped, relB || relRef
 	appended, used = b.n-nb, b.payload()-pb
 	t.countTx(v, b, nb, pb, rb)
 	if appended == 0 {
-		return 0, used, capped
+		return 0, used, capped, relRef
 	}
 	if v.needGo.Load() {
 		v.needGo.Store(false) // the go frame is the lane's first frame (M3-D8)
@@ -1013,7 +1027,7 @@ func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appende
 			t.runPost(&ms.post)
 		}
 	}
-	return appended, used, capped
+	return appended, used, capped, relRef
 }
 
 // reReadyLocked readies the views whose wake came (§A4.3): the views a
