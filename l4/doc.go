@@ -151,6 +151,11 @@
 //	no carrier for NoPathGrace              ErrNoPath (at PassiveRetain)  NoPath; NoPath
 //	a restart of the passive                ErrSessionLost at the dialer  —; SessionLost
 //
+// On a datagram carrier that a Peer's sessions share, at a round trip of
+// 100 ms or more, a burst of flows ending together can outlast the close
+// bound, and a few of them end ErrSessionLost at the dialer instead of
+// idle; the client's next datagram opens a new flow.
+//
 // After any end the ingress removes the flow, and the client's next
 // datagram opens a new one — a new session, a new socket on the passive, a
 // new source port at the target — as a NAT does when a mapping expires; a
@@ -159,6 +164,25 @@
 // once, at the end. An ingress that stops while no carrier lives reaches
 // the passive only at its PassiveRetain (34 s by default), which closes
 // the flow's socket then.
+//
+// A datagram the ingress takes from a client, or the passive from a target,
+// is delivered or counted: by the status counters (the drops and TooLarge of
+// UDPForwardStatus and UDPServerStatus, the far end's write noise, and
+// SessionDrops, the drops of the flows' sessions), or, after its session
+// handed it to a carrier, as a loss in flight (which a carrier's or the
+// network's counters show) or with the peer's session. At a flow end the
+// peer or the path decided (PeerIdle, PeerClosed, NoPath, SessionLost,
+// GoingAway) SessionUnreported adds the datagrams the session handed to a
+// carrier that the peer had not reported received by then: those lost in
+// flight or with the peer's session (one that crossed the peer's idle end
+// or its close, or reached a restarted passive). It is an upper bound: a
+// datagram the peer received after the last of its reports that arrived
+// counts too — normally one within the peer's report delay before the end
+// (its PacketPing, 1 s by default), more after a lost report (a lossy
+// return path) — so lost ≤ SessionUnreported ≤ lost + those; after the
+// peer's idle end it is exact unless a report was lost. An end this side
+// decided adds nothing: what its session sent before reaches the peer
+// ahead of the end.
 //
 // The first datagram. DialUDP puts a flow's first datagram into the OPEN
 // when the whole metadata stays within 438 bytes (a DNS query, a WireGuard
@@ -296,15 +320,16 @@
 // A new client's first datagram opens its flow (DialUDP, at most 12 s); its
 // later datagrams wait for the open (at most 8 datagrams and 16 KiB, each
 // charged at its buffer class, at most 1 s old at the flush) and are sent in
-// order. A client whose open failed, or whose flow the far end closed within
-// 5 s of its open, is held: its datagrams are dropped (DropHeld) for 5 s, so
-// a refusing passive sees at most one OPEN per client every 5 s while the
-// table has room. At most 256 flows are being opened at once per
-// PortForward (beyond: DropOpening). When MaxFlows entries exist (opening
-// and held ones included), a new client takes the place of a held client,
-// or of an open flow that never became a stream and has been idle for at
-// least 1 s (the least recently active among up to 8 entries sampled from
-// its socket's table); a stream and an opening flow are never taken.
+// order; one longer than the flow's MaxPayload counts TooLarge at the flush
+// however long it waited. A client whose open failed, or whose flow the far
+// end closed within 5 s of its open, is held: its datagrams are dropped
+// (DropHeld) for 5 s, so a refusing passive sees at most one OPEN per client
+// every 5 s while the table has room. At most 256 flows are being opened at
+// once per PortForward (beyond: DropOpening). When MaxFlows entries exist
+// (opening and held ones included), a new client takes the place of a held
+// client, or of an open flow that never became a stream and has been idle
+// for at least 1 s (the least recently active among up to 8 entries sampled
+// from its socket's table); a stream and an opening flow are never taken.
 // Without such an entry the new client's datagram is dropped (DropFull).
 // Because MaxFlows covers every socket of a PortForward, a flood of new
 // sources on one port can refuse new flows on another: use one PortForward
