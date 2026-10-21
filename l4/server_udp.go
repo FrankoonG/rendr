@@ -87,7 +87,9 @@ func (e errBadDatagramConn) Error() string {
 // CmdUDP target (ParseUDPMetadata: CmdConnect on a packet session is
 // CodeBadCommand); the target socket is dialled while the session is
 // pending; a first datagram that rode the OPEN is written to it once (a
-// policy-class error of that write is rejected CodeNotAllowed); the session
+// policy-class error of that write is rejected CodeNotAllowed; one above
+// the session's MaxPayload, which only an OPEN that DialUDP did not build
+// carries, is dropped and counted TooLarge instead); the session
 // is confirmed after that (a dial failure is rejected with the classified
 // code); then the flow is forwarded as by ForwardPacket with UDPIdle, the
 // first datagram counted toward its class, until the flow ends. Use it for
@@ -170,11 +172,18 @@ func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.P
 }
 
 // openFlow finishes the setup of a flow whose target socket t was dialled:
-// it writes the first datagram, if one rode the OPEN, and confirms p. It
-// returns the session and the forward's class seed, or nil after it closed
-// t and counted the outcome in k.
+// it writes the first datagram, if one rode the OPEN, and confirms p. A
+// first datagram above the session's MaxPayload follows the size rule of
+// every datagram of the flow: dropped and counted TooLarge (only an OPEN
+// that DialUDP did not build carries one; §A3.3). It returns the session
+// and the forward's class seed, or nil after it closed t and counted the
+// outcome in k.
 func (s *Server) openFlow(ctx context.Context, p *rendr.PendingPacket, k *kindStats, t net.Conn, first []byte) (*rendr.PacketConn, flowSeed) {
 	var seed flowSeed
+	if len(first) > p.MaxPayload() {
+		s.flow.tally.add(tallyTooLarge)
+		first = nil
+	}
 	if len(first) > 0 {
 		if p.Context().Err() != nil {
 			// Decided once the socket was dialled (withdrawn, timed out, its
@@ -371,7 +380,7 @@ type UDPServerStatus struct {
 	ByCode                                 map[RejectCode]uint64 // Rejected by code
 	ToTarget, FromTarget                   uint64                // datagrams written to the targets (FirstSent included) and read from them
 	FirstSent                              uint64                // first datagrams written from the OPEN
-	TooLarge                               uint64                // target datagrams above their flow's MaxPayload, dropped
+	TooLarge                               uint64                // target datagrams above their flow's MaxPayload, and first datagrams from an OPEN above it, dropped
 	TargetNoise                            uint64                // egress errors of the noise classes, counted and ignored
 	SessionDrops                           uint64                // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
 	MaxPayload                             int                   // the MaxPayload of the latest flow confirmed (0 before any)
