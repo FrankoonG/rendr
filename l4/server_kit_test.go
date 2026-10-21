@@ -77,11 +77,14 @@ type served struct {
 }
 
 // serve runs s.Serve on w's Listener with a cancellable ctx.
-func serve(w *world, s *Server) *served {
+func serve(w *world, s *Server) *served { return serveOn(s, w.ln) }
+
+// serveOn runs s.Serve on ln with a cancellable ctx.
+func serveOn(s *Server, ln *rendr.Listener) *served {
 	ctx, cancel := context.WithCancel(context.Background())
 	sv := &served{s: s, cancel: cancel, done: make(chan error, 1)}
 	go func() {
-		err := s.Serve(ctx, w.ln)
+		err := s.Serve(ctx, ln)
 		sv.ended.Store(time.Now().UnixNano())
 		sv.done <- err
 	}()

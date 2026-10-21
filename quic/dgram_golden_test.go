@@ -106,14 +106,7 @@ func (g *dgramGolden) format() []byte {
 // module's wire golden vectors of the same names.
 func TestQUICDatagramGolden(t *testing.T) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
-	inner := make([][]byte, len(dgramGoldenInner))
-	for i, v := range dgramGoldenInner {
-		b, err := hex.DecodeString(v.hex)
-		if err != nil {
-			t.Fatal(err)
-		}
-		inner[i] = b
-	}
+	inner := dgramGoldenInnerBytes(t)
 	checkRootWireVectors(t)
 
 	// Dialer: what the code sends.
@@ -157,14 +150,7 @@ func TestQUICDatagramGolden(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	raw, err := os.ReadFile(dgramGoldenPath)
-	if err != nil {
-		t.Fatalf("%v (go test -run TestQUICDatagramGolden -update writes it)", err)
-	}
-	want, err := readDgramGolden(raw)
-	if err != nil {
-		t.Fatalf("%s: %v", dgramGoldenPath, err)
-	}
+	want := dgramGoldenFile(t)
 	if want.alpn != ALPN || got.alpn != want.alpn {
 		t.Errorf("ALPN: file %q, negotiated %q, constant %q: the encapsulation is versioned by the ALPN", want.alpn, got.alpn, ALPN)
 	}
@@ -176,10 +162,53 @@ func TestQUICDatagramGolden(t *testing.T) {
 			t.Errorf("DATAGRAM %d: the carrier sent %s %x, the file holds %s %x", i, got.names[i], got.dgs[i], want.names[i], want.dgs[i])
 		}
 	}
+	dgramGoldenPassive(t, want, inner, nil, nil)
+}
 
+// dgramGoldenInnerBytes returns dgramGoldenInner's rendr datagrams.
+func dgramGoldenInnerBytes(t *testing.T) [][]byte {
+	t.Helper()
+	inner := make([][]byte, len(dgramGoldenInner))
+	for i, v := range dgramGoldenInner {
+		b, err := hex.DecodeString(v.hex)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inner[i] = b
+	}
+	return inner
+}
+
+// dgramGoldenFile returns the parsed testdata/dgram-q1.txt.
+func dgramGoldenFile(t *testing.T) *dgramGolden {
+	t.Helper()
+	raw, err := os.ReadFile(dgramGoldenPath)
+	if err != nil {
+		t.Fatalf("%v (go test -run TestQUICDatagramGolden -update writes it)", err)
+	}
+	want, err := readDgramGolden(raw)
+	if err != nil {
+		t.Fatalf("%s: %v", dgramGoldenPath, err)
+	}
+	return want
+}
+
+// dgramGoldenPassive is TestQUICDatagramGolden's passive part: a raw
+// quic-go client sends the file's payloads to a Listener, whose carrier
+// must deliver exactly inner and count no drop; then the file's numbering
+// continues in code past a stall. The Listener's quic-go is traced by the
+// returned frameTracer, through wrap when not nil
+// (TestQUICDatagramGoldenPassiveCountsFile_L46); read, when not nil, runs
+// once the carrier delivered the file's datagrams.
+func dgramGoldenPassive(t *testing.T, want *dgramGolden, inner [][]byte, wrap func(ft *frameTracer) tracerFunc, read func()) *frameTracer {
+	t.Helper()
 	// Passive: the file's payloads are what a carrier accepts.
 	ft := &frameTracer{}
-	l, f := serveFake(t, Options{Config: &qgo.Config{Tracer: ft.trace}})
+	tracer := tracerFunc(ft.trace)
+	if wrap != nil {
+		tracer = wrap(ft)
+	}
+	l, f := serveFake(t, Options{Config: &qgo.Config{Tracer: tracer}})
 	qc, err := rawTransport(t).Dial(dialCtx(t), l.Addr(), rawClientTLS(t), quicConfig(nil, 0, false, true))
 	if err != nil {
 		t.Fatal(err)
@@ -199,9 +228,18 @@ func TestQUICDatagramGolden(t *testing.T) {
 			t.Fatalf("passive datagram %d: %x, %v; want %x", i, buf[:n], err, w)
 		}
 	}
+	if read != nil {
+		read()
+	}
 	if s := l.Stats(); s.DatagramDrops != 0 {
 		t.Errorf("DatagramDrops %d after the file's consecutive sequence numbers, want 0", s.DatagramDrops)
 	}
+	// quic-go records a received packet after it handled the packet's
+	// frames (frameTracer): the carrier may have delivered the file's last
+	// datagram before the tracer counted it, and rawSendTraced's base would
+	// then be short of the count, its exact group target never reached (the
+	// race stallPair had, TestQUICStallPairCountsClassify_L46).
+	eventually(t, "the passive's quic-go recorded the file's DATAGRAMs", func() bool { return ft.rcvDatagrams.Load() == int64(len(want.dgs)) })
 
 	// Passive: how it reads the number. The file's numbering continues in
 	// code (the header's rule: one per datagram, big-endian, before the
@@ -236,6 +274,7 @@ func TestQUICDatagramGolden(t *testing.T) {
 		t.Errorf("DatagramDrops %d after DATAGRAMs %d … %d of which quic-go dropped %d … %d: want %d, counted from %d's gap",
 			s.DatagramDrops, next, next+uint32(len(burst)), next+uint32(kept), next+uint32(len(burst))-1, len(burst)-kept, next+uint32(len(burst)))
 	}
+	return ft
 }
 
 // checkRootWireVectors compares dgramGoldenInner with the root module's
