@@ -22,8 +22,8 @@ const fullPayload = 65507
 // TestL4UStreamCarrierFallback_L37 (§A4.1 "stream carriers only", L37):
 // one UDP flow through the ingress over a Peer of two stream Links s1 and
 // s2 (selector), 9,000-byte test datagrams at 100 per second each way for
-// 30 s (the client's, echoed by the target; lane.fallbackSpan, 14 s and
-// two kills under the race detector), once the flow is open (its first
+// 30 s (the client's, echoed by the target; lane.fallbackSpan, 8 s and
+// one kill under the race detector), once the flow is open (its first
 // datagram echoed). Stimulus: at 6, 12, 18 and 24 s the Link of the
 // session's active carrier is killed (both conns closed; the bytes in its
 // buffers lost), and each kill ends the carrier it was carrying the flow
@@ -148,12 +148,13 @@ func TestL4UStreamCarrierFallback_L37(t *testing.T) {
 // factory", M2-D43, L37): one UDP flow through the ingress over a Peer of
 // one datagram factory u1 (frame budget 1,463: 1,438-byte datagrams) and
 // one stream factory s1, bond mode; the client sends 1,000- and 3,000-byte
-// test datagrams alternately, 200 per second for 20 s (lane.bondSpan: 8 s
+// test datagrams alternately, 200 per second for 20 s (lane.bondSpan: 4 s
 // under the race detector), and the target echoes each. The flow opens with
 // one 1,000-byte datagram and the load starts once both members are live:
 // a datagram wider than the datagram member written while the stream
 // member is still joining has no carrier and is dropped (DropTooLarge), a
-// start-up gap this row does not judge (the WP9 report's open item).
+// start-up gap this row does not judge: the documented limitation
+// TestL4UMixedBondJoiningOversize_L37 pins.
 //
 // PASS: the flow's MaxPayload is 65,507 at both ends (the bond has a
 // stream member); every datagram of both sizes arrives whole and once in
@@ -187,7 +188,7 @@ func TestL4UMixedBondOversize_L37(t *testing.T) {
 		// The flow opens with a small datagram, and the load starts once
 		// both members are live: a datagram wider than the datagram member
 		// written while the stream member is still joining has no carrier
-		// and is dropped (DropTooLarge; the WP9 report's open item).
+		// and is dropped (DropTooLarge; TestL4UMixedBondJoiningOversize_L37).
 		openEcho(t, c, up, down, small)
 		var fi l4.FlowInfo
 		waitFor(t, 10*time.Second, "both members live", func() bool {

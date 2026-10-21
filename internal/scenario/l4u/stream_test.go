@@ -15,8 +15,13 @@ import (
 // The Moonlight-like stream miniature (M6 design §A16.2; G10 at reduced
 // scale, §B5.1).
 const (
-	mlW       = 200 * time.Millisecond
-	mlRejoin  = 10 * time.Second // a bond or race member rejoins within this of the removal
+	mlW = 200 * time.Millisecond
+	// mlRejoin is G5Bound for datagram carriers, within which a bond or
+	// race member rejoins after the removal (G10's removal row): T_gap +
+	// 3·RTT + S + 1 s = 2 s + 60 ms + 1 s + 1 s = 4.06 s (PA-13, F15: T_gap
+	// is the 2-s cap of the PREFACE's retransmissions, RelRTOMax, across
+	// back-to-back attempts; S the harness's 1-s Status sample).
+	mlRejoin  = 4060 * time.Millisecond
 	mlIDRWait = 500 * time.Millisecond
 	// G10's per-event bounds: the interruption of an event at t is the
 	// largest video arrival gap in [t − 1 s, t + 6 s] less Q's largest gap.
@@ -40,6 +45,7 @@ type mlEvent struct {
 	link   string
 	id     rendr.CarrierID
 	remove time.Time // drop: the blackhole's end
+	rejoin time.Time // drop, bond and race: a member on the restored path again
 }
 
 // TestL4UStreamMiniature_L39_L40_L70 (§A16.2; G10, §B3.1 and §B5.1 at
@@ -67,10 +73,11 @@ type mlEvent struct {
 // race: the member whose received bytes grew most in the last second,
 // alternating on a tie) at T + 5, 12, 19 and 26 s — and the blackhole of a
 // path (selector: the active one; bond and race: one member's) both ways at
-// T + 33 s for 20 s, then its removal; T ends 10 s later (lane: under the
-// race detector the selector only, Q 3 s, one kill at T + 2 s, the
-// blackhole at T + 7 s for 6 s, T's end 2 s after the removal; the same
-// windows and bounds).
+// T + 33 s for 20 s, then its removal; T ends 10 s later, and never less
+// than a second after a bond or race member's rejoin (lane: under the race
+// detector the selector only, Q 2 s, one kill at T + 1 s, the blackhole at
+// T + 4 s for 5 s — the death-detection bound — and T's end 1 s after the
+// removal; the same windows and bounds).
 //
 // Windows W per flow and direction (G10, R1-31): a kill [t − 200 ms,
 // t + 200 ms] (G3's, plan:750; race none); the blackhole, selector [t_d −
@@ -87,7 +94,9 @@ type mlEvent struct {
 // of that carrier counted; the blackholed link lost session datagrams and
 // its carrier died within recoveryBound (ping_timeout or write_stall,
 // PA-86's peer_down reading); bond and race: both members live before each
-// event and again within 10 s of the removal.
+// event, and a member on the restored path again within G5Bound of the
+// removal (G10's removal row; mlRejoin), T then lasting at least a second
+// past that rejoin.
 //
 // PASS (G10's criteria, numbered as there):
 //
@@ -126,10 +135,13 @@ type mlEvent struct {
 // 200 ms of a kill" (§A16.2), whatever the IDR extension of its W; the
 // blackhole: selector the first arrival of every flow within recoveryBound
 // (the W rule), race an interruption < 50 ms, bond the member's death
-// within recoveryBound (G10-bond's other rule, no video arrival gap above
-// 200 ms, is recorded here and judged by
-// TestL4UBondSilentMemberKeepsStream_L39, merged with its decision); the
-// removal: no loss.
+// within recoveryBound and the video's recovery within it (G10-bond's DROP
+// rule as the M6 delegate decision of 2026-10-21 amends it, judged against
+// the death-detection bound as G4-pkt-bond is: no video arrival gap above
+// 200 ms outside [t_d − 200 ms, t_d + recoveryBound], bondDropRecovery,
+// which TestL4UBondSilentMemberKeepsStream_L39 also judges in every lane);
+// the removal: no loss (bond and race: the member's rejoin within G5Bound,
+// above).
 func TestL4UStreamMiniature_L39_L40_L70(t *testing.T) {
 	for _, mode := range lane.mlModes {
 		t.Run(mode.String(), func(t *testing.T) {
@@ -183,7 +195,11 @@ func mlMiniature(t *testing.T, mode rendr.Mode) {
 		evs = append(evs, m.kill(t, w, pf, srcV, mode, k, at, members))
 	}
 	evs = append(evs, m.blackhole(t, w, pf, srcV, mode, t0.Add(lane.mlFirst+time.Duration(lane.mlKills)*lane.mlKill), members))
-	tEnd := evs[len(evs)-1].remove.Add(lane.mlTail)
+	last := evs[len(evs)-1]
+	tEnd := last.remove.Add(lane.mlTail)
+	if r := last.rejoin.Add(time.Second); !last.rejoin.IsZero() && r.After(tEnd) {
+		tEnd = r // a loss or a gap at the rejoin is judged in every lane
+	}
 	sleepUntil(tEnd)
 	m.end()
 	time.Sleep(time.Second) // the last datagrams arrive
@@ -357,7 +373,10 @@ func (m *mlRun) blackhole(t *testing.T, w *world, pf *l4.PortForward, srcV netip
 		t.Fatalf("stimulus: the blackhole of %s lost no session datagram", victim.Name)
 	}
 	down := w.dev.downOf(victim.ID)
-	if len(down) == 0 || (down[0].Cause != rendr.CausePingTimeout && down[0].Cause != rendr.CauseWriteStall && down[0].Cause != rendr.CausePeerDown) {
+	if len(down) == 0 {
+		t.Fatalf("the blackholed carrier %d was still live %v after the blackhole, want its death within %v (G10: the member's death ≤ 5 s)", victim.ID, lane.mlDrop, recoveryBound)
+	}
+	if c := down[0].Cause; c != rendr.CausePingTimeout && c != rendr.CauseWriteStall && c != rendr.CausePeerDown {
 		t.Fatalf("stimulus: the blackholed carrier %d did not die silently on the dialer: %+v", victim.ID, down)
 	}
 	if d := down[0].Time.Sub(at); d > recoveryBound {
@@ -367,8 +386,9 @@ func (m *mlRun) blackhole(t *testing.T, w *world, pf *l4.PortForward, srcV netip
 		l.Blackhole(d, false)
 	}
 	rm := time.Now()
+	var rejoin time.Time
 	if mode != rendr.ModeSelector {
-		waitFor(t, mlRejoin, "a member on the restored path again", func() bool {
+		waitFor(t, mlRejoin, "a member on the restored path again within G5Bound", func() bool {
 			fi, _ := flowOf(pf, srcV)
 			for _, c := range liveOf(fi.Session) {
 				if c.Name == victim.Name {
@@ -377,10 +397,11 @@ func (m *mlRun) blackhole(t *testing.T, w *world, pf *l4.PortForward, srcV netip
 			}
 			return false
 		})
-		t.Logf("blackhole of %s: a member on it again %v after the removal", victim.Name, time.Since(rm))
+		rejoin = time.Now()
+		t.Logf("blackhole of %s: a member on it again %v after the removal (G5Bound %v)", victim.Name, rejoin.Sub(rm), mlRejoin)
 	}
 	t.Logf("blackhole of %s (carrier %d): dead (%v) after %v", victim.Name, victim.ID, down[0].Cause, down[0].Time.Sub(at))
-	return mlEvent{at: at, drop: true, link: victim.Name, id: victim.ID, remove: rm}
+	return mlEvent{at: at, drop: true, link: victim.Name, id: victim.ID, remove: rm, rejoin: rejoin}
 }
 
 // windows returns flow f's loss windows for the events (G10's W, per flow
@@ -629,14 +650,17 @@ func (m *mlRun) judgeEvents(t *testing.T, evs []mlEvent, mode rendr.Mode, qGap t
 				t.Fatalf("kill at +%v: the video interruption is %v (largest gap %v less Q's %v), want below %v", ev.at.Sub(t0), g-qGap, g, qGap, bound)
 			}
 		case mode == rendr.ModeBond:
-			// Recorded here; G10-bond's rule (no video arrival gap above
-			// 200 ms) is TestL4UBondSilentMemberKeepsStream_L39's, which
-			// fails on the core of 2026-10-18: the bond keeps placing the
-			// video on the silent member until its death (the WP9 report's
-			// open item).
-			g := span(ev.remove.Add(mlSpanAfter))
-			t.Logf("blackhole at +%v (%s): largest video gap until the removal + %v: %v from +%v (G10-bond's bound %v: TestL4UBondSilentMemberKeepsStream_L39)",
-				ev.at.Sub(t0), ev.link, mlSpanAfter, g, gapAt.Sub(t0), mlStopMax)
+			// G10-bond's DROP rule as amended (2026-10-21): the bond keeps
+			// placing the video on the silent member until its death is
+			// detected, so the stream may stop until then, never after.
+			to := ev.remove.Add(mlSpanAfter)
+			if to.After(next) {
+				to = next
+			}
+			g := span(to)
+			rec := bondDropRecovery(t, m.vDown.ledger, ev.at, to, t0)
+			t.Logf("blackhole at +%v (%s): largest video gap until the removal + %v: %v from +%v; the video recovered %v after it (bound %v)",
+				ev.at.Sub(t0), ev.link, mlSpanAfter, g, gapAt.Sub(t0), rec, recoveryBound)
 		case mode == rendr.ModeRace:
 			g := span(ev.at.Add(mlSpanAfter))
 			t.Logf("blackhole at +%v (%s): largest video gap %v, interruption %v (bound %v)", ev.at.Sub(t0), ev.link, g, g-qGap, mlRaceStop)

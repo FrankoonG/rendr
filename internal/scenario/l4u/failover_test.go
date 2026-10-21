@@ -38,7 +38,7 @@ type manyFlow struct {
 // Peer of two DatagramLinks u1 and u2 (selector; frame budget 1,463, so
 // MaxPayload 1,438): flow 0 carries 1,000-byte test datagrams at 5,000 per
 // second each way, the other 63 carry 200-byte ones at 50 per second each
-// way (lane.failBig and lane.failSmall; 200 and 20 under the race
+// way (lane.failBig and lane.failSmall; 200 and 10 under the race
 // detector); the target streams its own datagrams to each flow's egress
 // source (learn-and-stream). The load starts once every flow is open at
 // both ends and one second has passed (steady). After 10 s of steady

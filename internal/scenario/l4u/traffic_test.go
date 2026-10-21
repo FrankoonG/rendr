@@ -224,6 +224,30 @@ func maxGapAt(l *ledger, a, b time.Time) (time.Duration, time.Time) {
 	return g, from
 }
 
+// gapsAbove returns, in time order, every interval within [a, b] longer
+// than over in which none of the ledger's datagrams arrived (maxGap's
+// intervals: one may start at a or end at b).
+func gapsAbove(l *ledger, a, b time.Time, over time.Duration) []window {
+	l.mu.Lock()
+	var ts []time.Time
+	for _, at := range l.arr {
+		if !at.IsZero() && !at.Before(a) && !at.After(b) {
+			ts = append(ts, at)
+		}
+	}
+	l.mu.Unlock()
+	slices.SortFunc(ts, time.Time.Compare)
+	var out []window
+	prev := a
+	for _, at := range append(ts, b) {
+		if at.Sub(prev) > over {
+			out = append(out, window{prev, at})
+		}
+		prev = at
+	}
+	return out
+}
+
 // integrity requires that every datagram that arrived was intact and
 // arrived once (PacketIntegrity: no corruption, no merged, split or
 // truncated datagram, no duplicate).
