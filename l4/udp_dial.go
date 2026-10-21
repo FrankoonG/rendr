@@ -3,6 +3,7 @@ package l4
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -126,8 +127,10 @@ func activeRule() promoteMode {
 // The session has DefaultFlowIdle set (an application that pumps the flow
 // itself may change it with SetIdleTimeout; ForwardPacket applies the
 // classes). Its MaxPayload is the largest datagram the flow carries (the
-// package's "UDP flows" section). Errors: ErrBadAddress (before any network
-// I/O); ErrPacketTooLarge for a first datagram that does not ride and is
+// package's "UDP flows" section). Errors: ErrBadAddress, and
+// ErrMetadataTooLarge for an o.Metadata that makes the flow's metadata
+// longer than 65,535 bytes (both before any network I/O);
+// ErrPacketTooLarge for a first datagram that does not ride and is
 // above the session's MaxPayload (DialUDP has closed the session);
 // Peer.DialPacket's errors (ErrProtocol for o.EarlyReturn,
 // ErrMetadataTooLarge, ErrCapacity, ErrNoPath, ErrVersion, ctx); an l4
@@ -140,6 +143,13 @@ func DialUDP(ctx context.Context, p *rendr.Peer, addr string, first []byte, o re
 	// network I/O, and the retry's OPEN (R1-4).
 	bare, err := AppendMetadata(make([]byte, 0, maxHeader+firstLenLen+len(app)), Request{Cmd: CmdUDP, Addr: addr, App: app})
 	if err != nil {
+		if !errors.Is(err, ErrBadAddress) {
+			// AppendMetadata's only other refusal of a CmdUDP Request without
+			// First: the metadata exceeds 65,535 bytes, more than any
+			// Handshake.MaxMetadata admits, so DialUDP reports its documented
+			// error (before any network I/O).
+			err = fmt.Errorf("l4: DialUDP: %d bytes of o.Metadata make the flow's metadata longer than %d bytes: %w", len(app), maxUDPMetadata, rendr.ErrMetadataTooLarge)
+		}
 		return nil, err
 	}
 	o.Metadata = bare
