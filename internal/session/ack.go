@@ -24,12 +24,12 @@ import (
 // not flagged, yet it fills only when that write returns. So the PingBusy
 // bound is also enforced where frames are placed: an ACK the duty lane
 // has not placed PingBusy after it became due is taken, with the duty, by
-// the next qualifying lane that is not leaving and fills
-// (ackOverdueLocked). Without it, two bond lanes whose writes each last
-// between one and two PingBusy passed the duty to each other forever, each
-// move to the lane that had just started a write, and the sender's
-// acknowledged front froze until the bulk ended
-// (TestAckDutyOverdueTakenByFillingLane_L08).
+// the next qualifying lane that is not leaving, has no write-blocked
+// HoLCoupled sibling and fills (ackOverdueLocked; stream sessions only).
+// Without it, two bond lanes whose writes each last between one and two
+// PingBusy passed the duty to each other forever, each move to the lane
+// that had just started a write, and the sender's acknowledged front froze
+// until the bulk ended (TestAckDutyOverdueTakenByFillingLane_L08).
 //
 // Receiver cadence: a bump once AckEvery bytes were delivered since the
 // last bump, else an ACK delay armed at the first unacknowledged delivery
@@ -47,8 +47,8 @@ import (
 func (s *Session) bumpNowLocked() {
 	st := &s.st
 	st.ackGen++
-	if st.ackOwedSince.IsZero() {
-		st.ackOwedSince = time.Now()
+	if s.pk == nil && st.ackOwedSince.IsZero() {
+		st.ackOwedSince = time.Now() // stream sessions only: PACK placement never clears it
 	}
 	st.ackBumped = st.rRead
 	st.ackDelayAt = time.Time{}
@@ -125,8 +125,13 @@ func (s *Session) ackCadenceLocked() {
 // l has not carried yet; later bumps do not restart the clock, so a
 // cadence faster than PingBusy cannot hold it off), or the armed ACK
 // delay. l must qualify and not be leaving (A7 (c): never onto a carrier
-// the dialer abandoned). A packet session's PACK duty and a race session,
-// whose every data lane already carries each ACK, are not concerned.
+// the dialer abandoned), and no lane of its HoLCoupled fate group may be
+// write-blocked (M3-D39, PA-30: its write would stall with that sibling;
+// the ranking of chooseAckLaneLocked still gives it the duty when nothing
+// better qualifies). Stream sessions only: a packet session's PACK duty
+// (its clock never starts) and a race session, whose every data lane
+// already carries each ACK, are not concerned
+// (TestAckOverdueStreamOnly_L08).
 func (s *Session) ackOverdueLocked(l *lane, now time.Time) bool {
 	st := &s.st
 	d := st.ackLane
@@ -142,7 +147,7 @@ func (s *Session) ackOverdueLocked(l *lane, now time.Time) bool {
 	default:
 		return false
 	}
-	return !now.Before(due.Add(s.pingBusy())) && s.ackQualifiesLocked(l) && !s.ackLeavingLocked(l)
+	return !now.Before(due.Add(s.pingBusy())) && s.ackQualifiesLocked(l) && !s.ackLeavingLocked(l) && !s.holSiblingBlockedLocked(l)
 }
 
 // ackQualifiesLocked: l may carry the session's ACKs — it is live, has sent

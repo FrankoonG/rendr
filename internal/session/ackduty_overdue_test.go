@@ -2,6 +2,7 @@ package session
 
 import (
 	"bytes"
+	"io"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -15,8 +16,12 @@ import (
 // TestMuxDeathDuringRequeue_L10_L27 race-lane gaps of 1.38 s and 1.32 s,
 // run 20261018-050552-0937): a bond receiver whose two member lanes both
 // carry bulk the other way, each over a saturated path on which every batch
-// write takes W = 62.5 ms (longer than PingBusy, shorter than twice it),
-// must not starve its ACKs. Before the fix the duty fled to whichever lane
+// write takes W = 62.5 ms, must not starve its ACKs. W is BatchBudget
+// (256 KiB) at the race lane's 4 MiB/s per Link (R1-11): longer than
+// PingBusy, shorter than twice it. The band PingBusy < W < 2·PingBusy is,
+// with the defaults (PingBusy 50 ms, BatchBudget 256 KiB), a saturated
+// member rate between 2.5 and 5 MiB/s, which is why only the race lane
+// showed it. Before the fix the duty fled to whichever lane
 // was not flagged write-blocked at that instant — at a lane's WriteBlocked
 // (PingBusy into its write) and at every cadence bump that found the duty
 // lane flagged — and an unflagged lane of a saturated path is one that has
@@ -24,8 +29,9 @@ import (
 // the duty has moved on. With the two writers' phases φ apart, W − PingBusy
 // < φ < PingBusy, every fill fell on the lane without the duty, the owed
 // ACK was never placed and the sender's acknowledged front froze for as
-// long as the bulk lasted (2.6 s measured in the scenario), until its
-// window ran out: a zero-delivery gap.
+// long as the bulk lasted (about 2.6 s, at most 2.85 s, in instrumented
+// host runs of the scenario at -race -cpu 8), until its window ran out: a
+// zero-delivery gap.
 //
 // Stimulus: the passive (receiver of A → B) of a bond session with lanes 1
 // (srtt 5 ms) and 2 (10 ms), both data lanes; its application writes B → A
@@ -221,6 +227,12 @@ func TestAckDutyOverdueTakenByFillingLane_L08(t *testing.T) {
 //   - delayed: a delivery below AckEvery arms the ACK delay at t1; lane 2
 //     filling 1 ns before t1 + delay + PingBusy places nothing, at that
 //     instant it places the ACK of the front and takes the duty.
+//   - holcoupled (M3-D39, PA-30): a dialer whose lanes a and b form a
+//     HoLCoupled fate group and c is independent (mgHolSession); a's write
+//     blocked, so the duty is on c. b filling PingBusy after a bump places
+//     nothing while a is blocked (its write would stall with a) and the
+//     duty stays on c; once a's write returned, b's next fill places the
+//     overdue ACK and takes the duty, after which c places none.
 func TestAckOverdueRule_L08(t *testing.T) {
 	const (
 		pingBusy = 50 * time.Millisecond
@@ -307,6 +319,175 @@ func TestAckOverdueRule_L08(t *testing.T) {
 			time.Sleep(time.Nanosecond)
 			if a, ok := wpsessAckOf(l2); !ok || a.Delivered != front || duty(s) != l2 {
 				t.Fatalf("lane 2 at the delay + PingBusy: ACK %v (%v), duty on lane 2 %v; want the ACK of %d and the duty", a, ok, duty(s) == l2, front)
+			}
+		})
+	})
+	t.Run("holcoupled", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, _, lanes, ports := mgHolSession(t, true)
+			defer stEnd(s, errClosed)
+			a, b, c := lanes[0], lanes[1], lanes[2]
+			ports[0].set(func(f *stPort) { f.blocked = true })
+			a.WriteBlocked(nil)
+			if duty(s) != c {
+				t.Fatalf("setup: a blocked, the duty on a %v, on b %v; want it on c", duty(s) == a, duty(s) == b)
+			}
+			s.mu.Lock()
+			s.bumpNowLocked()
+			gen := s.st.ackGen
+			s.mu.Unlock()
+			time.Sleep(pingBusy)
+			if ack, ok := wpsessAckOf(b); ok || duty(s) != c {
+				t.Fatalf("b, whose sibling a is blocked, placed %v (%v) and holds the duty %v: want nothing, the duty on c", ack, ok, duty(s) == b)
+			}
+			ports[0].set(func(f *stPort) { f.blocked = false })
+			if _, ok := wpsessAckOf(b); !ok || duty(s) != b {
+				t.Fatalf("b once a's write returned: ACK %v, duty on b %v; want the overdue ACK and the duty", ok, duty(s) == b)
+			}
+			if ack, ok := wpsessAckOf(c); ok {
+				t.Fatalf("c placed %v after b carried gen %d: want none", ack, gen)
+			}
+		})
+	})
+}
+
+// TestAckOverdueStreamOnly_L08: the overdue rule is a stream session's
+// (ackOverdueLocked). PingBusy is 50 ms; Fill is driven by hand and the
+// duty lane does not fill after the ACK or PACK became due.
+//   - packet_bump: a passive packet bond with stream lanes 1 (srtt 5 ms,
+//     the PACK duty) and 2 (10 ms): a bump starts no overdue clock (PACK
+//     placement would never clear it); lane 2 filling PingBusy later
+//     places no PACK and the duty stays on lane 1, which then places the
+//     owed PACK.
+//   - packet_delayed: as packet_bump, the PACK delay (PacketPing 1 s)
+//     armed by a datagram instead: lane 2 filling at the delay + PingBusy
+//     places no PACK, the duty stays and lane 1 places the PACK reporting
+//     the datagram.
+//   - race: a passive race session, data lanes 1 (5 ms, the duty) and 2
+//     (80 ms) and lane 3 (200 ms) that carries no data and so no ACK copy
+//     (M3-D33, PA-33). 64 KiB read bumps the ACK; lane 3 filling PingBusy
+//     later places nothing and the duty stays on the fastest lane 1; lane
+//     2's copy and lane 1 carry the front.
+func TestAckOverdueStreamOnly_L08(t *testing.T) {
+	const (
+		pingBusy = 50 * time.Millisecond
+		pp       = time.Second
+	)
+	pkSetup := func() (*Session, *lane, *lane) {
+		s := dpSession(dpOpt{role: RolePassive, mode: ModeBond, packetPing: pp})
+		l1, f1 := dpAddLane(s, 1, true, false)
+		l2, f2 := dpAddLane(s, 2, true, false)
+		f1.set(func(f *dpPort) { f.srtt = 5 * time.Millisecond })
+		f2.set(func(f *dpPort) { f.srtt = 10 * time.Millisecond })
+		s.mu.Lock()
+		s.refreshOrderLocked(time.Now(), true)
+		s.st.ackLane = nil
+		s.ensureAckLaneLocked()
+		s.mu.Unlock()
+		dpIdle(l1)
+		dpIdle(l2)
+		return s, l1, l2
+	}
+	duty := func(s *Session) *lane { return stLocked(s, func(st *stream) *lane { return st.ackLane }) }
+	packs := func(l *lane) []dpFrame {
+		var out []dpFrame
+		for _, f := range dpFrames(dpFill(l, time.Now())) {
+			if f.typ == wire.TypePack {
+				out = append(out, f)
+			}
+		}
+		return out
+	}
+
+	t.Run("packet_bump", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, l1, l2 := pkSetup()
+			defer dpEnd(s, io.EOF)
+			if duty(s) != l1 {
+				t.Fatalf("setup: the PACK duty is on lane %v, want 1", duty(s))
+			}
+			s.mu.Lock()
+			s.bumpNowLocked()
+			clock := s.st.ackOwedSince
+			s.mu.Unlock()
+			if !clock.IsZero() {
+				t.Fatalf("a packet session's bump started the overdue clock at %v: want none", clock)
+			}
+			time.Sleep(pingBusy)
+			if ps := packs(l2); len(ps) != 0 || duty(s) != l1 {
+				t.Fatalf("lane 2 PingBusy after the bump placed %v, duty on lane 2 %v: want no PACK, the duty on lane 1", ps, duty(s) == l2)
+			}
+			if ps := packs(l1); len(ps) != 1 {
+				t.Fatalf("the duty lane 1 placed %v: want the owed PACK", ps)
+			}
+		})
+	})
+	t.Run("packet_delayed", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s, l1, l2 := pkSetup()
+			defer dpEnd(s, io.EOF)
+			if err := dpDatagram(l1, 0, []byte("a")); err != nil {
+				t.Fatal(err)
+			}
+			if at := stLocked(s, func(st *stream) time.Time { return st.ackDelayAt }); at.IsZero() {
+				t.Fatal("setup: the datagram armed no PACK delay")
+			}
+			time.Sleep(pp + pingBusy)
+			if ps := packs(l2); len(ps) != 0 || duty(s) != l1 {
+				t.Fatalf("lane 2 at the delay + PingBusy placed %v, duty on lane 2 %v: want no PACK, the duty on lane 1", ps, duty(s) == l2)
+			}
+			if ps := packs(l1); len(ps) != 1 || ps[0].pack.Received != 1 {
+				t.Fatalf("the duty lane 1 placed %v: want one PACK reporting the datagram", ps)
+			}
+			if got, err := dpReadAll(t, s); err != nil || len(got) != 1 || string(got[0]) != "a" {
+				t.Fatalf("integrity: read %q, %v; want the one datagram \"a\"", got, err)
+			}
+		})
+	})
+	t.Run("race", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			s := stSession(stOpt{role: RolePassive, mode: ModeRace, window: 1 << 20})
+			defer stEnd(s, errClosed)
+			fast, fp := stAddLane(s, 1, true)
+			slow, sp := stAddLane(s, 2, true)
+			ctl, cp := stAddLane(s, 3, false)
+			rcRaceLanes(s)
+			s.mu.Lock()
+			ctl.data = false // carries no data: no ACK copy
+			s.mu.Unlock()
+			fp.set(func(f *stPort) { f.srtt = 5 * time.Millisecond })
+			sp.set(func(f *stPort) { f.srtt = 80 * time.Millisecond })
+			cp.set(func(f *stPort) { f.srtt = 200 * time.Millisecond })
+			// The first DATA after an attach bumps at once: deliver it, and
+			// let every lane place what it owes.
+			if err := stDeliverData(fast, 0, stPattern(0, 1000)); err != nil {
+				t.Fatal(err)
+			}
+			stReadN(t, s, 1000)
+			for _, l := range []*lane{fast, slow, ctl} {
+				for {
+					fs, b := stFill(l, time.Now())
+					b.ReleaseRefs()
+					if len(fs) == 0 {
+						break
+					}
+				}
+			}
+			front := uint64(1000 + 64<<10)
+			if err := stDeliverData(fast, 1000, stPattern(1000, 64<<10)); err != nil {
+				t.Fatal(err)
+			}
+			if got := stReadN(t, s, 64<<10); !bytes.Equal(got, stPattern(1000, 64<<10)) {
+				t.Fatal("integrity: the bytes read are not the pattern's")
+			}
+			time.Sleep(pingBusy)
+			if ack, ok := wpsessAckOf(ctl); ok || duty(s) != fast {
+				t.Fatalf("lane 3 (no data) PingBusy after the bump placed %v (%v), duty on lane 3 %v: want nothing, the duty on lane 1", ack, ok, duty(s) == ctl)
+			}
+			for _, l := range []*lane{slow, fast} {
+				if ack, ok := wpsessAckOf(l); !ok || ack.Delivered != front {
+					t.Fatalf("lane %d placed %v (%v): want the ACK of %d", l.id, ack, ok, front)
+				}
 			}
 		})
 	})

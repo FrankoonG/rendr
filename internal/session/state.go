@@ -191,7 +191,7 @@ type stream struct {
 
 	// ACK (§4.6).
 	ackGen       uint64    // incremented by every bump; a lane whose ackSent differs owes an ACK
-	ackOwedSince time.Time // the first bump since an ACK was last placed (zero: none owed since): the overdue rule's clock (ackOverdueLocked, L08)
+	ackOwedSince time.Time // stream sessions only: the first bump since an ACK was last placed (zero: none owed since), the overdue rule's clock (ackOverdueLocked, L08)
 	ackBumped    uint64    // rRead at the last bump (AckEvery cadence)
 	ackFlags     uint8     // header flags the next ACK carries (FIN_DELIVERED, DONE)
 	ackDelayAt   time.Time // armed ACK delay (zero: none); fired by the duty lane's writer timer, never by the actor

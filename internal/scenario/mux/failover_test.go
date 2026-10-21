@@ -384,8 +384,9 @@ func TestMuxFastPathJoin(t *testing.T) {
 // end and nothing left after Runtime.Close. The race lane's bond gaps of
 // 1.38 s and 1.32 s (run 20261018-050552-0937) were the receiver's ACK duty
 // passing between its two saturated member lanes without an ACK placed: the
-// sender's acknowledged front froze for up to 2.6 s and its window ran out
-// in the drain (fixed in internal/session, TestAckDutyOverdueTakenByFillingLane_L08).
+// sender's acknowledged front froze (about 2.6 s, at most 2.85 s, in
+// instrumented host runs at -race -cpu 8) and its window ran out in the
+// drain (fixed in internal/session, TestAckDutyOverdueTakenByFillingLane_L08).
 func TestMuxDeathDuringRequeue_L10_L27(t *testing.T) {
 	rate := float64(16 << 20)
 	if raceEnabled {

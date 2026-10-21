@@ -71,14 +71,17 @@ func stallPairWith(t *testing.T, passiveReceives bool, wrap func(ft *frameTracer
 }
 
 // lateTracer forwards a connection's qlog events to ft but holds the record
-// of the first received packet that carries a DATAGRAM (the classifying
-// one) until the sending side's quic-go sent its next DATAGRAM (sent
-// closes) or hold passed: quic-go's run loop descheduled between handling
-// that packet's frames and recording it. It runs on that run loop.
+// of the received packet that carries the at-th DATAGRAM (1: the
+// classifying one) until the sending side's quic-go sent its next DATAGRAM
+// (sent closes; nil: never) or hold passed: quic-go's run loop descheduled
+// between handling that packet's frames and recording it. It runs on that
+// run loop.
 type lateTracer struct {
 	ft         *frameTracer
+	at         int64
 	sent       <-chan struct{}
 	hold       time.Duration
+	seen       atomic.Int64 // DATAGRAMs in the received packets so far
 	held       atomic.Bool  // the record was held
 	bySend     atomic.Bool  // the sender's next DATAGRAM released it (not hold)
 	releasedAt atomic.Int64 // when the hold ended (UnixNano)
@@ -90,13 +93,15 @@ func (l *lateTracer) SupportsSchemas(string) bool                               
 func (l *lateTracer) Close() error                                                   { return nil }
 
 func (l *lateTracer) RecordEvent(e qlogwriter.Event) {
-	if p, ok := e.(qlog.PacketReceived); ok && hasDatagram(p.Frames) && l.held.CompareAndSwap(false, true) {
-		select {
-		case <-l.sent:
-			l.bySend.Store(true)
-		case <-time.After(l.hold):
+	if p, ok := e.(qlog.PacketReceived); ok {
+		if n := datagrams(p.Frames); n > 0 && l.seen.Add(n) >= l.at && l.held.CompareAndSwap(false, true) {
+			select {
+			case <-l.sent:
+				l.bySend.Store(true)
+			case <-time.After(l.hold):
+			}
+			l.releasedAt.Store(time.Now().UnixNano())
 		}
-		l.releasedAt.Store(time.Now().UnixNano())
 	}
 	l.ft.RecordEvent(e)
 }
@@ -114,18 +119,20 @@ func (s *sendTracer) SupportsSchemas(string) bool                               
 func (s *sendTracer) Close() error                                                   { return nil }
 
 func (s *sendTracer) RecordEvent(e qlogwriter.Event) {
-	if p, ok := e.(qlog.PacketSent); ok && hasDatagram(p.Frames) && s.n.Add(1) == 2 {
+	if p, ok := e.(qlog.PacketSent); ok && datagrams(p.Frames) > 0 && s.n.Add(1) == 2 {
 		close(s.sent)
 	}
 }
 
-func hasDatagram(frames []qlog.Frame) bool {
+// datagrams counts the DATAGRAM frames among a packet's frames.
+func datagrams(frames []qlog.Frame) int64 {
+	var n int64
 	for _, f := range frames {
 		if _, ok := f.Frame.(*qlog.DatagramFrame); ok {
-			return true
+			n++
 		}
 	}
-	return false
+	return n
 }
 
 // TestQUICStallPairCountsClassify_L46 is the row of stallPair's exact base
@@ -148,7 +155,7 @@ func TestQUICStallPairCountsClassify_L46(t *testing.T) {
 	var lt *lateTracer
 	var pairedAt time.Time
 	w, _, ft, wc, rc := stallPairWith(t, true, func(ft *frameTracer) (tracerFunc, tracerFunc) {
-		lt = &lateTracer{ft: ft, sent: sent, hold: 500 * time.Millisecond}
+		lt = &lateTracer{ft: ft, at: 1, sent: sent, hold: 500 * time.Millisecond}
 		st := &sendTracer{sent: sent}
 		return lt.trace, st.trace
 	}, func() { pairedAt = time.Now() })
@@ -161,6 +168,39 @@ func TestQUICStallPairCountsClassify_L46(t *testing.T) {
 		t.Fatalf("the passive's quic-go handled %d DATAGRAMs, IngressDrops %d, EgressDrops %d: want 33 (the classifying one and the group), none dropped", got, in, eg)
 	}
 	t.Logf("the record was released by the dialer's next DATAGRAM: %v", lt.bySend.Load())
+}
+
+// TestQUICDatagramGoldenPassiveCountsFile_L46 is the row of the golden
+// passive's exact base (TestQUICDatagramGolden, KL-19): the same race as
+// stallPair's, where the passive's raw client sends the file's DATAGRAMs
+// untraced and the carrier delivers them before the tracer counted them.
+// Stimulus: the passive's quic-go records the packet that carries the
+// file's last DATAGRAM only 500 ms after it handled it (lateTracer), so the
+// carrier delivers every file datagram while the tracer counts fewer.
+// Load: the file's DATAGRAMs, a 200-datagram burst into a held pump and
+// the trailing datagram (dgramGoldenPassive). PASS: the passive part
+// completes, so its exact group waits were met and its drops counted from
+// the gap; the hold happened and ended after the carrier delivered the
+// file's datagrams; and the passive's quic-go handled exactly the file's,
+// the burst's and the trailing DATAGRAMs. With the base read during the
+// hold (no wait for the file's records) the count ends above the exact
+// target of the burst's first group: the wait fails after 5 s.
+func TestQUICDatagramGoldenPassiveCountsFile_L46(t *testing.T) {
+	t.Cleanup(rendrtest.AssertNoLeak(t))
+	want, inner := dgramGoldenFile(t), dgramGoldenInnerBytes(t)
+	var lt *lateTracer
+	var readAt time.Time
+	ft := dgramGoldenPassive(t, want, inner, func(ft *frameTracer) tracerFunc {
+		lt = &lateTracer{ft: ft, at: int64(len(want.dgs)), hold: 500 * time.Millisecond}
+		return lt.trace
+	}, func() { readAt = time.Now() })
+	if !lt.held.Load() || !readAt.Before(time.Unix(0, lt.releasedAt.Load())) {
+		t.Fatalf("stimulus: the record of the file's last DATAGRAM was held %v, released at %v, the file's datagrams delivered at %v: want it held past the delivery",
+			lt.held.Load(), time.Unix(0, lt.releasedAt.Load()), readAt)
+	}
+	if got, n := ft.rcvDatagrams.Load(), int64(len(want.dgs)+200+1); got != n {
+		t.Fatalf("the passive's quic-go handled %d DATAGRAMs, want %d (the file's %d, the burst's 200 and the trailing one)", got, n, len(want.dgs))
+	}
 }
 
 // holdPump stops r's pump before its next receive. parked returns once
