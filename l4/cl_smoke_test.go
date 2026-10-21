@@ -490,7 +490,11 @@ func (c clCounting) Read(b []byte) (int, error) {
 	return k, err
 }
 
-// runRST: the target resets after 64 KiB: a prefix, then a reset.
+// runRST: the target resets after 64 KiB: a prefix, then a reset. The
+// target sends and resets without waiting for the client's 1-KiB request,
+// so that write may meet the reset once the ingress Forward has passed it
+// on (seen once in the pool's race lane, run 20261021-190416-5ec9): a
+// reset there is the target's, any other write error fails.
 func (s *clSmoke) runRST(addr string) {
 	t := s.t
 	cli, _, res, err := s.ingress(addr, 0)
@@ -499,7 +503,7 @@ func (s *clSmoke) runRST(addr string) {
 		return
 	}
 	defer cli.Close()
-	if err := writePRNG(cli, 3, 1<<10); err != nil {
+	if err := writePRNG(cli, 3, 1<<10); err != nil && !isReset(err) {
 		t.Errorf("%s: write: %v", addr, err)
 	}
 	n, sum, err := readAll(cli)

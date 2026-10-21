@@ -322,9 +322,14 @@ func TestServerIdleDefault(t *testing.T) {
 // difference is checked: one pair's baseline once came out 50 allocations
 // per connection low (the pool's l4 sweep, 1 run in 600; the sync.Pools
 // both loops draw on depend on when the collector ran).
+//
+// Lanes (allocsPerConnPlan): the race lane, which does not assert, runs one
+// pair of 50 connections (racebudget: m6-design T-6, R1-37; rendr's I2,
+// when race-unit passes reached 282–304 s); the non-race unit and sweep
+// lanes run three pairs of 400 and assert.
 func TestServerAllocsPerConn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		const k = 400 // enough connections that the difference of two totals is stable
+		pairs, k := allocsPerConnPlan(raceEnabled)
 		w := newSrvWorld(t, srvOpts{})
 		target := rendrtest.NewTarget(rendrtest.TargetEcho(), 0)
 		one := func() {
@@ -348,7 +353,7 @@ func TestServerAllocsPerConn(t *testing.T) {
 			}
 			settle()
 			runtime.ReadMemStats(&m1)
-			return float64(m1.Mallocs-m0.Mallocs) / k
+			return float64(m1.Mallocs-m0.Mallocs) / float64(k)
 		}
 
 		// The baseline: Accept, the target dial, Confirm, SetIdleTimeout and
@@ -398,16 +403,42 @@ func TestServerAllocsPerConn(t *testing.T) {
 			sv.stop(t)
 			return n
 		}
-		var own [3]float64
+		own := make([]float64, pairs)
 		for i := range own {
 			base, server := baseline(), served()
 			own[i] = server - base
 			t.Logf("allocations per connection: baseline %.1f, Serve %.1f, the Server's own %.1f", base, server, own[i])
 		}
-		slices.Sort(own[:])
-		if !raceEnabled && own[1] > 64 {
-			t.Fatalf("the Server allocates %.1f times per connection (median of %v), want ≤ 64", own[1], own)
+		slices.Sort(own)
+		if med := own[len(own)/2]; !raceEnabled && med > 64 {
+			t.Fatalf("the Server allocates %.1f times per connection (median of %v), want ≤ 64", med, own)
 		}
 		w.shutdown()
 	})
+}
+
+// allocsPerConnPlan is TestServerAllocsPerConn's measurement in a lane:
+// pairs of baseline and Serve loops and connections per loop. The non-race
+// lanes, which assert the ceiling on the median pair, measure three pairs
+// of 400 connections (enough that the difference of two totals is
+// stable); the race lane only exercises both loops under the detector and
+// logs the figure, so one pair of 50 suffices
+// (TestServerAllocsPerConnPlan).
+func allocsPerConnPlan(race bool) (pairs, k int) {
+	if race {
+		return 1, 50
+	}
+	return 3, 400
+}
+
+// TestServerAllocsPerConnPlan: the asserting lanes keep the measurement the
+// ceiling was set with (three pairs of 400, the median checked) and only
+// the race lane runs the smaller plan.
+func TestServerAllocsPerConnPlan(t *testing.T) {
+	if p, k := allocsPerConnPlan(false); p != 3 || k != 400 {
+		t.Errorf("the non-race plan is %d pairs of %d, want 3 of 400", p, k)
+	}
+	if p, k := allocsPerConnPlan(true); p != 1 || k != 50 {
+		t.Errorf("the race plan is %d pairs of %d, want 1 of 50", p, k)
+	}
 }

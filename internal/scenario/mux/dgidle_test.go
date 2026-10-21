@@ -81,13 +81,20 @@ var dgIdleArms = []struct {
 
 // dgIdleSize is the number of sessions an arm of
 // TestMuxDgramIdleEndReachesPeer_L30 opens at 500/s: 2,000 (the decision's
-// row) in the datagram arms in every lane; the stream-trunk control arms
-// run 500 under the race detector (M3 R1-11: the same criteria on a
-// smaller volume, for the race lane's budget) and 2,000 elsewhere
+// row) in every arm outside the race detector. Under it (M3 R1-11: the
+// same criteria on a smaller volume, for the race lane's budget) the
+// stream-trunk control arms run 500 and the datagram arms 640: ten full
+// trunks of 64 views, each trunk's views ending at the same 500/s, so
+// every trunk meets its 8-frame REL window exactly as at 2,000 (racebudget
+// at rendr's I2, when race-unit passes reached 282–304 s; defect A's
+// mutants still fail both datagram arms at that size)
 // (TestMuxDgramIdleLaneSize).
 func dgIdleSize(dgram, race bool) int {
-	if dgram || !race {
+	switch {
+	case !race:
 		return 2000
+	case dgram:
+		return 640
 	}
 	return 500
 }
@@ -107,8 +114,12 @@ func TestMuxDgramIdleLaneSize(t *testing.T) {
 	if got := dgIdleSize(false, raceEnabled); got != want {
 		t.Errorf("the stream control arms open %d sessions in this lane (race %v), want %d", got, race, want)
 	}
-	if got := dgIdleSize(true, raceEnabled); got != 2000 {
-		t.Errorf("the datagram arms open %d sessions in this lane (race %v), want 2,000", got, race)
+	wantDgram := 2000
+	if race {
+		wantDgram = 640
+	}
+	if got := dgIdleSize(true, raceEnabled); got != wantDgram {
+		t.Errorf("the datagram arms open %d sessions in this lane (race %v), want %d", got, race, wantDgram)
 	}
 	if got := dgIdleHighRTTSize(raceEnabled); got != want {
 		t.Errorf("TestMuxDgramIdleEndHighRTT_L30 opens %d sessions in this lane (race %v), want %d", got, race, want)
@@ -132,7 +143,7 @@ func TestMuxDgramIdleLaneSize(t *testing.T) {
 // Premise: one factory call per trunk the load needs (⌈sessions / the view
 // cap⌉: views of 64 on a datagram trunk, 256 on a stream trunk) and every
 // session echoed. Under the race detector the stream arms open 500
-// sessions (dgIdleSize).
+// sessions and the datagram arms 640 (dgIdleSize).
 // Stimulus: every session's last datagram is its echo; the idler's ends
 // come at 500/s, 10 s after the exchanges.
 // PASS: the idler ends every session ErrIdleTimeout; the peer ends every one

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && rendrtaildiag
 
 package realsock
 
@@ -30,9 +30,13 @@ import (
 
 // TestL4UQuietTailDiag is the quiet-path tail diagnostic of the M6
 // delegate decisions after wave D ("G10 criterion 7, the quiet-path tail
-// (C1)"). It runs only with RENDR_TAIL_DIAG=1, on a quiet Linux host (a
-// pool worker of rendr-regress, never the ordinary lanes), for
-// RENDR_TAIL_SECS seconds (default 60) after a 2-s warm-up;
+// (C1)"). It is built only with the build tag rendrtaildiag, so the
+// ordinary lanes never compile it (rendr-regress's race-unit, unit and
+// sweep lanes count a skipped test as INVALID unless it is a platform
+// skip), and it runs only with RENDR_TAIL_DIAG=1, on a quiet Linux host
+// (a pool worker of rendr-regress: its sweep set
+// sweep:internal/scenario/realsock.taildiag builds the tag and sets the
+// switches), for RENDR_TAIL_SECS seconds (default 60) after a 2-s warm-up;
 // RENDR_TAIL_PACE=sleep paces the bursts' groups with timers only (the
 // default spins between a burst's groups, so that the burst keeps about
 // 71 kpps where Go's timers round sub-millisecond sleeps up to 1 ms; with

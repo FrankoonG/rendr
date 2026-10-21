@@ -631,7 +631,7 @@ func TestL4URealSizes_L37_L71(t *testing.T) {
 // (lesson/l4u-edges step 4, R1-2).
 func TestL4URealConnectedICMP_L58_L73(t *testing.T) {
 	if runtime.GOOS != "linux" {
-		t.Skip("Linux socket behaviour: a connected UDP socket reports ICMP port unreachable as ECONNREFUSED (on Windows: TestL4URealConnectedICMPWindows_L73)")
+		t.Skip("platform: Linux socket behaviour: a connected UDP socket reports ICMP port unreachable as ECONNREFUSED (on Windows: TestL4URealConnectedICMPWindows_L73)")
 	}
 	l4uConnectedICMP(t, true)
 }
@@ -646,7 +646,7 @@ func TestL4URealConnectedICMP_L58_L73(t *testing.T) {
 // on Linux.
 func TestL4URealConnectedICMPWindows_L73(t *testing.T) {
 	if runtime.GOOS != "windows" {
-		t.Skip("Windows socket behaviour: Go switches SIO_UDP_CONNRESET and SIO_UDP_NETRESET off (on Linux: TestL4URealConnectedICMP_L58_L73)")
+		t.Skip("platform: Windows socket behaviour: Go switches SIO_UDP_CONNRESET and SIO_UDP_NETRESET off (on Linux: TestL4URealConnectedICMP_L58_L73)")
 	}
 	l4uConnectedICMP(t, false)
 }
@@ -1176,7 +1176,7 @@ func TestL4URealTCPUDPSamePort(t *testing.T) {
 // the unit row TestPortForwardReadNoise_L58_L73's.
 func TestL4URealIngressReadNoiseWindows_L73(t *testing.T) {
 	if runtime.GOOS != "windows" {
-		t.Skip("Windows socket behaviour: Winsock's SIO_UDP_CONNRESET (Linux reports nothing on an unconnected socket without IP_RECVERR)")
+		t.Skip("platform: Windows socket behaviour: Winsock's SIO_UDP_CONNRESET (Linux reports nothing on an unconnected socket without IP_RECVERR)")
 	}
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	n := newL4uNet(t, l4uOpts{})
