@@ -25,7 +25,9 @@ import (
 // the flow's MaxPayload is dropped and counted. Socket errors of the
 // system-call class are counted and backed off. ServeUDP owns sock from
 // the call on and closes it when it returns, after every flow it started
-// ended.
+// ended. At the stop each flow waits for its session's end, at most 2.1 s
+// (that long while no carrier lives), so that SessionDrops holds what the
+// sessions dropped after the close.
 //
 // ServeUDP returns ctx.Err() once ctx is done, the socket's error when its
 // reads fail (net.ErrClosed after a Close by someone else), or
@@ -98,10 +100,12 @@ func (f *PortForward) Flows() []FlowInfo {
 }
 
 // ingressSession is what the ingress uses of a flow's packet session: the
-// forward's methods and Status (Flows, SessionDrops).
+// forward's methods, Status (Flows, SessionDrops) and Metadata (whether
+// the first datagram rode the OPEN).
 type ingressSession interface {
 	packetSession
 	Status() rendr.SessionStatus
+	Metadata() []byte
 }
 
 // dialIngress opens one flow's session for the ingress: DialUDP. It is a
@@ -318,9 +322,6 @@ func (s *udpServe) admit(b []byte, src netip.AddrPort) {
 	t.mu.Unlock()
 	if victim != nil {
 		close(victim.done)
-		if evicted {
-			u.evicted.Add(1)
-		}
 		if vpc != nil {
 			victim.closeSession(vpc) // returns at once; the victim's goroutine leaves ReadFrom
 		}
@@ -413,19 +414,23 @@ func (s *udpServe) flow(e *ingressFlow) {
 	ctx, cancel := context.WithTimeout(s.ctx, ingressOpenBound)
 	pc, err := dialIngress(ctx, s.f.Peer, s.target, e.first, s.opts)
 	cancel()
-	rode := e.first != nil
+	first := e.first != nil
 	ingressFree(e.first) // DialUDP does not retain it
 	e.first = nil
 	if err != nil {
-		s.openFailed(e, err, rode)
+		s.openFailed(e, err, first)
 		return
 	}
 	opened := s.now()
 	u.opened.Add(1)
 	u.maxPayload.Store(int64(pc.MaxPayload()))
 	pc.SetIdleTimeout(s.short) // net.ErrClosed only: the session already ended, which ReadFrom reports
-	if rode {
-		u.firstInOpen.Add(1)
+	if first {
+		// DialUDP sent it: in the OPEN when the OPEN's metadata holds it,
+		// else after the open, by its retry without it (R1-4).
+		if len(pc.Metadata()) > s.bare {
+			u.firstInOpen.Add(1)
+		}
 		u.toSession.Add(1)
 		if e.class.out(s.base.Add(e.since)) {
 			s.promote(pc)
@@ -516,11 +521,16 @@ func (s *udpServe) pump(e *ingressFlow, pc ingressSession) error {
 // unit released, unless it is gone already (evicted, replaced) or it is
 // held — by the reader's expiry race or here when the far end closed the
 // flow within ingressReopenHold of its open (R1-2) — and then waits out
-// the hold.
+// the hold. An eviction counts only when its close ended the session: a
+// victim whose session had ended on its own before (its goroutine late)
+// counts that end. After this side's stop the session still sends or
+// drops what it queued, so its drops are read at its end, at most
+// ingressSettle later (R1-38); an evicted flow, idle for at least
+// ingressEvictIdle, is read at once (its goroutine returns at once, R1-5).
 func (s *udpServe) end(e *ingressFlow, pc ingressSession, err error) {
 	t := &s.tab
 	t.mu.Lock()
-	evicted, hold := e.evicted, false
+	evicted, hold := e.evicted && errors.Is(err, net.ErrClosed), false
 	if e.peerEnd {
 		err = io.EOF // the far end closed it; a local close since (an eviction, the stop) only woke the goroutine
 	}
@@ -538,27 +548,51 @@ func (s *udpServe) end(e *ingressFlow, pc ingressSession, err error) {
 	t.mu.Unlock()
 	e.closeSession(pc)
 	cause := s.f.udp.ends.count(err, evicted)
-	if pk := pc.Status().Packet; pk != nil {
+	if evicted {
+		s.f.udp.evicted.Add(1)
+	}
+	pk := pc.Status().Packet
+	if cause.unreported() {
+		s.f.udp.sessionUnreported.Add(unreportedOf(pk))
+	}
+	if cause == endStopped {
+		pk = settle(pc)
+	}
+	if pk != nil {
 		s.f.udp.sessionDrops.Add(sessionDrops(pk))
-		if cause.unreported() {
-			s.f.udp.sessionUnreported.Add(unreportedOf(pk))
-		}
 	}
 	if hold {
 		s.hold(e)
 	}
 }
 
+// settle waits for the end of pc, which this side closed, at most
+// ingressSettle, and returns its packet counters then (R1-38): a session
+// with a carrier ends about one round trip after the close; one without
+// has dropped every datagram it held once Packet.MaxAge has passed.
+func settle(pc ingressSession) *rendr.PacketCounters {
+	tm := time.NewTimer(ingressSettle)
+	select {
+	case <-pc.Done():
+	case <-tm.C:
+	}
+	tm.Stop()
+	return pc.Status().Packet
+}
+
 // openFailed holds the source of a failed open (M6-D28): its queued
-// datagrams — and the first that rode the failed OPEN — are DropHeld, the
-// failure is counted (Failed, ByCode, LastErr). An open the stop cancelled
-// counts no failure, its datagrams DropOpenQueue, and leaves the table at
-// once; an open that failed with the bare net.ErrClosed (the Peer or the
-// Runtime closed: DialUDP returns DialPacket's sentinel unwrapped) halts
-// the serve. A wrapped one is a carrier's (ErrNoPath's last carrier error:
-// an embedder tunnel that is down), so it is this flow's failure, as in
-// ServeTCP.
-func (s *udpServe) openFailed(e *ingressFlow, err error, rode bool) {
+// datagrams — and its first datagram, which rode the failed OPEN or would
+// have followed the open — are DropHeld, the failure is counted (Failed,
+// ByCode, LastErr). A first datagram that rode may have reached the
+// target all the same: a passive writes it before it confirms, and its
+// Confirm can still fail (UDPServerStatus.FirstSent and Unconfirmed). An
+// open the stop cancelled counts no failure, its datagrams DropOpenQueue,
+// and leaves the table at once; an open that failed with the bare
+// net.ErrClosed (the Peer or the Runtime closed: DialUDP returns
+// DialPacket's sentinel unwrapped) halts the serve. A wrapped one is a
+// carrier's (ErrNoPath's last carrier error: an embedder tunnel that is
+// down), so it is this flow's failure, as in ServeTCP.
+func (s *udpServe) openFailed(e *ingressFlow, err error, first bool) {
 	u, t := &s.f.udp, &s.tab
 	if err == net.ErrClosed {
 		s.halt(err)
@@ -570,7 +604,7 @@ func (s *udpServe) openFailed(e *ingressFlow, err error, rode bool) {
 	t.mu.Lock()
 	q := e.takeQueue()
 	n := len(q)
-	if rode {
+	if first {
 		n++
 	}
 	if stopping || t.stopped {
@@ -638,7 +672,7 @@ func (s *udpServe) shutdown() {
 
 // count adds one ended flow by the cause its session reported and returns
 // that cause: err is ReadFrom's end (or net.ErrClosed when the stop closed
-// it before it was open); evicted: the flow was removed to make room.
+// it before it was open); evicted: the close of an eviction ended it.
 func (c *flowEndCounts) count(err error, evicted bool) endCause {
 	var abort *rendr.AbortError
 	switch {
