@@ -4,10 +4,18 @@
 // an l4.Server{UDP: true} on the passive whose Dial hook gives every flow a
 // rendrtest.DatagramPipe toward the target application. The rows are a
 // Moonlight-like stream miniature per mode through carrier kills and a
-// blackhole (L39, L40, L70); 64 flows failing over at once (L27); a flow
-// churn in the tombstone-eviction regime with every OPEN duplicated on a
-// second carrier (L47); and the two size rows that need stream members,
-// stream carriers only and a mixed bond (L37).
+// blackhole (L39, L40, L70); 64 flows failing over at once (L27); a
+// DNS-like churn of one-shot flows that must leave nothing behind, under
+// the rule in force and its DNS recipe (L48, L72); a flow churn in the
+// tombstone-eviction regime with every OPEN duplicated on a second carrier
+// (L47); the two size rows that need stream members, stream carriers only
+// and a mixed bond (L37); two rules many views of one datagram MUX trunk
+// must keep at once (mux_test.go: an idle end crosses, a reply written at
+// Confirm arrives); a mixed bond's or race's start, where datagrams wider
+// than the datagram member written while the stream member is joining are
+// dropped, the limitation l4 documents (joining_test.go); and a bond
+// member's silent death, through which the stream recovers within the
+// death-detection bound (bonddrop_test.go).
 //
 // The scenarios run two Runtimes joined by rendrtest datagram and stream
 // links inside testing/synctest bubbles and drive them only through the
