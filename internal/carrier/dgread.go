@@ -396,8 +396,11 @@ func (c *Conn) dgAdapt(rd *dgReader, n int, parked bool) {
 // got and counts the nk − k slots it would have added in ChargeRefused
 // (R1-4; refused receive slots on both readers, M5 design R3-23) — and,
 // when the held header is too small (or none is held), a header of nk's
-// class lent to the transport. A lend refused while an idle release still
-// returns earlier extras keeps depth 1.
+// class lent to the transport: a reserved one (getReadHdr), so a regrowth
+// reuses the headers earlier growths returned, whatever the collector or
+// the scheduler did to the pools (TestDgramReadAdaptiveDepthReuse_L16_L54).
+// A lend refused while an idle release still returns earlier extras keeps
+// depth 1. Every header the reader returns goes back through putRead.
 func (rd *dgReader) grow(nk int) {
 	h, k := rd.hdr, 1
 	if h != nil {
@@ -405,7 +408,7 @@ func (rd *dgReader) grow(nk int) {
 	}
 	nh := h
 	if h == nil || h.cap() < nk {
-		nh = getHdr(nk, rd.stages)
+		nh = getReadHdr(nk, rd.stages)
 	}
 	for i := k; i < nk; i++ {
 		s := rd.pool.TryGet(rd.size, rd.budget)
@@ -415,7 +418,7 @@ func (rd *dgReader) grow(nk int) {
 			}
 			releaseSlots(nh, k, i)
 			if nh != h {
-				nh.put()
+				nh.putRead()
 			}
 			return
 		}
@@ -433,17 +436,17 @@ func (rd *dgReader) grow(nk int) {
 	if !rd.dio.lend(nh) {
 		releaseSlots(nh, k, nk)
 		clear(nh.slots[1:k])
-		nh.put()
+		nh.putRead()
 		return
 	}
 	if h != nil {
 		clear(h.slots[1:k]) // moved to nh
-		h.put()
+		h.putRead()
 	}
 	if rd.stale != nil {
 		// The lend found the Reader idle: the release that took the stale
 		// header completed.
-		rd.stale.put()
+		rd.stale.putRead()
 		rd.stale = nil
 	}
 	rd.hdr = nh
@@ -464,7 +467,7 @@ func (rd *dgReader) shrink(nk int) {
 	}
 	rd.dio.reclaim()
 	releaseSlots(h, 1, h.k)
-	h.put()
+	h.putRead()
 	rd.hdr = nil
 }
 
@@ -480,7 +483,7 @@ func releaseSlots(h *ioHdr, from, to int) {
 // completed.
 func (rd *dgReader) collect() {
 	if s := rd.stale; s != nil && rd.relGen.Load() == s.gen {
-		s.put()
+		s.putRead()
 		rd.stale = nil
 	}
 }
