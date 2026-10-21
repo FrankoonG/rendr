@@ -173,11 +173,14 @@
 // datagram carriers are full (64 flows each) dials another, before the OPEN
 // leaves. On a datagram carrier that a Peer's sessions already share, the
 // passive sends a new flow's replies only once the dialer's first frame for
-// it has arrived, about one round trip after its OPEN_ACK; replies wait in
-// the session's queue meanwhile, which drops datagrams older than the
-// passive's Packet.MaxAge (100 ms by default): on paths whose round trip
-// comes near it, raise it (up to 2 s), or the first answer of a new flow on
-// a shared carrier is dropped (DropAge) and the client must send again.
+// the flow has arrived, about one round trip after its OPEN_ACK. There the
+// first datagram still reaches the target one round trip earlier, but the
+// first reply reaches the client earlier only by the time the target takes
+// to answer, at most one round trip: an instant answer gains nothing, a
+// resolver that takes a round trip or more gains the whole round trip. On a
+// carrier dialled for the flow, or a CheapSubflow factory's, the first
+// reply comes one round trip earlier too. Replies written meanwhile wait in
+// the passive session's queue, within its Packet.Queue and Packet.MaxAge.
 //
 // Sizes. A flow's largest datagram is its session's MaxPayload, fixed at the
 // OPEN: the smallest datagram budget among the Peer's datagram factories, 25
@@ -191,8 +194,12 @@
 // budget ride the stream carriers, with that latency, and are not counted
 // TooLarge (one that no live carrier can carry is dropped by the session,
 // PacketCounters.DropTooLarge); a selector session on such a Peer keeps the
-// datagram budget. A datagram above MaxPayload is never fragmented or split:
-// it is dropped and counted where it was read — at the ingress
+// datagram budget. Such a bond or race session opens on a datagram carrier,
+// and its stream carrier joins about one round trip later: a wider datagram
+// the dialer writes in between, a flow's first datagram included, is dropped
+// (DropTooLarge), and the client must send it again; the flow lives on and
+// carries the next one. A datagram above MaxPayload is never fragmented or
+// split: it is dropped and counted where it was read — at the ingress
 // (UDPForwardStatus.TooLarge, and TooLargeMax: the ingress reads whole
 // datagrams), at the passive (UDPServerStatus.TooLarge), under ForwardPacket
 // (PacketResult.TooLarge). The application sees loss, as on a path whose MTU

@@ -176,7 +176,9 @@ func (k *kindStats) codes() map[RejectCode]uint64 {
 // flow ends at its idle limit). Without UDP, packet sessions are never
 // accepted: their OPENs on ln wait in its packet backlog until
 // AcceptTimeout answers them. Abandoned Dial hook calls may outlive Serve;
-// Status counts them.
+// Status counts them. Serve may run on several Listeners at once, one call
+// each: MaxConns and MaxFlows bound them together, and Status covers them
+// all.
 func (s *Server) Serve(ctx context.Context, ln *rendr.Listener) error {
 	var wg sync.WaitGroup
 	var err error
