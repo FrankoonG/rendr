@@ -2,6 +2,7 @@ package l4u
 
 import (
 	"errors"
+	"reflect"
 	"runtime/debug"
 	"testing"
 	"time"
@@ -31,7 +32,8 @@ type laneSize struct {
 	churnSpan                       time.Duration
 	fallbackSpan                    time.Duration // TestL4UStreamCarrierFallback_L37 (a kill every 6 s)
 	bondSpan                        time.Duration // TestL4UMixedBondOversize_L37
-	silentWarm, silentTail          time.Duration // TestL4UBondSilentMemberKeepsStream_L39: the streaming before the blackhole, the judged span after its removal
+	silentWarm, silentDrop          time.Duration // TestL4UBondSilentMemberKeepsStream_L39: the streaming before the blackhole, the blackhole (at least recoveryBound)
+	silentTail                      time.Duration // the judged span after the blackhole's removal (at least a second past the rejoin)
 }
 
 // fullLane is the design's size: what the non-race lanes run.
@@ -42,32 +44,40 @@ var fullLane = laneSize{
 	dnsQueries: [3]int{20000, 4000, 4000}, dnsPorts: 4096,
 	churnSessions: 1000, churnRate: 40, churnSpan: 5 * time.Minute,
 	fallbackSpan: 30 * time.Second, bondSpan: 20 * time.Second,
-	silentWarm: 3 * time.Second, silentTail: mlSpanAfter,
+	silentWarm: 3 * time.Second, silentDrop: 6 * time.Second, silentTail: mlSpanAfter,
 }
 
-// raceLane is the race lane's size: the default mode of the stream
-// miniature with one kill and a shorter blackhole (the same windows and
-// bounds), the 64 flows at 200 and 10 datagrams per second, an eightieth
-// and three fortieths of the DNS arms' queries (the reuse arm's port space
-// scaled with them), the churn's regime at an eighth of the sessions and
-// the rate (5 × 64 s = 320 tombstones wanted against 250), and the bond's
-// silent member after 2 s of streaming, judged until 2 s after the
-// blackhole's removal (its 6-s blackhole, windows and bounds unchanged).
+// raceLane is the race lane's size (every rule covered once, every window
+// and bound unchanged): the default mode of the stream miniature, Q 2 s,
+// one kill at T + 1 s, the blackhole 3 s later for 5 s (the
+// death-detection bound) and T's end 1 s after its removal; the 64 flows
+// at 200 and 10 datagrams per second; an eightieth and three fortieths of
+// the DNS arms' queries, the reuse arm's 300 over 250 ports (dnsArms:
+// about a fifth of them land on a live flow); the churn's regime at a
+// sixteenth of the sessions and 3/40 of the rate (3 × 64 s = 192
+// tombstones wanted against 128, 75 s of churn); one kill of the stream
+// fallback (8 s) and 4 s of the mixed bond; the bond's silent member after
+// 1 s of streaming, blackholed for 5 s (the death-detection bound) and
+// judged until 1 s after the blackhole's removal or the member's rejoin,
+// whichever is later.
 var raceLane = laneSize{
 	mlModes: []rendr.Mode{rendr.ModeSelector},
-	mlQuiet: 3 * time.Second, mlKills: 1, mlFirst: 2 * time.Second, mlKill: 5 * time.Second, mlDrop: 6 * time.Second, mlTail: 2 * time.Second,
+	mlQuiet: 2 * time.Second, mlKills: 1, mlFirst: time.Second, mlKill: 3 * time.Second, mlDrop: recoveryBound, mlTail: time.Second,
 	failBig: 200, failSmall: 10, failWarm: 4 * time.Second, failObserve: 6 * time.Second,
-	dnsQueries: [3]int{250, 300, 300}, dnsPorts: 307,
-	churnSessions: 125, churnRate: 5, churnSpan: 80 * time.Second,
-	fallbackSpan: 14 * time.Second, bondSpan: 8 * time.Second,
-	silentWarm: 2 * time.Second, silentTail: 2 * time.Second,
+	dnsQueries: [3]int{250, 300, 300}, dnsPorts: 250,
+	churnSessions: 64, churnRate: 3, churnSpan: 75 * time.Second,
+	fallbackSpan: 8 * time.Second, bondSpan: 4 * time.Second,
+	silentWarm: time.Second, silentDrop: recoveryBound, silentTail: time.Second,
 }
 
 // TestL4URaceLane (racebudget): the lane's sizes follow the binary's
 // build — the race lane's under -race, the design's otherwise — read from
 // the build information, not from raceEnabled, so an inverted switch
-// (race_on_test.go, race_off_test.go) fails in both lanes; and the churn
-// row's tombstone-eviction regime holds in both lanes.
+// (race_on_test.go, race_off_test.go) fails in both lanes; and in both
+// lanes the churn row's tombstone-eviction regime holds and the rows'
+// spans hold their windows (a blackhole lasts at least the death-detection
+// bound, the silent member is chosen from a full second of streaming, a
+// kill's judged span starts inside T).
 func TestL4URaceLane(t *testing.T) {
 	bi, ok := debug.ReadBuildInfo()
 	race, err := buildLane(bi, ok)
@@ -81,9 +91,7 @@ func TestL4URaceLane(t *testing.T) {
 	if race {
 		want = raceLane
 	}
-	if lane.mlKills != want.mlKills || len(lane.mlModes) != len(want.mlModes) || lane.dnsQueries != want.dnsQueries ||
-		lane.churnSpan != want.churnSpan || lane.churnSessions != want.churnSessions ||
-		lane.failBig != want.failBig || lane.failSmall != want.failSmall || lane.silentTail != want.silentTail {
+	if !reflect.DeepEqual(lane, want) {
 		t.Fatalf("the lane runs %+v, want %+v", lane, want)
 	}
 	// More tombstones wanted (rate × 64 s of TombstoneTTL) than the cap (2 ×
@@ -91,6 +99,9 @@ func TestL4URaceLane(t *testing.T) {
 	for _, l := range []laneSize{fullLane, raceLane} {
 		if l.churnRate*64 <= 2*l.churnSessions || l.churnSpan < time.Duration(2*l.churnSessions/l.churnRate)*time.Second+30*time.Second {
 			t.Fatalf("lane %+v: not the tombstone-eviction regime", l)
+		}
+		if l.mlDrop < recoveryBound || l.silentDrop < recoveryBound || l.silentWarm < time.Second || l.mlFirst < mlSpanBefore {
+			t.Fatalf("lane %+v: a blackhole shorter than %v, less than a second of streaming before the silent member's, or a kill within %v of T's start", l, recoveryBound, mlSpanBefore)
 		}
 	}
 	t.Logf("race lane %v: %+v", race, lane)

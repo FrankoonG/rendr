@@ -17,10 +17,12 @@ import (
 // (TestL4UStreamMiniature_L39_L40_L70's profile) in bond mode over two
 // DatagramLinks v1 and v2. After 3 s of streaming the path of the member
 // that carried most of the video in the last second is blackholed both
-// ways for 6 s, then restored; the row judges until 6 s after the removal
-// and the profile runs a second longer (lane.silentWarm and
-// lane.silentTail: under the race detector 2 s of streaming and 2 s after
-// the removal; the blackhole, the windows and the bounds are the same).
+// ways for 6 s, then restored; the row judges until 6 s after the removal,
+// and at least a second after the member's rejoin, and the profile runs a
+// second longer (lane.silentWarm, lane.silentDrop and lane.silentTail:
+// under the race detector 1 s of streaming, a blackhole of 5 s — the
+// death-detection bound — and 1 s after the removal; the windows and the
+// bounds are the same).
 //
 // A packet bond places by member srtt, and a silent member's srtt does
 // not rise before a PONG proves it, so the member keeps receiving most of
@@ -40,21 +42,22 @@ import (
 //   - the member's death on the dialer within recoveryBound (DeadMax 4 s +
 //     1 s) of the blackhole (G10-bond: the member's death ≤ 5 s);
 //   - recovery within the bound (bondDropRecovery): every video arrival
-//     gap above 200 ms from 1 s before the blackhole to 6 s after its
-//     removal (lane.silentTail) lies inside [t_d − 200 ms, t_d +
-//     recoveryBound] — the stream arrives again by the bound and stops
-//     for no longer than 200 ms before the blackhole, after the recovery,
-//     at the removal and at the member's rejoin;
+//     gap above 200 ms from 1 s before the blackhole to the judged span's
+//     end (6 s after the removal, lane.silentTail, and at least 1 s after
+//     the rejoin) lies inside [t_d − 200 ms, t_d + recoveryBound] — the
+//     stream arrives again by the bound and stops for no longer than
+//     200 ms before the blackhole, after the recovery, at the removal and
+//     at the member's rejoin;
 //   - losses only inside W, per flow and direction (every flow's sessions
 //     share the two paths), and none at the removal or the rejoin (G5-pkt);
-//   - the member rejoins within mlRejoin of the removal, every datagram
-//     that arrived is intact and arrived once, and each flow keeps its one
-//     session (three flows opened once, one egress source each: the stream
-//     is kept, never re-opened).
+//   - the member rejoins within G5Bound of the removal (G10-bond's removal
+//     row; mlRejoin, 4.06 s), every datagram that arrived is intact and
+//     arrived once, and each flow keeps its one session (three flows
+//     opened once, one egress source each: the stream is kept, never
+//     re-opened).
 func TestL4UBondSilentMemberKeepsStream_L39(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		const drop = 6 * time.Second
-		warm, tail := lane.silentWarm, lane.silentTail
+		warm, drop, tail := lane.silentWarm, lane.silentDrop, lane.silentTail
 		w := newWorld(t, worldOpts{}, linkSpec{name: "v1"}, linkSpec{name: "v2"})
 		m := newMLRun(w.quit)
 		w.target(mlVideoPort, m.hostVideo)
@@ -112,7 +115,10 @@ func TestL4UBondSilentMemberKeepsStream_L39(t *testing.T) {
 			t.Fatalf("stimulus: the blackhole of %s lost no session datagram", victim.Name)
 		}
 		downs := w.dev.downOf(victim.ID)
-		if len(downs) == 0 || (downs[0].Cause != rendr.CausePingTimeout && downs[0].Cause != rendr.CauseWriteStall && downs[0].Cause != rendr.CausePeerDown) {
+		if len(downs) == 0 {
+			t.Fatalf("G10-bond: the silent member %d was still live %v after the blackhole of its path, want its death within the death-detection bound %v", victim.ID, drop, recoveryBound)
+		}
+		if c := downs[0].Cause; c != rendr.CausePingTimeout && c != rendr.CauseWriteStall && c != rendr.CausePeerDown {
 			t.Fatalf("stimulus: the blackholed member %d did not die silently on the dialer: %+v", victim.ID, downs)
 		}
 		dead := downs[0].Time
@@ -123,7 +129,7 @@ func TestL4UBondSilentMemberKeepsStream_L39(t *testing.T) {
 			l.Blackhole(d, false)
 		}
 		rm := time.Now()
-		waitFor(t, mlRejoin, "a member on the restored path again", func() bool {
+		waitFor(t, mlRejoin, "a member on the restored path again within G5Bound", func() bool {
 			fi, _ := flowOf(pf, srcV)
 			for _, c := range liveOf(fi.Session) {
 				if c.Name == victim.Name {
@@ -133,15 +139,19 @@ func TestL4UBondSilentMemberKeepsStream_L39(t *testing.T) {
 			return false
 		})
 		rejoin := time.Since(rm)
-		sleepUntil(rm.Add(tail + time.Second))
+		// The judged span ends tail after the removal, and never less than
+		// a second after the rejoin: a gap or a loss at the rejoin is judged
+		// in every lane.
+		to := rm.Add(max(tail, rejoin+time.Second))
+		sleepUntil(to.Add(time.Second))
 		pEnd := time.Now()
 		m.end()
 		time.Sleep(time.Second) // the last datagrams arrive
 
 		sent, lost := sentIn(m.vDown.ledger, td, dead), len(m.vDown.lossesIn(td, dead))
-		t.Logf("blackhole of %s (member %d, %d of %d video bytes in the last second): dead (%v) after %v; video sent until then %d, arrived %d (recorded); a member on the path again %v after the removal",
-			victim.Name, victim.ID, most, total, downs[0].Cause, dead.Sub(td), sent, sent-lost, rejoin)
-		rec := bondDropRecovery(t, m.vDown.ledger, td, rm.Add(tail), td)
+		t.Logf("blackhole of %s (member %d, %d of %d video bytes in the last second): dead (%v) after %v; video sent until then %d, arrived %d (recorded); a member on the path again %v after the removal (G5Bound %v)",
+			victim.Name, victim.ID, most, total, downs[0].Cause, dead.Sub(td), sent, sent-lost, rejoin, mlRejoin)
+		rec := bondDropRecovery(t, m.vDown.ledger, td, to, td)
 		t.Logf("the video recovered %v after the blackhole (the end of its last arrival gap above %v; bound %v)", rec, mlStopMax, recoveryBound)
 
 		wins := map[*mlFlow][]window{}

@@ -39,13 +39,17 @@ type dnsArm struct {
 //   - recipe: 20,000 queries at 500 per second from unique sources
 //     through the DNS recipe (§A5.1: Idle{10 s, 10 s}, MaxFlows 8,192 on
 //     the PortForward and the Server; ≈ 5,000 flows wanted). Both classes
-//     are 10 s and the table never fills, so the arm's outcome does not
-//     depend on the promotion rule (the literal rule's arm is the same
-//     run). PASS: every query answered at its first try; DropFull 0, no
-//     eviction; every flow's first datagram rode the OPEN and was written
-//     to its target once (FirstInOpen = Opened = the queries, the Server's
-//     FirstSent = Confirmed, and every egress received exactly one query:
-//     the target's own count).
+//     are 10 s and the table never fills, so the answer, table and drain
+//     criteria do not depend on the promotion rule; the no-stream check
+//     (every arm) is O-1 (a)'s: under the literal rule every answered flow
+//     is a stream. The public API runs only the rule in force; the literal
+//     rule's rows are l4's own, through its test hook
+//     (TestPortForwardIngressClasses_L30_L72's reply rule,
+//     TestPortForwardFullRefuses_L48_L72). PASS: every query answered at
+//     its first try; DropFull 0, no eviction; every flow's first datagram
+//     rode the OPEN and was written to its target once (FirstInOpen =
+//     Opened = the queries, the Server's FirstSent = Confirmed, and every
+//     egress received exactly one query: the target's own count).
 //   - full-table (O-1 (a)): default classes (30 s / 180 s) over a table of
 //     256, 4,000 queries at 100 per second from unique sources (≈ 3,000
 //     flows wanted: the table recycles twelve times over; 100 per second
@@ -68,7 +72,10 @@ type dnsArm struct {
 //     flow would promote).
 //
 // Under the race detector the arms run 250, 300 and 300 queries (the reuse
-// arm over 307 ports; lane_test.go). Every arm: answers intact (each the
+// arm over 250 ports: at 100 queries per second and a 2-s rest the first
+// two seconds' queries take about 200 ports, so the third second's land
+// on rested ports and reuse a live flow — 59 of 300 do, against the tenth
+// required; lane_test.go). Every arm: answers intact (each the
 // target's answer to its own query); the PortForward never failed an open
 // and saw no socket noise; at the end, without stopping anything, the
 // flows drain: within the longest class + PacketPing + 2 s of the last
@@ -84,9 +91,9 @@ func TestL4UDNSChurnMiniature_L48_L72(t *testing.T) {
 	}
 }
 
-// dnsArms are the arms at the lane's size (lane.dnsQueries; the race lane
-// runs fewer queries at the same rates, tables and bounds, and the reuse
-// arm's port space scaled with them).
+// dnsArms are the arms at the lane's size (lane.dnsQueries and
+// lane.dnsPorts; the race lane runs fewer queries at the same rates,
+// tables and bounds, and the reuse arm over fewer ports).
 func dnsArms() []dnsArm {
 	recipe := l4.FlowIdle{Short: 10 * time.Second, Stream: 10 * time.Second}
 	return []dnsArm{

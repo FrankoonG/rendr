@@ -128,6 +128,11 @@ func TestL4UIdleEndsReachPassive_L30_L52(t *testing.T) {
 // passive session until its view may send and must then cross; it must
 // not age out at the passive (Packet.MaxAge) while the view is held.
 //
+// Stimulus: all 64 first datagrams reached the targets, each from its
+// flow's OPEN (the ingress's Opened and FirstInOpen and the Server's
+// Confirmed and FirstSent are all 64), so the last flows' answers were
+// written at their Confirm.
+//
 // PASS: every client receives its answer within a second.
 func TestL4UFirstReplyAtConfirm_L40(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
@@ -181,6 +186,10 @@ func TestL4UFirstReplyAtConfirm_L40(t *testing.T) {
 			t.Fatalf("stimulus: %d of %d first datagrams reached the targets", n, flows)
 		}
 		time.Sleep(time.Second)
+		if ps, ss := pf.Status().UDP, w.srv.Status().UDP; ps.Opened != flows || ps.FirstInOpen != flows || ss.Confirmed != flows || ss.FirstSent != flows {
+			t.Fatalf("stimulus: %d flows opened, %d first datagrams handed to the OPEN; the Server confirmed %d and wrote %d first datagrams from an OPEN; want %d each",
+				ps.Opened, ps.FirstInOpen, ss.Confirmed, ss.FirstSent, flows)
+		}
 		lost := 0
 		for i, ch := range answered {
 			select {
