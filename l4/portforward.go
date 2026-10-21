@@ -102,6 +102,7 @@ type udpForwardCounters struct {
 	tooLargeMax, maxPayload                           atomic.Int64
 	dropFull, dropOpening, dropOpenQueue, dropOpenAge atomic.Uint64
 	dropHeld, readNoise, writeNoise, sessionDrops     atomic.Uint64
+	sessionUnreported                                 atomic.Uint64
 	lastErr                                           atomic.Pointer[error]
 }
 
@@ -196,6 +197,8 @@ func (f *PortForward) Status() PortForwardStatus {
 			WriteNoise:    u.writeNoise.Load(),
 			SessionDrops:  u.sessionDrops.Load(),
 			LastErr:       loadErr(&u.lastErr),
+
+			SessionUnreported: u.sessionUnreported.Load(),
 		},
 	}
 }
@@ -327,4 +330,13 @@ type UDPForwardStatus struct {
 	WriteNoise                 uint64                // replies the socket's write refused (any error: the reply is lost), counted and ignored
 	SessionDrops               uint64                // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
 	LastErr                    error                 // the latest DialUDP error
+
+	// SessionUnreported counts the datagrams the flows' sessions handed to
+	// a carrier and the peer never reported received (PacketCounters.Sent
+	// − PeerReceived), summed at each flow end the peer or the path
+	// decided (Ended.PeerIdle, NoPath, SessionLost, GoingAway): lost in
+	// flight or with the peer's session. An upper bound: a datagram the
+	// peer received in its last report delay before the end counts too
+	// (see the package doc, "UDP flows").
+	SessionUnreported uint64
 }

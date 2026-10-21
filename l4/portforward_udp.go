@@ -432,7 +432,10 @@ func (s *udpServe) flow(e *ingressFlow) {
 		}
 	}
 	// The flush (R1-13): take the queue under the lock, write it outside,
-	// until the queue is empty under the lock; then the entry is open.
+	// until the queue is empty under the lock; then the entry is open. A
+	// datagram above MaxPayload is TooLarge whatever else holds (the
+	// user's L71 signal; C5 A2): its size is checked before its age.
+	mp := pc.MaxPayload()
 	for ended := false; ; {
 		t.mu.Lock()
 		if t.stopped {
@@ -453,6 +456,8 @@ func (s *udpServe) flow(e *ingressFlow) {
 		t.mu.Unlock()
 		for _, d := range q {
 			switch {
+			case len(d.b) > mp:
+				u.noteTooLarge(len(d.b)) // the flow lives (R1-9)
 			case ended:
 				u.dropOpenQueue.Add(1)
 			case s.now()-d.at > ingressQueueAge:
@@ -465,7 +470,7 @@ func (s *udpServe) flow(e *ingressFlow) {
 						s.promote(pc)
 					}
 				case errors.Is(werr, rendr.ErrPacketTooLarge):
-					u.noteTooLarge(len(d.b)) // the flow lives (R1-9)
+					u.noteTooLarge(len(d.b)) // cannot happen after the size check (MaxPayload is fixed at the OPEN)
 				default:
 					ended = true // the session ended: ReadFrom reports it below
 					u.dropOpenQueue.Add(1)
@@ -531,9 +536,12 @@ func (s *udpServe) end(e *ingressFlow, pc ingressSession, err error) {
 	}
 	t.mu.Unlock()
 	e.closeSession(pc)
-	s.f.udp.ends.count(err, evicted)
-	if st := pc.Status(); st.Packet != nil {
-		s.f.udp.sessionDrops.Add(sessionDrops(st.Packet))
+	cause := s.f.udp.ends.count(err, evicted)
+	if pk := pc.Status().Packet; pk != nil {
+		s.f.udp.sessionDrops.Add(sessionDrops(pk))
+		if cause.unreported() {
+			s.f.udp.sessionUnreported.Add(unreportedOf(pk))
+		}
 	}
 	if hold {
 		s.hold(e)
@@ -627,31 +635,39 @@ func (s *udpServe) shutdown() {
 	s.wg.Wait()
 }
 
-// count adds one ended flow by the cause its session reported: err is
-// ReadFrom's end (or net.ErrClosed when the stop closed it before it was
-// open); evicted: the flow was removed to make room.
-func (c *flowEndCounts) count(err error, evicted bool) {
+// count adds one ended flow by the cause its session reported and returns
+// that cause: err is ReadFrom's end (or net.ErrClosed when the stop closed
+// it before it was open); evicted: the flow was removed to make room.
+func (c *flowEndCounts) count(err error, evicted bool) endCause {
 	var abort *rendr.AbortError
 	switch {
 	case evicted:
 		c.evicted.Add(1)
+		return endEvicted
 	case errors.Is(err, rendr.ErrIdleTimeout):
 		c.idle.Add(1)
+		return endIdle
 	case errors.As(err, &abort) && abort.Code == rendr.AbortIdle:
 		c.peerIdle.Add(1)
+		return endPeerIdle
 	case errors.As(err, &abort) && abort.Code == rendr.AbortGoingAway:
 		c.goingAway.Add(1)
+		return endGoingAway
 	case errors.Is(err, io.EOF):
 		c.peerClosed.Add(1)
+		return endPeerClosed
 	case errors.Is(err, rendr.ErrNoPath):
 		c.noPath.Add(1)
+		return endNoPath
 	case errors.Is(err, rendr.ErrSessionLost):
 		c.sessionLost.Add(1)
+		return endSessionLost
 	case errors.Is(err, net.ErrClosed):
 		c.stopped.Add(1) // closed on this side: the stop, or this side's Runtime closed
-	default:
-		c.other.Add(1)
+		return endStopped
 	}
+	c.other.Add(1)
+	return endOther
 }
 
 // sessionDrops sums a packet session's drop counters (R1-38).

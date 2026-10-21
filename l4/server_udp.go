@@ -102,7 +102,7 @@ func (e errBadDatagramConn) Error() string {
 // flows whose sessions are still ending, and every one of them holds a
 // session, so the Runtime's MaxSessions bounds them as well.
 func (s *Server) HandleUDP(ctx context.Context, p *rendr.PendingPacket) {
-	pc := s.serveFlow(ctx, p)
+	pc, cause := s.serveFlow(ctx, p)
 	if pc == nil {
 		return
 	}
@@ -110,20 +110,25 @@ func (s *Server) HandleUDP(ctx context.Context, p *rendr.PendingPacket) {
 	case <-pc.Done():
 	case <-ctx.Done():
 	}
-	s.flow.sessionDrops.Add(packetDrops(pc.Status().Packet))
+	pk := pc.Status().Packet
+	s.flow.sessionDrops.Add(packetDrops(pk))
+	if cause.unreported() {
+		s.flow.sessionUnreported.Add(unreportedOf(pk))
+	}
 }
 
 // serveFlow is HandleUDP up to the flow's end: it returns the flow's
-// session once the forward ended, or nil when no session was confirmed.
-func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.PacketConn {
+// session and its end cause once the forward ended, or nil when no
+// session was confirmed.
+func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) (*rendr.PacketConn, endCause) {
 	k := &s.udp
 	if !s.UDP {
 		s.reject(p, k, CodeBadCommand) // M6-D16: UDP is opt-in
-		return nil
+		return nil, 0
 	}
 	if !acquire(&k.units, int64(s.maxFlows())) {
 		s.reject(p, k, CodeCapacity) // M6-D19: at once, no dial
-		return nil
+		return nil, 0
 	}
 	defer k.units.Add(-1)
 	// The kind check is the parser (M6-D1, R1-8): CmdConnect, and every
@@ -131,11 +136,11 @@ func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.P
 	r, err := ParseUDPMetadata(p.Metadata())
 	if err != nil {
 		s.reject(p, k, metadataCode(err))
-		return nil
+		return nil, 0
 	}
 	t := s.connect(ctx, p, k, r)
 	if t == nil {
-		return nil
+		return nil, 0
 	}
 	// The flow counts as Dialing until it is confirmed: the first
 	// datagram's write and Confirm finish the target's setup (a blocked
@@ -149,7 +154,7 @@ func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.P
 	}
 	k.dialing.Add(-1)
 	if pc == nil {
-		return nil
+		return nil, 0
 	}
 	res := forwardPacket(ctx, pc, t, s.UDPIdle, seed, &s.flow.tally)
 	cause := endCauseOf(res.SessionErr)
@@ -158,7 +163,7 @@ func (s *Server) serveFlow(ctx context.Context, p *rendr.PendingPacket) *rendr.P
 	}
 	s.flow.ended.add(cause)
 	k.live.Add(-1)
-	return pc
+	return pc, cause
 }
 
 // openFlow finishes the setup of a flow whose target socket t was dialled:
@@ -281,6 +286,39 @@ func packetDrops(pk *rendr.PacketCounters) uint64 {
 	return pk.DropQueue + pk.DropAge + pk.DropTooLarge + pk.DropNoPath + pk.DropRecvQueue + pk.DropLate
 }
 
+// unreportedOf is the datagrams a packet session handed to carriers that
+// its peer has not reported received: Sent − PeerReceived (0 for nil, and
+// never below 0). At the end of a session whose peer's last report never
+// came they were lost in flight, or with the peer's session, or received
+// within the peer's report delay (PacketPing) and not yet reported: an
+// upper bound of the loss, exact when nothing reached the peer within
+// that delay before its end and no report was lost (L39).
+func unreportedOf(pk *rendr.PacketCounters) uint64 {
+	if pk == nil || pk.PeerReceived >= pk.Sent {
+		return 0
+	}
+	return pk.Sent - pk.PeerReceived
+}
+
+// unreported reports whether a flow that ended by cause k adds its
+// session's unreportedOf to SessionUnreported: an end the peer or the
+// path decided, after which the peer's last report never comes — the
+// peer's idle limit or its Runtime's close (the peer's session ended
+// while datagrams of this side were on their way to it), no carrier for
+// NoPathGrace, the peer no longer knowing the session (L39; m6-design's
+// delegate decisions after wave D). An end this side decided leaves
+// nothing unreported that belongs to the end (its own idle limit: nothing
+// moved for Short), the peer's close reports its count (later arrivals
+// are the peer's own DropLate), and a stop, an eviction or a local
+// failure closes the session while its final report may still come.
+func (k endCause) unreported() bool {
+	switch k {
+	case endPeerIdle, endNoPath, endSessionLost, endGoingAway:
+		return true
+	}
+	return false
+}
+
 // flowCounts are a Server's counters of its UDP flows' datagrams and ends
 // (UDPServerStatus beside kindStats).
 type flowCounts struct {
@@ -289,6 +327,7 @@ type flowCounts struct {
 	tally                 packetTally
 	firstSent, firstNoise atomic.Uint64 // first datagrams written; noise errors of those writes
 	sessionDrops          atomic.Uint64
+	sessionUnreported     atomic.Uint64
 	maxPayload            atomic.Int64
 	ended                 endCounts
 }
@@ -313,6 +352,8 @@ func (s *Server) udpStatus() UDPServerStatus {
 		SessionDrops: f.sessionDrops.Load(),
 		MaxPayload:   int(f.maxPayload.Load()),
 		Ended:        f.ended.snapshot(),
+
+		SessionUnreported: f.sessionUnreported.Load(),
 	}
 }
 
@@ -328,6 +369,14 @@ type UDPServerStatus struct {
 	SessionDrops                           uint64                // datagrams the flows' sessions dropped (their PacketCounters' drop fields), summed at each flow's end
 	MaxPayload                             int                   // the MaxPayload of the latest flow confirmed (0 before any)
 	Ended                                  FlowEnds              // ended flows by cause
+
+	// SessionUnreported counts the datagrams the flows' sessions handed to
+	// a carrier and the dialer never reported received, summed at each
+	// flow end the dialer or the path decided, as
+	// UDPForwardStatus.SessionUnreported does at the ingress: an upper
+	// bound of the datagrams from the targets lost in flight or with the
+	// dialer's session.
+	SessionUnreported uint64
 }
 
 // FlowEnds counts ended flows by cause.
