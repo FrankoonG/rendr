@@ -194,7 +194,7 @@ type PacketCounters struct {
 	Received      uint64 // accepted from carriers (distinct)
 	Duplicates    uint64 // received again inside the dedup window (the 16,384 datagrams behind the newest received), also after ReadFrom returned io.EOF; in a race session the members' copies of a datagram while they arrive inside the window (copies beyond it count in DropLate)
 	DropQueue     uint64 // send side: evicted by a full queue, refused by MaxBufferedBytes, still queued or waiting to be placed again at the end or at the peer's FIN, or handed back unwritten by a dying carrier after either or while too many waited
-	DropAge       uint64 // send side: not handed to a carrier, or not placed again after a dying carrier handed it back unwritten, within Packet.MaxAge of its WriteTo while one existed
+	DropAge       uint64 // send side: not handed to a carrier, or not placed again after a dying carrier handed it back unwritten, within Packet.MaxAge of its WriteTo (on the passive, of the session's first moment to place one, if later) while one existed
 	DropTooLarge  uint64 // send side: no live carrier could carry it, a carrier refused it as too large, or a budget shrink left it on a member too small for it while every member that can carry it was write-blocked or at its capacity
 	DropNoPath    uint64 // send side: aged out or discarded while the session had no carrier
 	DropRecvQueue uint64 // receive side: evicted from a full receive queue (the application did not read)

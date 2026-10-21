@@ -72,7 +72,7 @@ func (s *Session) raceHeadLocked(nowNs int64) (moved bool) {
 	noPathEnd := pk.noPathEnd.Sub(pk.base).Nanoseconds()
 	for q.n > 0 {
 		d := q.front()
-		aged := nowNs-d.at > maxAge
+		aged := pk.ageOn && nowNs-d.at > maxAge // nothing ages before a lane could place (pktAgeStartLocked)
 		if q.pos >= lo && !aged {
 			break
 		}

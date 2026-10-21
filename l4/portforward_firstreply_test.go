@@ -10,27 +10,27 @@ import (
 )
 
 // TestPortForwardFirstReplyAgeOnTrunk (A-11 on a MUX trunk, M6 w0's
-// amendment 4; the package doc's "The first datagram" paragraph): on a
-// datagram carrier that a Peer's sessions already share, the passive
-// places a new flow's replies only once the dialer's first frame behind
-// its OPEN_ACK has arrived, about one round trip later, and its session
-// queue ages them by the passive's Packet.MaxAge meanwhile. The target
-// answers at once a first datagram that rode the OPEN. At a 40-ms round
-// trip the answer crosses at the first try; at 150 ms with the default
-// MaxAge (100 ms) the passive drops it (DropAge) and only the client's
-// resend is answered; with the passive's MaxAge raised to 500 ms it
-// crosses at the first try again. The flow that opened the carrier is not
-// held: its first answer crosses at 150 ms with the default MaxAge.
+// amendment 4; the package doc's "The first datagram" paragraph; core
+// defect B, the m6-design decision of 2026-10-21): on a datagram carrier
+// that a Peer's sessions already share, the passive places a new flow's
+// replies only once the dialer's first frame behind its OPEN_ACK has
+// arrived, about one round trip later, and its session queue ages them
+// by the passive's Packet.MaxAge only from then. The target answers at
+// once a first datagram that rode the OPEN. At a 40-ms round trip and at
+// 150 ms — above the default MaxAge (100 ms), and with the passive's
+// MaxAge raised to 500 ms — the answer crosses at the first try, after
+// the held view's extra round trip, and the passive drops nothing. The
+// flow that opened the carrier is not held: its first answer crosses at
+// 150 ms with the default MaxAge.
 func TestPortForwardFirstReplyAgeOnTrunk(t *testing.T) {
 	for _, r := range []struct {
-		name    string
-		oneWay  time.Duration
-		maxAge  time.Duration // the passive's Packet.MaxAge (0: the default)
-		dropped bool
+		name   string
+		oneWay time.Duration
+		maxAge time.Duration // the passive's Packet.MaxAge (0: the default)
 	}{
-		{"rtt 40ms", 20 * time.Millisecond, 0, false},
-		{"rtt 150ms", 75 * time.Millisecond, 0, true},
-		{"rtt 150ms, MaxAge 500ms", 75 * time.Millisecond, 500 * time.Millisecond, false},
+		{"rtt 40ms", 20 * time.Millisecond, 0},
+		{"rtt 150ms", 75 * time.Millisecond, 0},
+		{"rtt 150ms, MaxAge 500ms", 75 * time.Millisecond, 500 * time.Millisecond},
 	} {
 		t.Run(r.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -79,30 +79,17 @@ func TestPortForwardFirstReplyAgeOnTrunk(t *testing.T) {
 				}
 				ctr := fl.pc.Status().Packet
 				t.Logf("rtt %v, MaxAge %v: answer after %v (delivered %v); passive DropAge %d, DropNoPath %d", rtt, r.maxAge, took, ok, ctr.DropAge, ctr.DropNoPath)
-				if !r.dropped {
-					if !ok || !bytes.Equal(got, b1) {
-						t.Fatalf("the second flow's first answer was not delivered within 1 s (passive DropAge %d, DropNoPath %d)", ctr.DropAge, ctr.DropNoPath)
-					}
-					if took < 2*rtt {
-						t.Fatalf("the answer took %v, want the held view's extra round trip (≥ %v)", took, 2*rtt)
-					}
-					if ctr.DropAge != 0 || ctr.DropNoPath != 0 {
-						t.Fatalf("passive DropAge %d, DropNoPath %d, want 0", ctr.DropAge, ctr.DropNoPath)
-					}
-					return
+				if !ok || !bytes.Equal(got, b1) {
+					t.Fatalf("the second flow's first answer was not delivered within 1 s (passive DropAge %d, DropNoPath %d)", ctr.DropAge, ctr.DropNoPath)
 				}
-				if ok {
-					t.Fatalf("the second flow's first answer was delivered after %v, want it aged out on the passive", took)
+				if took < 2*rtt {
+					t.Fatalf("the answer took %v, want the held view's extra round trip (≥ %v)", took, 2*rtt)
 				}
-				if ctr.DropAge != 1 || ctr.DropNoPath != 0 {
-					t.Fatalf("passive DropAge %d, DropNoPath %d, want the one answer counted DropAge", ctr.DropAge, ctr.DropNoPath)
+				if ctr.DropAge != 0 || ctr.DropNoPath != 0 {
+					t.Fatalf("passive DropAge %d, DropNoPath %d, want 0", ctr.DropAge, ctr.DropNoPath)
 				}
-				// The flow lives: the client's resend is answered at once.
-				b2 := pwTagged(100, 0xa1, 1)
-				pfSend(t, c, b2)
-				pfExpect(t, c, b2)
 				if st := pwStatus(w.pf); st.Flows != 2 || st.Opened != 2 {
-					t.Fatalf("after the resend: %s", pwDescribe(st))
+					t.Fatalf("after the answer: %s", pwDescribe(st))
 				}
 			})
 		})

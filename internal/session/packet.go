@@ -43,6 +43,7 @@ type packet struct {
 	finWaitAt time.Time    // EOF straggler bound after the peer's FIN (M2-D40)
 	noPathEnd time.Time    // end of the latest no-path episode: DropNoPath vs DropAge (M2-D35)
 	finPlaced bool         // our FIN was placed once: st.fin.off holds the final seq
+	ageOn     bool         // MaxAge's clock runs: a dialer, or a passive whose data lane could place a DGRAM once (pktAgeStartLocked)
 	peerFirst bool         // the peer's FIN came before ours was requested: PA-6 released the send queues, and a DGRAM a dying carrier hands back afterwards is DropQueue (pkt_unsent.go)
 	dgMax     int          // the largest DgramMax over live datagram data lanes (0: none; routing, M2-D43, M2-D45)
 	dgMin     int          // the smallest DgramMax over live datagram data lanes (0: none): pdesc.wide (W4-REL-5)
@@ -313,6 +314,10 @@ func (s *Session) initPacketLocked() {
 	if s.p.Role == RolePassive {
 		pk.maxPayload = s.p.Packet.MaxPayload
 	}
+	// A dialer's lanes can place from their start; a passive's first lane
+	// only once its first response is placed and, on a MUX view, the
+	// dialer's go frame came (pktAgeStartLocked).
+	pk.ageOn = s.p.Role != RolePassive
 	pk.base = time.Now()
 }
 
