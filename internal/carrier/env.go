@@ -340,10 +340,10 @@ func (p *AbandonPool) Full() bool {
 // two or more (kept across short parks, returned at its idle release,
 // dgread.go). Nobody holds one while idle, and none is allocated per call:
 // the headers live in one pool per class — the readers' also in a bounded
-// reserve beside it (getReadHdr) — shared by the Runtimes of the process
-// as sync.Pool shares DBufs' classes; each Runtime is charged for the
-// headers it holds, to Env.Stages (forced: visible in BufferedBytes), so
-// the per-Runtime accounts of plan:221 stay separate.
+// reserve beside it (getReadHdr, putRead) — shared by the Runtimes of the
+// process as sync.Pool shares DBufs' classes; each Runtime is charged for
+// the headers it holds, to Env.Stages (forced: visible in BufferedBytes),
+// so the per-Runtime accounts of plan:221 stay separate.
 type ioHdr struct {
 	b      *udpsocket.Batch
 	ms     []udpsocket.Msg // len = the class capacity; cleared when pooled
@@ -379,24 +379,39 @@ func hdrClass(n int) int {
 // allocation gates; L16, L54). A dialer reader takes a header at every
 // regrowth — its first growth after an idle release or a socket fallback,
 // and each growth past the class it holds — and returns one at each class
-// change, idle release, fallback and exit. Through the pools alone such a
-// take builds a new header whenever the pool has none the taker's P can
-// reach: after two collections, or with the returned header in another
-// P's private slot (the reader's goroutine moves between Ps, its idle
-// release runs on the timer's; the gates' switch to one P strands every
-// other P's). So a reader's return fills the reserve first and a reader's
-// take empties it first, the pools holding the rest: up to hdrSpares
-// headers per class that every P reaches and no collection drops. One
-// atomic pointer per entry — a take swaps a header out, a return swaps one
-// into an empty entry: no lock, and no ABA, since no exchange expects a
-// header — bounds it at hdrSpares × six classes (at most ≈ 100 KiB with
-// Linux's kernel arrays, ≈ 50 KiB at the default MaxBatch's five).
-// Reserved headers are uncharged, as pooled ones: they belong to no
-// Runtime. Writers use the pools only (getHdr, put): they take and return
-// one per call, where a process-wide entry would be a contended cache line
-// on the hot path. Rows: TestDgramReadAdaptiveDepthReuse_L16_L54,
+// change, idle release, fallback and exit, always on its own goroutine
+// (grow, shrink, collect; the idle release on the timer's goroutine
+// returns only the slots and the charge, releaseHdr). Through the pools
+// alone such a take builds a new header whenever the pool has none the
+// taker's P can reach: after two collections, or with the returned header
+// in another P's private slot (the reader's goroutine moves between Ps;
+// the gates' switch to one P strands every other P's). So a reader's
+// return fills the reserve first and a reader's take empties it first,
+// the pools holding the rest: up to hdrSpares headers per class that every
+// P reaches and no collection drops. One atomic pointer per entry — a take
+// swaps a header out, a return swaps one into an empty entry: no lock, and
+// no ABA, since no exchange expects a header — bounds it at hdrSpares × six
+// classes (at most ≈ 100 KiB with Linux's kernel arrays, ≈ 50 KiB at the
+// default MaxBatch's five). Reserved headers are uncharged, as pooled
+// ones: they belong to no Runtime. Writers use the pools only (getHdr,
+// put): they take and return one per call, where a process-wide entry
+// would be a contended cache line on the hot path. The reserve covers
+// headers only: the slots, which the idle release returns on the timer's
+// goroutine, stay in DBufs, the Runtime's pool shared with every other
+// datagram buffer. Rows: TestDgramReadAdaptiveDepthReuse_L16_L54,
 // TestDgramReadHeaderReturnsReused_L16_L54; the bound,
 // TestBatchMemoryBounded_L16.
+//
+// hdrSpares is the most headers of one class that the dialer readers of a
+// race session over two datagram paths (G10-race) have out at once: race
+// carries every datagram on both members, so both readers grow, hold and
+// release in step, and one reader can have two headers of a class out (a
+// header of 2 an idle release took, before collect matched it, and the
+// one its next growth lends; grow's stale return). Two readers × two = 4.
+// More readers that regrow at once share the reserve and use the pools
+// for the rest. TestDgramReadHeaderReturnsReused_L16_L54/four_at_once
+// fails with fewer entries (four readers hold a header of 32 at once);
+// TestBatchMemoryBounded_L16 fails with an unbounded reserve.
 const hdrSpares = 4
 
 var hdrReserve [hdrClasses][hdrSpares]atomic.Pointer[ioHdr]
