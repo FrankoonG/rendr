@@ -110,6 +110,9 @@ func (s *Session) fillControlLocked(l *lane, b *carrier.Batch) bool {
 			l.schedSent = s.ctl.epoch
 		}
 	}
+	if l != st.ackLane && s.ackOverdueLocked(l, b.Now()) {
+		st.ackLane = l // the lane that writes now carries the overdue ACK, and the duty (L08)
+	}
 	if l == st.ackLane || (l == st.gapLane && s.ackQualifiesLocked(l)) || s.raceAckDutyLocked(l) {
 		if s.pk != nil {
 			s.fillPackLocked(l, b) // a packet session places PACK (M2 design §A5.5)

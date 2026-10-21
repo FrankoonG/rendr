@@ -19,6 +19,18 @@ import (
 // so ACKs do not keep riding a carrier the dialer abandoned after a death
 // only it detected.
 //
+// "Not blocked" is only the watchdog's flag, raised PingBusy into a write:
+// a lane of a saturated path whose write began less than PingBusy ago is
+// not flagged, yet it fills only when that write returns. So the PingBusy
+// bound is also enforced where frames are placed: an ACK the duty lane
+// has not placed PingBusy after it became due is taken, with the duty, by
+// the next qualifying lane that is not leaving and fills
+// (ackOverdueLocked). Without it, two bond lanes whose writes each last
+// between one and two PingBusy passed the duty to each other forever, each
+// move to the lane that had just started a write, and the sender's
+// acknowledged front froze until the bulk ended
+// (TestAckDutyOverdueTakenByFillingLane_L08).
+//
 // Receiver cadence: a bump once AckEvery bytes were delivered since the
 // last bump, else an ACK delay armed at the first unacknowledged delivery
 // that the duty lane's writer timer fires (b.WakeAt), never the actor.
@@ -35,6 +47,9 @@ import (
 func (s *Session) bumpNowLocked() {
 	st := &s.st
 	st.ackGen++
+	if st.ackOwedSince.IsZero() {
+		st.ackOwedSince = time.Now()
+	}
 	st.ackBumped = st.rRead
 	st.ackDelayAt = time.Time{}
 	s.ensureAckLaneLocked()
@@ -102,6 +117,32 @@ func (s *Session) ackCadenceLocked() {
 		}
 		s.raceWakeAckLocked() // race: each copy lane arms its own timer
 	}
+}
+
+// ackOverdueLocked (§4.6, L08, D5) reports whether lane l, which fills
+// now, takes the ACK duty because no ACK was placed within PingBusy of
+// when one became due: the first bump since an ACK was last placed (a gen
+// l has not carried yet; later bumps do not restart the clock, so a
+// cadence faster than PingBusy cannot hold it off), or the armed ACK
+// delay. l must qualify and not be leaving (A7 (c): never onto a carrier
+// the dialer abandoned). A packet session's PACK duty and a race session,
+// whose every data lane already carries each ACK, are not concerned.
+func (s *Session) ackOverdueLocked(l *lane, now time.Time) bool {
+	st := &s.st
+	d := st.ackLane
+	if d == nil || d == l || s.pk != nil || s.p.Mode == ModeRace {
+		return false
+	}
+	var due time.Time
+	switch {
+	case !st.ackOwedSince.IsZero() && l.ackSent != st.ackGen:
+		due = st.ackOwedSince
+	case !st.ackDelayAt.IsZero():
+		due = st.ackDelayAt
+	default:
+		return false
+	}
+	return !now.Before(due.Add(s.pingBusy())) && s.ackQualifiesLocked(l) && !s.ackLeavingLocked(l)
 }
 
 // ackQualifiesLocked: l may carry the session's ACKs — it is live, has sent
@@ -251,6 +292,9 @@ func (s *Session) fillAckLocked(l *lane, b *carrier.Batch) {
 	if !st.ackDelayAt.IsZero() {
 		if l.retireCalled || !b.Now().Before(st.ackDelayAt) {
 			st.ackGen++
+			if st.ackOwedSince.IsZero() {
+				st.ackOwedSince = b.Now()
+			}
 			st.ackBumped = st.rRead
 			st.ackDelayAt = time.Time{}
 			s.raceWakeAckLocked() // race: the copy lanes place it too
@@ -275,6 +319,7 @@ func (s *Session) fillAckLocked(l *lane, b *carrier.Batch) {
 		return
 	}
 	l.ackSent = st.ackGen
+	st.ackOwedSince = time.Time{} // an ACK of the current values went out
 	prev := st.lastWin
 	st.lastWin = int64(a.Window)
 	if floor := s.readvertiseFloor(); prev >= floor && st.lastWin < floor {
