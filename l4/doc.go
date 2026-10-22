@@ -217,6 +217,10 @@
 // carrier dialled for the flow, or a CheapSubflow factory's, the first
 // reply comes one round trip earlier too. Replies written meanwhile wait in
 // the passive session's queue, within its Packet.Queue and Packet.MaxAge.
+// Compared with no rendr in between, a new flow's first reply on such a
+// shared carrier therefore arrives about one round trip later, and a
+// DNS-like forward pays that on every query: use the DNS recipe below,
+// on a Peer of its own with datagram carriers where latency matters.
 //
 // Sizes. A flow's largest datagram is its session's MaxPayload, fixed at the
 // OPEN: the smallest datagram budget among the Peer's datagram factories, 25
@@ -341,7 +345,12 @@
 // open, is held: its datagrams are dropped (DropHeld) for 5 s, so a
 // refusing passive sees at most one OPEN per client every 5 s while the
 // table has room. At most 256 flows are being opened at once per
-// PortForward (beyond: DropOpening). When MaxFlows entries exist
+// PortForward (beyond: DropOpening). A path that goes silent is given up only
+// when death detection declares its carriers dead (rendr installs no
+// traffic-pattern trigger; the verdict comes within DeadMax + 1 s of the
+// silence), so flows that open on it meanwhile wait in the opening stage,
+// their later datagrams queued, aged or dropped as above, and open on a
+// surviving path after the verdict. When MaxFlows entries exist
 // (opening and held ones included), a new client takes the place of a held
 // client, or of an open flow that never became a stream and has been idle
 // for at least 1 s, counted from its last datagram or its open, whichever
