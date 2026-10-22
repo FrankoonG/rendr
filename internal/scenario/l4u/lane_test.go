@@ -34,6 +34,7 @@ type laneSize struct {
 	bondSpan                        time.Duration // TestL4UMixedBondOversize_L37
 	silentWarm, silentDrop          time.Duration // TestL4UBondSilentMemberKeepsStream_L39: the streaming before the blackhole, the blackhole (at least recoveryBound)
 	silentTail                      time.Duration // the judged span after the blackhole's removal (at least a second past the rejoin)
+	replySpan, replyFlip            time.Duration // TestL4UFirstReplyUnderChurn_L12_L72: the load's span and the event's time
 }
 
 // fullLane is the design's size: what the non-race lanes run.
@@ -45,6 +46,7 @@ var fullLane = laneSize{
 	churnSessions: 1000, churnRate: 40, churnSpan: 5 * time.Minute,
 	fallbackSpan: 30 * time.Second, bondSpan: 20 * time.Second,
 	silentWarm: 3 * time.Second, silentDrop: 6 * time.Second, silentTail: mlSpanAfter,
+	replySpan: 30 * time.Second, replyFlip: 15 * time.Second,
 }
 
 // raceLane is the race lane's size (every rule covered once, every window
@@ -59,7 +61,10 @@ var fullLane = laneSize{
 // fallback (8 s) and 4 s of the mixed bond; the bond's silent member after
 // 1 s of streaming, blackholed for 5 s (the death-detection bound) and
 // judged until 1 s after the blackhole's removal or the member's rejoin,
-// whichever is later.
+// whichever is later; the first-reply row's 300 flows per second for 2 s
+// with its event at 0.3 s (all of it inside the build-up spans: its
+// run-wide median and build-up p99 are judged, its steady windows only in
+// the full lane).
 var raceLane = laneSize{
 	mlModes: []rendr.Mode{rendr.ModeSelector},
 	mlQuiet: 2 * time.Second, mlKills: 1, mlFirst: time.Second, mlKill: 3 * time.Second, mlDrop: recoveryBound, mlTail: time.Second,
@@ -68,6 +73,7 @@ var raceLane = laneSize{
 	churnSessions: 64, churnRate: 3, churnSpan: 75 * time.Second,
 	fallbackSpan: 8 * time.Second, bondSpan: 4 * time.Second,
 	silentWarm: time.Second, silentDrop: recoveryBound, silentTail: time.Second,
+	replySpan: 2 * time.Second, replyFlip: 300 * time.Millisecond,
 }
 
 // TestL4URaceLane (racebudget): the lane's sizes follow the binary's
@@ -77,7 +83,8 @@ var raceLane = laneSize{
 // lanes the churn row's tombstone-eviction regime holds and the rows'
 // spans hold their windows (a blackhole lasts at least the death-detection
 // bound, the silent member is chosen from a full second of streaming, a
-// kill's judged span starts inside T).
+// kill's judged span starts inside T, the first-reply row has flows opened
+// after its ranking moved).
 func TestL4URaceLane(t *testing.T) {
 	bi, ok := debug.ReadBuildInfo()
 	race, err := buildLane(bi, ok)
@@ -102,6 +109,9 @@ func TestL4URaceLane(t *testing.T) {
 		}
 		if l.mlDrop < recoveryBound || l.silentDrop < recoveryBound || l.silentWarm < time.Second || l.mlFirst < mlSpanBefore {
 			t.Fatalf("lane %+v: a blackhole shorter than %v, less than a second of streaming before the silent member's, or a kill within %v of T's start", l, recoveryBound, mlSpanBefore)
+		}
+		if l.replyFlip < 0 || l.replyFlip+replyMoved+time.Second/2 > l.replySpan {
+			t.Fatalf("lane %+v: the first-reply row's event leaves no flows opened %v after it", l, replyMoved)
 		}
 	}
 	t.Logf("race lane %v: %+v", race, lane)

@@ -13,9 +13,13 @@
 // must keep at once (mux_test.go: an idle end crosses, a reply written at
 // Confirm arrives); a mixed bond's or race's start, where datagrams wider
 // than the datagram member written while the stream member is joining are
-// dropped, the limitation l4 documents (joining_test.go); and a bond
-// member's silent death, through which the stream recovers within the
-// death-detection bound (bonddrop_test.go).
+// dropped, the limitation l4 documents (joining_test.go); a bond member's
+// silent death, through which the stream recovers within the
+// death-detection bound (bonddrop_test.go); and the first reply of
+// G11-dns's one-shot flows while the Peer's datagram trunks fill and
+// refill, also after its ranking moved to another factory, where a view's
+// first frames must not wait behind the other views' reliable frames
+// (firstreply_test.go; L12, L72).
 //
 // The scenarios run two Runtimes joined by rendrtest datagram and stream
 // links inside testing/synctest bubbles and drive them only through the

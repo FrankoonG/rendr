@@ -616,11 +616,13 @@ func deathSched(epoch uint32, ids ...uint32) []byte {
 // every SCHED's, on a stream trunk earlier in the byte stream — so the peer
 // applies the trunk's death before any session's new route and needs no
 // SCHED to move off the dead trunk (on a datagram trunk the REL window
-// paces SCHEDs eight at a time). Both writer states: between rounds (its
+// paces SCHEDs six at a time, relFirstKeep). Both writer states: between rounds (its
 // carrier control places the DOWN first), and inside a round whose later
 // calls place the SCHEDs (a reliable session frame goes behind every DOWN
 // queued before it: the fence the writer arms on both kinds). Premise
-// (datagram): the window has room for the DOWN and all six SCHEDs.
+// (datagram): one flight has room for the DOWN and all five SCHEDs (the
+// frames of open views take 6 of the window's 8 RELs, leaving 2 for first
+// frames, relFirstKeep; a DOWN is not held to that).
 func TestDownPrecedesDeathScheds_PA86(t *testing.T) {
 	for _, kind := range []string{"stream", "datagram"} {
 		dg := kind == "datagram"
@@ -680,7 +682,7 @@ func downOrderRow(t *testing.T, dg, inside bool) {
 	dying := newDownRx(t, env, dg, 101, true, mPassiveInst)
 	sv := newDownRx(t, env, dg, 102, true, mPassiveInst)
 	s := sv.s
-	const k = 6 // sessions with a lane on both trunks; one more view holds the round
+	const k = 5 // sessions with a lane on both trunks; one more view holds the round
 	var views []*Conn
 	var waits []func() (*Established, error)
 	for i := range k + 1 {
@@ -938,8 +940,14 @@ func downBurstRow(t *testing.T, dg bool, k int) {
 	}
 	synctest.Wait()
 	surv.downs() // what the starts wrote
-	if dg && surv.s.c.RelRoom() != wire.RelWindow {
-		t.Fatalf("premise: the survivor's REL room is %d, want the whole window %d", surv.s.c.RelRoom(), wire.RelWindow)
+	if dg {
+		c := surv.s.c
+		c.mu.Lock()
+		room := c.dg.rel.room()
+		c.mu.Unlock()
+		if room != wire.RelWindow {
+			t.Fatalf("premise: the survivor's REL window holds %d free RELs, want the whole window %d", room, wire.RelWindow)
+		}
 	}
 	release := surv.holdWrite(t)
 	for _, v := range victims {
