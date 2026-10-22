@@ -751,6 +751,8 @@ func countMallocs(n int, window time.Duration, f func()) (mallocs uint64, runs i
 //     killed once; M6 I3 moved TestPacketSmokeUDP_CA's bond run there).
 //   - TestLoopbackCloseWithUnreadNoReset_L05: both variants (dedicated,
 //     mux), 50 of the 200 rounds; each round repeats the rule.
+//   - TestMuxSmoke_CM: 30 of the 60 virtual seconds (M6 I3): the kills at
+//     10 and 20 s reach each Link once, 100 churn sessions.
 func TestRaceLaneSubtests(t *testing.T) {
 	race := raceBuild(t)
 	if loopbackRace != race {
@@ -798,6 +800,8 @@ func TestRaceLaneSubtests(t *testing.T) {
 	rounds := []string{fmt.Sprintf("%d rounds", loopCloseRounds())}
 	check("TestLoopbackCloseWithUnreadNoReset_L05 (each variant)", rounds, []string{"200 rounds"}, []string{"50 rounds"})
 	check("TestPacketSmokeUDP60_CA", modes(smokeUDP60Modes()), []string{"selector", "bond"}, []string{"bond"})
+	cm := cmSmokeConfig()
+	check("TestMuxSmoke_CM", []string{fmt.Sprintf("%v, %d churn sessions", cm.duration, cm.churn)}, []string{"1m0s, 200 churn sessions"}, []string{"30s, 100 churn sessions"})
 }
 
 // raceBuild reports whether this test binary was built with -race. It reads

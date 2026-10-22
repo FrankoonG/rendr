@@ -60,26 +60,38 @@ import (
 // before Runtime.Close). Runtime.Close then leaves nothing (crRuntimeEmpty,
 // the session registry back at its baseline, and the bubble ends with no
 // goroutine).
+//
+// Under -race the run is smaller (R2-37) and, since M6 I3 (race-unit
+// passes reached 282 s on the builder at the M6 RC, run
+// 20261022-141914-ce19), half as long: 30 virtual seconds with the kills
+// at 10 and 20 s (each Link killed once) and 100 churn sessions, with the
+// same criteria; the non-race lanes run the 60-s timeline.
 func TestMuxSmoke_CM(t *testing.T) {
-	cfg := cmConfig{up: 4 << 20, back: 1 << 20, rate: 1000, rateBack: 200, churnBytes: 16 << 10}
-	if loopbackRace {
-		// The same timeline at a smaller size (R2-37).
-		cfg = cmConfig{up: 1 << 20, back: 256 << 10, rate: 250, rateBack: 50, churnBytes: 4 << 10}
-	}
+	cfg := cmSmokeConfig()
 	synctest.Test(t, func(t *testing.T) { runMuxSmoke(t, cfg) })
+}
+
+// cmSmokeConfig is TestMuxSmoke_CM's size in the binary's lane
+// (TestRaceLaneSubtests checks it).
+func cmSmokeConfig() cmConfig {
+	if loopbackRace {
+		// The same rules at a smaller size (R2-37) over half the timeline (M6 I3).
+		return cmConfig{up: 512 << 10, back: 128 << 10, rate: 250, rateBack: 50, churnBytes: 4 << 10, duration: 30 * time.Second, churn: 100}
+	}
+	return cmConfig{up: 4 << 20, back: 1 << 20, rate: 1000, rateBack: 200, churnBytes: 16 << 10, duration: 60 * time.Second, churn: 200}
 }
 
 // cmConfig sizes the C-M smoke.
 type cmConfig struct {
-	up, back       int64 // stream bytes per session, dialer → passive and back
-	rate, rateBack int   // packet datagrams per second per session, each way
-	churnBytes     int64 // bytes each way per churn session
+	up, back       int64         // stream bytes per session, dialer → passive and back
+	rate, rateBack int           // packet datagrams per second per session, each way
+	churnBytes     int64         // bytes each way per churn session
+	duration       time.Duration // the run: the streams' pacing, the packet flows and the kills
+	churn          int           // churn sessions, one every cmChurnGap from the start
 }
 
 const (
-	cmDuration = 60 * time.Second
 	cmEvery    = 10 * time.Second
-	cmChurn    = 200
 	cmChurnGap = 300 * time.Millisecond
 )
 
@@ -398,7 +410,7 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 
 	// Traffic: the stream sessions both ways, paced over the run.
 	start := time.Now()
-	errs := make(chan error, 4*ns+2*cmChurn)
+	errs := make(chan error, 4*ns+2*cfg.churn)
 	var streams sync.WaitGroup
 	sums := make([][4][]byte, ns) // up sent, up read, back sent, back read
 	for i := range ns {
@@ -409,11 +421,11 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 			}
 			var wg sync.WaitGroup
 			wg.Go(func() {
-				errs <- wrapErr(fmt.Sprintf("S%d up write", i), cmPace(sd[i], cfg.up, uint64(100+i), cmDuration, hs[0]))
+				errs <- wrapErr(fmt.Sprintf("S%d up write", i), cmPace(sd[i], cfg.up, uint64(100+i), cfg.duration, hs[0]))
 			})
 			wg.Go(func() { errs <- wrapErr(fmt.Sprintf("S%d up read", i), cmRead(sp[i], cfg.up, uint64(100+i), hs[1])) })
 			wg.Go(func() {
-				errs <- wrapErr(fmt.Sprintf("S%d back write", i), cmPace(sp[i], cfg.back, uint64(200+i), cmDuration, hs[2]))
+				errs <- wrapErr(fmt.Sprintf("S%d back write", i), cmPace(sp[i], cfg.back, uint64(200+i), cfg.duration, hs[2]))
 			})
 			wg.Go(func() {
 				errs <- wrapErr(fmt.Sprintf("S%d back read", i), cmRead(sd[i], cfg.back, uint64(200+i), hs[3]))
@@ -443,7 +455,7 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	var churn sync.WaitGroup
 	churn.Go(func() {
 		var each sync.WaitGroup
-		for j := range cmChurn {
+		for j := range cfg.churn {
 			time.Sleep(time.Until(start.Add(time.Duration(j) * cmChurnGap)))
 			each.Go(func() {
 				if err := cmChurnOne(peer, cp, j, cfg.churnBytes); err != nil {
@@ -460,7 +472,7 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	// A kill every 10 s, Links a and b in turn.
 	var kills []time.Duration
 	killsOf := make([]int, len(links))
-	for k := 1; time.Duration(k)*cmEvery < cmDuration; k++ {
+	for k := 1; time.Duration(k)*cmEvery < cfg.duration; k++ {
 		time.Sleep(time.Until(start.Add(time.Duration(k) * cmEvery)))
 		v := (k - 1) % 2
 		before := links[v].Stats().Session.Killed
@@ -471,7 +483,7 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 			killsOf[v]++
 		}
 	}
-	time.Sleep(time.Until(start.Add(cmDuration)))
+	time.Sleep(time.Until(start.Add(cfg.duration)))
 	close(stop)
 	gens.Wait()
 	streams.Wait()
@@ -489,8 +501,8 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	}
 
 	// Stimulus.
-	if len(kills) != int(cmDuration/cmEvery)-1 {
-		t.Errorf("stimulus: %d kills ended a session carrier, want %d", len(kills), int(cmDuration/cmEvery)-1)
+	if len(kills) != int(cfg.duration/cmEvery)-1 {
+		t.Errorf("stimulus: %d kills ended a session carrier, want %d", len(kills), int(cfg.duration/cmEvery)-1)
 	}
 	if got := downs.Load(); got < int64(len(kills)) {
 		t.Errorf("stimulus: %d CarrierDown events for %d kills", got, len(kills))
@@ -499,8 +511,8 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	// Link, not per kind: a Link's log cannot tell a JOIN's kind (its
 	// payload does not carry it). It is still tight per kind here: the
 	// identities before the run require both kinds' trunks on every Link,
-	// the stream sessions pace until cmDuration and the packet sessions run
-	// until stop, and every kill comes before cmDuration, so each kill ends
+	// the stream sessions pace until cfg.duration and the packet sessions run
+	// until stop, and every kill comes before cfg.duration, so each kill ends
 	// one trunk of each kind and each kind is owed at most one redial. The
 	// bound has slack for a double dial of one kind only after a kill at
 	// which the other kind did not redial on that Link; the root-level
@@ -512,8 +524,8 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 			t.Errorf("Link %d carried %d session carriers with %d kills, want ≤ 2 × (1 + %d) (one dial per factory and session kind per kill)", i, all, killsOf[i], killsOf[i])
 		}
 	}
-	if churned.Load() != cmChurn {
-		t.Errorf("%d of %d churn sessions completed", churned.Load(), cmChurn)
+	if churned.Load() != int64(cfg.churn) {
+		t.Errorf("%d of %d churn sessions completed", churned.Load(), cfg.churn)
 	}
 	// The ACKs of the last bytes may still be on their way.
 	crUntil(t, 10*time.Second, "the last ACKs", func() bool {
