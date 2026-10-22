@@ -63,15 +63,24 @@ import (
 // releases at once, for REL room on that trunk). replyExpect = 2 × 20 ms +
 // replyDialDelay is the direct path's reply on u1 (one RTT and the
 // target's connect) plus the go-frame RTT; u2's after the event is 0.4 ms
-// less. A build-up span is the idle period after the start, and the one
-// after the ranking moved (from the event to replyMoved + the idle period
-// after it), while the pool fills fresh trunks one at a time at the
-// factory's whole open rate: each new trunk costs its coalesced waiters a
-// dial's verdict, and a new view's OPEN shares the filling trunk's REL
-// window with the SCHED and go PACK of the views opened just before it
-// (the designed cold-start costs, §A8.4; M3's ⌈N/8⌉ RTTs of control under
-// churn); its windows are recorded. The run drains as
-// TestL4UDNSChurnMiniature_L48_L72's arms do.
+// less. A build-up span runs from a pool build to the refill of the trunks
+// it built: from the start to its first second (replyCold, the cold fill)
+// plus the idle period, and from the event to replyMoved plus the idle
+// period. The pool fills fresh trunks one at a time at the factory's whole
+// open rate: each new trunk costs its coalesced waiters a dial's verdict,
+// and a new view's OPEN shares the filling trunk's REL window with the
+// SCHED and go PACK of the views opened just before it; an idle period
+// later the views of that fill end together and the pool refills their
+// trunks at the same rate, the new views' SCHED and go PACK beside the RST
+// and DETACH of the ending ones (the designed cold-start costs, §A8.4;
+// M3's ⌈N/8⌉ RTTs of control under churn, ⌈N/6⌉ on a trunk taking new
+// views, rc3); its windows are recorded. (M6 I3: the start's span ended at
+// the idle period, so its refill second, +10 s, was judged as a steady
+// window: medians 41.8–42.2 ms on the host and up to 43.0 ms in 30 of 100
+// Linux sweep runs at GOMAXPROCS 2 and 4, run 20261022-164605-2e70, where
+// every other steady window sat at 40.33 ms; the event's span already held
+// its refill.) The run drains as TestL4UDNSChurnMiniature_L48_L72's arms
+// do.
 func TestL4UFirstReplyUnderChurn_L12_L72(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		const (
@@ -208,7 +217,9 @@ func TestL4UFirstReplyUnderChurn_L12_L72(t *testing.T) {
 		}
 
 		// The first replies, by 1-s window of first sends.
-		buildUp := func(s time.Duration) bool { return s < idle.Short || (s >= flip && s < flip+replyMoved+idle.Short) }
+		buildUp := func(s time.Duration) bool {
+			return s < replyCold+idle.Short || (s >= flip && s < flip+replyMoved+idle.Short)
+		}
 		var judged, steadyLat, buildLat []time.Duration
 		var over, built []string
 		steady := 0
@@ -308,6 +319,10 @@ const (
 	// after the event, whose PONG comes within 2 × replyProbe + one RTT.
 	replyProbe = 500 * time.Millisecond
 	replyMoved = 2*replyProbe + 100*time.Millisecond
+	// replyCold is the start's pool build: the first second, whose flows
+	// the run-wide median leaves out (the cold Peer's Probe.DialWait) and
+	// whose views end together an idle period later.
+	replyCold = time.Second
 	// replyU2Before and replyU2After are u2's one-way delays before and
 	// after the event: 8 ms of RTT apart, a level shift beyond 3σ (6 ms),
 	// and after it 0.4 ms below u1's RTT.
