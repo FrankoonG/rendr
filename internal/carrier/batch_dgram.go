@@ -69,17 +69,20 @@ func (b *Batch) DgramRoom() int {
 	return min(b.Room(), wire.MaxPacketPayload)
 }
 
-// RelRoom returns the REL frames a reliable Add* may still reserve this
-// round (datagram mode); 0 in stream mode (nothing is wrapped). It counts
-// the REL window only: a reliable Add* can still fail on a full batch while
-// RelRoom is positive, and a stream batch reports 0 whatever it holds, so a
-// caller that asks why a reliable frame was refused tests Datagram() too
-// (only a datagram batch refuses for lack of REL room; R1-17).
+// RelRoom returns the REL frames a reliable Add* other than a view's first
+// frame may still reserve this round (datagram mode): the round's REL room
+// less what it reserved and less the room the carrier keeps for first
+// frames (relFirstKeep, relKeeps); 0 in stream mode (nothing is wrapped).
+// It counts the REL window only: a reliable Add* can still fail on a full
+// batch while RelRoom is positive, and a stream batch reports 0 whatever
+// it holds, so a caller that asks why a reliable frame was refused tests
+// Datagram() too (only a datagram batch refuses for lack of REL room;
+// R1-17).
 func (b *Batch) RelRoom() int {
 	if !b.dgram {
 		return 0
 	}
-	return b.relRoom - b.nrel
+	return max(b.relRoom-b.relKeep-b.nrel, 0)
 }
 
 // AddDgram appends one DGRAM: seq ‖ body, where body references packet
@@ -167,16 +170,22 @@ func (b *Batch) AddPack(handle uint32, flags uint8, p *wire.Pack, reliable bool)
 // (outer header REL, handle 0) whose REL payload is the head — cseq 0
 // until relPayload stamps it, itype t, iflags, ihandle — followed by the
 // inner payload. ok is false when the frame count or the control arena is
-// exhausted or, on a datagram batch, the round's REL room is used (then
-// relRefused reports it). It panics on a REL payload above
-// wire.RelMaxPayload (only OPEN and JOIN, which travel in the handshake's
-// first datagram, could be that large).
+// exhausted or, on a datagram batch, the round's REL room is used — for a
+// type relKeeps names, all but the room the round keeps for first frames
+// (relKeep) — (then relRefused reports it). It panics on a REL payload
+// above wire.RelMaxPayload (only OPEN and JOIN, which travel in the
+// handshake's first datagram, could be that large).
 func (b *Batch) addReliable(t wire.Type, flags uint8, handle uint32, n int) (p []byte, ok bool) {
 	if !b.dgram {
 		return b.addControl(t, flags, handle, n)
 	}
-	if b.nrel >= b.relRoom {
+	limit := b.relRoom
+	if relKeeps(t) {
+		limit -= b.relKeep
+	}
+	if b.nrel >= limit {
 		b.relBlocked = true
+		b.relShort = b.relShort || b.nrel >= b.relRoom
 		return nil, false
 	}
 	m := wire.RelHeadLen + n

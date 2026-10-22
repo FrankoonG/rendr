@@ -84,6 +84,8 @@ type Batch struct {
 	relIdx      [wire.RelWindow]uint8 // frame index of the k-th new REL
 	relStamped  uint32                // bit k: relPayload stamped the k-th new REL's cseq
 	relBlocked  bool                  // a reliable Add* found no REL room this round
+	relKeep     int                   // REL frames the types relKeeps names leave free this round (Conn.relKeep; 0 unless the writer sets it)
+	relShort    bool                  // a reliable Add* found no REL room at all (not only the kept room)
 	lastRef     *Buf                  // the chunk of the latest DGRAM reference taken this round
 
 	// The payload quota of the current endpoint call (M3-D10; set by limit
@@ -135,6 +137,7 @@ func (b *Batch) Reset(now time.Time) {
 	b.n, b.data, b.retx, b.ctl, b.bodies, b.used, b.dgBytes = 0, 0, 0, 0, 0, 0, 0
 	b.now, b.wake, b.capBlocked = now, time.Time{}, false
 	b.dgram, b.frameBudget, b.relRoom, b.nrel, b.relStamped, b.relBlocked = false, 0, 0, 0, 0, false
+	b.relKeep, b.relShort = 0, false
 	b.quota, b.ctlOnly, b.qEnd, b.taken = false, false, 0, 0
 	b.holdH, b.holdOn = 0, false
 	b.downs = nil

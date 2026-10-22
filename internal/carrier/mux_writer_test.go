@@ -511,8 +511,9 @@ func TestMuxViewWakeAt(t *testing.T) {
 }
 
 // TestMuxRelFairness_L12 (§A5.10, L12): on a datagram trunk 16 views share
-// one REL window of 8; each places one reliable frame (FIN) at once and
-// all of them are dispatched within ⌈16/8⌉ RTTs + RTO.
+// one REL window of 8 (of which their frames take 8 − relFirstKeep while
+// the trunk takes new views, rel.go); each places one reliable frame (FIN)
+// at once and all of them are dispatched within ⌈16/6⌉ RTTs + RTO.
 func TestMuxRelFairness_L12(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		d, p, ia, ib := dgMuxPair(t, 1200, nil)
@@ -553,9 +554,10 @@ func TestMuxRelFairness_L12(t *testing.T) {
 			}
 			time.Sleep(time.Millisecond)
 		}
-		bound := 2*(2*delay) + rto + 2*time.Millisecond
+		share := wire.RelWindow - relFirstKeep
+		bound := time.Duration((16+share-1)/share)*(2*delay) + rto + 2*time.Millisecond
 		if el := time.Since(start); el > bound {
-			t.Fatalf("16 views' FINs took %v, want ≤ ⌈16/8⌉·RTT + RTO = %v", el, bound)
+			t.Fatalf("16 views' FINs took %v, want ≤ ⌈16/%d⌉·RTT + RTO = %v", el, share, bound)
 		}
 	})
 }

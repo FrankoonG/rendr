@@ -46,6 +46,7 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 		room = 0 // nothing new follows our CLOSE
 	}
 	b.SetDatagram(int(dg.budget.Load()), room)
+	b.relKeep = c.relKeepLocked(now) // the room kept for first frames (relFirstKeep)
 	if c.mux && !w.held && !closing {
 		b.downs = &c.downs // a reliable session frame goes behind the pending DOWNs (PA-86)
 	}
@@ -94,8 +95,10 @@ func (c *Conn) dgWriteRound(w *writer) bool {
 		c.relSealLocked(b)
 		if b.relRefused() {
 			// A reliable frame found no REL room: a RACK with progress wakes
-			// the writer (§A5.9); room freed since SetDatagram wakes it now.
-			if dg.rel.room() > 0 {
+			// the writer (§A5.9); room freed since SetDatagram wakes it now —
+			// beyond the room kept for first frames, unless one of those
+			// (or a carrier frame) was refused (relFirstKeep).
+			if r := dg.rel.room(); r > b.relKeep || (r > 0 && b.relShort) {
 				c.wakeWriter()
 			} else {
 				dg.rel.blocked = true
