@@ -1,6 +1,7 @@
 package l4
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -47,8 +48,26 @@ func newFakeDNS(t *testing.T, silent bool) *fakeDNS {
 			}
 		}
 	}()
-	t.Cleanup(func() { pc.Close(); <-f.done })
+	t.Cleanup(func() {
+		pc.Close()
+		<-f.done
+		// No lookup of f's resolvers outlives the test (resolverHook).
+		waitFor(t, 2*time.Second, "the resolver's lookups end", func() bool { return !resolverLookups() })
+	})
 	return f
+}
+
+// resolverLookups reports whether a goroutine runs a lookup of the net
+// package's resolver.
+func resolverLookups() bool {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return bytes.Contains(buf[:n], []byte("net.(*Resolver)."))
+		}
+		buf = make([]byte, 2*len(buf))
+	}
 }
 
 // nxdomain is the NXDOMAIN answer to query q: its header and question
@@ -69,14 +88,40 @@ func nxdomain(q []byte) []byte {
 	return r
 }
 
-// resolverHook is a Dial hook whose pure-Go resolver asks only f.
+// resolverHook is a Dial hook whose pure-Go resolver asks only f. Each of
+// the resolver's UDP conns closes when its exchange's context ends: the net
+// package does not interrupt a pending read for that context, so a lookup
+// that the Server's dial budget abandoned would otherwise run on to the
+// resolver's own per-try timeout (5 s) and its retries, inside the tests
+// that follow (M6 I3: TestServerDNSFailureSilent's lookups woke inside
+// TestForwardZeroAllocs_L41_L54's window and put 70 allocations there
+// against its bound of 40, run 20261022-164605-2e70). newFakeDNS's cleanup
+// checks that no lookup is left.
 func resolverHook(f *fakeDNS) func(context.Context, Request) (net.Conn, error) {
 	res := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "udp", f.pc.LocalAddr().String())
+		c, err := (&net.Dialer{}).DialContext(ctx, "udp", f.pc.LocalAddr().String())
+		if err != nil {
+			return nil, err
+		}
+		u := c.(*net.UDPConn)
+		return &dnsConn{UDPConn: u, stop: context.AfterFunc(ctx, func() { u.Close() })}, nil
 	}}
 	return func(ctx context.Context, r Request) (net.Conn, error) {
 		return (&net.Dialer{Resolver: res}).DialContext(ctx, "tcp", r.Addr)
 	}
+}
+
+// dnsConn is a resolver's UDP conn that closes when its exchange's context
+// ends (resolverHook). It stays a net.PacketConn, so the resolver keeps its
+// datagram framing.
+type dnsConn struct {
+	*net.UDPConn
+	stop func() bool
+}
+
+func (c *dnsConn) Close() error {
+	c.stop()
+	return c.UDPConn.Close()
 }
 
 // TestServerDNSNotFound (§A8.1 row 2): a name that does not exist is
