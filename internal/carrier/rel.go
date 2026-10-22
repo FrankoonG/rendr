@@ -44,6 +44,10 @@ type relState struct {
 	retxCseq uint32
 	retxRnd  uint32
 
+	// firstAt is when this side last sealed a view's first frame
+	// (relFirst), in ns after the trunk's base; 0: never (relKeepLocked).
+	firstAt int64
+
 	// Receiver.
 	cum      uint32                  // highest cseq dispatched in order
 	heldMask uint8                   // bit c mod RelWindow: cseq c (cum + 2 … cum + 8) is held
@@ -86,14 +90,79 @@ func (r *relState) room() int {
 	return wire.RelWindow - int(r.next-r.una)
 }
 
+// relFirstKeep is the room a datagram MUX trunk's REL window keeps for the
+// first frames of its views (m6 item rc3; G11-dns) while the trunk takes
+// new views: while it sealed a first frame within its REL RTO, a reliable
+// frame that relKeeps names leaves that many of the window's free REL
+// frames unused (relKeepLocked). The window of 8 is the trunk's, shared by
+// every view on it. While a pool fills a fresh trunk, or refills one whose
+// views end together, the reliable frames of the views already open — per
+// one-shot flow SCHED, the go PACK, RST and DETACH one way, two epoch-echo
+// PACKs and DETACH the other — outnumber the first frames four to one and
+// took every REL frame a RACK freed, so a first frame produced between two
+// RACKs (an OPEN when the client's datagram arrives, an OPEN_ACK after the
+// target's dial and Confirm) waited for the next RACK, up to a round trip
+// on each side (G11-dns at 300 new flows a second: OPEN +10 ms and
+// OPEN_ACK +20 ms at the median, and every first reply that much later,
+// for a minute after each pool build). With 2 kept, the first frames find
+// room in the round that has them while the views recycle (the row's
+// steady 1-s medians at its expectation of 40.3 ms, against 49–56 ms
+// before); while a pool fills a fresh trunk at the factory's whole open
+// rate, an OPEN still shares the window with the SCHED and go PACK of the
+// views opened just before it (the row's build-up medians 0–7 ms above the
+// expectation, against 11–16 ms before). The frames of open views keep 6
+// of the 8 then, so N views' control completes within ⌈N/6⌉ RTTs + RTO
+// instead of ⌈N/8⌉ (§A5.10's bound keeps its RTO term); a trunk that took
+// no view within its RTO keeps nothing, so a burst of ends of views opened
+// long before has the whole window, as before
+// (TestMuxDgramIdleEndHighRTT_L30: 64 ends a trunk at a 100-ms round
+// trip). While the kept room refuses a frame, at least 6 RELs are
+// outstanding, so the RACK that covers them wakes the writer (relOnRack),
+// and the next round decides again; no timer is needed. A dedicated
+// carrier carries one session: its dialer's first frame rides the
+// handshake and keeps nothing, its passive keeps the room for one RTO
+// after its first response. Rows: TestL4UFirstReplyUnderChurn_L12_L72,
+// TestMuxRelKeepsFirstFrameRoom_L12.
+const relFirstKeep = 2
+
+// relFirst reports a view's first frame: the dialer's OPEN or JOIN of a
+// view and the passive's response to it (OPEN_ACK or JOIN_ACK, a refusal
+// included).
+func relFirst(t wire.Type) bool {
+	switch t {
+	case wire.TypeOpen, wire.TypeJoin, wire.TypeOpenAck, wire.TypeJoinAck:
+		return true
+	}
+	return false
+}
+
+// relKeeps reports whether a reliable frame of type t leaves the room kept
+// for first frames free: every type but the first frames and DOWN, which
+// every reliable session frame follows (PA-86), first frames included.
+func relKeeps(t wire.Type) bool {
+	return t != wire.TypeDown && !relFirst(t)
+}
+
+// relKeepLocked returns the REL room this carrier keeps for first frames at
+// now (Conn.mu): relFirstKeep when it sealed a first frame within its REL
+// RTO (a MUX trunk taking new views), else 0.
+func (c *Conn) relKeepLocked(now time.Time) int {
+	if c.dg.rel.firstAt == 0 || c.nsAt(now)-c.dg.rel.firstAt >= int64(c.relRTOLocked()) {
+		return 0
+	}
+	return relFirstKeep
+}
+
 // outstanding reports whether a REL waits for its RACK (Conn.mu).
 func (r *relState) outstanding() bool { return r.una != r.next }
 
-// RelRoom returns the REL frames a reliable frame could still reserve on
-// this carrier now: wire.RelWindow minus those outstanding; 0 on stream
-// carriers and on a dead carrier. A session whose reliable PACK found no REL
-// room on its duty lane moves the PACK duty to a live lane whose RelRoom is
-// positive (R1-17). It takes Conn.mu (Session.mu → Conn.mu).
+// RelRoom returns the REL frames a reliable session frame other than a
+// view's first frame could still reserve on this carrier now:
+// wire.RelWindow minus those outstanding, less the room kept for first
+// frames (relFirstKeep); 0 on stream carriers and on a dead
+// carrier. A session whose reliable PACK found no REL room on its duty
+// lane moves the PACK duty to a live lane whose RelRoom is positive
+// (R1-17). It takes Conn.mu (Session.mu → Conn.mu).
 func (c *Conn) RelRoom() int {
 	if c.dg == nil || c.death.Load() != nil {
 		return 0
@@ -103,7 +172,7 @@ func (c *Conn) RelRoom() int {
 	if c.closeSent.Load() {
 		return 0 // nothing follows our CLOSE
 	}
-	return c.dg.rel.room()
+	return max(c.dg.rel.room()-c.relKeepLocked(time.Now()), 0)
 }
 
 // relRTOLocked returns the carrier's REL timeout: RelRTOInit before the
@@ -127,6 +196,9 @@ func (c *Conn) relSealLocked(b *Batch) {
 		s.n = uint16(copy(s.b[:], p))
 		r.sealed[cs%wire.RelWindow] = r.round
 		r.next++
+		if relFirst(wire.Type(p[4])) { // the REL payload's itype (§A3.3)
+			r.firstAt = c.nsAt(b.Now())
+		}
 	}
 }
 

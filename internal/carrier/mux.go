@@ -630,6 +630,8 @@ type roundData struct {
 	una      uint32 // datagram: the REL sender's oldest unacknowledged cseq
 	relNext  uint32 // datagram: the next cseq (writer-owned)
 	relRoom  int
+	relKeep  int  // datagram: the REL room kept for first frames (Batch.relKeep)
+	relHeld  bool // datagram: REL-marked views wait for more room than the kept room (reReadyLocked)
 	pongMark uint64
 	goAway   bool
 }
@@ -650,6 +652,7 @@ func (t *trunk) muxRound(b *Batch) {
 	if t.dg != nil {
 		rd.rto = t.view1.relRTOLocked()
 		rd.una, rd.relNext, rd.relRoom = t.dg.rel.una, t.dg.rel.next, t.dg.rel.room()
+		rd.relKeep = b.relKeep
 	}
 	t.mu.Unlock()
 
@@ -661,6 +664,9 @@ func (t *trunk) muxRound(b *Batch) {
 		n = t.takeReadyLocked()
 	}
 	t.mx.Unlock()
+	if rd.relHeld {
+		b.relBlocked = true // the RACK that frees more room wakes the writer (dgWriteRound)
+	}
 	t.runPost(&ms.post)
 
 	if !multi {
@@ -1033,7 +1039,11 @@ func (t *trunk) viewCall(v *Conn, b *Batch, rd *roundData, nowNs int64) (appende
 // reReadyLocked readies the views whose wake came (§A4.3): the views a
 // PONG freed capacity for (cap-marked, once the PONG watermark moved), the
 // views a RACK freed REL room for, and the views whose WakeAt is due. It
-// visits the marked views only, never the idle ones (L54).
+// visits the marked views only, never the idle ones (L54). While the free
+// REL room is no more than the room kept for first frames (relFirstKeep),
+// only a view that owes its first response is readied; the others stay
+// marked (rd.relHeld), so that a view whose frames the kept room refuses is
+// not called again before a RACK frees more.
 func (t *trunk) reReadyLocked(rd *roundData, nowNs int64) {
 	ms := &t.ms
 	if len(ms.capList) > 0 && rd.pongMark != ms.capPM {
@@ -1046,13 +1056,20 @@ func (t *trunk) reReadyLocked(rd *roundData, nowNs int64) {
 		ms.capList = ms.capList[:0]
 	}
 	if len(ms.relList) > 0 && rd.relRoom > 0 {
-		for i, v := range ms.relList {
+		k := 0
+		for _, v := range ms.relList {
 			ms.touched++
+			if rd.relRoom <= rd.relKeep && !v.vx.needResp.Load() {
+				ms.relList[k] = v
+				k++
+				continue
+			}
 			v.vx.relMarked = false
 			t.readyLocked(v)
-			ms.relList[i] = nil
 		}
-		ms.relList = ms.relList[:0]
+		clear(ms.relList[k:])
+		ms.relList = ms.relList[:k]
+		rd.relHeld = k > 0
 	}
 	if ms.nextWake == 0 || nowNs < ms.nextWake {
 		return

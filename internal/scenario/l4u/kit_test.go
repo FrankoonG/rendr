@@ -93,6 +93,10 @@ type worldOpts struct {
 	srv func(*l4.Server)
 	// pipeQueue is every target pipe's Queue (0: the pipe's 256).
 	pipeQueue int
+	// dialDelay is how long the Server's Dial hook takes before it returns
+	// (0: at once), the passive's own work between an OPEN's arrival and
+	// its Confirm (a real target's connect).
+	dialDelay time.Duration
 }
 
 // targetApp is a target application: it serves one flow on its pipe end
@@ -236,6 +240,9 @@ func (w *world) target(port uint16, app targetApp) {
 func (w *world) dialTarget(_ context.Context, r l4.Request) (net.Conn, error) {
 	if r.Cmd != l4.CmdUDP {
 		return nil, fmt.Errorf("scenario: a %#x request on the UDP kit", r.Cmd)
+	}
+	if w.o.dialDelay > 0 {
+		time.Sleep(w.o.dialDelay)
 	}
 	ap, err := netip.ParseAddrPort(r.Addr)
 	if err != nil {
