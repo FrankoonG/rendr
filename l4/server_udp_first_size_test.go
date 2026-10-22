@@ -61,6 +61,7 @@ func TestServerUDPFirstAboveMaxPayload_L37(t *testing.T) {
 				} else {
 					pfNone(t, app)
 				}
+				synctest.Wait() // the Server counts a datagram after its write returns (M6 I3)
 				u := srv.Status().UDP
 				wantSent, wantLarge := uint64(0), uint64(1)
 				if tc.write {
@@ -74,6 +75,7 @@ func TestServerUDPFirstAboveMaxPayload_L37(t *testing.T) {
 					t.Fatalf("WriteTo: %v", err)
 				}
 				pfExpect(t, app, next)
+				synctest.Wait()
 				if u := srv.Status().UDP; u.ToTarget != wantSent+1 || u.TooLarge != wantLarge {
 					t.Fatalf("UDP status after a datagram %+v: want ToTarget %d, TooLarge %d", u, wantSent+1, wantLarge)
 				}

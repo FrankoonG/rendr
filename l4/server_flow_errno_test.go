@@ -123,6 +123,11 @@ func TestServerUDPFirstWriteErrors(t *testing.T) {
 					d := pfData(60, 2)
 					res.pc.WriteTo(d, nil)
 					pfExpect(t, target, d)
+					// The forward counts a datagram after its write returns,
+					// so the target can read it first (M6 I3: a race-unit run
+					// read ToTarget 0 in 2 of 3 passes on one worker, run
+					// 20261022-225138-fa5f).
+					synctest.Wait()
 					if u := s.Status().UDP; u.ToTarget != 1 || u.TargetNoise != 1 {
 						t.Fatalf("UDP status after a datagram %+v", u)
 					}
