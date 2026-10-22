@@ -420,7 +420,15 @@ func TestPortForwardTCP_L02(t *testing.T) {
 						}
 					}
 					ptWantReset(t, "a refused Dial", c, time.Minute)
-					waitFor(t, 10*time.Second, "the failure counted", func() bool { return w.pf.Status().TCP.Failed == uint64(k) })
+					// The reset reaches the client before the forward counts the
+					// failure (Failed, then its code and LastErr: independent
+					// atomics), so the wait covers every counter the row reads
+					// (M6 I3: the Linux l4.slow sweep read Failed 2 and ByCode 1
+					// in 1 of 300 runs, run 20261022-192558-cff1).
+					waitFor(t, 10*time.Second, "the failure counted with its code", func() bool {
+						st := w.pf.Status().TCP
+						return st.Failed == uint64(k) && st.ByCode[CodeNotAllowed] == uint64(k) && st.LastErr != nil
+					})
 				}
 				st := w.pf.Status().TCP
 				if code, ok := CodeOf(st.LastErr); st.Accepted != 2 || st.Failed != 2 || st.ByCode[CodeNotAllowed] != 2 || !ok || code != CodeNotAllowed {
