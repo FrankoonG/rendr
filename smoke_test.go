@@ -1775,8 +1775,8 @@ func smokeTransports() []smokeTransport {
 // TestPacketSmokeUDP_CA is the real-socket half over carrier/udp on
 // loopback: 10 real seconds with a kill every 2 s per mode (a shortened
 // timeline: the host runs no long real-time loads); 6 s (two kills) under
-// the race detector (m3 R1-23's first lever, I3 of M4), with the same
-// criteria.
+// the race detector (m3 R1-23's first lever, I3 of M4), in selector mode
+// only (smokeUDPModes), with the same criteria.
 func TestPacketSmokeUDP_CA(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-time smoke")
@@ -1786,7 +1786,7 @@ func TestPacketSmokeUDP_CA(t *testing.T) {
 		rate, duration = 2000, 6*time.Second
 	}
 	pre, post := realLossWindows()
-	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
+	for _, mode := range smokeUDPModes() {
 		t.Run(mode.String(), func(t *testing.T) {
 			g0 := runtime.NumGoroutine()
 			n := smokeUDPNet(t)
@@ -1887,15 +1887,31 @@ func TestPacketSmokeUDP60_CA(t *testing.T) {
 	}
 }
 
+// smokeUDPModes are TestPacketSmokeUDP_CA's subtests: selector and bond.
+// Under -race (R1-23 lever 1; M6 I3: race-unit passes reached 282 s on the
+// builder at the M6 RC, run 20261022-141914-ce19) it runs selector only,
+// with unchanged criteria: TestPacketSmokeUDP60_CA's race timeline (2,000
+// datagrams per second and 1,000 back over carrier/udp, two kills that
+// reach each bond member once) is this row's bond race timeline (the same
+// rates, two kills 2 s apart, the members in turn), so bond is judged
+// there under the race detector. The non-race lanes run both;
+// TestRaceLaneSubtests checks the lists.
+func smokeUDPModes() []rendr.Mode {
+	if loopbackRace {
+		return []rendr.Mode{rendr.ModeSelector}
+	}
+	return []rendr.Mode{rendr.ModeSelector, rendr.ModeBond}
+}
+
 // udpEndToEndModes are TestUDPEndToEnd's subtests: selector and bond.
 // Under -race (R1-23 lever 1; the race-unit target of 270 s per pass,
 // m5's prerc decision) its timeline — 2,000 datagrams per second and
 // 1,000 back over carrier/udp, a carrier closed under rendr — repeats
 // TestPacketSmokeUDP_CA's race timeline (the same rates, a carrier closed
-// every 2 s), which runs both modes, so it runs selector only, the mode
-// whose kill is a migration of the session's one active carrier, with
-// unchanged criteria. The non-race lanes run both; TestRaceLaneSubtests
-// checks the lists.
+// every 2 s), so it runs selector only, the mode whose kill is a migration
+// of the session's one active carrier, with unchanged criteria (bond's
+// race timeline is TestPacketSmokeUDP60_CA's). The non-race lanes run
+// both; TestRaceLaneSubtests checks the lists.
 func udpEndToEndModes() []rendr.Mode {
 	if loopbackRace {
 		return []rendr.Mode{rendr.ModeSelector}
@@ -1907,9 +1923,10 @@ func udpEndToEndModes() []rendr.Mode {
 // bond. Under -race (R1-23 lever 1; the race-unit target of 270 s per
 // pass, m5's prerc decision) its timeline — 2,000 datagrams per second
 // over carrier/udp with two kills — repeats TestPacketSmokeUDP_CA's race
-// timeline, which runs both modes, so it runs bond only, the mode whose
-// two kills reach each member once, with unchanged criteria. The non-race
-// lanes run both at 10,000 datagrams per second for 60 s;
+// timeline, so it runs bond only, the mode whose two kills reach each
+// member once, with unchanged criteria: the race lane's one bond run of
+// the real-UDP smoke (TestPacketSmokeUDP_CA runs selector there, M6 I3).
+// The non-race lanes run both at 10,000 datagrams per second for 60 s;
 // TestRaceLaneSubtests checks the lists.
 func smokeUDP60Modes() []rendr.Mode {
 	if loopbackRace {

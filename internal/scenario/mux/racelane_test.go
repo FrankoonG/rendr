@@ -35,6 +35,20 @@ func TestRaceLaneSubtests(t *testing.T) {
 	if !slices.Equal(got, want) {
 		t.Errorf("%s: TestMuxBulkBothWaysKeepsTheLink runs %v, want %v", lane, got, want)
 	}
+
+	// TestMuxPacketBesideBulk (M6 I3): each bulk shape and each rate once.
+	want = []string{"twoway=false/rate=1.048576e+06", "twoway=false/rate=4.194304e+06", "twoway=true/rate=1.048576e+06", "twoway=true/rate=4.194304e+06"}
+	if race {
+		want = []string{"twoway=false/rate=1.048576e+06", "twoway=true/rate=4.194304e+06"}
+	}
+	got = nil
+	for _, c := range besideBulkCases() {
+		got = append(got, c.name())
+	}
+	t.Logf("%s: TestMuxPacketBesideBulk runs %v", lane, got)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s: TestMuxPacketBesideBulk runs %v, want %v", lane, got, want)
+	}
 }
 
 // raceBuild reports whether this test binary was built with -race. It reads

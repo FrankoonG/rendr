@@ -743,11 +743,12 @@ func countMallocs(n int, window time.Duration, f func()) (mallocs uint64, runs i
 //     pair (stimulus, load, integrity, counters, nothing left).
 //   - TestPacketRaceSmoke_CR: DatagramHub; its race rules (delivery,
 //     Duplicates, Race.Copies) are the mode's on either transport.
-//   - TestUDPEndToEnd and TestPacketSmokeUDP60_CA: their race timelines
-//     repeat TestPacketSmokeUDP_CA's (2,000 datagrams per second over
-//     carrier/udp with carrier kills), which keeps both modes; they keep
-//     one mode each: selector (the active carrier's migration) and bond
-//     (each member killed once).
+//   - TestPacketSmokeUDP_CA, TestUDPEndToEnd and TestPacketSmokeUDP60_CA:
+//     one race timeline (2,000 datagrams per second over carrier/udp with
+//     carrier kills); TestPacketSmokeUDP_CA and TestUDPEndToEnd keep
+//     selector (the active carrier's migration after a kill and after a
+//     close under rendr), TestPacketSmokeUDP60_CA keeps bond (each member
+//     killed once; M6 I3 moved TestPacketSmokeUDP_CA's bond run there).
 //   - TestLoopbackCloseWithUnreadNoReset_L05: both variants (dedicated,
 //     mux), 50 of the 200 rounds; each round repeats the rule.
 func TestRaceLaneSubtests(t *testing.T) {
@@ -792,6 +793,7 @@ func TestRaceLaneSubtests(t *testing.T) {
 	}
 	check("TestPacketRaceSmoke_CR", rs, []string{"DatagramLink", "DatagramHub"}, []string{"DatagramHub"})
 
+	check("TestPacketSmokeUDP_CA", modes(smokeUDPModes()), []string{"selector", "bond"}, []string{"selector"})
 	check("TestUDPEndToEnd", modes(udpEndToEndModes()), []string{"selector", "bond"}, []string{"selector"})
 	rounds := []string{fmt.Sprintf("%d rounds", loopCloseRounds())}
 	check("TestLoopbackCloseWithUnreadNoReset_L05 (each variant)", rounds, []string{"200 rounds"}, []string{"50 rounds"})
