@@ -344,8 +344,9 @@
 // PortForward (beyond: DropOpening). When MaxFlows entries exist
 // (opening and held ones included), a new client takes the place of a held
 // client, or of an open flow that never became a stream and has been idle
-// for at least 1 s (the least recently active among up to 8 entries sampled
-// from its socket's table); a stream and an opening flow are never taken.
+// for at least 1 s (the least recently active among 8 entries drawn
+// uniformly at random from its socket's table, or among all of them while
+// it holds at most 8); a stream and an opening flow are never taken.
 // Without such an entry the new client's datagram is dropped (DropFull).
 // Because MaxFlows covers every socket of a PortForward, a flood of new
 // sources on one port can refuse new flows on another: use one PortForward

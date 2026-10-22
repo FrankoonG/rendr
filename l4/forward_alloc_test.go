@@ -152,8 +152,20 @@ func TestForwardZeroAllocs_L41_L54(t *testing.T) {
 // steady-state allocation (M6 I1: on Linux workers it put 20–42 of them
 // into the window of TestPortForwardZeroAllocs_L54, bound 40).
 func countMallocs(n int, window time.Duration, f func()) (mallocs uint64, runs int, el time.Duration) {
+	return countMallocsWarm(n, window, nil, f)
+}
+
+// countMallocsWarm is countMallocs with warm (when not nil) run once at
+// one P and with the collector off before the settle runs: a warm-up whose
+// pool growth must happen in the pools of the P that the window runs on
+// and survive until the window (no collection in between), as the UDP
+// gates' dgWarm bursts.
+func countMallocsWarm(n int, window time.Duration, warm, f func()) (mallocs uint64, runs int, el time.Duration) {
 	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	if warm != nil {
+		warm()
+	}
 	for range settleRuns(n) {
 		f()
 	}

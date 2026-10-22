@@ -1,6 +1,7 @@
 package l4
 
 import (
+	"math/rand/v2"
 	"net/netip"
 	"sync"
 	"sync/atomic"
@@ -49,11 +50,54 @@ const (
 
 // flowTable is one ServeUDP socket's table: the flows by client address
 // (M6-D24) under one mutex. No call into rendr or the socket is made under
-// it (M6-D26, R1-13).
+// it (M6-D26, R1-13). all holds the same entries densely (each entry's
+// index in it is its idx), so that a full table's victim sample draws
+// entries uniformly and independently in O(1) (M6-D29): a run of a map
+// range from a random start is not such a sample.
 type flowTable struct {
 	mu      sync.Mutex
 	m       map[netip.AddrPort]*ingressFlow
+	all     []*ingressFlow
 	stopped bool // the serve is stopping: no flow becomes open or held
+}
+
+// put adds e under its client's key, which has no entry (the mutex held).
+func (t *flowTable) put(e *ingressFlow) {
+	t.m[e.client] = e
+	e.idx = len(t.all)
+	t.all = append(t.all, e)
+}
+
+// del takes e out if it is its client's entry (the mutex held): the last
+// entry of all takes e's index.
+func (t *flowTable) del(e *ingressFlow) {
+	if t.m[e.client] != e {
+		return
+	}
+	delete(t.m, e.client)
+	last := len(t.all) - 1
+	if i := e.idx; i != last {
+		t.all[i] = t.all[last]
+		t.all[i].idx = i
+	}
+	t.all[last] = nil
+	t.all = t.all[:last]
+}
+
+// sample returns the i-th entry of a full table's victim sample (the mutex
+// held; 0 ≤ i < ingressSample): a table of at most ingressSample entries
+// is its own sample, entry i (nil beyond its length); a larger one's
+// sample is ingressSample independent uniform draws (math/rand/v2's
+// generator: per thread, no lock, no allocation).
+func (t *flowTable) sample(i int) *ingressFlow {
+	n := len(t.all)
+	switch {
+	case n > ingressSample:
+		return t.all[rand.IntN(n)]
+	case i < n:
+		return t.all[i]
+	}
+	return nil
 }
 
 // ingressFlow is one table entry: a client's flow, opening, open or held.
@@ -77,6 +121,7 @@ type ingressFlow struct {
 	first []byte
 
 	// Under the table's mutex:
+	idx     int // its index in the table's all while it is the table's
 	state   FlowState
 	gone    bool             // removed from the table (its MaxFlows unit handed on or released)
 	evicted bool             // removed to make room (M6-D29)
@@ -219,25 +264,23 @@ func (s *udpServe) remove(e *ingressFlow) {
 	s.leaveState(e)
 	e.state = 0
 	e.gone = true
-	if s.tab.m[e.client] == e {
-		delete(s.tab.m, e.client)
-	}
+	s.tab.del(e)
 }
 
 // victim picks the entry a newcomer may replace in a full table (M6-D29;
-// the mutex held): among at most ingressSample entries (Go's map
-// iteration starts at a random place), a held entry first; under
-// promoteActive (O-1 (a)) else the least recently active open flow that
-// never became a stream and whose last datagram is at least
-// ingressEvictIdle old. Opening flows and streams never are victims; under
-// promoteOnReply only held entries are. nil: none.
+// the mutex held): among the table's sample (at most ingressSample
+// entries drawn uniformly and independently, flowTable.sample), a held
+// entry first; under promoteActive (O-1 (a)) else the least recently
+// active open flow that never became a stream and whose last datagram is
+// at least ingressEvictIdle old. Opening flows and streams never are
+// victims; under promoteOnReply only held entries are. nil: none.
 func (s *udpServe) victim(now time.Duration) *ingressFlow {
 	var best *ingressFlow
 	var bestLast int64
 	cutoff := int64(now - ingressEvictIdle)
-	n := 0
-	for _, e := range s.tab.m {
-		if n++; n > ingressSample {
+	for i := range ingressSample {
+		e := s.tab.sample(i)
+		if e == nil {
 			break
 		}
 		switch {

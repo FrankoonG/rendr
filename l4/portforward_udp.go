@@ -327,7 +327,7 @@ func (s *udpServe) admit(b []byte, src netip.AddrPort) {
 		victim.evicted = evicted
 	}
 	e := s.newEntry(b, src, now)
-	t.m[src] = e
+	t.put(e)
 	t.mu.Unlock()
 	if victim != nil {
 		close(victim.done)
@@ -392,7 +392,7 @@ func (s *udpServe) replace(e *ingressFlow, b []byte, src netip.AddrPort, err err
 	}
 	s.remove(e)
 	ne := s.newEntry(b, src, s.now())
-	t.m[src] = ne
+	t.put(ne)
 	t.mu.Unlock()
 	u.replaced.Add(1)
 	s.start(ne)
