@@ -222,7 +222,11 @@ func tcpEcho(t *testing.T, addr string, n int) {
 }
 
 // tcpRefused checks that a connection to the TCP ingress at addr is reset
-// without a byte (ServeTCP never ends a refused connection cleanly).
+// without a byte (ServeTCP never ends a refused connection cleanly). The
+// reset can reach the socket before the client's write: Linux then reports
+// it to that write, once, and the read sees the end of the stream (M6 I3:
+// a race-unit pass under host load read "0 bytes, EOF", run
+// 20261022-211620-0824), so a reset the write reported counts as well.
 func tcpRefused(t *testing.T, addr string) {
 	t.Helper()
 	c, err := net.Dial("tcp", addr)
@@ -230,11 +234,12 @@ func tcpRefused(t *testing.T, addr string) {
 		t.Fatalf("dial the TCP ingress: %v", err)
 	}
 	defer c.Close()
-	c.Write([]byte("ping"))
+	_, werr := c.Write([]byte("ping"))
 	c.SetReadDeadline(time.Now().Add(10 * time.Second))
 	var b [1]byte
-	if n, err := c.Read(b[:]); n != 0 || !errors.Is(err, errConnReset) {
-		t.Fatalf("a refused connection: %d bytes, %v; want a reset without data", n, err)
+	n, err := c.Read(b[:])
+	if reset := errors.Is(err, errConnReset) || errors.Is(werr, errConnReset) && errors.Is(err, io.EOF); n != 0 || !reset {
+		t.Fatalf("a refused connection: %d bytes, %v (the write: %v); want a reset without data", n, err, werr)
 	}
 }
 
