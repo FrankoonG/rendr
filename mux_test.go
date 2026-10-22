@@ -224,6 +224,11 @@ func TestLaneGoFrameE2E(t *testing.T) {
 			if n, m := taps.count(), e.d.Status().Mux; n != 2 || m.Carriers != 2 || m.Views != 3 || m.FastPaths != 1 {
 				t.Fatalf("%d trunks dialled, dialer Mux %+v; want the second packet session as a fast path on the packet sessions' trunk", n, m)
 			}
+			// The tamper logs a frame after its write downstream returns, so
+			// the passive can answer before the go frame's record lands (M6
+			// I3: a race-unit pass logged OPEN alone, run
+			// 20261022-204628-a69e).
+			synctest.Wait() // the tamper logged what it forwarded
 			var up2 []rendrtest.FrameType
 			for _, rec := range taps.tap(t, 1).Log(rendrtest.Up) {
 				if rec.Handle == 2 {
