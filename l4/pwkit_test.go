@@ -336,13 +336,19 @@ func pwEntries(f *PortForward) (n int, by map[FlowState]int) {
 }
 
 // pwUnits checks the MaxFlows units against the tables: one unit per
-// entry, and the opening units against the opening entries.
+// entry, and the opening units against the opening entries; and each
+// table's dense entries against its map (pwTableDense).
 func pwUnits(t testing.TB, f *PortForward) {
 	t.Helper()
 	f.mu.Lock()
 	n, opening := 0, 0
 	for s := range f.serves {
 		s.tab.mu.Lock()
+		if err := pwTableDense(&s.tab); err != nil {
+			s.tab.mu.Unlock()
+			f.mu.Unlock()
+			t.Fatal(err)
+		}
 		for _, e := range s.tab.m {
 			n++
 			if e.state == FlowOpening {
@@ -355,6 +361,30 @@ func pwUnits(t testing.TB, f *PortForward) {
 	if u, o := f.flows.Load(), f.opening.Load(); u != int64(n) || o != int64(opening) {
 		t.Fatalf("MaxFlows units %d for %d entries, opening units %d for %d opening entries", u, n, o, opening)
 	}
+}
+
+// pwTableDense checks a table's dense entries (the victim sample's, M6-D29)
+// against its map, the table's mutex held: the same entries, each at its
+// own index, and no removed entry kept in the spare capacity (its
+// session would stay reachable).
+func pwTableDense(t *flowTable) error {
+	if len(t.all) != len(t.m) {
+		return fmt.Errorf("table: %d dense entries for %d in the map", len(t.all), len(t.m))
+	}
+	for i, e := range t.all {
+		if e == nil {
+			return fmt.Errorf("table: dense entry %d of %d is nil", i, len(t.all))
+		}
+		if e.idx != i || t.m[e.client] != e {
+			return fmt.Errorf("table: dense entry %d of %d (%v, index %d) is not its map entry at its index", i, len(t.all), e.client, e.idx)
+		}
+	}
+	for i, e := range t.all[len(t.all):cap(t.all)] {
+		if e != nil {
+			return fmt.Errorf("table: spare dense slot %d keeps a removed entry", len(t.all)+i)
+		}
+	}
+	return nil
 }
 
 // pwStatus is f.Status().UDP.

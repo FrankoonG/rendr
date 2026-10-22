@@ -28,8 +28,13 @@ import (
 // exceeds the bound. Two legs: promoted (round trips under the reply
 // rule: a stream from the warm-up) and unpromoted (the rule in force,
 // promoteActive, client datagrams only: the class is checked on every
-// datagram). Asserted in the non-race lane; the race lane (racebudget) runs
-// the promoted leg only and logs the figure.
+// datagram). Before the window, at its one P with the collector off, bursts
+// of up to 32 datagrams (dgWarm) take the path's readers through their
+// full adaptive depth, so that the read path's buffer, header and pool
+// growth falls before the window; the bound stays 40 (M6, the wave-E
+// decision on the allocation gates). Asserted in the non-race lane; the
+// race lane (racebudget) runs the promoted leg only, without the warm-up,
+// and logs the figure.
 func TestPortForwardZeroAllocs_L54(t *testing.T) {
 	t.Run("promoted", func(t *testing.T) { pwZeroAllocs(t, promoteOnReply, true) })
 	if !raceEnabled {
@@ -144,11 +149,16 @@ func pwZeroAllocs(t *testing.T, rule promoteMode, twoWay bool) {
 	if raceEnabled {
 		minRounds, minWindow = warm, 0
 	}
-	mallocs, rounds, el := countMallocs(minRounds, minWindow, round)
+	bursts := 0
+	var warmUp func() // the race lane does not assert: no warm-up (racebudget)
+	if !raceEnabled {
+		warmUp = func() { bursts = dgWarm(dgBurst(t, cli, tgt, up, down, rbuf, twoWay)) }
+	}
+	mallocs, rounds, el := countMallocsWarm(minRounds, minWindow, warmUp, round)
 	if last := map[bool][]byte{true: down, false: up}[twoWay]; !bytes.Equal(rbuf[:len(last)], last) {
 		t.Fatal("the last round delivered other bytes")
 	}
-	t.Logf("%d allocations in %d rounds of %d bytes (both ways: %v) through the ingress (%v)", mallocs, rounds, len(up), twoWay, el)
+	t.Logf("%d allocations in %d rounds of %d bytes (both ways: %v) through the ingress (%v), after %d warm-up datagrams (each way it carries) at one P", mallocs, rounds, len(up), twoWay, el, bursts)
 	if rounds < minRounds || el < minWindow {
 		t.Fatalf("load: %d rounds in %v", rounds, el)
 	}
@@ -157,7 +167,7 @@ func pwZeroAllocs(t *testing.T, rule promoteMode, twoWay bool) {
 	} else if mallocs > maxAllocs {
 		t.Fatalf("%d allocations in %d steady-state rounds (both ways: %v) over %v, want at most %d", mallocs, rounds, twoWay, el, maxAllocs)
 	}
-	n := uint64(warm + 16 + settleRuns(minRounds) + rounds)
+	n := uint64(warm + 16 + bursts + settleRuns(minRounds) + rounds)
 	st := pf.Status().UDP
 	if st.Opened != 1 || st.ToSession != n || st.ToClient != map[bool]uint64{true: n, false: 0}[twoWay] {
 		t.Fatalf("ingress status %+v: want one flow and %d datagrams", st, n)
