@@ -1180,6 +1180,15 @@ func TestPacketFactoryMisbehaviour_L51(t *testing.T) {
 				if abandoned != want {
 					t.Fatalf("Abandoned %d while the bad factory hung, want %d", abandoned, want)
 				}
+				// The released call returns on its own goroutine and leaves
+				// the count there (a late conn's close drains at most 1 s), so
+				// settle before the close requires it back at 0, as
+				// TestFactoryMisbehaviour_L51 does (M6 I3: a race-unit pass
+				// under host load found abandoned 1 at the close, run
+				// 20261022-215637-13c5).
+				synctest.Wait()
+				time.Sleep(time.Second)
+				synctest.Wait()
 				e.close()
 			})
 		})
