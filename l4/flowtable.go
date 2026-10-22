@@ -37,7 +37,8 @@ const (
 	ingressReopenHold = 5 * time.Second
 	// ingressSample entries of a full table are sampled for a victim
 	// (M6-D29); under promoteActive an open flow that never became a
-	// stream is one once its last datagram is ingressEvictIdle old.
+	// stream is one once its last datagram and its open are both
+	// ingressEvictIdle old.
 	ingressSample    = 8
 	ingressEvictIdle = time.Second
 	// ingressSettle bounds how long a flow that the stop closed waits for
@@ -127,7 +128,7 @@ type ingressFlow struct {
 	evicted bool             // removed to make room (M6-D29)
 	peerEnd bool             // its WriteTo met the far end's close (replace): its end is PeerClosed, whatever ReadFrom reports after a local close
 	pc      ingressSession   // the session once open
-	opened  time.Duration    // when DialUDP returned (the reopen rate limit)
+	opened  time.Duration    // when DialUDP returned (the reopen rate limit; the eviction's idle floor, victim)
 	firstQ  *queuedDatagram  // the first datagram's own copy when it does not ride (R1-9): it heads the queue, uncharged
 	q       []queuedDatagram // the opening queue (charged copies), oldest first
 	qBytes  int              // the queue's charge
@@ -271,12 +272,17 @@ func (s *udpServe) remove(e *ingressFlow) {
 // the mutex held): among the table's sample (at most ingressSample
 // entries drawn uniformly and independently, flowTable.sample), a held
 // entry first; under promoteActive (O-1 (a)) else the least recently
-// active open flow that never became a stream and whose last datagram is
-// at least ingressEvictIdle old. Opening flows and streams never are
-// victims; under promoteOnReply only held entries are. nil: none.
+// active open flow that never became a stream and has been idle for at
+// least ingressEvictIdle. Opening flows and streams never are victims;
+// under promoteOnReply only held entries are. nil: none.
+//
+// An open flow's activity is the later of its last datagram and its
+// open's completion (opened, written under the mutex with FlowOpen): a
+// flow whose open was slow is not idle the instant it opens, while its
+// target's reply to the datagram that waited is on its way (CP2).
 func (s *udpServe) victim(now time.Duration) *ingressFlow {
 	var best *ingressFlow
-	var bestLast int64
+	var bestActive int64
 	cutoff := int64(now - ingressEvictIdle)
 	for i := range ingressSample {
 		e := s.tab.sample(i)
@@ -287,8 +293,8 @@ func (s *udpServe) victim(now time.Duration) *ingressFlow {
 		case e.state == FlowHeld:
 			return e
 		case s.rule == promoteActive && e.state == FlowOpen && !e.class.isStream():
-			if l := e.last.Load(); l <= cutoff && (best == nil || l < bestLast) {
-				best, bestLast = e, l
+			if a := max(e.last.Load(), int64(e.opened)); a <= cutoff && (best == nil || a < bestActive) {
+				best, bestActive = e, a
 			}
 		}
 	}
