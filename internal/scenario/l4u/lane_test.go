@@ -35,6 +35,9 @@ type laneSize struct {
 	silentWarm, silentDrop          time.Duration // TestL4UBondSilentMemberKeepsStream_L39: the streaming before the blackhole, the blackhole (at least recoveryBound)
 	silentTail                      time.Duration // the judged span after the blackhole's removal (at least a second past the rejoin)
 	replySpan, replyFlip            time.Duration // TestL4UFirstReplyUnderChurn_L12_L72: the load's span and the event's time
+	massRate                        int           // TestMuxDgramMassRejoinAfterBlackhole_L27_L72: new flows per second
+	massBefore, massAfter           time.Duration // its load before the DROP and after it
+	massSessions                    int           // its sessions on the dropped path at the DROP (at least)
 }
 
 // fullLane is the design's size: what the non-race lanes run.
@@ -47,6 +50,7 @@ var fullLane = laneSize{
 	fallbackSpan: 30 * time.Second, bondSpan: 20 * time.Second,
 	silentWarm: 3 * time.Second, silentDrop: 6 * time.Second, silentTail: mlSpanAfter,
 	replySpan: 30 * time.Second, replyFlip: 15 * time.Second,
+	massRate: 300, massBefore: 7700 * time.Millisecond, massAfter: 8 * time.Second, massSessions: 2200,
 }
 
 // raceLane is the race lane's size (every rule covered once, every window
@@ -64,7 +68,9 @@ var fullLane = laneSize{
 // whichever is later; the first-reply row's 300 flows per second for 2 s
 // with its event at 0.3 s (all of it inside the build-up spans: its
 // run-wide median and build-up p99 are judged, its steady windows only in
-// the full lane).
+// the full lane); the mass rejoin's 50 flows per second, 3.2 s before its
+// DROP (≈ 160 sessions on 3 trunks of the dropped path) and 5.5 s after it
+// (its late flows from tDead + 1 s on).
 var raceLane = laneSize{
 	mlModes: []rendr.Mode{rendr.ModeSelector},
 	mlQuiet: 2 * time.Second, mlKills: 1, mlFirst: time.Second, mlKill: 3 * time.Second, mlDrop: recoveryBound, mlTail: time.Second,
@@ -74,6 +80,7 @@ var raceLane = laneSize{
 	fallbackSpan: 8 * time.Second, bondSpan: 4 * time.Second,
 	silentWarm: time.Second, silentDrop: recoveryBound, silentTail: time.Second,
 	replySpan: 2 * time.Second, replyFlip: 300 * time.Millisecond,
+	massRate: 50, massBefore: 3200 * time.Millisecond, massAfter: 5500 * time.Millisecond, massSessions: 150,
 }
 
 // TestL4URaceLane (racebudget): the lane's sizes follow the binary's
@@ -84,7 +91,8 @@ var raceLane = laneSize{
 // spans hold their windows (a blackhole lasts at least the death-detection
 // bound, the silent member is chosen from a full second of streaming, a
 // kill's judged span starts inside T, the first-reply row has flows opened
-// after its ranking moved).
+// after its ranking moved, the mass rejoin has its sessions at the DROP and
+// late flows after its verdicts).
 func TestL4URaceLane(t *testing.T) {
 	bi, ok := debug.ReadBuildInfo()
 	race, err := buildLane(bi, ok)
@@ -112,6 +120,11 @@ func TestL4URaceLane(t *testing.T) {
 		}
 		if l.replyFlip < 0 || l.replyFlip+replyMoved+time.Second/2 > l.replySpan {
 			t.Fatalf("lane %+v: the first-reply row's event leaves no flows opened %v after it", l, replyMoved)
+		}
+		// The mass rejoin: its sessions at the DROP, and late flows after
+		// the last death verdict (≤ DeadMax) + 1 s.
+		if time.Duration(l.massRate)*l.massBefore < time.Duration(l.massSessions)*time.Second || l.massAfter < kitDeadMax+time.Second+time.Second/2 {
+			t.Fatalf("lane %+v: the mass rejoin opens fewer than %d sessions before its DROP, or no flow after its verdicts + 1 s", l, l.massSessions)
 		}
 	}
 	t.Logf("race lane %v: %+v", race, lane)

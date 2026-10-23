@@ -76,7 +76,13 @@ type EstablishError struct {
 	Status    wire.PrefaceStatus // the PREFACE_ACK status when a well-formed non-OK one was read
 	PrefaceOK bool               // the PREFACE exchange completed (cadence outcome Refused, not Failed)
 	Instance  [16]byte           // the passive InstanceID when PrefaceOK; also set (PrefaceOK false) from a well-formed non-OK PREFACE_ACK of this major, e.g. the instance a GOING_AWAY names (§6.6)
-	Err       error
+	// View marks the error of a view on an already started MUX trunk (a
+	// pool fast path, Conn.awaitResponse): the PREFACE exchange PrefaceOK
+	// reports was the trunk's, made at its own dial, so the error proves
+	// nothing about the factory's path now — the session keeps the
+	// factory's failed mark (rc5: a view whose trunk died with the path).
+	View bool
+	Err  error
 }
 
 // Error implements error.

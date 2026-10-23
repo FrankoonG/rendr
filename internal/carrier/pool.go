@@ -497,7 +497,7 @@ func (p *Pool) fastPath(ctx context.Context, v *Conn, check func(*wire.PrefaceAc
 	expired := err != nil && ctx.Err() == nil && actx.Err() != nil
 	cancel()
 	if expired {
-		return nil, false, &EstablishError{Stage: "response", Cause: CauseTransportError, PrefaceOK: true, Instance: v.trunk.peer,
+		return nil, false, &EstablishError{Stage: "response", Cause: CauseTransportError, PrefaceOK: true, View: true, Instance: v.trunk.peer,
 			Err: fmt.Errorf("%w (waiting for the view's response)", errDialTimeout)}
 	}
 	return est, p.fastPathRetry(ctx, v, est, err), err
