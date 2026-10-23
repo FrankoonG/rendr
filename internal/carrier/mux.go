@@ -1321,7 +1321,7 @@ func (c *Conn) awaitResponseMux(ctx context.Context, check func(*wire.PrefaceAck
 		if st == wire.StatusOK && check != nil {
 			if err := check(&ack); err != nil {
 				c.Kill(CauseInstanceMismatch, "check: "+err.Error())
-				return nil, &EstablishError{Stage: "preface", Cause: CauseInstanceMismatch, PrefaceOK: true, Instance: t.peer, Err: err}
+				return nil, &EstablishError{Stage: "preface", Cause: CauseInstanceMismatch, PrefaceOK: true, View: true, Instance: t.peer, Err: err}
 			}
 		}
 		est := &Established{Conn: c, Ack: ack, Resp: hdr, Payload: p}
@@ -1341,10 +1341,10 @@ func (c *Conn) awaitResponseMux(ctx context.Context, check func(*wire.PrefaceAck
 		} else {
 			c.Kill(CauseLocalClose, "attempt ended before the response")
 		}
-		return nil, &EstablishError{Stage: "response", Cause: CauseLocalClose, PrefaceOK: true, Instance: t.peer, Err: context.Cause(ctx)}
+		return nil, &EstablishError{Stage: "response", Cause: CauseLocalClose, PrefaceOK: true, View: true, Instance: t.peer, Err: context.Cause(ctx)}
 	}
 	c.Kill(CauseTransportError, "the carrier ended before the response")
-	return nil, &EstablishError{Stage: "response", Cause: CauseTransportError, PrefaceOK: true, Instance: t.peer, Err: errors.New("rendr/carrier: the carrier ended before the view's response")}
+	return nil, &EstablishError{Stage: "response", Cause: CauseTransportError, PrefaceOK: true, View: true, Instance: t.peer, Err: errors.New("rendr/carrier: the carrier ended before the view's response")}
 }
 
 // usableForMux is the trunk half of the pool's usable rule (M3-D17).

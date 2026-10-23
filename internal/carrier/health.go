@@ -340,8 +340,10 @@ func (h *Health) Snapshot() *Snapshot {
 }
 
 // Subscribe rings b after every published snapshot (coalesced) until cancel
-// is called. Ring runs with the Health's lock held: per the Doorbell
-// contract it must not block, and it must not call back into Health.
+// is called; a snapshot that only records a repeated failed mark
+// (MarkFailedAt) rings nobody. Ring runs with the Health's lock held: per
+// the Doorbell contract it must not block, and it must not call back into
+// Health.
 // cancel is idempotent; once it returned, b is never rung again.
 func (h *Health) Subscribe(b Doorbell) (cancel func()) {
 	s := &healthSub{b: b}
@@ -374,6 +376,19 @@ func (h *Health) MarkFailed(i int, reason string) {
 // was committed at or after at, or whose latest successful stream probe
 // dial started at or after at, is not marked at all, and a mark already
 // set for a later failure keeps that later time.
+//
+// A mark of a factory that is marked already changes nothing a subscriber
+// ranks by: it keeps the later failure time and the latest reason, and
+// rings no subscriber; a new snapshot is stored only when the reason
+// changed (FailReason) or the mark is the current run's first evidence of
+// the factory (WaitFirst). A dead shared path reports one such mark per
+// session it carried, each from that session's death step (rc5: about
+// 2,300 in G11-dns's DROP); ringing every subscribed session at each of
+// them, under mu, cost deaths × sessions actor wake-ups, and the death
+// steps, which make this call before their next step, queued for mu
+// behind one another for seconds, among them the session whose Start
+// publishes a factory's fresh trunk to the attempts waiting for it (Pool,
+// M3-D19).
 func (h *Health) MarkFailedAt(i int, reason string, at time.Time) {
 	now := time.Now()
 	if at.IsZero() || at.After(now) {
@@ -388,11 +403,19 @@ func (h *Health) MarkFailedAt(i int, reason string, at time.Time) {
 	if !f.failed && !f.proofAt.IsZero() && !f.proofAt.Before(at) {
 		return // a round trip after the failure already proved the factory
 	}
-	if f.failed && f.markAt.After(at) {
+	if !f.failed {
+		h.markLocked(i, reason, at)
+		h.publishLocked()
+		return
+	}
+	if f.markAt.After(at) {
 		at = f.markAt
 	}
+	changed := f.reason != reason
 	h.markLocked(i, reason, at)
-	h.publishLocked()
+	if r := h.run; changed || (r != nil && r.firstDue && !r.firstClosed) {
+		h.storeLocked()
+	}
 }
 
 // Succeeded clears factory i's failed mark: any dial on i completed the
@@ -470,9 +493,21 @@ func (h *Health) noteFirstLocked(i int) {
 }
 
 // publishLocked stores a new immutable snapshot and rings the subscribers.
-// Summaries are time-independent (D25): consumers classify them at their
-// own now, so evidence ages into Stale without a new publication.
 func (h *Health) publishLocked() {
+	h.storeLocked()
+	if hk := h.env.Hooks; hk != nil && hk.HealthRing != nil {
+		hk.HealthRing(len(h.subs))
+	}
+	for sub := range h.subs {
+		sub.b.Ring()
+	}
+}
+
+// storeLocked stores a new immutable snapshot without ringing the
+// subscribers (publishLocked rings them). Summaries are time-independent
+// (D25): consumers classify them at their own now, so evidence ages into
+// Stale without a new publication.
+func (h *Health) storeLocked() {
 	h.version++
 	n := len(h.fac)
 	s := &Snapshot{
@@ -496,9 +531,6 @@ func (h *Health) publishLocked() {
 	h.snap.Store(s)
 	if r := h.run; r != nil && r.firstDue {
 		r.closeFirstLocked()
-	}
-	for sub := range h.subs {
-		sub.b.Ring()
 	}
 }
 
