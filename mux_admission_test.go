@@ -716,6 +716,390 @@ func TestMuxJoinAtPassiveViewCap_L48(t *testing.T) {
 	})
 }
 
+// TestMuxCloseLeavesNoPoolTrunk_L52 (L52, C24, invariant 4; M3 design
+// §A4.6: MUX trunks close after their last view or at the M1 close bound;
+// m6 rc6): Runtime.Close leaves no dialer MUX trunk behind. Close posts
+// nothing to a pool trunk itself: the trunk drains as its views end —
+// through their sessions' Shutdown (RST, GOAWAY, DETACH), the passive's
+// DETACH or the trunk's death — and the pool closes it at its last view.
+// So a pool trunk whose CLOSE is still unwritten at the close bound,
+// min(1 s, DeadMax) — its views held by no session of the closing Runtime,
+// or its writer stuck in the embedder's Write — is killed then, as the
+// passive's trunks are, and joined. On 33de081 Close's pool join gave up at
+// its bound and Close returned with the trunk running (race-unit gate run
+// 1, TestMuxJoinAtPassiveViewCap_L48/bond: its two sessions had finished
+// before Close's Shutdown reached them, so no GOAWAY crossed, and the views
+// the row injected kept both full trunks).
+//
+// The bond scenario at the passive's view cap of
+// TestMuxJoinAtPassiveViewCap_L48: two factories, the passive holds four
+// views per trunk; a bond session opens trunks A and B; three injected
+// OPENs per trunk fill them (mxInject: views no session holds, which the
+// passive confirms); the session finishes cleanly and a fourth injected
+// OPEN per trunk refills each to the cap. A bond Dial then has its OPEN
+// refused CodeMuxFull on one full trunk and its JOIN on the other, each
+// followed by a dial of a new trunk, and the dialer's Runtime closes at
+// each phase:
+//
+//   - OPEN refusal in flight: queued at the passive, held in the tampers;
+//   - OPEN redial: the factory call after the OPEN's refusal, held until
+//     its context ends;
+//   - JOIN refusal in flight: queued at the passive, held in the tampers;
+//   - JOIN redial: the factory call after the JOIN's refusal, held;
+//   - members attached: both members on their new trunks;
+//   - sessions ended: the bond session finished cleanly before Close (the
+//     gate's interleaving).
+//
+// Rows "stuck writer", without injected views: a selector session's trunk
+// whose writer is stuck in the embedder's Write (its tamper stopped
+// reading; WriteStall and both ends' death deadline beyond Close's bound),
+// with the session open at Close, and with the session ended before Close
+// (Linger 1 s): the pool retired the trunk at its last view, and its CLOSE
+// is stuck behind that Write.
+//
+// After Close returns, within its bound: the dialer's Status.Mux.Carriers
+// and Views are 0, BufferedBytes 0, Abandoned 0, no session or
+// reservation, and its pool is joined; once the passive and the links
+// closed, no rendr goroutine is left and rendr closed every dialer conn
+// exactly once.
+func TestMuxCloseLeavesNoPoolTrunk_L52(t *testing.T) {
+	const dialTimeout = 10 * time.Second
+	type phase int
+	const (
+		openInFlight phase = iota
+		openRedial
+		joinInFlight
+		joinRedial
+		attached
+		ended
+	)
+	for _, ph := range []struct {
+		name string
+		at   phase
+	}{
+		{"OPEN refusal in flight", openInFlight},
+		{"OPEN redial", openRedial},
+		{"JOIN refusal in flight", joinInFlight},
+		{"JOIN redial", joinRedial},
+		{"members attached", attached},
+		{"sessions ended", ended},
+	} {
+		t.Run(ph.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				k := newPCKit(t, testhooks.Overrides{}, testhooks.Overrides{}, "a", "b")
+				pool := k.peer.pool
+				s0, q0 := e2eOpen(t, k.peer, k.ln, DialOptions{Mode: ModeBond})
+				mxWait(t, dialTimeout, "the first bond's members", func() bool { return mxMembers(s0) == 2 })
+				acc := newAcceptLog(k.ln, func(pc *PendingConn) (*Conn, error) { return pc.Confirm() })
+				sid := 600
+				inject := func(f int) {
+					t.Helper()
+					_, st, code, err := mxInject(context.Background(), k.peer, f, wire.TypeOpen, wpOpen(wpSID(sid), wire.KindStream, 1, nil))
+					sid++
+					if err != nil || st != wire.StatusOK {
+						t.Fatalf("injected OPEN on factory %d: %v code %d, %v", f, st, code, err)
+					}
+				}
+				for f := range 2 {
+					for range 3 {
+						inject(f)
+					}
+				}
+				e2eFinish(t, s0, q0) // its views leave A and B
+				for f := range 2 {
+					inject(f)
+				}
+				for _, tr := range mxTrunkSet(k.p) {
+					if n := tr.Views(); n != 4 {
+						t.Fatalf("a passive trunk holds %d views, want its cap 4", n)
+					}
+				}
+				if st := k.d.Status().Mux; st.Carriers != 2 || st.Views != 8 {
+					t.Fatalf("premise: dialer MUX %+v, want trunks A and B with four injected views each", st)
+				}
+
+				var once atomic.Bool
+				switch ph.at {
+				case openInFlight: // the bond's OPEN on a full trunk: its answer stays in the tampers
+					k.onView(func() {
+						if once.CompareAndSwap(false, true) {
+							k.holdDown()
+						}
+					})
+				case joinInFlight: // the OPEN, then the JOIN on the other full trunk
+					var views atomic.Int32
+					k.onView(func() {
+						if views.Add(1) == 2 {
+							k.holdDown()
+						}
+					})
+				case openRedial, joinRedial:
+					mf := uint64(1)
+					if ph.at == joinRedial {
+						mf = 2
+					}
+					k.holdDial(func(int) bool { return pool.Stats().MuxFull == mf && once.CompareAndSwap(false, true) })
+				}
+				ch := e2eDialAsync(context.Background(), k.peer, DialOptions{Mode: ModeBond})
+				var s *Conn
+				switch ph.at {
+				case openInFlight, joinInFlight:
+					want := uint64(1)
+					if ph.at == joinInFlight {
+						want = 2
+					}
+					mxWait(t, dialTimeout, "the refusal queued at the passive", func() bool { return k.p.Status().Mux.MuxFull == want })
+					if n := pool.Stats().MuxFull; n != want-1 {
+						t.Fatalf("premise: the dialer's pool got %d CodeMuxFull answers, want %d (the last one held)", n, want-1)
+					}
+				case openRedial, joinRedial:
+					select {
+					case <-k.held:
+					case <-time.After(dialTimeout):
+						t.Fatalf("no factory call after the refusal within %v", dialTimeout)
+					}
+				default:
+					r := <-ch
+					if r.err != nil {
+						t.Fatalf("Dial: %v", r.err)
+					}
+					s = r.c
+					mxWait(t, dialTimeout, "the second member through a JOIN", func() bool { return mxMembers(s) == 2 })
+					if ms := pool.Stats().MuxFull; ms < 2 {
+						t.Fatalf("pool MuxFull %d, want the OPEN's and the JOIN's", ms)
+					}
+					if ph.at == ended {
+						var q *Conn
+						mxWait(t, dialTimeout, "the bond's passive end", func() bool {
+							acc.mu.Lock()
+							defer acc.mu.Unlock()
+							for _, c := range acc.conns {
+								if c.ID() == s.ID() {
+									q = c
+								}
+							}
+							return q != nil
+						})
+						e2eFinish(t, s, q)
+					}
+				}
+				k.closeDialer(t)
+				if s == nil {
+					s = (<-ch).c // the JOIN rows: the Dial returned with its first member
+				}
+				if s != nil {
+					s.Close()
+				}
+				k.finish(t, acc)
+			})
+		})
+	}
+	for _, ended := range []bool{false, true} {
+		name := "stuck writer"
+		if ended {
+			name = "stuck writer, session ended"
+		}
+		t.Run(name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				// The write stall bound (WriteStall, up to 30 s) and both
+				// ends' death deadline beyond Close's bound: neither the
+				// trunk's watchdog nor a death ends it during Close.
+				slow := testhooks.Overrides{WriteStall: 10 * time.Second, DeadMin: 10 * time.Second, DeadMax: 10 * time.Second}
+				dov := slow
+				dov.Linger = time.Second
+				k := newPCKit(t, dov, slow, "a")
+				dc, pc := e2eOpen(t, k.peer, k.ln, DialOptions{})
+				e2eExchange(t, dc, pc, 64<<10, 1)
+				tp := k.taps[0].tap(t, 0)
+				tp.Hold(rendrtest.Up) // the tamper stops reading the dialer's conn: the next Write blocks
+				if _, err := dc.Write(make([]byte, 256<<10)); err != nil {
+					t.Fatal(err)
+				}
+				synctest.Wait()
+				if n := tp.Stats().Held; n == 0 {
+					t.Fatal("stimulus: the tamper held no write of the dialer")
+				}
+				if ended {
+					// Its FIN unplaced, the session ends at Linger and kills
+					// its view at its close bound; the pool then retires the
+					// trunk, whose CLOSE waits behind the stuck Write.
+					dc.Close()
+					e2eDone(t, dc, 5*time.Second)
+					synctest.Wait() // the pool's view hook ran
+					if st := k.d.Status().Mux; st.Carriers != 0 || st.Views != 0 {
+						t.Fatalf("premise: dialer MUX %+v, want the trunk retired at its last view", st)
+					}
+					if st := k.d.Status(); st.BufferedBytes == 0 {
+						t.Fatal("premise: nothing charged, want the retired trunk's reader stage")
+					}
+				}
+				k.closeDialer(t)
+				pc.Close()
+				k.finish(t, nil)
+			})
+		})
+	}
+}
+
+// pcKit is the scenario kit of TestMuxCloseLeavesNoPoolTrunk_L52: the e2e
+// pair (the passive holds four views per trunk), one dialer Peer over a
+// tapped factory per name whose conns are counted (pcConn), a held factory
+// call and a hook at every view a dial attempt opens on a live trunk.
+type pcKit struct {
+	*e2ePair
+	taps []*mxTaps
+	peer *Peer
+	view atomic.Pointer[func()]         // Hooks.BeforeOpenView
+	hold atomic.Pointer[func(int) bool] // whether a factory call (of factory f) is held until its context ends
+	held chan int                       // the factory of the held call
+
+	mu    sync.Mutex
+	conns []*pcConn
+}
+
+// pcConn counts the Close calls of a dialer conn.
+type pcConn struct {
+	net.Conn
+	closes atomic.Int32
+}
+
+func (c *pcConn) Close() error {
+	c.closes.Add(1)
+	return c.Conn.Close()
+}
+
+// newPCKit builds the kit with the dialer's overrides dov and the
+// passive's pov (each with its own hooks; the passive holds four views per
+// trunk).
+func newPCKit(t *testing.T, dov, pov testhooks.Overrides, names ...string) *pcKit {
+	t.Helper()
+	k := &pcKit{held: make(chan int, 1)}
+	dov.Hooks = &testhooks.Hooks{BeforeOpenView: func(uint32, uint32) {
+		if f := k.view.Load(); f != nil {
+			(*f)()
+		}
+	}}
+	pov.MuxMaxViews = 4
+	k.e2ePair = &e2ePair{t: t, d: wpTestRuntime(t, Config{}, &dov), p: wpTestRuntime(t, Config{}, &pov)}
+	k.ln = wpListen(t, k.p, ListenConfig{AcceptBacklog: 64})
+	cs := make([]Carrier, len(names))
+	for i, n := range names {
+		l := rendrtest.NewLink(rendrtest.LinkConfig{Name: n, Accept: k.ln.Handle})
+		t.Cleanup(l.Close)
+		k.links = append(k.links, l)
+		tp := &mxTaps{}
+		t.Cleanup(tp.close)
+		k.taps = append(k.taps, tp)
+		cs[i] = k.factory(i, l, tp)
+	}
+	k.peer = k.mxPeer(cs...)
+	return k
+}
+
+// factory is mxTapCarrier's factory over l with each conn counted and a
+// call that hold selects held until its context ends.
+func (k *pcKit) factory(f int, l *rendrtest.Link, taps *mxTaps) StreamCarrier {
+	sc := mxTapCarrier(l, taps)
+	dial := sc.Dial
+	sc.Dial = func(ctx context.Context) (net.Conn, error) {
+		if h := k.hold.Load(); h != nil && (*h)(f) {
+			k.held <- f
+			<-ctx.Done()
+			return nil, context.Cause(ctx)
+		}
+		c, err := dial(ctx)
+		if err != nil {
+			return nil, err
+		}
+		pc := &pcConn{Conn: c}
+		k.mu.Lock()
+		k.conns = append(k.conns, pc)
+		k.mu.Unlock()
+		return pc, nil
+	}
+	return sc
+}
+
+func (k *pcKit) onView(f func())           { k.view.Store(&f) }
+func (k *pcKit) holdDial(f func(int) bool) { k.hold.Store(&f) }
+
+// holdDown stops every tamper so far in the passive-to-dialer direction.
+func (k *pcKit) holdDown() {
+	for _, m := range k.taps {
+		m.mu.Lock()
+		for _, tp := range m.tps {
+			tp.Hold(rendrtest.Down)
+		}
+		m.mu.Unlock()
+	}
+}
+
+// closeDialer closes the dialer's Runtime and requires that it left
+// nothing: Close within its bound, no MUX trunk or view, no byte charged,
+// nothing abandoned, no session or reservation, and its pool joined.
+func (k *pcKit) closeDialer(t *testing.T) {
+	t.Helper()
+	eff := k.d.eff
+	bound := max(min(time.Second, eff.cfg.DeadMax)+eff.timing.AbandonWait, 2*eff.timing.AbandonWait) + closeSlack
+	start := time.Now()
+	k.d.Close()
+	if el := time.Since(start); el > bound {
+		t.Errorf("Runtime.Close took %v, bound %v", el, bound)
+	}
+	if st := k.d.Status(); st.Mux.Carriers != 0 || st.Mux.Views != 0 || st.BufferedBytes != 0 || st.Abandoned != 0 {
+		t.Fatalf("after Runtime.Close the dialer still has %d MUX carriers with %d views, %d bytes charged, %d abandoned",
+			st.Mux.Carriers, st.Mux.Views, st.BufferedBytes, st.Abandoned)
+	}
+	wpNoState(t, k.d)
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := k.peer.pool.Wait(done); err != nil {
+		t.Fatalf("the pool still counts a trunk after Runtime.Close: %v", err)
+	}
+}
+
+// finish ends the passive side and requires no rendr goroutine left and
+// every dialer conn closed exactly once.
+func (k *pcKit) finish(t *testing.T, acc *acceptLog) {
+	t.Helper()
+	for _, m := range k.taps {
+		m.mu.Lock()
+		for _, tp := range m.tps {
+			tp.Release(rendrtest.Up)
+			tp.Release(rendrtest.Down)
+		}
+		m.mu.Unlock()
+	}
+	if acc != nil {
+		acc.stop()
+		for _, c := range acc.conns {
+			c.Close()
+		}
+	}
+	k.p.Close()
+	for _, l := range k.links {
+		l.Close()
+	}
+	for _, m := range k.taps {
+		m.close()
+	}
+	wpNoState(t, k.p)
+	if n := k.p.Status().Abandoned; n != 0 {
+		t.Fatalf("the passive abandoned %d goroutines", n)
+	}
+	synctest.Wait()
+	if n, left := rendrGoroutines(); n != 0 {
+		t.Fatalf("rendr goroutines after both Close calls: %v", left)
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	for i, c := range k.conns {
+		if n := c.closes.Load(); n != 1 {
+			t.Fatalf("dialer conn %d (of %d) closed %d times", i, len(k.conns), n)
+		}
+	}
+}
+
 // TestMuxWithdrawAtAsyncAttach_R1_5 (R1-5, §A3.3; WP16 W1): a Dial whose
 // opening race placed its second OPEN as a view on another live trunk —
 // which the passive admits through AttachOpen, attached only when the

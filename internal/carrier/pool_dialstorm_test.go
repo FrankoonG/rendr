@@ -610,7 +610,7 @@ func TestPoolWaitJoinsWatchers(t *testing.T) {
 			}
 			synctest.Wait()
 			pt.p.mu.Lock()
-			live, watch := pt.p.live, pt.p.watch
+			live, watch := len(pt.p.live), pt.p.watch
 			pt.p.mu.Unlock()
 			if live != 0 || watch != 1 {
 				t.Fatalf("stimulus: %d live trunks and %d watchers, want 0 and 1 (the trunk done before its watcher ended)", live, watch)
@@ -667,7 +667,7 @@ func TestPoolKeepsNoDoneTrunk(t *testing.T) {
 		}
 		synctest.Wait()
 		pt.p.mu.Lock()
-		live, watch, listed, extra, dialing := pt.p.live, pt.p.watch, len(pt.p.trunks[0]), len(pt.p.extra), pt.p.dialing[0]
+		live, watch, listed, extra, dialing := len(pt.p.live), pt.p.watch, len(pt.p.trunks[0]), len(pt.p.extra), pt.p.dialing[0]
 		pt.p.mu.Unlock()
 		if live != 0 || watch != 0 || listed != 0 || extra != 0 || dialing != nil {
 			t.Fatalf("after %d done trunks: live %d, watchers %d, listed %d, extra %d, dial in flight %v; want none", n, live, watch, listed, extra, dialing != nil)

@@ -47,7 +47,9 @@ import (
 // a trunk past its Done: the pool's goroutine of a fresh trunk lives until
 // the trunk is settled (published) or, for a trunk that is discarded or
 // retired unpublished, until its Done; the view hook that retires a
-// published trunk at its last view waits for the trunk's Done.
+// published trunk at its last view waits for the trunk's Done. At
+// Runtime.Close's close bound the trunks it still counts whose CLOSE is
+// unwritten are killed (Kill).
 //
 // Locks: mu is per Pool and never taken under a session lock, Conn.mu or
 // trunk.mx; it may take the trunk's leaf locks trunk.mx (allocating a
@@ -65,7 +67,7 @@ type Pool struct {
 	dialing []*dialWait         // per factory and session kind (dialSlot): the dial in flight that later attempts wait for (nil: none)
 	full    map[*trunk]bool     // published trunks that answered CAPACITY CodeMuxFull, until a view leaves (§A5.8)
 	extra   map[*Conn]*dialWait // fresh trunks of dials outside dialing (dialWait: a verdict grace ran out), until settled
-	live    int                 // fresh trunks whose Done is still open (Wait)
+	live    map[*Conn]struct{}  // fresh trunks (view 1) whose Done is still open (Wait, Kill)
 	watch   int                 // watchFresh goroutines running
 	idle    chan struct{}       // Wait's: closed (and reset) when Close runs, a trunk is done or a watcher ends
 	closed  bool
@@ -226,6 +228,7 @@ func NewPool(env *Env, fs []Factory) *Pool {
 		joinStall:   env.Timing.withDefaults().DeadMin,
 		trunks:      make([][]*Conn, len(fs)),
 		dialing:     make([]*dialWait, 2*len(fs)),
+		live:        make(map[*Conn]struct{}),
 	}
 }
 
@@ -615,7 +618,7 @@ func (p *Pool) claimed(ctx context.Context, w *dialWait, est *Established, err e
 			// have dropped it meanwhile, so that Status.Mux and
 			// Runtime.Close's join see the trunk (WP16 API-1).
 			relive := p.closed && p.env.PoolLive != nil
-			p.live++
+			p.live[c] = struct{}{}
 			p.watch++
 			p.mu.Unlock()
 			if relive {
@@ -677,7 +680,7 @@ func (p *Pool) watchFresh(w *dialWait, c *Conn) {
 	}
 	p.mu.Lock()
 	if !kept {
-		p.live--
+		delete(p.live, c)
 	}
 	p.watch--
 	p.idleLocked()
@@ -777,7 +780,7 @@ func (p *Pool) viewGone(f int, c, v *Conn) {
 	// pool keeps no reference to a trunk past its Done.
 	<-c.tdone
 	p.mu.Lock()
-	p.live--
+	delete(p.live, c)
 	p.idleLocked()
 	p.mu.Unlock()
 }
@@ -801,6 +804,27 @@ func (p *Pool) Close() {
 	p.mu.Unlock()
 }
 
+// Kill kills every trunk the pool counts whose CLOSE is still unwritten
+// (Runtime.Close's close bound, C24; L52): a trunk drains only as its views
+// end, and one whose views no session of the closing Runtime ends, or whose
+// writer is stuck in the embedder's Write, would outlive Close. Every view
+// on a killed trunk ends with it, and the pool settles and joins it as any
+// trunk that died (Wait). A trunk whose CLOSE was written ends within its
+// own retirement bound and is left alone.
+func (p *Pool) Kill(cause Cause, detail string) {
+	p.mu.Lock()
+	cs := make([]*Conn, 0, len(p.live))
+	for c := range p.live {
+		cs = append(cs, c)
+	}
+	p.mu.Unlock()
+	for _, c := range cs {
+		if !c.closeSent.Load() {
+			c.killCarrier(cause, detail)
+		}
+	}
+}
+
 // Wait joins the pool (Runtime.Close, L52): it returns nil once Close ran,
 // every trunk the pool dialled is done (its goroutines finished) and the
 // pool's watchers ended, or context.Cause(ctx) when ctx ends first. A
@@ -808,7 +832,7 @@ func (p *Pool) Close() {
 func (p *Pool) Wait(ctx context.Context) error {
 	for {
 		p.mu.Lock()
-		if p.closed && p.live == 0 && p.watch == 0 {
+		if p.closed && len(p.live) == 0 && p.watch == 0 {
 			p.mu.Unlock()
 			return nil
 		}
