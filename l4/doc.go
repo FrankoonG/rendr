@@ -50,7 +50,10 @@
 // CONNECT metadata only and ParseUDPMetadata UDP metadata only; each
 // answers the other command, and every unknown one, CodeBadCommand, so the
 // parser is the kind check (Handle uses ParseMetadata, HandleUDP
-// ParseUDPMetadata). AppendMetadata encodes both. The dialer resolves
+// ParseUDPMetadata). AppendMetadata encodes both; its target is "host:port"
+// as net.JoinHostPort writes it, so square brackets enclose an IPv6 address
+// and nothing else ("[a.test]:80" and "[192.0.2.1]:80" are refused, not read
+// as a.test or 192.0.2.1). The dialer resolves
 // nothing: a name is resolved by the passive, with its DNS view. The header
 // is at most 262 bytes (264 with flen); a UDP flow's metadata is at most
 // 65,535 bytes, and the first datagram rides in it only when the whole

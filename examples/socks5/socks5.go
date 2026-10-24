@@ -194,7 +194,9 @@ type request struct {
 
 // hostport is the request's destination as l4.Dial takes it; l4 applies
 // its address grammar (a bad name or port 0 is l4.ErrBadAddress; an IP
-// literal in domain form travels as that address).
+// literal in domain form travels as that address; a name in square
+// brackets, which the host:port form would read as what they enclose, is
+// l4.ErrBadAddress too), so a name never changes meaning on its way.
 func (q request) hostport() string {
 	host := string(q.addr)
 	if q.atyp != atypDomain {

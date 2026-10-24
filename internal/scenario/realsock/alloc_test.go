@@ -41,9 +41,44 @@ import (
 // 50 PING intervals (PingBusy 10 ms), the raw number of heap allocations of every
 // goroutine (runtime.MemStats.Mallocs, GC off, one P) is at most 40: an
 // allocation per frame, per round, per PING or per PONG alone exceeds it.
+// The sessions' Window is the minimum, 256 KiB (msWindow), so a late ACK
+// lets them hold only a few send chunks more than the warm-up left in the
+// pool (TestMuxSteadyStateLateAckZeroAllocs_L41_L54).
 // Asserted in the non-race lane; the race lane runs the same window
 // without the assertion and logs the figure (R-F1).
-func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
+func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) { msSteadyState(t, 0) }
+
+// TestMuxSteadyStateLateAckZeroAllocs_L41_L54 (M6 rc7): the same window
+// with late ACKs, under the same bound. Stimulus: msAckHolds times in the
+// window, after each fifth of its minimum rounds, the passive's trunk
+// writer, which carries the ACKs (testhooks BeforeWrite on the passive), is
+// held for msAckHold, below the write watchdog's first stage (PingBusy);
+// every hold ended inside the window. Gate run 1's realsock sweep counted 70
+// allocations in one window of the gate (0 in the other 59): a write of
+// that writer delayed a few milliseconds on a loaded VM (at one P the
+// dialer's rounds go on while the write waits in the kernel) left the
+// delivered data unacknowledged (ACK = delivered), and with the default
+// 8-MiB Window the dialer's sessions went on reserving send chunks beyond
+// what the warm-up had left in the pool, two allocations per chunk. With
+// that Window one such hold costs 0 to 250 allocations, depending on how
+// far the trunk's capacity lets the dialer run ahead; four of them failed
+// the bound in every run.
+func TestMuxSteadyStateLateAckZeroAllocs_L41_L54(t *testing.T) { msSteadyState(t, msAckHold) }
+
+// The late ACKs of TestMuxSteadyStateLateAckZeroAllocs_L41_L54, and the
+// sessions' Window: the minimum, 256 KiB, far above what a round and an
+// ACK cadence (64 KiB, internal/session's defaultAckEvery) leave
+// unacknowledged; it also bounds a carrier's capacity, so it bounds what a
+// late ACK lets the dialer hold.
+const (
+	msAckHold  = 8 * time.Millisecond
+	msAckHolds = 4
+	msWindow   = 256 << 10
+)
+
+// msSteadyState is the body of both rows: hold > 0 holds the passive's
+// trunk writer msAckHolds times for hold during the window.
+func msSteadyState(t *testing.T, hold time.Duration) {
 	t.Cleanup(rendrtest.AssertNoLeak(t))
 	const (
 		n         = 4
@@ -52,7 +87,7 @@ func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 		maxAllocs = 40
 		minFrames = 100 * maxAllocs
 	)
-	cfg := rendr.Config{PingBusy: 10 * time.Millisecond}
+	cfg := rendr.Config{PingBusy: 10 * time.Millisecond, Window: msWindow}
 	// Stimulus counters, kept by the dialer's trunk writer (hooks on the
 	// dialer only; atomics, no allocation): its DRR Fill calls, the first
 	// handle filled since its last physical write, whether another one
@@ -75,8 +110,23 @@ func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 			}
 		},
 	}}
+	// The late ACKs: each armed hold makes the passive's next physical
+	// write wait for hold (and its ACKs with it), then counts it.
+	var holdArmed atomic.Bool
+	var holds atomic.Int64
+	var pov *testhooks.Overrides
+	if hold > 0 {
+		pov = &testhooks.Overrides{Hooks: &testhooks.Hooks{
+			BeforeWrite: func(uint32, int, int) {
+				if holdArmed.CompareAndSwap(true, false) {
+					time.Sleep(hold)
+					holds.Add(1)
+				}
+			},
+		}}
+	}
 	l := msTCPListen(t)
-	m := newMsPairOv(t, cfg, dov, nil, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromListener(l)}},
+	m := newMsPairOv(t, cfg, dov, pov, rendr.ListenConfig{Sources: []rendr.Source{rendr.FromListener(l)}},
 		[]rendr.Carrier{tcp.Carrier("direct", "tcp", l.Addr().String(), tcp.Options{})})
 	dcs, pcs := make([]*rendr.Conn, n), make([]*rendr.Conn, n)
 	for i := range n {
@@ -90,7 +140,11 @@ func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 		t.Fatal(err)
 	}
 	rbuf := make([]byte, size)
+	calls, arm0, armEvery := 0, -1, 0 // round calls; the calls that arm a hold
 	round := func() {
+		if calls++; arm0 >= 0 && calls > arm0 && (calls-arm0)%armEvery == 0 && (calls-arm0)/armEvery <= msAckHolds {
+			holdArmed.Store(true)
+		}
 		for i := range n {
 			if k, err := dcs[i].Write(wbuf); k != size || err != nil {
 				t.Fatalf("session %d: Write = %d, %v", i, k, err)
@@ -120,6 +174,9 @@ func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 		t.Fatalf("load: %.1f frames per round of %d writes during the warm-up", perRound, n)
 	}
 	minRounds, minWindow := int(float64(minFrames)/perRound*1.25)+1, 50*cfg.PingBusy
+	if hold > 0 { // the window's first run is call arm0+1
+		arm0, armEvery = calls+msRefill, max(minRounds/(msAckHolds+1), 1)
+	}
 	trunk := dcs[0].Status().Carriers[0].ID
 	f1, d1, w1 := frames(), drrFills.Load(), multiWrites.Load()
 	mallocs, rounds, el := msCountMallocs(minRounds, minWindow, round)
@@ -142,6 +199,9 @@ func TestMuxSteadyStateZeroAllocs_L41_L54(t *testing.T) {
 	// least (measured: about one per round).
 	if drr < int64(rounds) || 2*multi < int64(rounds) {
 		t.Fatalf("stimulus: %d DRR Fill calls and %d writes of two views or more in %d rounds, want ≥ %d and ≥ %d", drr, multi, rounds, rounds, (rounds+1)/2)
+	}
+	if h := holds.Load(); hold > 0 && h != msAckHolds {
+		t.Fatalf("stimulus: the passive's writer was held %v %d times inside the window, want %d", hold, h, msAckHolds)
 	}
 	t.Logf("%d allocations in %d rounds of %d × %d KiB (%v; the dialer's views wrote %d frames; %d DRR Fill calls; %d writes of two views or more)", mallocs, rounds, n, size>>10, el, wrote, drr, multi)
 	if msRace {

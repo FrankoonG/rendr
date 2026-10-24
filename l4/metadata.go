@@ -17,7 +17,7 @@ const (
 // Request is what an OPEN's L4 metadata carries.
 type Request struct {
 	Cmd  uint8  // CmdConnect or CmdUDP
-	Addr string // "host:port"; an IPv6 host in brackets; a host name is resolved by the passive
+	Addr string // "host:port"; an IPv6 host, and only an IPv6 host, in brackets; a host name is resolved by the passive
 	App  []byte // the application's own metadata (aliases the decoded input)
 	// First is, for CmdUDP, the flow's first datagram when it rode the OPEN
 	// (aliases the decoded input; nil otherwise, always nil for CmdConnect).
@@ -62,7 +62,9 @@ const (
 // the header for r.Addr, then, for CmdUDP, the length of r.First and
 // r.First, then r.App. An IP host is encoded as an address (an IPv4-mapped
 // IPv6 address as IPv4), any other host as a domain; the dialer resolves
-// nothing. CmdConnect has no first datagram (r.First must be empty). For
+// nothing. Square brackets enclose an IPv6 address only (r.Addr as
+// net.JoinHostPort writes it): "[a.test]:80" and "[192.0.2.1]:80" are
+// refused, not read as a.test or 192.0.2.1. CmdConnect has no first datagram (r.First must be empty). For
 // CmdUDP an empty r.First is encoded as absent (length 0), and a First, or
 // a whole metadata, longer than 65,535 bytes is refused ("first datagram
 // too long"). A Cmd other than CmdConnect and CmdUDP (the zero value
@@ -88,14 +90,24 @@ func AppendMetadata(dst []byte, r Request) ([]byte, error) {
 		ip   [16]byte // atypIPv4: the first 4 bytes
 		hdr  int      // the header's length, through the port
 	)
+	// Square brackets enclose an IPv6 address and nothing else, as
+	// netip.ParseAddrPort reads them. net.SplitHostPort strips them from
+	// any host, and net.JoinHostPort adds them only to a host with a
+	// colon, so a host "[x]" joined with its port would otherwise travel
+	// as the name or address x (a SOCKS5 domain "[A000]" as A000).
+	// SplitHostPort succeeded, so r.Addr is not empty.
+	bracketed := r.Addr[0] == '['
 	// A valid domain never parses as an IP address (its last label is not
 	// numeric and it has no colon), so a valid name is encoded without
 	// trying netip.ParseAddr, whose error would allocate.
-	if why := checkName(host); why == "" {
+	if why := checkName(host); why == "" && !bracketed {
 		atyp, hdr = atypDomain, metaFixed+1+len(host)+2
 	} else {
+		if bracketed {
+			why = "square brackets around a host that is not an IPv6 address"
+		}
 		a, err := netip.ParseAddr(host)
-		if err != nil {
+		if err != nil || bracketed && !a.Is6() {
 			return dst, fmt.Errorf("%w: %q: %s", ErrBadAddress, r.Addr, why)
 		}
 		if a.Zone() != "" {

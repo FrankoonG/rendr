@@ -161,7 +161,7 @@ func TestL4MetadataUDPRoundTrip_L44(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, s := range []string{"[::ffff:127.0.0.1]:53", "[::FFFF:7f00:1]:53", "[127.0.0.1]:53", "127.0.0.1:053"} {
+	for _, s := range []string{"[::ffff:127.0.0.1]:53", "[::FFFF:7f00:1]:53", "127.0.0.1:053"} {
 		got, err := AppendMetadata(nil, Request{Cmd: CmdUDP, Addr: s, First: []byte{1}})
 		if err != nil || !bytes.Equal(got, want) {
 			t.Errorf("AppendMetadata(CmdUDP, %q) = %x, %v; want %x", s, got, err, want)
@@ -172,6 +172,7 @@ func TestL4MetadataUDPRoundTrip_L44(t *testing.T) {
 		"", "localhost", ":53", "localhost:0", "localhost:65536", "0.0.0.0:53", "255.255.255.255:53",
 		"224.0.0.251:5353", "[::]:53", "[ff02::fb]:5353", "[::ffff:0.0.0.0]:53", "[fe80::1%eth0]:53",
 		"127.1:53", "0x7f.1:53", "a..b:53", "a b:53", strings.Repeat("a", 64) + ":53",
+		"[a.test]:53", "[127.0.0.1]:53", "[A000]:12336",
 	} {
 		dst := bytes.Clone(prefix)
 		out, err := AppendMetadata(dst, Request{Cmd: CmdUDP, Addr: addr, First: []byte("q")})
