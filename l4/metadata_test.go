@@ -340,7 +340,7 @@ func TestL4MetadataCanonical_L44(t *testing.T) {
 func TestL4MetadataJoinedHost_L44(t *testing.T) {
 	refused := []string{
 		"[A000]", "[a.test]", "[localhost]", "[192.0.2.1]", "[127.0.0.1]", "[::1]", "[2001:db8::1]", "[]",
-		"[", "]", "[a", "a]", "a[b", "a]b", "[a]b", "a:b", "a.test:80", "1.2.3.4:5", "::1]", "[::1",
+		"[", "]", "[a", "a]", "a[b", "a]b", "[a]b", "a:b", "a.test:80", "192.0.2.4:5", "::1]", "[::1",
 		"a\x00b", "a b", " a", "a ", "a\tb", "a\nb", "a\rb", "a%b", "a/b", "a#b", "a@b", "a?b", "a\\b",
 		"fe80::1%eth0", "", ".", "a..b",
 	}
