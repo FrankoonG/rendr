@@ -793,6 +793,7 @@ func TestPortForwardTCP_L02(t *testing.T) {
 				{"no peer", &PortForward{}, ptLoopback, ptTarget, errNoPeer},
 				{"bad target", &PortForward{Peer: peer}, ptLoopback, "no-port", ErrBadAddress},
 				{"port 0", &PortForward{Peer: peer}, ptLoopback, "target.test:0", ErrBadAddress},
+				{"bracketed name", &PortForward{Peer: peer}, ptLoopback, "[target.test]:80", ErrBadAddress},
 				{"non-loopback", &PortForward{Peer: peer}, &net.TCPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 80}, ptTarget, ErrNonLoopback},
 				{"unspecified", &PortForward{Peer: peer}, &net.TCPAddr{Port: 80}, ptTarget, ErrNonLoopback},
 				{"ipv6 unspecified", &PortForward{Peer: peer}, &net.TCPAddr{IP: net.IPv6unspecified, Port: 80}, ptTarget, ErrNonLoopback},

@@ -23,6 +23,7 @@ func TestDialBadAddressNoIO(t *testing.T) {
 			"", "host", "host:", "host:0", "host:65536", ":80", "0.0.0.0:80", "[::]:80",
 			"224.0.0.1:80", "255.255.255.255:80", "[fe80::1%eth0]:80", "a..b:80",
 			"-x.test:http", "127.1:80", "x.0x10:80", strings.Repeat("a", 64) + ".test:80",
+			"[a.test]:80", "[192.0.2.1]:80", // brackets enclose an IPv6 address only (rc7)
 		} {
 			c, err := Dial(context.Background(), w.peer, addr, rendr.DialOptions{})
 			if !errors.Is(err, ErrBadAddress) || c != nil {

@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
@@ -263,6 +266,8 @@ func TestL4MetadataCanonical_L44(t *testing.T) {
 		"a b:80", "a%b:80", "a/b:80", "exämple.com:80", strings.Repeat("a", 64) + ":80",
 		strings.Repeat("a.", 126) + "aaa:80", // 255 bytes
 		"[a:b]:80", "a:b:80",
+		// Square brackets enclose an IPv6 address only (rc7).
+		"[A000]:12336", "[a.test]:80", "[localhost]:80", "[192.0.2.1]:80", "[127.0.0.1]:443", "[]:80",
 	}
 	prefix := []byte("keep")
 	for _, addr := range bad {
@@ -285,7 +290,7 @@ func TestL4MetadataCanonical_L44(t *testing.T) {
 	// One encoding per destination: every spelling of an address encodes to
 	// the canonical bytes (an IPv4-mapped IPv6 address as IPv4).
 	same := [][]string{
-		{"127.0.0.1:443", "[::ffff:127.0.0.1]:443", "[::FFFF:7f00:1]:443", "[127.0.0.1]:443", "127.0.0.1:0443"},
+		{"127.0.0.1:443", "[::ffff:127.0.0.1]:443", "[::FFFF:7f00:1]:443", "127.0.0.1:0443"},
 		{"[::1]:80", "[0:0:0:0:0:0:0:1]:80", "[::0001]:80"},
 		{"[2001:db8::1]:65535", "[2001:DB8:0::1]:65535"},
 	}
@@ -317,6 +322,75 @@ func TestL4MetadataCanonical_L44(t *testing.T) {
 		}
 		if r, err := ParseMetadata(enc); err != nil || r.Addr != addr {
 			t.Errorf("round trip of %q = %+v, %v", addr, r, err)
+		}
+	}
+}
+
+// TestL4MetadataJoinedHost_L44 (M6 rc7; L44): a host joined with its port
+// by net.JoinHostPort, as a front end builds a target from a name it was
+// given (examples/socks5's ATYP 3), never changes meaning: AppendMetadata
+// refuses it with ErrBadAddress or carries exactly it, a name byte for
+// byte and an IP literal as its address, for CmdConnect and CmdUDP. The
+// hosts are names with every byte that alters or breaks the host:port
+// reading (brackets, colons, NUL, whitespace and the like) and the valid
+// forms around them. The fuzz input that found the hole: the name
+// "[A000]", which SplitHostPort read as A000. The decoders refuse a domain
+// holding any of those bytes with CodeBadAddress, so a decoded Addr never
+// holds one either.
+func TestL4MetadataJoinedHost_L44(t *testing.T) {
+	refused := []string{
+		"[A000]", "[a.test]", "[localhost]", "[192.0.2.1]", "[127.0.0.1]", "[::1]", "[2001:db8::1]", "[]",
+		"[", "]", "[a", "a]", "a[b", "a]b", "[a]b", "a:b", "a.test:80", "1.2.3.4:5", "::1]", "[::1",
+		"a\x00b", "a b", " a", "a ", "a\tb", "a\nb", "a\rb", "a%b", "a/b", "a#b", "a@b", "a?b", "a\\b",
+		"fe80::1%eth0", "", ".", "a..b",
+	}
+	kept := []string{"a.test", "A000", "localhost", "example.com.", "192.0.2.1", "::1", "2001:db8::1", "::ffff:192.0.2.1"}
+	for _, cmd := range []uint8{CmdConnect, CmdUDP} {
+		parse := ParseMetadata
+		if cmd == CmdUDP {
+			parse = ParseUDPMetadata
+		}
+		for i, host := range append(refused, kept...) {
+			addr := net.JoinHostPort(host, "80")
+			md, err := AppendMetadata(nil, Request{Cmd: cmd, Addr: addr})
+			if i < len(refused) {
+				if !errors.Is(err, ErrBadAddress) {
+					t.Errorf("cmd %#x: host %q joined as %q: AppendMetadata = %x, %v; want ErrBadAddress", cmd, host, addr, md, err)
+				}
+				continue
+			}
+			if err != nil {
+				t.Errorf("cmd %#x: host %q joined as %q: %v", cmd, host, addr, err)
+				continue
+			}
+			r, err := parse(md)
+			if err != nil {
+				t.Fatalf("cmd %#x: %q: %v", cmd, addr, err)
+			}
+			got, port, err := net.SplitHostPort(r.Addr)
+			if err != nil || port != "80" {
+				t.Fatalf("cmd %#x: %q travels as %q", cmd, addr, r.Addr)
+			}
+			want := host
+			if a, err := netip.ParseAddr(host); err == nil {
+				want = a.Unmap().String()
+			}
+			if got != want {
+				t.Errorf("cmd %#x: host %q joined as %q travels as %q, want host %q", cmd, host, addr, r.Addr, want)
+			}
+		}
+		for _, b := range []byte("[]: \t\n\x00%/") {
+			name := []byte("a" + string(b) + "b")
+			md := append([]byte{'L', '4', 1, cmd, atypDomain, byte(len(name))}, name...)
+			md = append(md, 0, 80)
+			if cmd == CmdUDP {
+				md = append(md, 0, 0)
+			}
+			if _, err := parse(md); err == nil {
+				t.Errorf("cmd %#x: the domain %q was accepted", cmd, name)
+			} else {
+				wantMetadataError(t, fmt.Sprintf("cmd %#x, domain %q", cmd, name), err, CodeBadAddress)
+			}
 		}
 	}
 }

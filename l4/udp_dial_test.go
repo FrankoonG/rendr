@@ -205,7 +205,7 @@ func TestDialUDPErrors(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			var begins atomic.Int64
 			w := newPFWorld(t, pfOpts{ov: pfDialBegins(&begins)})
-			for _, addr := range []string{"192.0.2.1", "192.0.2.1:0", ":53", "224.0.0.1:53", "255.255.255.255:53", "[fe80::1%eth0]:53", "[::ffff:224.0.0.1]:53", "a..b.test:53"} {
+			for _, addr := range []string{"192.0.2.1", "192.0.2.1:0", ":53", "224.0.0.1:53", "255.255.255.255:53", "[fe80::1%eth0]:53", "[::ffff:224.0.0.1]:53", "a..b.test:53", "[a.test]:53", "[192.0.2.1]:53"} {
 				if pc, err := DialUDP(context.Background(), w.peer, addr, pfData(20, 1), rendr.DialOptions{}); pc != nil || !errors.Is(err, ErrBadAddress) || errors.Is(err, rendr.ErrMetadataTooLarge) {
 					t.Errorf("DialUDP(%q) = %v, %v; want ErrBadAddress alone", addr, pc, err)
 				}

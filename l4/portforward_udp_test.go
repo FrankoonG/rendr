@@ -623,6 +623,8 @@ func TestPortForwardConnectedRefused(t *testing.T) {
 			{"no peer", &PortForward{}, pfTarget, errNoPeer},
 			{"bad target", pf, "no-port", ErrBadAddress},
 			{"port 0", pf, "192.0.2.1:0", ErrBadAddress},
+			{"bracketed name", pf, "[target.test]:53", ErrBadAddress},
+			{"bracketed IPv4", pf, "[192.0.2.1]:53", ErrBadAddress},
 		} {
 			hub := rendrtest.NewUDPSocketHub(rendrtest.UDPSocketHubConfig{})
 			cs := &pwCountSock{UDPSocket: hub.Socket()}
