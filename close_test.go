@@ -3,6 +3,7 @@ package rendr
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -1694,4 +1695,148 @@ func TestHelloOutlivingSlotJoinedByClose_L52(t *testing.T) {
 			})
 		})
 	}
+}
+
+// TestRuntimeCloseSharedTrunkEndsClosed (rc9; plan §3.4: every session of
+// a closing Runtime ends locally with net.ErrClosed): Close posts Shutdown
+// to its sessions one at a time, and on a shared MUX trunk the first
+// session's reset can reach a sibling before the sibling's own Shutdown is
+// posted. The first session's GOAWAY is the dialer instance's, so it ends
+// every passive session on the trunk, and their DETACHes reach the dialer
+// siblings as routing losses. The siblings must still end with
+// net.ErrClosed, and the passive ends get *AbortError{AbortGoingAway,
+// Remote}. The hook holds Close after its first Shutdown until the bubble
+// is quiet (synctest.Wait: no virtual time passes) and checks the
+// stimulus: a sibling's passive peer has ended, its dialer's Shutdown
+// still unposted. Arms:
+//
+//   - open: the siblings' applications read; the blocked Read and a later
+//     Write return net.ErrClosed, and Close dials no carrier;
+//   - lingering: closed by their applications, waiting for the passive's
+//     DONE (the race-unit failure at 3a3fc14); Close dials no carrier;
+//   - joining: bond sessions over links a and b, each with a JOIN held in
+//     link b's dial when Close begins; the hook releases it once the
+//     sibling's passive peer ended, the sibling still open with its JOIN in
+//     flight (stimulus), so the JOIN meets the ended session.
+//
+// Before the fix the open and lingering siblings redialled, and every JOIN
+// that met the ended passive session (UNKNOWN_SESSION) ended its session
+// with ErrSessionLost.
+func TestRuntimeCloseSharedTrunkEndsClosed(t *testing.T) {
+	for _, arm := range []string{"open", "lingering", "joining"} {
+		t.Run(arm, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { testCloseSharedTrunk(t, arm) })
+		})
+	}
+}
+
+func testCloseSharedTrunk(t *testing.T, arm string) {
+	var e *e2ePair
+	var dcs, pcs []*Conn
+	armed, crossed, joining := false, -1, false
+	hooks := &testhooks.Hooks{AfterShutdown: func(sid [16]byte) {
+		// On the test's goroutine: it called Close.
+		if !armed {
+			return
+		}
+		armed, crossed = false, 0
+		synctest.Wait()
+		for i, dc := range dcs {
+			if [16]byte(dc.ID()) == sid || pcs[i].Status().State != StateEnded {
+				continue
+			}
+			crossed++
+			st := dc.Status()
+			joining = st.State != StateEnded && cdJoining(st) == 1
+		}
+		if arm == "joining" {
+			e.links[1].SetDial(rendrtest.DialNormal)
+			e.links[1].Release()
+			synctest.Wait()
+		}
+	}}
+	var dev, pev eventLog
+	links, mode, views := []string{"a"}, ModeSelector, 2
+	if arm == "joining" {
+		links, mode, views = []string{"a", "b"}, ModeBond, 4
+	}
+	e = e2eNew(t, Config{OnEvent: dev.add}, Config{OnEvent: pev.add}, &testhooks.Overrides{Hooks: hooks}, ListenConfig{}, links...)
+	peer := e.peer()
+	for i := range 2 {
+		dc, pc := e2eOpen(t, peer, e.ln, DialOptions{Mode: mode})
+		e2eExchange(t, dc, pc, 64<<10, uint64(20+2*i))
+		dcs, pcs = append(dcs, dc), append(pcs, pc)
+	}
+	synctest.Wait()
+	if mx := e.d.Status().Mux; mx.Carriers != len(links) || mx.Views != views {
+		t.Fatalf("stimulus: dialer mux %+v, want both sessions on each link's one trunk", mx)
+	}
+	if arm == "joining" {
+		e.links[1].SetDial(rendrtest.DialLateSuccess) // the redials wait for Release
+		e.links[1].Kill()
+		synctest.Wait()
+		for i, dc := range dcs {
+			if n := cdJoining(dc.Status()); n != 1 {
+				t.Fatalf("stimulus: dialer %d has %d JOINs in flight, want 1", i, n)
+			}
+		}
+	}
+	var dws, pws []*cdWatch
+	reads := make(chan error, len(dcs))
+	for i, dc := range dcs {
+		dws = append(dws, cdWatchEnd(fmt.Sprintf("dialer %d", i), dc))
+		pws = append(pws, cdWatchEnd(fmt.Sprintf("passive %d", i), pcs[i]))
+		switch arm {
+		case "lingering":
+			if err := dc.Close(); err != nil {
+				t.Fatal(err)
+			}
+		case "open":
+			go func() {
+				_, err := dc.Read(make([]byte, 1))
+				reads <- err
+			}()
+		}
+	}
+	cdOpen(t, "before Runtime.Close", append(dws, pws...)...)
+	for i, dc := range dcs {
+		if st := dc.Status(); arm == "lingering" && st.State != StateClosing {
+			t.Fatalf("dialer %d before Runtime.Close: %v, want lingering (Closing)", i, st.State)
+		}
+	}
+	dials := e.links[0].Stats().Dials
+	armed = true
+	if err := e.d.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if crossed != 1 {
+		t.Fatalf("stimulus: %d passive peers of a sibling ended before its Shutdown was posted, want 1", crossed)
+	}
+	for _, w := range dws {
+		if !isClosed(w.c.Done()) {
+			t.Fatalf("%s: Done open when Runtime.Close returned (%+v)", w.name, w.c.Status())
+		}
+		cdEnded(t, w, &dev, time.Second, cdIs(net.ErrClosed))
+		if _, err := w.c.Write([]byte{1}); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("%s: Write after Runtime.Close returned %v, want net.ErrClosed", w.name, err)
+		}
+	}
+	if arm == "open" {
+		for range dcs {
+			if err := <-reads; !errors.Is(err, net.ErrClosed) {
+				t.Fatalf("a blocked Read returned %v at Runtime.Close, want net.ErrClosed", err)
+			}
+		}
+	}
+	for _, w := range pws {
+		cdEnded(t, w, &pev, time.Second, cdAbort(AbortGoingAway, true))
+	}
+	if n := e.links[0].Stats().Dials - dials; arm != "joining" && n != 0 {
+		t.Fatalf("Runtime.Close dialled %d carriers", n)
+	}
+	if arm == "joining" && !joining {
+		t.Fatal("stimulus: the sibling had ended or had no JOIN in flight when its passive peer ended")
+	}
+	e.close()
+	cdFinal(t, append(dws, pws...)...)
 }

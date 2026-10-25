@@ -606,3 +606,10 @@ func (a *actor) maxCarriers() int {
 	}
 	return defMaxCarriers
 }
+
+// runtimeClosing reports that the session's Runtime is closing
+// (Env.Closing): its Shutdown is posted at once.
+func (a *actor) runtimeClosing() bool {
+	c := a.s.env.Closing
+	return c != nil && c.Load()
+}

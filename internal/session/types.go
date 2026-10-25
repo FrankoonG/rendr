@@ -195,4 +195,14 @@ type Env struct {
 	Registry Registry
 	Rand     func() float64   // U[0,1) jitter source
 	Hooks    *testhooks.Hooks // nil in production
+	// Closing is the Runtime's closing flag, set by Runtime.Close before
+	// it posts any Shutdown (nil: none). Close posts Shutdown to one
+	// session at a time, and on a shared MUX trunk the first one's reset
+	// can reach the others first: its GOAWAY ends every passive session on
+	// the trunk, whose DETACH is a routing loss here. Once the flag is set,
+	// an open dialer session starts no attempt (dialActLocked), and a JOIN
+	// answered UNKNOWN_SESSION ends it as its Shutdown does, with
+	// net.ErrClosed instead of ErrSessionLost (joinRefusedLocked; rc9,
+	// TestRuntimeCloseSharedTrunkEndsClosed).
+	Closing *atomic.Bool
 }

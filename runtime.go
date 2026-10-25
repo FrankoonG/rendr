@@ -493,6 +493,9 @@ func (rt *Runtime) Close() error {
 	// Step 3: every session; pending ones answer GOING_AWAY.
 	for _, s := range rt.table.live() {
 		s.Shutdown()
+		if h := rt.eff.hooks; h != nil && h.AfterShutdown != nil {
+			h.AfterShutdown(s.ID())
+		}
 	}
 	// Step 4: every Peer stops probing (Health.Close is bounded).
 	health := newGroup()

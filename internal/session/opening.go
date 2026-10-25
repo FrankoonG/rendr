@@ -413,6 +413,7 @@ func (a *actor) dialActLocked(now time.Time) {
 			a.openingLocked(now)
 		}
 	case a.doneWaitLocked():
+	case a.runtimeClosing(): // its Shutdown is posted at once: no redial (Env.Closing)
 	case a.s.p.Mode.members(): // bond and race (M3-D29)
 		a.bondSlotsLocked(now)
 	default:
@@ -1052,6 +1053,13 @@ func (a *actor) joinRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 	a.switchFailedLocked(now, i)
 	switch st {
 	case wire.StatusUnknownSession:
+		if !a.s.st.doneSent && a.runtimeClosing() {
+			// The peer ended meanwhile, maybe reset through a trunk shared
+			// with a sibling whose Shutdown came first: Close's end
+			// (Env.Closing).
+			a.onShutdownLocked(now)
+			return
+		}
 		if est.EndCode != 0 {
 			a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortCode(est.EndCode), Remote: true}), nil, false)
 			return

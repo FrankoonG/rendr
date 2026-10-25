@@ -163,6 +163,7 @@ func newPeer(rt *Runtime, cfg PeerConfig) (*Peer, error) {
 		Events:  rt.ev, // a nil *eventQueue discards every event
 		Rand:    rt.eff.rand,
 		Hooks:   rt.eff.hooks,
+		Closing: &rt.closing,
 	}
 	if n >= 2 {
 		p.health = carrier.NewHealth(&rt.cenv, p.factories, rt.eff.health)
