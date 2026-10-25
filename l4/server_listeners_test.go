@@ -105,6 +105,9 @@ func TestServerSeveralListeners_L48(t *testing.T) {
 		_, err = Dial(ctx, w.speer, kitTarget, rendr.DialOptions{})
 		wantReject(t, err, CodeCapacity)
 
+		// The Server counts a refusal after sending it (Server.reject), so the
+		// dialer can see the refusal before Status counts it.
+		waitFor(t, time.Minute, "the Server counts the refusals", func() bool { st := s.Status(); return st.UDP.Rejected >= 2 && st.Rejected >= 2 })
 		st := s.Status()
 		if u := st.UDP; u.Confirmed != 2 || u.Rejected != 2 || u.ByCode[CodeCapacity] != 2 || u.Live != 1 {
 			t.Fatalf("UDP status %+v: want both Listeners' flows (2 confirmed, 2 refused CodeCapacity, 1 live)", u)

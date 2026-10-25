@@ -116,6 +116,9 @@ func TestServeStreamOnlyWithoutUDP_L50(t *testing.T) {
 			if calls, _, _, _ := hl.snapshot(); calls != 1 || ts.calls() != 0 {
 				t.Fatalf("%d hook calls (%d UDP), want the TCP connection's only", calls, ts.calls())
 			}
+			// The Server counts a refusal after sending it (Server.reject), so the
+			// dialer can see the refusal before Status counts it.
+			waitFor(t, time.Minute, "the Server counts the refusal", func() bool { return s.Status().UDP.Rejected != 0 })
 			if u := s.Status().UDP; u.Rejected != 1 || u.ByCode[CodeBadCommand] != 1 || u.Confirmed != 0 {
 				t.Fatalf("UDP status %+v", u)
 			}
@@ -775,6 +778,9 @@ func TestServerUDPRejectCodes_L51(t *testing.T) {
 					}
 				}
 				waitFor(t, time.Minute, "the hook call ends", func() bool { return s.Status().Hooks == 0 })
+				// The Server counts a refusal after sending it (Server.reject), so the
+				// dialer can see the refusal before Status counts it.
+				waitFor(t, time.Minute, "the Server counts the refusal", func() bool { return s.Status().UDP.Rejected != 0 })
 				st := s.Status()
 				if st.Panics != row.panics || st.Abandoned != 0 || st.LastErr == nil || counts.Unclosed() != 0 {
 					t.Fatalf("status %+v; %d conns open", st, counts.Unclosed())
@@ -919,6 +925,9 @@ func TestServerUDPKindMismatch_L44(t *testing.T) {
 		if calls, _, _, _ := hl.snapshot(); calls != 0 {
 			t.Fatalf("%d hook calls", calls)
 		}
+		// The Server counts a refusal after sending it (Server.reject), so the
+		// dialer can see the refusal before Status counts it.
+		waitFor(t, time.Minute, "the Server counts the refusals", func() bool { st := s.Status(); return st.UDP.Rejected >= 3 && st.Rejected >= 1 })
 		st := s.Status()
 		if u := st.UDP; u.Rejected != 3 || u.ByCode[CodeBadCommand] != 1 || u.ByCode[CodeBadRequest] != 1 || u.ByCode[CodeBadVersion] != 1 {
 			t.Fatalf("UDP status %+v", u)
