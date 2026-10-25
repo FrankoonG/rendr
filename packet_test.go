@@ -943,10 +943,15 @@ func (b *cfBond) end(t *testing.T) {
 // nothing is dropped as too large.
 func TestPacketBigAwaitsSchedE2E_L37(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		// 10 ms RTT: the SCHED comes about 10 ms after the member is listed, and
+		// 10 ms RTT: the SCHED comes about 10 ms after the stall below ends, and
 		// the new stream member's first capacity rounds fit in MaxAge (100 ms).
 		b := cfOpen(t, Config{}, 5*time.Millisecond)
 		st := b.streamMember(t)
+		// The stream link stalls while the member's JOIN_ACK is in flight, so
+		// the dialer cannot send the SCHED that lists it before every write has
+		// happened, however long the writes take (a write that blocked once
+		// let the SCHED in first under -race).
+		b.sl.SetStall(true)
 		cfWrite(t, b.pc, 7, 0, 16, 60000, 1000)
 		// Stimulus: every write happened before the SCHED that routes the
 		// stream member was applied (routing and Status change in one
@@ -954,6 +959,7 @@ func TestPacketBigAwaitsSchedE2E_L37(t *testing.T) {
 		if after := b.pc.Status(); after.SchedEpoch != st.SchedEpoch {
 			t.Fatalf("INVALID: the passive applied SCHED %d → %d before the writes ended", st.SchedEpoch, after.SchedEpoch)
 		}
+		b.sl.SetStall(false)
 		v := peRecv(t, b.dc, 7, 16, time.Second)
 		r := v.Result()
 		ps := b.pc.Status()
@@ -988,6 +994,9 @@ func TestPacketBigHeldMemberDiesE2E_L37(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		b := cfOpen(t, Config{}, 20*time.Millisecond)
 		st := b.streamMember(t)
+		// As in TestPacketBigAwaitsSchedE2E_L37: the stalled link holds the
+		// JOIN_ACK, so no SCHED can route the member before it dies.
+		b.sl.SetStall(true)
 		cfWrite(t, b.pc, 9, 0, 8, 60000, 1000)
 		if after := b.pc.Status(); after.SchedEpoch != st.SchedEpoch {
 			t.Fatalf("INVALID: the passive applied SCHED %d → %d before the writes ended", st.SchedEpoch, after.SchedEpoch)
