@@ -104,6 +104,11 @@ func TestServerUDPFirstWriteErrors(t *testing.T) {
 				sv := suServe(w, s)
 				res := suRecv(t, suDialAsync(context.Background(), w, pfTarget, pfData(40, 1), rendr.DialOptions{}), time.Minute)
 				target := ts.next(t, time.Second)
+				if r.code != 0 {
+					// The Server counts a refusal after sending it (Server.reject), so the
+					// dialer can see the refusal before Status counts it.
+					waitFor(t, time.Minute, "the Server counts the refusal", func() bool { return s.Status().UDP.Rejected != 0 })
+				}
 				u := s.Status().UDP
 				if r.code != 0 {
 					wantReject(t, res.err, r.code)
@@ -462,6 +467,9 @@ func TestServerUDPResolvedTargetRefused(t *testing.T) {
 				}
 				wantReject(t, r.err, CodeNotAllowed)
 				want++
+				// The Server counts a refusal after sending it (Server.reject), so the
+				// dialer can see the refusal before Status counts it.
+				waitFor(t, time.Minute, "the Server counts the refusal", func() bool { return s.Status().UDP.ByCode[CodeNotAllowed] >= want })
 				st := s.Status()
 				if !errors.Is(st.LastErr, errResolvedTarget) || st.UDP.ByCode[CodeNotAllowed] != want || st.UDP.FirstSent != 0 {
 					t.Fatalf("%s: LastErr %v; UDP status %+v", name, st.LastErr, st.UDP)

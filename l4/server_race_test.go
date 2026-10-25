@@ -224,6 +224,9 @@ func TestServerDialBoundedByPendingDeadline(t *testing.T) {
 			if n := counts.Calls(); n != 0 {
 				t.Fatalf("%d hook calls with the budget spent", n)
 			}
+			// The Server counts a refusal after sending it (Server.reject), so the
+			// dialer can see the refusal before Status counts it.
+			waitFor(t, time.Minute, "the Server counts the refusal", func() bool { return s.Status().ByCode[CodeTimeout] != 0 })
 			if st := s.Status(); st.Hooks != 0 || st.ByCode[CodeTimeout] != 1 {
 				t.Fatalf("status %+v", st)
 			}
