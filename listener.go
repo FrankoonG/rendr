@@ -177,6 +177,7 @@ func newListener(rt *Runtime, cfg ListenConfig, srcs []net.Listener) *Listener {
 		Registry: lnRegistry{ln},
 		Rand:     rt.eff.rand,
 		Hooks:    rt.eff.hooks,
+		Closing:  &rt.closing,
 	}
 	return ln
 }
