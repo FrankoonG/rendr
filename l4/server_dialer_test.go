@@ -95,6 +95,9 @@ func TestServerDefaultDialerBudget(t *testing.T) {
 				if row.acceptTimeout > 0 && r.at.Sub(start) >= row.acceptTimeout {
 					t.Fatalf("refused after %v, not before the AcceptTimeout", r.at.Sub(start))
 				}
+				// The Server counts a refusal after sending it (Server.reject), so the
+				// dialer can see the refusal before Status counts it.
+				waitFor(t, time.Minute, "the Server counts the refusal", func() bool { return s.Status().ByCode[CodeTimeout] != 0 })
 				if st := s.Status(); st.ByCode[CodeTimeout] != 1 || st.Dialing != 0 || st.Hooks != 0 {
 					t.Fatalf("status %+v", st)
 				}

@@ -1,6 +1,7 @@
 package l4
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -47,8 +48,26 @@ func newFakeDNS(t *testing.T, silent bool) *fakeDNS {
 			}
 		}
 	}()
-	t.Cleanup(func() { pc.Close(); <-f.done })
+	t.Cleanup(func() {
+		pc.Close()
+		<-f.done
+		// No lookup of f's resolvers outlives the test (resolverHook).
+		waitFor(t, 2*time.Second, "the resolver's lookups end", func() bool { return !resolverLookups() })
+	})
 	return f
+}
+
+// resolverLookups reports whether a goroutine runs a lookup of the net
+// package's resolver.
+func resolverLookups() bool {
+	buf := make([]byte, 1<<20)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			return bytes.Contains(buf[:n], []byte("net.(*Resolver)."))
+		}
+		buf = make([]byte, 2*len(buf))
+	}
 }
 
 // nxdomain is the NXDOMAIN answer to query q: its header and question
@@ -69,14 +88,40 @@ func nxdomain(q []byte) []byte {
 	return r
 }
 
-// resolverHook is a Dial hook whose pure-Go resolver asks only f.
+// resolverHook is a Dial hook whose pure-Go resolver asks only f. Each of
+// the resolver's UDP conns closes when its exchange's context ends: the net
+// package does not interrupt a pending read for that context, so a lookup
+// that the Server's dial budget abandoned would otherwise run on to the
+// resolver's own per-try timeout (5 s) and its retries, inside the tests
+// that follow (M6 I3: TestServerDNSFailureSilent's lookups woke inside
+// TestForwardZeroAllocs_L41_L54's window and put 70 allocations there
+// against its bound of 40, run 20261022-164605-2e70). newFakeDNS's cleanup
+// checks that no lookup is left.
 func resolverHook(f *fakeDNS) func(context.Context, Request) (net.Conn, error) {
 	res := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "udp", f.pc.LocalAddr().String())
+		c, err := (&net.Dialer{}).DialContext(ctx, "udp", f.pc.LocalAddr().String())
+		if err != nil {
+			return nil, err
+		}
+		u := c.(*net.UDPConn)
+		return &dnsConn{UDPConn: u, stop: context.AfterFunc(ctx, func() { u.Close() })}, nil
 	}}
 	return func(ctx context.Context, r Request) (net.Conn, error) {
 		return (&net.Dialer{Resolver: res}).DialContext(ctx, "tcp", r.Addr)
 	}
+}
+
+// dnsConn is a resolver's UDP conn that closes when its exchange's context
+// ends (resolverHook). It stays a net.PacketConn, so the resolver keeps its
+// datagram framing.
+type dnsConn struct {
+	*net.UDPConn
+	stop func() bool
+}
+
+func (c *dnsConn) Close() error {
+	c.stop()
+	return c.UDPConn.Close()
 }
 
 // TestServerDNSNotFound (§A8.1 row 2): a name that does not exist is
@@ -322,9 +367,14 @@ func TestServerIdleDefault(t *testing.T) {
 // difference is checked: one pair's baseline once came out 50 allocations
 // per connection low (the pool's l4 sweep, 1 run in 600; the sync.Pools
 // both loops draw on depend on when the collector ran).
+//
+// Lanes (allocsPerConnPlan): the race lane, which does not assert, runs one
+// pair of 50 connections (racebudget: m6-design T-6, R1-37; rendr's I2,
+// when race-unit passes reached 282–304 s); the non-race unit and sweep
+// lanes run three pairs of 400 and assert.
 func TestServerAllocsPerConn(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		const k = 400 // enough connections that the difference of two totals is stable
+		pairs, k := allocsPerConnPlan(raceEnabled)
 		w := newSrvWorld(t, srvOpts{})
 		target := rendrtest.NewTarget(rendrtest.TargetEcho(), 0)
 		one := func() {
@@ -348,7 +398,7 @@ func TestServerAllocsPerConn(t *testing.T) {
 			}
 			settle()
 			runtime.ReadMemStats(&m1)
-			return float64(m1.Mallocs-m0.Mallocs) / k
+			return float64(m1.Mallocs-m0.Mallocs) / float64(k)
 		}
 
 		// The baseline: Accept, the target dial, Confirm, SetIdleTimeout and
@@ -398,16 +448,42 @@ func TestServerAllocsPerConn(t *testing.T) {
 			sv.stop(t)
 			return n
 		}
-		var own [3]float64
+		own := make([]float64, pairs)
 		for i := range own {
 			base, server := baseline(), served()
 			own[i] = server - base
 			t.Logf("allocations per connection: baseline %.1f, Serve %.1f, the Server's own %.1f", base, server, own[i])
 		}
-		slices.Sort(own[:])
-		if !raceEnabled && own[1] > 64 {
-			t.Fatalf("the Server allocates %.1f times per connection (median of %v), want ≤ 64", own[1], own)
+		slices.Sort(own)
+		if med := own[len(own)/2]; !raceEnabled && med > 64 {
+			t.Fatalf("the Server allocates %.1f times per connection (median of %v), want ≤ 64", med, own)
 		}
 		w.shutdown()
 	})
+}
+
+// allocsPerConnPlan is TestServerAllocsPerConn's measurement in a lane:
+// pairs of baseline and Serve loops and connections per loop. The non-race
+// lanes, which assert the ceiling on the median pair, measure three pairs
+// of 400 connections (enough that the difference of two totals is
+// stable); the race lane only exercises both loops under the detector and
+// logs the figure, so one pair of 50 suffices
+// (TestServerAllocsPerConnPlan).
+func allocsPerConnPlan(race bool) (pairs, k int) {
+	if race {
+		return 1, 50
+	}
+	return 3, 400
+}
+
+// TestServerAllocsPerConnPlan: the asserting lanes keep the measurement the
+// ceiling was set with (three pairs of 400, the median checked) and only
+// the race lane runs the smaller plan.
+func TestServerAllocsPerConnPlan(t *testing.T) {
+	if p, k := allocsPerConnPlan(false); p != 3 || k != 400 {
+		t.Errorf("the non-race plan is %d pairs of %d, want 3 of 400", p, k)
+	}
+	if p, k := allocsPerConnPlan(true); p != 1 || k != 50 {
+		t.Errorf("the race plan is %d pairs of %d, want 1 of 50", p, k)
+	}
 }

@@ -395,22 +395,45 @@ func TestPacketWakePolicy_L08(t *testing.T) {
 	})
 
 	// The minimum share (R1-19), emulated writers in a bubble.
-	for _, tc := range []struct {
-		members int
-		every   time.Duration
-		run     time.Duration
-	}{
+	for _, tc := range dpShareCases() {
+		t.Run(tc.name(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) { dpShareRun(t, tc.members, tc.every, tc.run) })
+		})
+	}
+}
+
+// dpShareCase is one minimum-share subtest of TestPacketWakePolicy_L08:
+// the bond's members, the interval between WriteTo calls and the run.
+type dpShareCase struct {
+	members int
+	every   time.Duration
+	run     time.Duration
+}
+
+func (c dpShareCase) name() string { return fmt.Sprintf("share/%d@%v", c.members, c.every) }
+
+// dpShareCases are TestPacketWakePolicy_L08's minimum-share subtests.
+// Under -race (R1-23 lever 1; M6 I3: race-unit passes reached 282 s on the
+// builder at the M6 RC, run 20261022-141914-ce19) four of the six run, with
+// the same criteria: 2 members at 1 ms for 60 s, 4 at 100 µs, 8 and 16 at
+// 1 ms, so each member count, each interval and the long run are judged
+// once (the rule, at most one writer woken per WriteTo and every member
+// placing a DGRAM at least every PacketPing/2, is the same in each). The
+// non-race unit and sweep lanes run all six; TestRaceLaneSubtests checks
+// the lists.
+func dpShareCases() []dpShareCase {
+	all := []dpShareCase{
 		{2, time.Millisecond, 60 * time.Second},
 		{4, time.Millisecond, 60 * time.Second},
 		{2, 100 * time.Microsecond, 6 * time.Second},
 		{4, 100 * time.Microsecond, 6 * time.Second},
 		{8, time.Millisecond, 10 * time.Second},
 		{16, time.Millisecond, 10 * time.Second}, // MaxCarriersPerSession's maximum
-	} {
-		t.Run(fmt.Sprintf("share/%d@%v", tc.members, tc.every), func(t *testing.T) {
-			synctest.Test(t, func(t *testing.T) { dpShareRun(t, tc.members, tc.every, tc.run) })
-		})
 	}
+	if dpRaceEnabled {
+		return []dpShareCase{all[0], all[3], all[4], all[5]}
+	}
+	return all
 }
 
 // dpCapBlockedRun: a bond whose fastest member is a stream lane with no

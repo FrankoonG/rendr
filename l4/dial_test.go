@@ -23,6 +23,7 @@ func TestDialBadAddressNoIO(t *testing.T) {
 			"", "host", "host:", "host:0", "host:65536", ":80", "0.0.0.0:80", "[::]:80",
 			"224.0.0.1:80", "255.255.255.255:80", "[fe80::1%eth0]:80", "a..b:80",
 			"-x.test:http", "127.1:80", "x.0x10:80", strings.Repeat("a", 64) + ".test:80",
+			"[a.test]:80", "[192.0.2.1]:80", // brackets enclose an IPv6 address only (rc7)
 		} {
 			c, err := Dial(context.Background(), w.peer, addr, rendr.DialOptions{})
 			if !errors.Is(err, ErrBadAddress) || c != nil {
@@ -125,7 +126,9 @@ func TestDialAppMetadataRoundTrip(t *testing.T) {
 // TestL4MetadataLimit_L37 (M4-D25, R1-28): the longest L4 header (a
 // 253-byte domain with its trailing dot: 262 bytes) plus the application's
 // metadata may fill Handshake.MaxMetadata exactly; one byte more fails with
-// ErrMetadataTooLarge before any carrier is dialled.
+// ErrMetadataTooLarge before any carrier is dialled. The same holds for a
+// UDP flow's metadata on a packet session (264 bytes of header with the
+// first-datagram length; M6 design §A3.3).
 func TestL4MetadataLimit_L37(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newWorld(t, worldOpts{})
@@ -157,6 +160,49 @@ func TestL4MetadataLimit_L37(t *testing.T) {
 		_, err = Dial(context.Background(), w.peer, addr, rendr.DialOptions{Metadata: app[:len(app)-1]})
 		if n := <-accepted; !errors.Is(err, rendr.ErrRejected) || n != maxMeta {
 			t.Fatalf("Dial with %d bytes of metadata: %v (the passive saw %d); want it carried", maxMeta, err, n)
+		}
+
+		// UDP (M6 design §A3.1, §A3.3): the longest UDP header adds the
+		// 2-byte first-datagram length (264 bytes); with a first datagram
+		// and the application's metadata it may fill MaxMetadata exactly on
+		// a packet session, and one byte more fails with
+		// ErrMetadataTooLarge before any carrier is dialled.
+		udpHdr, err := AppendMetadata(nil, Request{Cmd: CmdUDP, Addr: addr})
+		if err != nil || len(udpHdr) != maxHeader+2 {
+			t.Fatalf("the longest UDP header: %d bytes, %v; want 264", len(udpHdr), err)
+		}
+		first, udpApp := make([]byte, maxMeta-len(udpHdr)-10), make([]byte, 11)
+		for i := range first {
+			first[i] = byte(i)
+		}
+		over, err := AppendMetadata(nil, Request{Cmd: CmdUDP, Addr: addr, First: first, App: udpApp})
+		if err != nil || len(over) != maxMeta+1 {
+			t.Fatalf("UDP metadata: %d bytes, %v; want %d", len(over), err, maxMeta+1)
+		}
+		dials := w.links[0].Stats().Dials
+		if pc, err := w.peer.DialPacket(context.Background(), rendr.DialOptions{Metadata: over}); pc != nil || !errors.Is(err, rendr.ErrMetadataTooLarge) {
+			t.Fatalf("DialPacket with %d bytes of UDP metadata: %v, %v; want ErrMetadataTooLarge", len(over), pc, err)
+		}
+		if n := w.links[0].Stats().Dials; n != dials {
+			t.Fatalf("%d carrier dials before the size check, want none", n-dials)
+		}
+		seen := make(chan []byte, 1)
+		go func() {
+			pend, err := w.ln.AcceptPacket(context.Background())
+			if err != nil {
+				seen <- nil
+				return
+			}
+			seen <- bytes.Clone(pend.Metadata())
+			pend.Reject(4000, "done")
+		}()
+		_, err = w.peer.DialPacket(context.Background(), rendr.DialOptions{Metadata: over[:maxMeta]})
+		got := <-seen
+		if !errors.Is(err, rendr.ErrRejected) || len(got) != maxMeta {
+			t.Fatalf("DialPacket with %d bytes of UDP metadata: %v (the passive saw %d); want it carried", maxMeta, err, len(got))
+		}
+		if r, err := ParseUDPMetadata(got); err != nil || r.Addr != addr || !bytes.Equal(r.First, first) || len(r.App) != 10 {
+			t.Fatalf("the passive decoded %q, %d-byte first, %d-byte App, %v; want %q, %d, 10", r.Addr, len(r.First), len(r.App), err, addr, len(first))
 		}
 		w.shutdown()
 	})

@@ -493,6 +493,9 @@ func (rt *Runtime) Close() error {
 	// Step 3: every session; pending ones answer GOING_AWAY.
 	for _, s := range rt.table.live() {
 		s.Shutdown()
+		if h := rt.eff.hooks; h != nil && h.AfterShutdown != nil {
+			h.AfterShutdown(s.ID())
+		}
 	}
 	// Step 4: every Peer stops probing (Health.Close is bounded).
 	health := newGroup()
@@ -580,6 +583,19 @@ func (rt *Runtime) Close() error {
 			}
 		}
 	}
+	// The same close bound for the dialer MUX trunks (C24, L52): Close posts
+	// nothing to a pool trunk, which drains as its views end, so one whose
+	// CLOSE is still unwritten then — its views held by no session of this
+	// Runtime, or its writer stuck in the embedder's Write — is killed, every
+	// view on it ending with it (rc6).
+	pools = rt.poolsSince(pools)
+	kctx, kcancel := context.WithDeadline(context.Background(), killAt)
+	for _, p := range pools {
+		if p.Wait(kctx) != nil {
+			p.Kill(carrier.CauseLocalClose, "Runtime.Close: CLOSE not written within the close bound")
+		}
+	}
+	kcancel()
 	close(rt.cut)
 	// FromPacketConn sources close their sockets only after the sessions
 	// (M2-D58, M2 design §A4.6): the open packet sessions' RST(GoingAway)
@@ -613,17 +629,9 @@ func (rt *Runtime) Close() error {
 	// at their trunks' Done; every pool (also of a closed Peer) is joined
 	// once its trunks are done.
 	rt.trk.wait(bound, nil)
-	// A closed Peer's pool that dialled again after the snapshot of step 1
-	// was tracked again then (carrier.Env.PoolLive): the sessions are
-	// joined, so the pools now are every pool that can hold a trunk.
-	rt.mu.Lock()
-	for p := range rt.pools {
-		if !slices.Contains(pools, p) {
-			p.Close()
-			pools = append(pools, p)
-		}
-	}
-	rt.mu.Unlock()
+	// The sessions are joined, so the pools now are every pool that can
+	// hold a trunk.
+	pools = rt.poolsSince(pools)
 	pctx, pcancel := context.WithDeadline(context.Background(), bound)
 	for _, p := range pools {
 		_ = p.Wait(pctx)
@@ -639,6 +647,21 @@ func (rt *Runtime) Close() error {
 	close(rt.closed) // under mu: noteEnded records nothing afterwards
 	rt.mu.Unlock()
 	return nil
+}
+
+// poolsSince returns pools with every pool registered since appended and
+// closed: a closed Peer's pool that dialled again after Close's snapshot of
+// step 1 was tracked again then (carrier.Env.PoolLive).
+func (rt *Runtime) poolsSince(pools []*carrier.Pool) []*carrier.Pool {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	for p := range rt.pools {
+		if !slices.Contains(pools, p) {
+			p.Close()
+			pools = append(pools, p)
+		}
+	}
+	return pools
 }
 
 // onEventWorker reports whether the caller runs on the event worker (it

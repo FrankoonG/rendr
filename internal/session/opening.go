@@ -413,6 +413,7 @@ func (a *actor) dialActLocked(now time.Time) {
 			a.openingLocked(now)
 		}
 	case a.doneWaitLocked():
+	case a.runtimeClosing(): // its Shutdown is posted at once: no redial (Env.Closing)
 	case a.s.p.Mode.members(): // bond and race (M3-D29)
 		a.bondSlotsLocked(now)
 	default:
@@ -777,9 +778,13 @@ func (a *actor) finish(now time.Time, i int, at *attempt, o sched.Outcome) {
 // (failed mark cleared; the backoff resets at the slot's first refusal and
 // inside its recovery window, and keeps its first step while no carrier
 // lives: sched.Cadence, finish); everything else is Failed (failed mark,
-// backoff). An open session ends when the bound instance answers
-// GOING_AWAY (*AbortError) or a JOIN reached a restarted peer
-// (ErrSessionLost) — cleanly (io.EOF) once our DONE was sent (doneOr).
+// backoff). A fast-path view's failure (EstablishError.View) counts as
+// Refused but clears no failed mark: the PREFACE exchange was its trunk's,
+// at an earlier dial (rc5: the views of a dead path's trunks fail one by
+// one while the sessions' death steps mark the factory). An open session
+// ends when the bound instance answers GOING_AWAY (*AbortError) or a JOIN
+// reached a restarted peer (ErrSessionLost) — cleanly (io.EOF) once our
+// DONE was sent (doneOr).
 func (a *actor) attemptFailedLocked(now time.Time, i int, at *attempt, err error) {
 	s := a.s
 	d := a.d
@@ -819,7 +824,7 @@ func (a *actor) attemptFailedLocked(now time.Time, i int, at *attempt, err error
 			reason = e.Cause.String()
 		}
 		a.markFailed(i, reason, now)
-	} else if e != nil && e.PrefaceOK {
+	} else if e != nil && e.PrefaceOK && !e.View {
 		a.succeeded(i)
 	}
 	a.switchFailedLocked(now, i)
@@ -1048,6 +1053,13 @@ func (a *actor) joinRefusedLocked(now time.Time, i int, at *attempt, est *carrie
 	a.switchFailedLocked(now, i)
 	switch st {
 	case wire.StatusUnknownSession:
+		if !a.s.st.doneSent && a.runtimeClosing() {
+			// The peer ended meanwhile, maybe reset through a trunk shared
+			// with a sibling whose Shutdown came first: Close's end
+			// (Env.Closing).
+			a.onShutdownLocked(now)
+			return
+		}
 		if est.EndCode != 0 {
 			a.terminateLocked(now, a.doneOr(&AbortError{Code: AbortCode(est.EndCode), Remote: true}), nil, false)
 			return

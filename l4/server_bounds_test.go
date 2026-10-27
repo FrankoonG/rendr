@@ -75,6 +75,9 @@ func TestServerMaxConns_L48(t *testing.T) {
 			t.Fatalf("Dial after a slot freed: %v", err)
 		}
 		ping(t, c, 100)
+		// The Server counts a refusal after sending it (Server.reject), so the
+		// dialer can see the refusal before Status counts it.
+		waitFor(t, time.Minute, "the Server counts the refusal", func() bool { return s.Status().ByCode[CodeCapacity] != 0 })
 		if st := s.Status(); st.ByCode[CodeCapacity] != 1 || st.Confirmed != 3 {
 			t.Fatalf("status %+v", st)
 		}

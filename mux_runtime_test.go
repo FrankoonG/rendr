@@ -754,7 +754,23 @@ func TestStatusMuxSurvivesPeerClose(t *testing.T) {
 // snapshot is joined (Pool.Wait with a done context returns nil: closed,
 // no live trunk, no watcher), and both Runtimes end with nothing left.
 // Without the second check Close returns before that trunk ends.
+//
+// Row "stuck writer" (rc6): the dialer's writes on link a block (honouring
+// deadlines and Close) once that pool registered, with WriteStall and the
+// death deadline beyond Close's bound: the trunk's CLOSE stays unwritten,
+// so Close kills it at the close bound — that pool included — and joins
+// it, within Close's bound and with nothing abandoned.
 func TestRuntimeCloseJoinsPoolBackAfterSnapshot(t *testing.T) {
+	for _, stuck := range []bool{false, true} {
+		name := "drained"
+		if stuck {
+			name = "stuck writer"
+		}
+		t.Run(name, func(t *testing.T) { testRuntimeCloseJoinsPoolBack(t, stuck) })
+	}
+}
+
+func testRuntimeCloseJoinsPoolBack(t *testing.T, stuck bool) {
 	synctest.Test(t, func(t *testing.T) {
 		var armed atomic.Bool
 		var e *e2ePair
@@ -773,8 +789,15 @@ func TestRuntimeCloseJoinsPoolBackAfterSnapshot(t *testing.T) {
 					}
 				}
 			}
+			if stuck && back != nil {
+				e.links[0].BlockWrites(rendrtest.Up, rendrtest.BlockSoft)
+			}
 		}}
-		e = e2eNew(t, Config{}, Config{}, &testhooks.Overrides{Hooks: hooks}, ListenConfig{}, "a", "b")
+		ov := &testhooks.Overrides{Hooks: hooks}
+		if stuck {
+			ov.WriteStall, ov.DeadMin, ov.DeadMax = 10*time.Second, 10*time.Second, 10*time.Second
+		}
+		e = e2eNew(t, Config{}, Config{}, ov, ListenConfig{}, "a", "b")
 		e.links[0].SetDelay(50*time.Millisecond, 0)
 		p := e.mxPeer(e2eCarrier(e.links[0]))
 		dc, pc := e2eOpen(t, p, e.ln, DialOptions{})
@@ -792,17 +815,30 @@ func TestRuntimeCloseJoinsPoolBackAfterSnapshot(t *testing.T) {
 		}
 
 		armed.Store(true)
+		eff := e.d.eff
+		bound := max(min(time.Second, eff.cfg.DeadMax)+eff.timing.AbandonWait, 2*eff.timing.AbandonWait) + closeSlack
+		start := time.Now()
 		if err := e.d.Close(); err != nil {
 			t.Fatal(err)
 		}
+		if el := time.Since(start); stuck && el > bound {
+			t.Errorf("Runtime.Close took %v, bound %v", el, bound)
+		}
 		if back == nil {
 			t.Fatal("premise: no pool registered with the Runtime after Close's snapshot (the released redial did not publish a trunk)")
+		}
+		if n := e.links[0].Stats().Session.WritesBlocked; stuck && n == 0 {
+			t.Fatal("stimulus: no write of the dialer blocked")
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		if err := back.Wait(ctx); err != nil {
 			t.Fatalf("Runtime.Close returned before the pool that registered after its snapshot was joined (%v)", err)
 		}
+		if st := e.d.Status(); st.Abandoned != 0 || st.BufferedBytes != 0 {
+			t.Fatalf("after Runtime.Close: %d abandoned, %d bytes charged", st.Abandoned, st.BufferedBytes)
+		}
+		e.links[0].BlockWrites(rendrtest.Up, rendrtest.BlockOff)
 		_ = other
 		e.close()
 	})

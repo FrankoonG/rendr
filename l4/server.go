@@ -19,9 +19,11 @@ const (
 	DefaultMaxConns    = 10000
 )
 
-// maxHookCalls bounds the custom Dial hook calls a Server runs at once, in
-// flight or abandoned (M4-D28, R1-9); at the cap a request is rejected
-// CodeCapacity without calling the hook.
+// maxHookCalls bounds the custom Dial hook calls of one kind (TCP
+// connections, UDP flows) a Server runs at once, in flight or abandoned
+// (M4-D28, R1-9; M6-D17, R1-12: per kind, so a burst of UDP flows against a
+// slow hook never refuses a TCP connection); at the cap a request is
+// rejected CodeCapacity without calling the hook.
 const maxHookCalls = 192
 
 // The dial budget (M4 design §A6.3, §A6.4).
@@ -83,52 +85,134 @@ type Server struct {
 	// returned without an error belongs to the Server, which forwards it
 	// (or resets it, when the session was decided while it dialled), and
 	// must not panic.
+	//
+	// With UDP set, r.Cmd may be CmdUDP: return a connected datagram conn
+	// (each Read one datagram from the target, each Write one datagram to
+	// it). The conn must report a non-nil RemoteAddr and either implement
+	// net.PacketConn (a connected *net.UDPConn does) or report a LocalAddr
+	// whose Network is "udp", "udp4" or "udp6" (an embedder's own datagram
+	// tunnel reports "udp"); any other conn is closed and answered
+	// CodeDialFailed. A hook used with UDP must check r.Cmd. Every other
+	// rule above holds for both commands; at most 192 calls of each kind run
+	// at once. With nil Dial, a UDP flow uses a net.Dialer's DialContext on
+	// "udp" whose Control refuses a resolved multicast, limited-broadcast or
+	// unspecified address (CodeNotAllowed; Windows dials the loopback for an
+	// unspecified one) and turns SO_BROADCAST off. Go
+	// turns SO_BROADCAST on for every IPv4 UDP socket it makes, so with it
+	// off the OS refuses a directed broadcast (CodeNotAllowed). A hook that
+	// dials its own sockets should do the same in its Control.
 	Dial func(ctx context.Context, r Request) (net.Conn, error)
 	// DialTimeout bounds one target dial (0: DefaultDialTimeout; clamped to
 	// 0.5–30 s) and never runs past the pending session's AcceptTimeout
 	// minus 250 ms, so a slow target is answered CodeTimeout.
 	DialTimeout time.Duration
-	// IdleTimeout is set on every served session (0: DefaultIdleTimeout;
-	// negative: none, so the Runtime's Config.IdleTimeout applies, which is
-	// off by default).
+	// IdleTimeout is set on every served TCP connection's session (0:
+	// DefaultIdleTimeout; negative: none, so the Runtime's
+	// Config.IdleTimeout applies, which is off by default). UDP flows take
+	// UDPIdle instead.
 	IdleTimeout time.Duration
-	// MaxConns bounds the sessions this Server dials for or forwards at once
-	// (0 or less: DefaultMaxConns); a session beyond it is rejected
-	// CodeCapacity at once.
+	// MaxConns bounds the TCP connections this Server dials for or forwards
+	// at once (0 or less: DefaultMaxConns); a session beyond it is rejected
+	// CodeCapacity at once. UDP flows have MaxFlows.
 	MaxConns int
 
-	conns     atomic.Int64 // handlers admitted under MaxConns: dialling or forwarding
-	hooks     atomic.Int64 // custom hook calls running, abandoned ones included
-	dialing   atomic.Int64
-	live      atomic.Int64
+	// UDP enables L4 UDP flows: Serve also accepts packet sessions, and
+	// HandleUDP serves them. False (the zero value): Serve never calls
+	// AcceptPacket, as in v2.0.0.
+	UDP bool
+	// UDPIdle is the FlowIdle of every served flow (zero: the defaults).
+	UDPIdle FlowIdle
+	// MaxFlows bounds the UDP flows this Server dials for or forwards at once
+	// (0 or less: DefaultMaxFlows); a flow beyond it is rejected CodeCapacity
+	// at once. A flow's handler may outlive its unit while the flow's
+	// session ends (see HandleUDP). MaxConns bounds TCP connections only.
+	MaxFlows int
+	// UDPBuffer is the receive and send buffer size the default UDP dialer
+	// requests for each target socket (0 or less: 1 MiB). The OS may grant
+	// less: Linux caps the request at net.core.rmem_max and wmem_max (about
+	// 208 KiB by default), which must be raised for large bursts; darwin
+	// keeps its default for a request above kern.ipc.maxsockbuf. Bursts
+	// from the target wait there until the flow's pump reads them: size it
+	// for the largest burst.
+	UDPBuffer int
+
+	tcp, udp  kindStats  // the counters of TCP connections and of UDP flows
+	flow      flowCounts // the UDP flows' datagram and end counters
 	abandoned atomic.Int64
-
-	confirmed, rejected, unconfirmed, lost, panics atomic.Uint64
-
-	byCode  [CodeDialFailed - CodeBadRequest + 1]atomic.Uint64
-	lastErr atomic.Pointer[error]
+	panics    atomic.Uint64
+	lastErr   atomic.Pointer[error]
 }
 
-// Serve accepts stream sessions from ln until ctx is done or Accept fails
-// and handles each on its own goroutine (see Handle). Cancelling ctx
-// resets every connection it serves. Serve returns after every connection
-// it started has ended, with ctx.Err() or Accept's error (net.ErrClosed
-// after Listener.Close or Runtime.Close; confirmed connections keep running
-// until they end or ctx is done). Packet sessions are never accepted: their
-// OPENs on ln wait in its packet backlog until AcceptTimeout answers them.
-// Abandoned Dial hook calls may outlive Serve; Status counts them.
+// kindStats are a Server's counters of one kind of session: TCP
+// connections (stream sessions, Handle) or UDP flows (packet sessions,
+// HandleUDP). Keeping them apart keeps every TCP counter's v2.0.0 meaning
+// when both kinds run (M6-D19).
+type kindStats struct {
+	units   atomic.Int64 // handlers admitted under MaxConns or MaxFlows: dialling or forwarding
+	hooks   atomic.Int64 // custom hook calls of this kind running, abandoned ones included (R1-12)
+	dialing atomic.Int64
+	live    atomic.Int64
+
+	confirmed, rejected, unconfirmed, lost atomic.Uint64
+
+	byCode [CodeDialFailed - CodeBadRequest + 1]atomic.Uint64
+}
+
+// codes returns a fresh map of the kind's refusals by code.
+func (k *kindStats) codes() map[RejectCode]uint64 {
+	m := make(map[RejectCode]uint64)
+	for i := range k.byCode {
+		if n := k.byCode[i].Load(); n > 0 {
+			m[CodeBadRequest+RejectCode(i)] = n
+		}
+	}
+	return m
+}
+
+// Serve accepts stream sessions from ln — and, with UDP set, packet
+// sessions on a second accept loop — until ctx is done or Accept fails,
+// and handles each on its own goroutine (see Handle and HandleUDP).
+// Cancelling ctx resets every connection and ends every flow it serves.
+// Serve returns after its accept loops ended and every connection and flow
+// it started has ended, with ctx.Err() or the first loop's error
+// (net.ErrClosed after Listener.Close or Runtime.Close; confirmed
+// connections and flows keep running until they end or ctx is done — a
+// flow ends at its idle limit). Without UDP, packet sessions are never
+// accepted: their OPENs on ln wait in its packet backlog until
+// AcceptTimeout answers them. Abandoned Dial hook calls may outlive Serve;
+// Status counts them. Serve may run on several Listeners at once, one call
+// each: MaxConns and MaxFlows bound them together, and Status covers them
+// all.
 func (s *Server) Serve(ctx context.Context, ln *rendr.Listener) error {
 	var wg sync.WaitGroup
+	var err error
+	if s.UDP {
+		// M6-D16: the packet loop beside the stream loop; both end on ctx
+		// or the Listener's close, and the first one's error is returned.
+		errs := make(chan error, 2)
+		go func() { errs <- acceptLoop(ctx, &wg, ln.AcceptPacket, s.HandleUDP) }()
+		go func() { errs <- acceptLoop(ctx, &wg, ln.Accept, s.Handle) }()
+		err = <-errs
+		<-errs
+	} else {
+		err = acceptLoop(ctx, &wg, ln.Accept, s.Handle)
+	}
+	wg.Wait()
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	return err
+}
+
+// acceptLoop accepts pending sessions with accept until it fails and runs
+// handle for each on a goroutine of wg; it returns accept's error.
+func acceptLoop[P any](ctx context.Context, wg *sync.WaitGroup, accept func(context.Context) (P, error), handle func(context.Context, P)) error {
 	for {
-		p, err := ln.Accept(ctx)
+		p, err := accept(ctx)
 		if err != nil {
-			wg.Wait()
-			if cerr := ctx.Err(); cerr != nil {
-				return cerr
-			}
 			return err
 		}
-		wg.Go(func() { s.Handle(ctx, p) })
+		wg.Go(func() { handle(ctx, p) })
 	}
 }
 
@@ -141,21 +225,18 @@ func (s *Server) Serve(ctx context.Context, ln *rendr.Listener) error {
 // tells them apart). Cancelling ctx stops the dial (the session is
 // rejected CodeDialFailed) or resets the forwarded connection.
 func (s *Server) Handle(ctx context.Context, p *rendr.PendingConn) {
-	if !acquire(&s.conns, int64(s.maxConns())) {
-		s.reject(p, CodeCapacity)
+	k := &s.tcp
+	if !acquire(&k.units, int64(s.maxConns())) {
+		s.reject(p, k, CodeCapacity)
 		return
 	}
-	defer s.conns.Add(-1)
+	defer k.units.Add(-1)
 	r, err := ParseMetadata(p.Metadata())
 	if err != nil {
-		code := CodeBadRequest
-		if me, ok := errors.AsType[*MetadataError](err); ok {
-			code = me.Code
-		}
-		s.reject(p, code)
+		s.reject(p, k, metadataCode(err))
 		return
 	}
-	t := s.connect(ctx, p, r)
+	t := s.connect(ctx, p, k, r)
 	if t == nil {
 		return
 	}
@@ -164,25 +245,36 @@ func (s *Server) Handle(ctx context.Context, p *rendr.PendingConn) {
 		// The session was decided while the target connected (withdrawn,
 		// timed out, its Listener or Runtime closed; M4-D31, R1-25).
 		resetConn(t)
-		s.unconfirmed.Add(1)
+		k.unconfirmed.Add(1)
 		return
 	}
-	s.confirmed.Add(1)
+	k.confirmed.Add(1)
 	if d := s.idleTimeout(); d >= 0 {
 		c.SetIdleTimeout(d) // net.ErrClosed only: the session ended already, and Forward sees it
 	}
-	s.live.Add(1)
-	defer s.live.Add(-1)
+	k.live.Add(1)
+	defer k.live.Add(-1)
 	Forward(ctx, c, t)
 }
 
-// connect dials the target of r for the pending session p within the dial
-// budget (§A6.1, §A6.3). It returns the connected target, or nil after it
-// answered p (or found p decided already).
-func (s *Server) connect(ctx context.Context, p *rendr.PendingConn, r Request) net.Conn {
+// metadataCode is the Reject code of a metadata decode error.
+func metadataCode(err error) RejectCode {
+	if me, ok := errors.AsType[*MetadataError](err); ok {
+		return me.Code
+	}
+	return CodeBadRequest
+}
+
+// connect dials the target of r for the pending session p, counted in k,
+// within the dial budget (M4 design §A6.1, §A6.3; M6 design §A6.2): the
+// Dial hook, else dialTCP (CmdConnect) or dialUDP (CmdUDP). A hook's conn
+// for a UDP flow must be a connected datagram conn (M6-D17, R1-11). It
+// returns the connected target, or nil after it answered p (or found p
+// decided already).
+func (s *Server) connect(ctx context.Context, p pending, k *kindStats, r Request) net.Conn {
 	custom := s.Dial != nil
-	if custom && !acquire(&s.hooks, maxHookCalls) {
-		s.reject(p, CodeCapacity) // R1-9: no hook call at the cap
+	if custom && !acquire(&k.hooks, maxHookCalls) {
+		s.reject(p, k, CodeCapacity) // R1-9: no hook call at the cap; R1-12: the cap of r's kind
 		return nil
 	}
 	pctx := p.Context()
@@ -195,12 +287,12 @@ func (s *Server) connect(ctx context.Context, p *rendr.PendingConn, r Request) n
 	}
 	if pctx.Err() != nil || !now.Before(deadline) {
 		if custom {
-			s.hooks.Add(-1)
+			k.hooks.Add(-1)
 		}
 		if pctx.Err() != nil {
-			s.lost.Add(1) // decided before the dial (withdrawn, closed): no Reject
+			k.lost.Add(1) // decided before the dial (withdrawn, closed): no Reject
 		} else {
-			s.reject(p, CodeTimeout) // the budget is spent: no dial
+			s.reject(p, k, CodeTimeout) // the budget is spent: no dial
 		}
 		return nil
 	}
@@ -210,17 +302,22 @@ func (s *Server) connect(ctx context.Context, p *rendr.PendingConn, r Request) n
 	// context package runs cancel on a goroutine of its own, as it runs
 	// every AfterFunc function.
 	stop := context.AfterFunc(pctx, cancel)
-	s.dialing.Add(1)
+	k.dialing.Add(1)
 	var t net.Conn
 	var err error
-	if custom {
-		t, err = s.callHook(dctx, r, deadline)
-	} else {
+	switch {
+	case custom:
+		t, err = s.callHook(dctx, &k.hooks, r, deadline)
+	case r.Cmd == CmdUDP:
+		if t, err = dialUDP(dctx, r.Addr); err == nil {
+			requestBuffers(t, s.udpBuffer())
+		}
+	default:
 		t, err = dialTCP(dctx, r.Addr)
 	}
 	stop()
 	cancel()
-	s.dialing.Add(-1)
+	k.dialing.Add(-1)
 	if err == nil && ctx.Err() != nil {
 		// Serve stopped while the target connected: no session is confirmed
 		// that Forward would reset at once.
@@ -233,11 +330,11 @@ func (s *Server) connect(ctx context.Context, p *rendr.PendingConn, r Request) n
 	s.lastErr.Store(&err)
 	switch { // R1-6: Serve's ctx first, then the pending context, then classify
 	case ctx.Err() != nil:
-		s.reject(p, CodeDialFailed)
+		s.reject(p, k, CodeDialFailed)
 	case pctx.Err() != nil:
-		s.lost.Add(1) // decided already (withdrawn, AcceptTimeout, closed): no Reject
+		k.lost.Add(1) // decided already (withdrawn, AcceptTimeout, closed): no Reject
 	default:
-		s.reject(p, classify(err))
+		s.reject(p, k, classify(err))
 	}
 	return nil
 }
@@ -260,13 +357,13 @@ const (
 	hookAbandoned
 )
 
-// callHook runs the custom hook on its own goroutine (counted in hooks by
-// connect, never in Serve's WaitGroup: R1-7) and waits for its result
-// until deadline + abandonAfter; a call still running then is abandoned
-// and answered errAbandoned (CodeTimeout).
-func (s *Server) callHook(ctx context.Context, r Request, deadline time.Time) (net.Conn, error) {
+// callHook runs the custom hook on its own goroutine (counted in hooks, the
+// count of r's kind, by connect, never in Serve's WaitGroup: R1-7) and
+// waits for its result until deadline + abandonAfter; a call still running
+// then is abandoned and answered errAbandoned (CodeTimeout).
+func (s *Server) callHook(ctx context.Context, hooks *atomic.Int64, r Request, deadline time.Time) (net.Conn, error) {
 	h := &hookCall{done: make(chan struct{})}
-	go s.runHook(h, ctx, r)
+	go s.runHook(h, hooks, ctx, r)
 	t := time.NewTimer(time.Until(deadline) + abandonAfter)
 	defer t.Stop()
 	select {
@@ -284,17 +381,26 @@ func (s *Server) callHook(ctx context.Context, r Request, deadline time.Time) (n
 
 // runHook is the hook call's goroutine. A panic or runtime.Goexit is
 // recovered into hookPanic; (nil, nil) becomes errNilConn; the conn of a
-// (conn, err) result is closed once and err kept. The result is handed to
-// the handler first; a conn to drop (of a (conn, err) result, or late) is
-// closed after that, under recover, and the hook count is released last
-// even if that Close calls runtime.Goexit.
-func (s *Server) runHook(h *hookCall, ctx context.Context, r Request) {
-	defer s.hooks.Add(-1)
+// (conn, err) result is closed once and err kept. A UDP flow's conn must
+// pass isDatagramConn, run here (M6-D17, R1-11), so that a panic or
+// runtime.Goexit in its address methods ends only this goroutine: such a
+// conn, and one the check refuses, is dropped with errBadDatagramConn or
+// errNotDatagram (CodeDialFailed; a panic or Goexit counted in Panics).
+// The result is handed to the handler first; a conn to drop (of a (conn,
+// err) result, refused, or late) is closed after that, under recover, and
+// the hook count (hooks, of the call's kind) is released last even if
+// that Close calls runtime.Goexit.
+func (s *Server) runHook(h *hookCall, hooks *atomic.Int64, ctx context.Context, r Request) {
+	defer hooks.Add(-1)
 	var conn net.Conn
 	var err error
-	returned := false
+	returned, checking := false, false
 	defer func() {
-		if !returned {
+		switch {
+		case checking:
+			err = errBadDatagramConn{v: recover()} // the check panicked (or Goexit, which then goes on)
+			s.panics.Add(1)
+		case !returned:
 			conn, err = nil, hookPanic{v: recover()} // recover is nil under Goexit, which then goes on
 			s.panics.Add(1)
 		}
@@ -321,6 +427,13 @@ func (s *Server) runHook(h *hookCall, ctx context.Context, r Request) {
 	}()
 	conn, err = s.Dial(ctx, r)
 	returned = true
+	if err == nil && conn != nil && r.Cmd == CmdUDP {
+		checking = true
+		if !isDatagramConn(conn) {
+			err = errNotDatagram
+		}
+		checking = false
+	}
 }
 
 // closeHookConn closes a conn the Dial hook supplied and the Server drops.
@@ -353,12 +466,12 @@ func acquire(n *atomic.Int64, limit int64) bool {
 }
 
 // reject answers p with code and its fixed text (M4-D32: the raw error
-// never reaches the dialer). Reject's own error is ignored: the session is
-// decided either way.
-func (s *Server) reject(p *rendr.PendingConn, code RejectCode) {
+// never reaches the dialer) and counts it in k. Reject's own error is
+// ignored: the session is decided either way.
+func (s *Server) reject(p pending, k *kindStats, code RejectCode) {
 	p.Reject(uint32(code), code.String())
-	s.rejected.Add(1)
-	s.byCode[code-CodeBadRequest].Add(1)
+	k.rejected.Add(1)
+	k.byCode[code-CodeBadRequest].Add(1)
 }
 
 func (s *Server) maxConns() int {
@@ -385,22 +498,19 @@ func (s *Server) idleTimeout() time.Duration {
 
 // Status returns a snapshot of the Server's counters.
 func (s *Server) Status() ServerStatus {
+	k := &s.tcp
 	st := ServerStatus{
-		Dialing:     int(s.dialing.Load()),
-		Live:        int(s.live.Load()),
-		Hooks:       int(s.hooks.Load()),
+		Dialing:     int(k.dialing.Load()),
+		Live:        int(k.live.Load()),
+		Hooks:       int(k.hooks.Load() + s.udp.hooks.Load()),
 		Abandoned:   int(s.abandoned.Load()),
-		Confirmed:   s.confirmed.Load(),
-		Rejected:    s.rejected.Load(),
-		Unconfirmed: s.unconfirmed.Load(),
-		Lost:        s.lost.Load(),
-		ByCode:      make(map[RejectCode]uint64),
+		Confirmed:   k.confirmed.Load(),
+		Rejected:    k.rejected.Load(),
+		Unconfirmed: k.unconfirmed.Load(),
+		Lost:        k.lost.Load(),
+		ByCode:      k.codes(),
 		Panics:      s.panics.Load(),
-	}
-	for i := range s.byCode {
-		if n := s.byCode[i].Load(); n > 0 {
-			st.ByCode[CodeBadRequest+RejectCode(i)] = n
-		}
+		UDP:         s.udpStatus(),
 	}
 	if e := s.lastErr.Load(); e != nil {
 		st.LastErr = *e
@@ -416,7 +526,7 @@ func Serve(ctx context.Context, ln *rendr.Listener) error {
 // ServerStatus counts what a Server does.
 type ServerStatus struct {
 	Dialing, Live       int                   // sessions being dialled for; connections being forwarded
-	Hooks               int                   // custom hook calls running, in flight or abandoned (≤ 192)
+	Hooks               int                   // custom hook calls running, in flight or abandoned (≤ 192 of each kind)
 	Abandoned           int                   // hook calls still running past their bound
 	Confirmed, Rejected uint64                // totals (Rejected: Reject calls, also one that found the session decided)
 	Unconfirmed         uint64                // dialled, then reset because Confirm failed
@@ -424,4 +534,8 @@ type ServerStatus struct {
 	ByCode              map[RejectCode]uint64 // Rejected by code
 	Panics              uint64                // recovered hook panics and Goexits
 	LastErr             error                 // the last raw dial error (never sent to the dialer)
+	// UDP counts the UDP flows (Server.UDP). The fields above count TCP
+	// connections, except Hooks, Abandoned, Panics and LastErr, which count
+	// both kinds.
+	UDP UDPServerStatus
 }

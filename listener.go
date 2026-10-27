@@ -177,6 +177,7 @@ func newListener(rt *Runtime, cfg ListenConfig, srcs []net.Listener) *Listener {
 		Registry: lnRegistry{ln},
 		Rand:     rt.eff.rand,
 		Hooks:    rt.eff.hooks,
+		Closing:  &rt.closing,
 	}
 	return ln
 }
@@ -690,3 +691,11 @@ func (pendingCtx) Value(any) any           { return nil }
 func (c pendingCtx) AfterFunc(f func()) (stop func() bool) { return c.s.PendingAfterFunc(f) }
 
 func (pendingCtx) String() string { return "rendr.PendingConn.Context" }
+
+// pendingPacketCtx is PendingPacket's pending context: the same view of the
+// session's pending phase under its own name (M6, R1-19). It embeds
+// pendingCtx instead of adding a kind flag, so it stays one pointer wide
+// and Context does not allocate.
+type pendingPacketCtx struct{ pendingCtx }
+
+func (pendingPacketCtx) String() string { return "rendr.PendingPacket.Context" }

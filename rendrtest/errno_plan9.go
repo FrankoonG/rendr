@@ -13,6 +13,10 @@ const errWSAEMSGSIZE = syscall.ErrorString("WSAEMSGSIZE")
 // errnos (ErrReset matches it with errors.Is).
 var errConnReset error = syscall.ErrorString("connection reset by peer")
 
+// errMsgSize stands in for EMSGSIZE (ErrMsgSize) on Plan 9, which has no
+// numeric errnos.
+var errMsgSize error = errWSAEMSGSIZE
+
 // The errors of ScriptedDial's failures on Plan 9, which has no numeric
 // errnos.
 var (

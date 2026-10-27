@@ -130,7 +130,7 @@ func TestForwardZeroAllocs_L41_L54(t *testing.T) {
 	if _, err := io.ReadFull(cli, rbuf[:1]); err != io.EOF {
 		t.Fatalf("client: %v, want the target's FIN", err)
 	}
-	want := int64(warm+rounds) * chunk
+	want := int64(warm+settleRuns(minRounds)+rounds) * chunk
 	checkClean(t, "ingress", <-in, want, want)
 	checkClean(t, "egress", <-out, want, want)
 	fcancel()
@@ -146,10 +146,29 @@ func TestForwardZeroAllocs_L41_L54(t *testing.T) {
 // countMallocs runs f at least n times and for at least window, with the
 // garbage collector off and one P (as testing.AllocsPerRun), and returns
 // the raw number of heap allocations of every goroutine during the window,
-// the runs and the window's duration.
+// the runs and the window's duration. Like testing.AllocsPerRun it first
+// runs f at one P outside the window (settleRuns(n) times): the switch to
+// one P drops every sync.Pool's per-P cache, and the pools' refill is no
+// steady-state allocation (M6 I1: on Linux workers it put 20–42 of them
+// into the window of TestPortForwardZeroAllocs_L54, bound 40).
 func countMallocs(n int, window time.Duration, f func()) (mallocs uint64, runs int, el time.Duration) {
+	return countMallocsWarm(n, window, nil, f)
+}
+
+// countMallocsWarm is countMallocs with warm (when not nil) run once at
+// one P and with the collector off before the settle runs: a warm-up whose
+// pool growth must happen in the pools of the P that the window runs on
+// and survive until the window (no collection in between), as the UDP
+// gates' dgWarm bursts.
+func countMallocsWarm(n int, window time.Duration, warm, f func()) (mallocs uint64, runs int, el time.Duration) {
 	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	if warm != nil {
+		warm()
+	}
+	for range settleRuns(n) {
+		f()
+	}
 	var m0, m1 runtime.MemStats
 	runtime.ReadMemStats(&m0)
 	start := time.Now()
@@ -161,3 +180,7 @@ func countMallocs(n int, window time.Duration, f func()) (mallocs uint64, runs i
 	runtime.ReadMemStats(&m1)
 	return m1.Mallocs - m0.Mallocs, runs, el
 }
+
+// settleRuns is how many times countMallocs(n, …) runs f before its
+// window; the callers' byte and datagram accounting adds them.
+func settleRuns(n int) int { return max(n/100, 16) }

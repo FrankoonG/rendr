@@ -5,19 +5,24 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
 )
 
-// goldenVector is one line of testdata/meta-v1.txt.
+// goldenVector is one line of testdata/meta-v1.txt or of
+// testdata/meta-v1-udp.txt.
 type goldenVector struct {
-	name string
-	md   []byte
-	ok   bool
-	addr string     // ok
-	app  []byte     // ok
-	code RejectCode // bad
+	name  string
+	md    []byte
+	ok    bool
+	addr  string     // ok
+	first []byte     // ok, the UDP file only
+	app   []byte     // ok
+	code  RejectCode // bad
 }
 
 var codeByName = map[string]RejectCode{
@@ -27,9 +32,26 @@ var codeByName = map[string]RejectCode{
 	"BadAddress": CodeBadAddress,
 }
 
-func loadGolden(t testing.TB) []goldenVector {
+// The golden vector files: CONNECT (M4, frozen at v2.0.0) and UDP (M6). An
+// ok line of the UDP file has one more field, the first datagram.
+const (
+	goldenConnect = "testdata/meta-v1.txt"
+	goldenUDP     = "testdata/meta-v1-udp.txt"
+)
+
+// loadGolden returns the vectors of testdata/meta-v1.txt.
+func loadGolden(t testing.TB) []goldenVector { return loadGoldenFile(t, goldenConnect) }
+
+// loadGoldenUDP returns the vectors of testdata/meta-v1-udp.txt.
+func loadGoldenUDP(t testing.TB) []goldenVector { return loadGoldenFile(t, goldenUDP) }
+
+func loadGoldenFile(t testing.TB, path string) []goldenVector {
 	t.Helper()
-	f, err := os.Open("testdata/meta-v1.txt")
+	udp, least := path == goldenUDP, 40
+	if udp {
+		least = 17
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +65,7 @@ func loadGolden(t testing.TB) []goldenVector {
 		}
 		b, err := hex.DecodeString(s)
 		if err != nil {
-			t.Fatalf("testdata: %q: %v", s, err)
+			t.Fatalf("%s: %q: %v", path, s, err)
 		}
 		return b
 	}
@@ -54,23 +76,25 @@ func loadGolden(t testing.TB) []goldenVector {
 		}
 		fs := strings.Fields(line)
 		switch {
-		case fs[0] == "ok" && len(fs) == 5:
+		case fs[0] == "ok" && len(fs) == 5 && !udp:
 			out = append(out, goldenVector{name: fs[1], md: unhex(fs[2]), ok: true, addr: fs[3], app: unhex(fs[4])})
+		case fs[0] == "ok" && len(fs) == 6 && udp:
+			out = append(out, goldenVector{name: fs[1], md: unhex(fs[2]), ok: true, addr: fs[3], first: unhex(fs[4]), app: unhex(fs[5])})
 		case fs[0] == "bad" && len(fs) == 4:
 			code, known := codeByName[fs[3]]
 			if !known {
-				t.Fatalf("testdata: unknown code in %q", line)
+				t.Fatalf("%s: unknown code in %q", path, line)
 			}
 			out = append(out, goldenVector{name: fs[1], md: unhex(fs[2]), code: code})
 		default:
-			t.Fatalf("testdata: malformed line %q", line)
+			t.Fatalf("%s: malformed line %q", path, line)
 		}
 	}
 	if err := sc.Err(); err != nil {
 		t.Fatal(err)
 	}
-	if len(out) < 40 {
-		t.Fatalf("testdata: only %d vectors", len(out))
+	if len(out) < least {
+		t.Fatalf("%s: only %d vectors", path, len(out))
 	}
 	return out
 }
@@ -88,12 +112,18 @@ func wantMetadataError(t *testing.T, what string, err error, code RejectCode) {
 }
 
 // TestL4MetadataGolden_L44: every vector of testdata/meta-v1.txt (M4 design
-// §A3.5) decodes to its request, re-encodes to its bytes, and every
-// rejection carries its code; the header of every valid vector truncated by
-// one byte is rejected CodeBadAddress (a truncated IPv4 header never parses
-// as a domain).
+// §A3.5) decodes through ParseMetadata to its request, re-encodes to its
+// bytes, and every rejection carries its code; the header of every valid
+// vector truncated by one byte is rejected CodeBadAddress (a truncated IPv4
+// header never parses as a domain). Every vector of
+// testdata/meta-v1-udp.txt (M6 design §A3.5) does the same through
+// ParseUDPMetadata, and a valid one truncated inside its first-datagram
+// length or its first datagram is CodeBadRequest. Every valid vector of
+// each file is CodeBadCommand through the other parser (R1-8).
 func TestL4MetadataGolden_L44(t *testing.T) {
+	names := map[string]bool{}
 	for _, v := range loadGolden(t) {
+		names[v.name] = true
 		t.Run(v.name, func(t *testing.T) {
 			in := bytes.Clone(v.md)
 			r, err := ParseMetadata(in)
@@ -107,7 +137,7 @@ func TestL4MetadataGolden_L44(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseMetadata: %v", err)
 			}
-			if r.Cmd != CmdConnect || r.Addr != v.addr || !bytes.Equal(r.App, v.app) {
+			if r.Cmd != CmdConnect || r.Addr != v.addr || !bytes.Equal(r.App, v.app) || r.First != nil {
 				t.Fatalf("ParseMetadata = %+v, want Addr %q App %x", r, v.addr, v.app)
 			}
 			if len(v.app) > 0 && &r.App[0] != &in[len(in)-len(v.app)] {
@@ -127,6 +157,60 @@ func TestL4MetadataGolden_L44(t *testing.T) {
 			hdr := len(v.md) - len(v.app)
 			_, err = ParseMetadata(v.md[:hdr-1])
 			wantMetadataError(t, "truncated header", err, CodeBadAddress)
+			_, err = ParseUDPMetadata(in)
+			wantMetadataError(t, "ParseUDPMetadata of a CONNECT vector", err, CodeBadCommand)
+		})
+	}
+	for _, v := range loadGoldenUDP(t) {
+		if names[v.name] {
+			t.Fatalf("%s names %q, as %s does", goldenUDP, v.name, goldenConnect)
+		}
+		t.Run(v.name, func(t *testing.T) {
+			in := bytes.Clone(v.md)
+			r, err := ParseUDPMetadata(in)
+			if !bytes.Equal(in, v.md) {
+				t.Fatal("ParseUDPMetadata modified its input")
+			}
+			if !v.ok {
+				wantMetadataError(t, "ParseUDPMetadata", err, v.code)
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseUDPMetadata: %v", err)
+			}
+			if r.Cmd != CmdUDP || r.Addr != v.addr || !bytes.Equal(r.First, v.first) || !bytes.Equal(r.App, v.app) ||
+				(r.First == nil) != (v.first == nil) || (r.App == nil) != (v.app == nil) {
+				t.Fatalf("ParseUDPMetadata = %+v, want Addr %q First %x App %x", r, v.addr, v.first, v.app)
+			}
+			hdr := len(v.md) - 2 - len(v.first) - len(v.app) // the header's end, after the port
+			if len(v.first) > 0 && (&r.First[0] != &in[hdr+2] || cap(r.First) != len(v.first)) {
+				t.Fatal("First does not alias the input, or reaches into App")
+			}
+			if len(v.app) > 0 && &r.App[0] != &in[len(in)-len(v.app)] {
+				t.Fatal("App does not alias the input")
+			}
+			if !Match(in) {
+				t.Fatal("Match = false")
+			}
+			enc, err := AppendMetadata(nil, Request{Cmd: CmdUDP, Addr: v.addr, First: v.first, App: v.app})
+			if err != nil {
+				t.Fatalf("AppendMetadata: %v", err)
+			}
+			if !bytes.Equal(enc, v.md) {
+				t.Fatalf("AppendMetadata = %x, want %x", enc, v.md)
+			}
+			_, err = ParseUDPMetadata(v.md[:hdr-1])
+			wantMetadataError(t, "truncated header", err, CodeBadAddress)
+			for _, cut := range []int{hdr, hdr + 1} {
+				_, err = ParseUDPMetadata(v.md[:cut])
+				wantMetadataError(t, "truncated first-datagram length", err, CodeBadRequest)
+			}
+			if len(v.first) > 0 {
+				_, err = ParseUDPMetadata(v.md[:hdr+2+len(v.first)-1])
+				wantMetadataError(t, "truncated first datagram", err, CodeBadRequest)
+			}
+			_, err = ParseMetadata(in)
+			wantMetadataError(t, "ParseMetadata of a UDP vector", err, CodeBadCommand)
 		})
 	}
 }
@@ -182,6 +266,8 @@ func TestL4MetadataCanonical_L44(t *testing.T) {
 		"a b:80", "a%b:80", "a/b:80", "exämple.com:80", strings.Repeat("a", 64) + ":80",
 		strings.Repeat("a.", 126) + "aaa:80", // 255 bytes
 		"[a:b]:80", "a:b:80",
+		// Square brackets enclose an IPv6 address only (rc7).
+		"[A000]:12336", "[a.test]:80", "[localhost]:80", "[192.0.2.1]:80", "[127.0.0.1]:443", "[]:80",
 	}
 	prefix := []byte("keep")
 	for _, addr := range bad {
@@ -204,7 +290,7 @@ func TestL4MetadataCanonical_L44(t *testing.T) {
 	// One encoding per destination: every spelling of an address encodes to
 	// the canonical bytes (an IPv4-mapped IPv6 address as IPv4).
 	same := [][]string{
-		{"127.0.0.1:443", "[::ffff:127.0.0.1]:443", "[::FFFF:7f00:1]:443", "[127.0.0.1]:443", "127.0.0.1:0443"},
+		{"127.0.0.1:443", "[::ffff:127.0.0.1]:443", "[::FFFF:7f00:1]:443", "127.0.0.1:0443"},
 		{"[::1]:80", "[0:0:0:0:0:0:0:1]:80", "[::0001]:80"},
 		{"[2001:db8::1]:65535", "[2001:DB8:0::1]:65535"},
 	}
@@ -236,6 +322,75 @@ func TestL4MetadataCanonical_L44(t *testing.T) {
 		}
 		if r, err := ParseMetadata(enc); err != nil || r.Addr != addr {
 			t.Errorf("round trip of %q = %+v, %v", addr, r, err)
+		}
+	}
+}
+
+// TestL4MetadataJoinedHost_L44 (M6 rc7; L44): a host joined with its port
+// by net.JoinHostPort, as a front end builds a target from a name it was
+// given (examples/socks5's ATYP 3), never changes meaning: AppendMetadata
+// refuses it with ErrBadAddress or carries exactly it, a name byte for
+// byte and an IP literal as its address, for CmdConnect and CmdUDP. The
+// hosts are names with every byte that alters or breaks the host:port
+// reading (brackets, colons, NUL, whitespace and the like) and the valid
+// forms around them. The fuzz input that found the hole: the name
+// "[A000]", which SplitHostPort read as A000. The decoders refuse a domain
+// holding any of those bytes with CodeBadAddress, so a decoded Addr never
+// holds one either.
+func TestL4MetadataJoinedHost_L44(t *testing.T) {
+	refused := []string{
+		"[A000]", "[a.test]", "[localhost]", "[192.0.2.1]", "[127.0.0.1]", "[::1]", "[2001:db8::1]", "[]",
+		"[", "]", "[a", "a]", "a[b", "a]b", "[a]b", "a:b", "a.test:80", "192.0.2.4:5", "::1]", "[::1",
+		"a\x00b", "a b", " a", "a ", "a\tb", "a\nb", "a\rb", "a%b", "a/b", "a#b", "a@b", "a?b", "a\\b",
+		"fe80::1%eth0", "", ".", "a..b",
+	}
+	kept := []string{"a.test", "A000", "localhost", "example.com.", "192.0.2.1", "::1", "2001:db8::1", "::ffff:192.0.2.1"}
+	for _, cmd := range []uint8{CmdConnect, CmdUDP} {
+		parse := ParseMetadata
+		if cmd == CmdUDP {
+			parse = ParseUDPMetadata
+		}
+		for i, host := range append(refused, kept...) {
+			addr := net.JoinHostPort(host, "80")
+			md, err := AppendMetadata(nil, Request{Cmd: cmd, Addr: addr})
+			if i < len(refused) {
+				if !errors.Is(err, ErrBadAddress) {
+					t.Errorf("cmd %#x: host %q joined as %q: AppendMetadata = %x, %v; want ErrBadAddress", cmd, host, addr, md, err)
+				}
+				continue
+			}
+			if err != nil {
+				t.Errorf("cmd %#x: host %q joined as %q: %v", cmd, host, addr, err)
+				continue
+			}
+			r, err := parse(md)
+			if err != nil {
+				t.Fatalf("cmd %#x: %q: %v", cmd, addr, err)
+			}
+			got, port, err := net.SplitHostPort(r.Addr)
+			if err != nil || port != "80" {
+				t.Fatalf("cmd %#x: %q travels as %q", cmd, addr, r.Addr)
+			}
+			want := host
+			if a, err := netip.ParseAddr(host); err == nil {
+				want = a.Unmap().String()
+			}
+			if got != want {
+				t.Errorf("cmd %#x: host %q joined as %q travels as %q, want host %q", cmd, host, addr, r.Addr, want)
+			}
+		}
+		for _, b := range []byte("[]: \t\n\x00%/") {
+			name := []byte("a" + string(b) + "b")
+			md := append([]byte{'L', '4', 1, cmd, atypDomain, byte(len(name))}, name...)
+			md = append(md, 0, 80)
+			if cmd == CmdUDP {
+				md = append(md, 0, 0)
+			}
+			if _, err := parse(md); err == nil {
+				t.Errorf("cmd %#x: the domain %q was accepted", cmd, name)
+			} else {
+				wantMetadataError(t, fmt.Sprintf("cmd %#x, domain %q", cmd, name), err, CodeBadAddress)
+			}
 		}
 	}
 }
@@ -295,31 +450,41 @@ var (
 )
 
 // TestL4MetadataAllocs: AppendMetadata allocates nothing into a dst sized
-// for the header and the application's metadata; ParseMetadata allocates
-// only the address string (M4 design §A12.6).
+// for the header, the first datagram and the application's metadata;
+// ParseMetadata and ParseUDPMetadata allocate only the address string (M4
+// design §A12.6; M6 design §A3.2).
 func TestL4MetadataAllocs(t *testing.T) {
 	addrs := []string{"127.0.0.1:443", "[::ffff:192.0.2.1]:80", "[2001:db8::1]:8080", "localhost:8080", "example.com.:443"}
 	app := bytes.Repeat([]byte("app"), 100)
-	dst := make([]byte, 0, maxHeader+len(app))
+	first := bytes.Repeat([]byte("dgram"), 40)
+	dst := make([]byte, 0, maxHeader+2+len(first)+len(app))
 	for _, addr := range addrs {
-		r := Request{Cmd: CmdConnect, Addr: addr, App: app}
-		md, err := AppendMetadata(nil, r)
-		if err != nil {
-			t.Fatal(err)
-		}
-		a := testing.AllocsPerRun(100, func() { sinkBytes, sinkErr = AppendMetadata(dst[:0], r) })
-		p := testing.AllocsPerRun(100, func() { sinkRequest, sinkErr = ParseMetadata(md) })
-		if sinkErr != nil {
-			t.Fatal(sinkErr)
-		}
-		if raceEnabled {
-			continue
-		}
-		if a != 0 {
-			t.Errorf("AppendMetadata(%q): %v allocations, want 0", addr, a)
-		}
-		if p > 1 {
-			t.Errorf("ParseMetadata(%q): %v allocations, want ≤ 1", addr, p)
+		for _, r := range []Request{
+			{Cmd: CmdConnect, Addr: addr, App: app},
+			{Cmd: CmdUDP, Addr: addr, First: first, App: app},
+		} {
+			md, err := AppendMetadata(nil, r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parse := ParseMetadata
+			if r.Cmd == CmdUDP {
+				parse = ParseUDPMetadata
+			}
+			a := testing.AllocsPerRun(100, func() { sinkBytes, sinkErr = AppendMetadata(dst[:0], r) })
+			p := testing.AllocsPerRun(100, func() { sinkRequest, sinkErr = parse(md) })
+			if sinkErr != nil {
+				t.Fatal(sinkErr)
+			}
+			if raceEnabled {
+				continue
+			}
+			if a != 0 {
+				t.Errorf("AppendMetadata(cmd %d, %q): %v allocations, want 0", r.Cmd, addr, a)
+			}
+			if p > 1 {
+				t.Errorf("parsing cmd %d, %q: %v allocations, want ≤ 1", r.Cmd, addr, p)
+			}
 		}
 	}
 }

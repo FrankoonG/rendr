@@ -81,6 +81,9 @@ func TestEarlyRejectThroughL4_L49(t *testing.T) {
 		if got, unclosed := refused.Calls(), refused.Unclosed(); got != 1 || unclosed != 0 {
 			t.Fatalf("the refusing hook: %d calls, %d conns unclosed; want 1, 0", got, unclosed)
 		}
+		// The Server counts a refusal after sending it (Server.reject), so the
+		// dialer can see the refusal before Status counts it.
+		waitFor(t, 10*time.Second, "the Server counts the refusal", func() bool { return w.srv.Status().Rejected != 0 })
 		if st := w.srv.Status(); st.Confirmed != 0 || st.Rejected != 1 || st.ByCode[l4.CodeRefused] != 1 {
 			t.Fatalf("Server %+v, want one rejection CodeRefused and nothing confirmed", plain(st))
 		}

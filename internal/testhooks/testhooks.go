@@ -195,6 +195,23 @@ type Hooks struct {
 	// death catches attached-pending, started after the death). It must
 	// not call into that session.
 	BeforeAttachStart func(session [16]byte, carrier uint32)
+
+	// M6 (rc5).
+
+	// HealthRing runs under a Peer health layer's lock each time a new
+	// snapshot rings its subscribers, with their number (each one is a
+	// dialer session whose actor the ring wakes): the work bound of
+	// TestMuxDgramMassRejoinAfterBlackhole_L27_L72. It must not block or
+	// call into rendr.
+	HealthRing func(subscribers int)
+
+	// M6 (rc9).
+
+	// AfterShutdown runs in Runtime.Close right after it posted Shutdown
+	// to session (step 3), before the next session's, with no lock held:
+	// a test can let that session's reset cross first
+	// (TestRuntimeCloseSharedTrunkEndsClosed).
+	AfterShutdown func(session [16]byte)
 }
 
 // Session registry gauges (M3 design Revision 1, R1-24): always compiled,

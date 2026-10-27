@@ -60,26 +60,38 @@ import (
 // before Runtime.Close). Runtime.Close then leaves nothing (crRuntimeEmpty,
 // the session registry back at its baseline, and the bubble ends with no
 // goroutine).
+//
+// Under -race the run is smaller (R2-37) and, since M6 I3 (race-unit
+// passes reached 282 s on the builder at the M6 RC, run
+// 20261022-141914-ce19), half as long: 30 virtual seconds with the kills
+// at 10 and 20 s (each Link killed once) and 100 churn sessions, with the
+// same criteria; the non-race lanes run the 60-s timeline.
 func TestMuxSmoke_CM(t *testing.T) {
-	cfg := cmConfig{up: 4 << 20, back: 1 << 20, rate: 1000, rateBack: 200, churnBytes: 16 << 10}
-	if loopbackRace {
-		// The same timeline at a smaller size (R2-37).
-		cfg = cmConfig{up: 1 << 20, back: 256 << 10, rate: 250, rateBack: 50, churnBytes: 4 << 10}
-	}
+	cfg := cmSmokeConfig()
 	synctest.Test(t, func(t *testing.T) { runMuxSmoke(t, cfg) })
+}
+
+// cmSmokeConfig is TestMuxSmoke_CM's size in the binary's lane
+// (TestRaceLaneSubtests checks it).
+func cmSmokeConfig() cmConfig {
+	if loopbackRace {
+		// The same rules at a smaller size (R2-37) over half the timeline (M6 I3).
+		return cmConfig{up: 512 << 10, back: 128 << 10, rate: 250, rateBack: 50, churnBytes: 4 << 10, duration: 30 * time.Second, churn: 100}
+	}
+	return cmConfig{up: 4 << 20, back: 1 << 20, rate: 1000, rateBack: 200, churnBytes: 16 << 10, duration: 60 * time.Second, churn: 200}
 }
 
 // cmConfig sizes the C-M smoke.
 type cmConfig struct {
-	up, back       int64 // stream bytes per session, dialer → passive and back
-	rate, rateBack int   // packet datagrams per second per session, each way
-	churnBytes     int64 // bytes each way per churn session
+	up, back       int64         // stream bytes per session, dialer → passive and back
+	rate, rateBack int           // packet datagrams per second per session, each way
+	churnBytes     int64         // bytes each way per churn session
+	duration       time.Duration // the run: the streams' pacing, the packet flows and the kills
+	churn          int           // churn sessions, one every cmChurnGap from the start
 }
 
 const (
-	cmDuration = 60 * time.Second
 	cmEvery    = 10 * time.Second
-	cmChurn    = 200
 	cmChurnGap = 300 * time.Millisecond
 )
 
@@ -398,7 +410,7 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 
 	// Traffic: the stream sessions both ways, paced over the run.
 	start := time.Now()
-	errs := make(chan error, 4*ns+2*cmChurn)
+	errs := make(chan error, 4*ns+2*cfg.churn)
 	var streams sync.WaitGroup
 	sums := make([][4][]byte, ns) // up sent, up read, back sent, back read
 	for i := range ns {
@@ -409,11 +421,11 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 			}
 			var wg sync.WaitGroup
 			wg.Go(func() {
-				errs <- wrapErr(fmt.Sprintf("S%d up write", i), cmPace(sd[i], cfg.up, uint64(100+i), cmDuration, hs[0]))
+				errs <- wrapErr(fmt.Sprintf("S%d up write", i), cmPace(sd[i], cfg.up, uint64(100+i), cfg.duration, hs[0]))
 			})
 			wg.Go(func() { errs <- wrapErr(fmt.Sprintf("S%d up read", i), cmRead(sp[i], cfg.up, uint64(100+i), hs[1])) })
 			wg.Go(func() {
-				errs <- wrapErr(fmt.Sprintf("S%d back write", i), cmPace(sp[i], cfg.back, uint64(200+i), cmDuration, hs[2]))
+				errs <- wrapErr(fmt.Sprintf("S%d back write", i), cmPace(sp[i], cfg.back, uint64(200+i), cfg.duration, hs[2]))
 			})
 			wg.Go(func() {
 				errs <- wrapErr(fmt.Sprintf("S%d back read", i), cmRead(sd[i], cfg.back, uint64(200+i), hs[3]))
@@ -443,7 +455,7 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	var churn sync.WaitGroup
 	churn.Go(func() {
 		var each sync.WaitGroup
-		for j := range cmChurn {
+		for j := range cfg.churn {
 			time.Sleep(time.Until(start.Add(time.Duration(j) * cmChurnGap)))
 			each.Go(func() {
 				if err := cmChurnOne(peer, cp, j, cfg.churnBytes); err != nil {
@@ -460,7 +472,7 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	// A kill every 10 s, Links a and b in turn.
 	var kills []time.Duration
 	killsOf := make([]int, len(links))
-	for k := 1; time.Duration(k)*cmEvery < cmDuration; k++ {
+	for k := 1; time.Duration(k)*cmEvery < cfg.duration; k++ {
 		time.Sleep(time.Until(start.Add(time.Duration(k) * cmEvery)))
 		v := (k - 1) % 2
 		before := links[v].Stats().Session.Killed
@@ -471,7 +483,7 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 			killsOf[v]++
 		}
 	}
-	time.Sleep(time.Until(start.Add(cmDuration)))
+	time.Sleep(time.Until(start.Add(cfg.duration)))
 	close(stop)
 	gens.Wait()
 	streams.Wait()
@@ -489,8 +501,8 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	}
 
 	// Stimulus.
-	if len(kills) != int(cmDuration/cmEvery)-1 {
-		t.Errorf("stimulus: %d kills ended a session carrier, want %d", len(kills), int(cmDuration/cmEvery)-1)
+	if len(kills) != int(cfg.duration/cmEvery)-1 {
+		t.Errorf("stimulus: %d kills ended a session carrier, want %d", len(kills), int(cfg.duration/cmEvery)-1)
 	}
 	if got := downs.Load(); got < int64(len(kills)) {
 		t.Errorf("stimulus: %d CarrierDown events for %d kills", got, len(kills))
@@ -499,8 +511,8 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 	// Link, not per kind: a Link's log cannot tell a JOIN's kind (its
 	// payload does not carry it). It is still tight per kind here: the
 	// identities before the run require both kinds' trunks on every Link,
-	// the stream sessions pace until cmDuration and the packet sessions run
-	// until stop, and every kill comes before cmDuration, so each kill ends
+	// the stream sessions pace until cfg.duration and the packet sessions run
+	// until stop, and every kill comes before cfg.duration, so each kill ends
 	// one trunk of each kind and each kind is owed at most one redial. The
 	// bound has slack for a double dial of one kind only after a kill at
 	// which the other kind did not redial on that Link; the root-level
@@ -512,8 +524,8 @@ func runMuxSmoke(t *testing.T, cfg cmConfig) {
 			t.Errorf("Link %d carried %d session carriers with %d kills, want ≤ 2 × (1 + %d) (one dial per factory and session kind per kill)", i, all, killsOf[i], killsOf[i])
 		}
 	}
-	if churned.Load() != cmChurn {
-		t.Errorf("%d of %d churn sessions completed", churned.Load(), cmChurn)
+	if churned.Load() != int64(cfg.churn) {
+		t.Errorf("%d of %d churn sessions completed", churned.Load(), cfg.churn)
 	}
 	// The ACKs of the last bytes may still be on their way.
 	crUntil(t, 10*time.Second, "the last ACKs", func() bool {
@@ -1775,8 +1787,8 @@ func smokeTransports() []smokeTransport {
 // TestPacketSmokeUDP_CA is the real-socket half over carrier/udp on
 // loopback: 10 real seconds with a kill every 2 s per mode (a shortened
 // timeline: the host runs no long real-time loads); 6 s (two kills) under
-// the race detector (m3 R1-23's first lever, I3 of M4), with the same
-// criteria.
+// the race detector (m3 R1-23's first lever, I3 of M4), in selector mode
+// only (smokeUDPModes), with the same criteria.
 func TestPacketSmokeUDP_CA(t *testing.T) {
 	if testing.Short() {
 		t.Skip("real-time smoke")
@@ -1786,7 +1798,7 @@ func TestPacketSmokeUDP_CA(t *testing.T) {
 		rate, duration = 2000, 6*time.Second
 	}
 	pre, post := realLossWindows()
-	for _, mode := range []rendr.Mode{rendr.ModeSelector, rendr.ModeBond} {
+	for _, mode := range smokeUDPModes() {
 		t.Run(mode.String(), func(t *testing.T) {
 			g0 := runtime.NumGoroutine()
 			n := smokeUDPNet(t)
@@ -1887,15 +1899,31 @@ func TestPacketSmokeUDP60_CA(t *testing.T) {
 	}
 }
 
+// smokeUDPModes are TestPacketSmokeUDP_CA's subtests: selector and bond.
+// Under -race (R1-23 lever 1; M6 I3: race-unit passes reached 282 s on the
+// builder at the M6 RC, run 20261022-141914-ce19) it runs selector only,
+// with unchanged criteria: TestPacketSmokeUDP60_CA's race timeline (2,000
+// datagrams per second and 1,000 back over carrier/udp, two kills that
+// reach each bond member once) is this row's bond race timeline (the same
+// rates, two kills 2 s apart, the members in turn), so bond is judged
+// there under the race detector. The non-race lanes run both;
+// TestRaceLaneSubtests checks the lists.
+func smokeUDPModes() []rendr.Mode {
+	if loopbackRace {
+		return []rendr.Mode{rendr.ModeSelector}
+	}
+	return []rendr.Mode{rendr.ModeSelector, rendr.ModeBond}
+}
+
 // udpEndToEndModes are TestUDPEndToEnd's subtests: selector and bond.
 // Under -race (R1-23 lever 1; the race-unit target of 270 s per pass,
 // m5's prerc decision) its timeline — 2,000 datagrams per second and
 // 1,000 back over carrier/udp, a carrier closed under rendr — repeats
 // TestPacketSmokeUDP_CA's race timeline (the same rates, a carrier closed
-// every 2 s), which runs both modes, so it runs selector only, the mode
-// whose kill is a migration of the session's one active carrier, with
-// unchanged criteria. The non-race lanes run both; TestRaceLaneSubtests
-// checks the lists.
+// every 2 s), so it runs selector only, the mode whose kill is a migration
+// of the session's one active carrier, with unchanged criteria (bond's
+// race timeline is TestPacketSmokeUDP60_CA's). The non-race lanes run
+// both; TestRaceLaneSubtests checks the lists.
 func udpEndToEndModes() []rendr.Mode {
 	if loopbackRace {
 		return []rendr.Mode{rendr.ModeSelector}
@@ -1907,9 +1935,10 @@ func udpEndToEndModes() []rendr.Mode {
 // bond. Under -race (R1-23 lever 1; the race-unit target of 270 s per
 // pass, m5's prerc decision) its timeline — 2,000 datagrams per second
 // over carrier/udp with two kills — repeats TestPacketSmokeUDP_CA's race
-// timeline, which runs both modes, so it runs bond only, the mode whose
-// two kills reach each member once, with unchanged criteria. The non-race
-// lanes run both at 10,000 datagrams per second for 60 s;
+// timeline, so it runs bond only, the mode whose two kills reach each
+// member once, with unchanged criteria: the race lane's one bond run of
+// the real-UDP smoke (TestPacketSmokeUDP_CA runs selector there, M6 I3).
+// The non-race lanes run both at 10,000 datagrams per second for 60 s;
 // TestRaceLaneSubtests checks the lists.
 func smokeUDP60Modes() []rendr.Mode {
 	if loopbackRace {

@@ -84,6 +84,8 @@ type Batch struct {
 	relIdx      [wire.RelWindow]uint8 // frame index of the k-th new REL
 	relStamped  uint32                // bit k: relPayload stamped the k-th new REL's cseq
 	relBlocked  bool                  // a reliable Add* found no REL room this round
+	relKeep     int                   // REL frames the types relKeeps names leave free this round (Conn.relKeep; 0 unless the writer sets it)
+	relShort    bool                  // a reliable Add* found no REL room at all (not only the kept room)
 	lastRef     *Buf                  // the chunk of the latest DGRAM reference taken this round
 
 	// The payload quota of the current endpoint call (M3-D10; set by limit
@@ -135,6 +137,7 @@ func (b *Batch) Reset(now time.Time) {
 	b.n, b.data, b.retx, b.ctl, b.bodies, b.used, b.dgBytes = 0, 0, 0, 0, 0, 0, 0
 	b.now, b.wake, b.capBlocked = now, time.Time{}, false
 	b.dgram, b.frameBudget, b.relRoom, b.nrel, b.relStamped, b.relBlocked = false, 0, 0, 0, 0, false
+	b.relKeep, b.relShort = 0, false
 	b.quota, b.ctlOnly, b.qEnd, b.taken = false, false, 0, 0
 	b.holdH, b.holdOn = 0, false
 	b.downs = nil
@@ -302,6 +305,20 @@ func (b *Batch) heldBy(handle uint32, st wire.AckStatus) {
 func (b *Batch) heldOut(handle uint32) bool {
 	return b.holdOn && handle == b.holdH
 }
+
+// HeldOut reports that the response hold keeps handle's session frames out
+// of the rest of this call (M3-D8): the call placed the OK response of a
+// passive view of a MUX trunk, which places nothing else for the handle
+// until the dialer's go frame ends the hold. A passive packet session's
+// MaxAge clock does not start in such a call (core defect B, 2026-10-21).
+func (b *Batch) HeldOut(handle uint32) bool { return b.heldOut(handle) }
+
+// SetResponseHold arms the response hold for the next endpoint call
+// (M3-D8): once it adds an OK OPEN_ACK or JOIN_ACK for handle, the call
+// adds nothing else for that handle. The MUX writer arms it around the
+// call of a passive view whose first response is due; package session
+// tests call it to drive such a call. Reset disarms it.
+func (b *Batch) SetResponseHold(handle uint32) { b.holdH, b.holdOn = handle, false }
 
 // AddJoinAck appends a JOIN_ACK frame (REL on a datagram batch); false if
 // the batch is full or no REL room is left.

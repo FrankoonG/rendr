@@ -381,7 +381,12 @@ func TestMuxFastPathJoin(t *testing.T) {
 // against the PRNG with io.EOF after exactly what its sender wrote (the
 // merged retransmission ranges replay from the ACK edge before new data,
 // L10, independent of how many carriers the session lost, L27); a clean
-// end and nothing left after Runtime.Close.
+// end and nothing left after Runtime.Close. The race lane's bond gaps of
+// 1.38 s and 1.32 s (run 20261018-050552-0937) were the receiver's ACK duty
+// passing between its two saturated member lanes without an ACK placed: the
+// sender's acknowledged front froze (about 2.6 s, at most 2.85 s, in
+// instrumented host runs at -race -cpu 8) and its window ran out in the
+// drain (fixed in internal/session, TestAckDutyOverdueTakenByFillingLane_L08).
 func TestMuxDeathDuringRequeue_L10_L27(t *testing.T) {
 	rate := float64(16 << 20)
 	if raceEnabled {

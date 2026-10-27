@@ -648,6 +648,9 @@ func TestServeRefusedRealSocket(t *testing.T) {
 	if took > bound {
 		t.Errorf("the refusal took %v, want ≤ %v on %s", took, bound, runtime.GOOS)
 	}
+	// The Server counts a refusal after sending it (Server.reject), so the
+	// dialer can see the refusal before Status counts it.
+	msUntil(t, 10*time.Second, "the Server counts the refusal", func() bool { return n.srv.Status().Rejected != 0 })
 	ss := n.srv.Status()
 	if ss.Rejected != 1 || ss.ByCode[l4.CodeRefused] != 1 || ss.Confirmed != 0 || ss.LastErr == nil {
 		t.Errorf("Server: %+v, want one CodeRefused refusal and its raw error kept", ss)

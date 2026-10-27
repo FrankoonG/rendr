@@ -69,6 +69,12 @@ func (s *Session) fillPacketLocked(l *lane, b *carrier.Batch) {
 // capacity afterwards (M3-D52, KL-13). It stops at a full batch. A race
 // lane places from its own cursor (raceFillDgramsLocked, M3-D32).
 func (s *Session) fillDgramLocked(l *lane, b *carrier.Batch) {
+	if !s.pk.ageOn {
+		if b.HeldOut(l.Handle()) {
+			return // the OK this call placed holds the view until the dialer's go frame (M3-D8)
+		}
+		s.pktAgeStartLocked(b.Now().Sub(s.pk.base).Nanoseconds())
+	}
 	var placed bool
 	if s.p.Mode == ModeRace {
 		placed = s.raceFillDgramsLocked(l, b)
@@ -170,7 +176,9 @@ func (s *Session) placeDgramsLocked(l *lane, b *carrier.Batch) (placed bool) {
 // pktAgeQueueLocked drops q's heads older than MaxAge at nowNs (ns since
 // the base), counting each DropNoPath when it was queued before the latest
 // no-path episode ended or no data lane exists now, else DropAge
-// (M2-D35). noData forces DropNoPath (the actor's no-path step).
+// (M2-D35). noData forces DropNoPath (the actor's no-path step). While a
+// data lane exists but none could place yet (pk.ageOn false), nothing
+// ages (pktAgeStartLocked).
 func (s *Session) pktAgeQueueLocked(q *pring, nowNs int64, noData bool) {
 	pk := s.pk
 	maxAge := int64(s.pktMaxAge())
@@ -180,6 +188,9 @@ func (s *Session) pktAgeQueueLocked(q *pring, nowNs int64, noData bool) {
 	noPathEnd := pk.noPathEnd.Sub(pk.base).Nanoseconds()
 	if !noData {
 		noData = !s.pktHasDataLaneLocked()
+		if !noData && !pk.ageOn {
+			return
+		}
 	}
 	for q.n > 0 && nowNs-q.front().at > maxAge {
 		at := q.front().at
@@ -191,6 +202,36 @@ func (s *Session) pktAgeQueueLocked(q *pring, nowNs int64, noData bool) {
 		} else {
 			pk.ctr.DropAge++
 		}
+	}
+}
+
+// pktAgeStartLocked starts a passive session's MaxAge clock (M2-D35) at
+// nowNs, the first call in which a data lane of it can place a DGRAM: a
+// datagram queued while none could — a view waiting for REL room for its
+// first response or held until the dialer's go frame (M3-D8) — ages from
+// this moment, never from its WriteTo, so nothing is dropped for age
+// before the view could place it; Packet.Queue bounds the queue meanwhile,
+// as always (the m6-design decision on core defect B, 2026-10-21;
+// TestMuxFirstReplyAgesFromPlaceable_L40, TestPacketPassiveAgeFromPlaceable_L40).
+// A call that placed a MUX view's OK response (a Confirm that came after
+// the writer's control pass of the round) is held (Batch.HeldOut): the
+// clock starts at the view's first call after the go frame. A dedicated
+// carrier's first response and DGRAMs share a round (R1-8). A dialer's
+// clock runs from its start (initPacketLocked). Once per session;
+// O(queued). A held txBig (pk.bigHeld: a mixed bond's stream member
+// awaits its SCHED) is aged by the actor, which wanted no deadline for it
+// until now (pktAgeBigLocked): it is rung to arm the restamped one.
+func (s *Session) pktAgeStartLocked(nowNs int64) {
+	pk := s.pk
+	pk.ageOn = true
+	for _, q := range [2]*pring{&pk.tx, &pk.txBig} {
+		for i := 0; i < q.n; i++ {
+			d := &q.desc[(q.head+i)&(len(q.desc)-1)]
+			d.at = max(d.at, nowNs)
+		}
+	}
+	if pk.bigHeld && pk.txBig.n > 0 {
+		s.ringActor()
 	}
 }
 
